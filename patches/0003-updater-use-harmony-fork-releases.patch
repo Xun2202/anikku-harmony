@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 18:09:16 +0000
+Subject: [PATCH 3/4] updater: check this fork's GitHub releases for
+ -harmony-preview builds
+
+The stock updater asks api.github.com for komikku-app/anikku-preview's
+releases and only understands "r1234" / "v0.1.2" version strings, so a
+build versioned 0.2.0-harmony.1 would either crash the parser
+(NumberFormatException on "0.2.0.1") or be offered the official APK, which
+cannot be installed over an APK signed with a different key.
+
+- AppUpdateChecker: GITHUB_REPO is Xun2202/anikku-harmony for every build
+  type; RELEASE_TAG is derived from VERSION_NAME as
+  v<ver>-harmony-preview.<N> (used by the About screen / release links).
+- GetApplicationRelease: compare (major, minor, patch, harmony) tuples
+  parsed from "(\d+)\.(\d+)\.(\d+)-harmony(?:-preview)?\.(\d+)"; a harmony
+  build never accepts a non-harmony tag. The upstream comparison is kept as
+  fallback with toIntOrNull() so an unexpected tag cannot crash the app.
+- ReleaseServiceImpl needs no change: Anikku already lists /releases and
+  picks the first non-prerelease entry, so fork releases must be published
+  as regular (non-prerelease) releases with -arm64-v8a / universal assets.
+---
+ .../data/updater/AppUpdateChecker.kt          | 32 ++++++++-----
+ .../interactor/GetApplicationRelease.kt       | 47 +++++++++++++++----
+ 2 files changed, 58 insertions(+), 21 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateChecker.kt b/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateChecker.kt
+index 3505269..dea5839 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateChecker.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateChecker.kt
+@@ -95,20 +95,30 @@ class AppUpdateChecker(
+ 
+ val GITHUB_REPO: String by lazy { getGithubRepo() }
+ 
+-fun getGithubRepo(peekIntoPreview: Boolean = false): String =
+-    if (isPreviewBuildType || peekIntoPreview) {
+-        "komikku-app/anikku-preview"
+-    } else {
+-        "komikku-app/anikku"
+-    }
++/**
++ * Anikku Harmony fork: every build is published as a GitHub release of the fork repository,
++ * tagged `v<upstream version>-harmony-preview.<N>`. There is no separate preview repository.
++ */
++const val HARMONY_GITHUB_REPO: String = "Xun2202/anikku-harmony"
++
++private val HARMONY_VERSION_REGEX = Regex("""^(\d+\.\d+\.\d+)-harmony\.(\d+)""")
++
++@Suppress("UNUSED_PARAMETER")
++fun getGithubRepo(peekIntoPreview: Boolean = false): String = HARMONY_GITHUB_REPO
+ 
+ val RELEASE_TAG: String by lazy { getReleaseTag() }
+ 
+-fun getReleaseTag(peekIntoPreview: Boolean = false): String =
+-    if (isPreviewBuildType || peekIntoPreview) {
+-        "r${BuildConfig.COMMIT_COUNT}"
+-    } else {
+-        "v${BuildConfig.VERSION_NAME}"
++fun getReleaseTag(peekIntoPreview: Boolean = false): String {
++    // versionName looks like "0.2.0-harmony.1" ("-<commitCount>" is appended in preview builds).
++    val match = HARMONY_VERSION_REGEX.find(BuildConfig.VERSION_NAME)
++    return when {
++        match != null -> {
++            val (base, patch) = match.destructured
++            "v$base-harmony-preview.$patch"
++        }
++        isPreviewBuildType || peekIntoPreview -> "r${BuildConfig.COMMIT_COUNT}"
++        else -> "v${BuildConfig.VERSION_NAME}"
+     }
++}
+ 
+ val RELEASE_URL = "https://github.com/$GITHUB_REPO/releases/tag/$RELEASE_TAG"
+diff --git a/domain/src/main/java/tachiyomi/domain/release/interactor/GetApplicationRelease.kt b/domain/src/main/java/tachiyomi/domain/release/interactor/GetApplicationRelease.kt
+index 7bf8753..1c40a83 100644
+--- a/domain/src/main/java/tachiyomi/domain/release/interactor/GetApplicationRelease.kt
++++ b/domain/src/main/java/tachiyomi/domain/release/interactor/GetApplicationRelease.kt
+@@ -80,29 +80,52 @@ class GetApplicationRelease(
+         versionName: String,
+         versionTag: String,
+     ): Boolean {
++        // Anikku Harmony fork: versionName looks like "0.2.0-harmony.1" (preview builds append
++        // "-<commitCount>") and release tags look like "v0.2.0-harmony-preview.1". Compare the
++        // (major, minor, patch, harmony) tuples and never offer a release that is not a harmony
++        // build, because it is signed with a different key and could not be installed anyway.
++        val oldHarmony = parseHarmonyVersion(versionName)
++        if (oldHarmony != null) {
++            val newHarmony = parseHarmonyVersion(versionTag) ?: return false
++            return compareVersions(newHarmony, oldHarmony) > 0
++        }
++
++        // Fallback to the upstream logic, hardened so an unexpected tag cannot crash the app.
+         // Removes prefixes like "r" or "v"
+         val newVersion = versionTag.replace("[^\\d.]".toRegex(), "")
+         return if (isPreview) {
+             // Preview builds: based on releases in "komikku-app/komikku-preview" repo
+             // tagged as something like "r1234"
+-            newVersion.toInt() > commitCount
++            newVersion.toIntOrNull()?.let { it > commitCount } ?: false
+         } else {
+             // Release builds: based on releases in "komikku-app/komikku" repo
+             // tagged as something like "v0.1.2"
+             val oldVersion = versionName.replace("[^\\d.]".toRegex(), "")
+ 
+-            val newSemVer = newVersion.split(".").map { it.toInt() }
+-            val oldSemVer = oldVersion.split(".").map { it.toInt() }
++            val newSemVer = newVersion.split(".").mapNotNull { it.toIntOrNull() }
++            val oldSemVer = oldVersion.split(".").mapNotNull { it.toIntOrNull() }
+ 
+-            oldSemVer.mapIndexed { index, i ->
+-                if (newSemVer[index] > i) {
+-                    return true
+-                }
+-                if (newSemVer[index] < i) return false
+-            }
++            compareVersions(newSemVer, oldSemVer) > 0
++        }
++    }
+ 
+-            false
++    /**
++     * Returns `[major, minor, patch, harmonyPatch]` or null when [value] is not an Anikku Harmony
++     * version string or release tag.
++     */
++    private fun parseHarmonyVersion(value: String): List<Int>? {
++        val match = HARMONY_VERSION_REGEX.find(value) ?: return null
++        return match.groupValues.drop(1).map { it.toInt() }
++    }
++
++    private fun compareVersions(a: List<Int>, b: List<Int>): Int {
++        val size = maxOf(a.size, b.size)
++        for (index in 0 until size) {
++            val x = a.getOrElse(index) { 0 }
++            val y = b.getOrElse(index) { 0 }
++            if (x != y) return x.compareTo(y)
+         }
++        return 0
+     }
+ 
+     data class Arguments(
+@@ -124,6 +147,10 @@ class GetApplicationRelease(
+         data object NoNewUpdate : Result
+         data object OsTooOld : Result
+     }
++
++    private companion object {
++        val HARMONY_VERSION_REGEX = Regex("""(\d+)\.(\d+)\.(\d+)-harmony(?:-preview)?\.(\d+)""")
++    }
+ }
+ 
+ // KMK --.

@@ -1,0 +1,84 @@
+name: Check patches
+
+# 补丁必须能干净地套到官方最新稳定版上 (这是 Harmony Preview 实际编译的版本).
+# 同时试套官方 master, 提前发现即将到来的冲突; master 冲突只警告, 不算失败.
+# 只检查补丁能否套用, 不编译.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'patches/**'
+      - 'scripts/**'
+      - '.github/workflows/check_patches.yml'
+  pull_request:
+    paths:
+      - 'patches/**'
+      - 'scripts/**'
+      - '.github/workflows/check_patches.yml'
+  schedule:
+    - cron: '47 2 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  UPSTREAM_REPO: komikku-app/anikku
+
+jobs:
+  apply:
+    name: Apply to ${{ matrix.target.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: latest stable
+            ref: latest
+            required: true
+          - name: master
+            ref: master
+            required: false
+    continue-on-error: ${{ !matrix.target.required }}
+
+    steps:
+      - name: Checkout patches
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream ref
+        id: ref
+        env:
+          TARGET_REF: ${{ matrix.target.ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$TARGET_REF" == "latest" ]]; then
+            ref="$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq '.tag_name')"
+          else
+            ref="$TARGET_REF"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Testing against $UPSTREAM_REPO@$ref"
+
+      - name: Fetch official source
+        env:
+          REF: ${{ steps.ref.outputs.ref }}
+        run: git clone --depth 1 --branch "$REF" "https://github.com/$UPSTREAM_REPO.git" "$RUNNER_TEMP/anikku"
+
+      - name: Apply patches
+        env:
+          REF: ${{ steps.ref.outputs.ref }}
+        run: |
+          set -euo pipefail
+          # prepare-source.sh 只接受稳定版 tag; 对 master 用一个占位 tag 走同样的流程.
+          tag="$REF"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || tag="v0.0.0"
+          scripts/prepare-source.sh "$RUNNER_TEMP/anikku" "$tag" 1
+          {
+            echo "### Patches applied to \`$UPSTREAM_REPO@$REF\`"
+            echo
+            echo '```'
+            git -C "$RUNNER_TEMP/anikku" log --oneline -n 7
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

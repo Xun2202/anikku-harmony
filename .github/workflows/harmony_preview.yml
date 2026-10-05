@@ -1,0 +1,237 @@
+name: Harmony Preview
+
+# 每天检查 Anikku 官方最新稳定版; 若本仓库还没有对应的 <tag>-harmony-preview.<N> Release,
+# 就拉取官方源码、套用 patches/ 下的补丁、编译 preview 构建 (包名 app.anikku.beta), 用本仓库
+# 自己的密钥重签并发布. 也可手动触发指定版本, 或只编译不发布 (dry_run).
+
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Anikku 官方 tag (如 v0.2.0); 留空则取最新稳定版'
+        required: false
+        type: string
+      patch_number:
+        description: 'harmony 补丁序号 (同一官方版本重新打包时递增)'
+        required: true
+        default: '1'
+        type: string
+      dry_run:
+        description: '只编译并上传 artifact, 不创建 Release'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: harmony-preview
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  UPSTREAM_REPO: komikku-app/anikku
+
+jobs:
+  preview:
+    name: Build and release preview
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout patches
+        uses: actions/checkout@v4
+
+      - name: Resolve release version
+        id: version
+        env:
+          INPUT_UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          INPUT_PATCH_NUMBER: ${{ inputs.patch_number }}
+        run: |
+          set -euo pipefail
+
+          upstream_tag="${INPUT_UPSTREAM_TAG:-}"
+          patch_number="${INPUT_PATCH_NUMBER:-1}"
+
+          if [[ -z "$upstream_tag" ]]; then
+            upstream_tag="$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq '.tag_name')"
+          fi
+
+          if [[ ! "$upstream_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unsupported upstream tag: $upstream_tag (only stable vX.Y.Z tags are supported)" >&2
+            exit 1
+          fi
+          if [[ ! "$patch_number" =~ ^[1-9][0-9]?$ ]]; then
+            echo "Patch number must be between 1 and 99" >&2
+            exit 1
+          fi
+
+          upstream_version="${upstream_tag#v}"
+          {
+            echo "upstream_tag=$upstream_tag"
+            echo "upstream_version=$upstream_version"
+            echo "patch_number=$patch_number"
+            echo "harmony_version=${upstream_version}-harmony.${patch_number}"
+            # 更新器按 tag 里的 "-harmony-preview." 识别版本, 不要改这个格式.
+            echo "release_tag=${upstream_tag}-harmony-preview.${patch_number}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Skip an existing release
+        id: existing
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [[ "$DRY_RUN" != "true" ]] && gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate signing secrets
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [[ -n "$SIGNING_KEY" ]] || { echo "Missing SIGNING_KEY secret (base64 keystore)" >&2; exit 1; }
+          [[ -n "$KEY_STORE_PASSWORD" ]] || { echo "Missing KEY_STORE_PASSWORD secret" >&2; exit 1; }
+          [[ -n "$ALIAS" ]] || { echo "Missing ALIAS secret" >&2; exit 1; }
+          [[ -n "$KEY_PASSWORD" ]] || { echo "Missing KEY_PASSWORD secret" >&2; exit 1; }
+
+      - name: Fetch official source
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          # 完整历史 (单分支): preview 构建的 versionNameSuffix / BuildConfig.COMMIT_COUNT 用 `git rev-list --count HEAD`.
+          git clone --branch "$UPSTREAM_TAG" --single-branch "https://github.com/$UPSTREAM_REPO.git" "$RUNNER_TEMP/anikku"
+
+      - name: Apply Harmony patches
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.version.outputs.upstream_tag }}
+          PATCH_NUMBER: ${{ steps.version.outputs.patch_number }}
+          FORK_REPO: ${{ github.repository }}
+        run: scripts/prepare-source.sh "$RUNNER_TEMP/anikku" "$UPSTREAM_TAG" "$PATCH_NUMBER"
+
+      - name: Set up JDK
+        if: steps.existing.outputs.skip != 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          # 与官方 build_preview.yml 一致 (仓库里没有 .java-version 文件).
+          java-version: 17
+
+      - name: Set up Gradle
+        if: steps.existing.outputs.skip != 'true'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build preview APKs
+        if: steps.existing.outputs.skip != 'true'
+        working-directory: ${{ runner.temp }}/anikku
+        # 不加 -Pinclude-telemetry: 不需要 Firebase, 也就不需要官方的 google-services.json.
+        # -Penable-updater 打开 BuildConfig.UPDATER_ENABLED, 否则 App 不会检查更新.
+        # preview 构建类型用 debug 密钥出包, 下一步再用本仓库的密钥重签.
+        run: ./gradlew assemblePreview -Penable-updater --stacktrace
+
+      - name: Sign APKs with the Harmony key
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          build_tools="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)"
+          echo "Using build-tools: $build_tools"
+          keystore="$RUNNER_TEMP/signing.jks"
+          printf '%s' "$SIGNING_KEY" | base64 -d > "$keystore"
+
+          apk_dir="$RUNNER_TEMP/anikku/app/build/outputs/apk/preview"
+          ls -la "$apk_dir"
+          mkdir -p release-files
+
+          # 文件名必须保留 -arm64-v8a 片段 (更新器靠它挑选 APK); 没有 ABI 片段的那个是 universal,
+          # 更新器找不到匹配 ABI 时会退回到它. 不要再上传其它名字里含 -arm64-v8a 的文件.
+          sign() {
+            "$build_tools/zipalign" -p -f 4 "$1" "$RUNNER_TEMP/aligned.apk"
+            "$build_tools/apksigner" sign \
+              --ks "$keystore" --ks-key-alias "$ALIAS" \
+              --ks-pass env:KEY_STORE_PASSWORD --key-pass env:KEY_PASSWORD \
+              --out "$2" "$RUNNER_TEMP/aligned.apk"
+            "$build_tools/apksigner" verify --print-certs "$2" | grep -i 'SHA-256'
+          }
+          sign "$apk_dir/app-arm64-v8a-preview.apk" "release-files/Anikku-${RELEASE_TAG}-arm64-v8a.apk"
+          sign "$apk_dir/app-universal-preview.apk" "release-files/Anikku-${RELEASE_TAG}.apk"
+          rm -f "$keystore" "$RUNNER_TEMP/aligned.apk"
+
+          (cd release-files && sha256sum *.apk > "$RUNNER_TEMP/checksums.txt")
+          cat "$RUNNER_TEMP/checksums.txt"
+
+      - name: Upload APKs as workflow artifact
+        if: steps.existing.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: anikku-harmony-preview-${{ steps.version.outputs.release_tag }}
+          path: release-files/*.apk
+
+      - name: Write release notes
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.version.outputs.upstream_tag }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          {
+            echo "基于 [Anikku $UPSTREAM_TAG](https://github.com/$UPSTREAM_REPO/releases/tag/$UPSTREAM_TAG) 的非官方 HarmonyOS / 卓易通 兼容构建 (preview 构建类型)。"
+            echo
+            echo "## 本构建包含的补丁"
+            echo
+            while IFS= read -r patch || [[ -n "$patch" ]]; do
+              [[ -z "$patch" || "$patch" == \#* ]] && continue
+              # format-patch 会把长 Subject 折行, 续行以空格开头.
+              subject="$(awk '/^Subject: /{ sub(/^Subject: /,""); sub(/^\[PATCH[^]]*\] /,""); s=$0; while ((getline line) > 0 && line ~ /^ /) { s = s line } print s; exit }' "patches/$patch")"
+              echo "- \`$patch\`: $subject"
+            done < patches/series
+            echo
+            echo "## 安装说明"
+            echo
+            echo "- 下载 \`Anikku-${RELEASE_TAG}-arm64-v8a.apk\`（华为设备均为 arm64）。"
+            echo "- 包名为 \`app.anikku.beta\`，与官方 Anikku Preview 相同，但签名不同：**第一次安装前必须先卸载官方 Preview**。卸载前先在 设置 → 数据与存储 → 创建备份 导出备份，装好后再恢复；下载目录里已下载的视频不会丢，重新选择同一个存储位置即可。"
+            echo "- harmony-preview 版本之间可直接覆盖安装；应用内更新会检查本仓库的 Release，而不是官方更新服务器。"
+            echo "- 鸿蒙建议：设置 → 数据与存储 → 「使用应用私有目录（鸿蒙推荐）」。下载完全不经过 SAF，图库也不会索引这些视频；代价是卸载应用时会一并删除。"
+            echo "- 继续使用 Documents/Anikku 这类自选文件夹也可以：本构建已把 ffmpeg 输出改到应用私有缓存再复制过去，并在目录重命名失败时自动改为复制。"
+            echo
+            echo "## 校验 (SHA-256)"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/checksums.txt"
+            echo '```'
+          } > "$RUNNER_TEMP/release-notes.md"
+          cat "$RUNNER_TEMP/release-notes.md"
+
+      - name: Create GitHub release
+        if: steps.existing.outputs.skip != 'true' && inputs.dry_run != true
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          # 打包后的源码树不会推回本仓库; tag 指向运行本次 workflow 的提交, 补丁内容以该提交的 patches/ 为准.
+          # 必须是正式 Release (非 prerelease): 应用内更新器会过滤掉 prerelease.
+          gh release create "$RELEASE_TAG" \
+            release-files/*.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Anikku Harmony Preview $RELEASE_TAG" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"

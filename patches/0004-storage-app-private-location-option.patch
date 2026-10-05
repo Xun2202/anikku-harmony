@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 18:10:45 +0000
+Subject: [PATCH 4/4] storage: offer the app-private directory as a one-tap
+ storage location
+
+Anikku already falls back to Android/data/<package>/files/<app name> when
+no SAF folder picker is available (Fire TV). Expose that location as an
+explicit choice:
+
+- Settings > Data and storage: a "Use app-private storage" entry below the
+  storage location picker (disabled once it is active).
+- Onboarding storage step: a second button next to "Select folder".
+
+The directory is a plain filesystem path, so UniFile works on java.io.File
+and neither ffmpeg-kit's SAF protocol nor renameDocument() is involved -
+both are broken on HarmonyOS ZhuoyiTong. Gallery apps never index
+Android/data, which is the second reason HarmonyOS users want it. The
+trade-off (contents are removed when the app is uninstalled) is stated in
+the summary text.
+
+Strings are added to i18n-ank (base + zh-rCN).
+---
+ .../more/onboarding/StorageStep.kt            | 11 ++++++
+ .../settings/screen/SettingsDataScreen.kt     | 35 +++++++++++++++++++
+ .../domain/storage/service/StorageManager.kt  | 30 +++++++++++++++-
+ .../moko-resources/base/strings.xml           |  5 +++
+ .../moko-resources/zh-rCN/strings.xml         |  5 +++
+ 5 files changed, 85 insertions(+), 1 deletion(-)
+
+diff --git a/app/src/main/java/eu/kanade/presentation/more/onboarding/StorageStep.kt b/app/src/main/java/eu/kanade/presentation/more/onboarding/StorageStep.kt
+index 1e58f2e..f2e511b 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/onboarding/StorageStep.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/onboarding/StorageStep.kt
+@@ -22,8 +22,10 @@ import eu.kanade.tachiyomi.util.system.toast
+ import kotlinx.coroutines.flow.collectLatest
+ import tachiyomi.domain.storage.service.StorageManager.Companion.allowAccessStorage
+ import tachiyomi.domain.storage.service.StorageManager.Companion.directoryAccessible
++import tachiyomi.domain.storage.service.StorageManager.Companion.useAppPrivateStorage
+ import tachiyomi.domain.storage.service.StoragePreferences
+ import tachiyomi.i18n.MR
++import tachiyomi.i18n.ank.AMR
+ import tachiyomi.presentation.core.components.material.Button
+ import tachiyomi.presentation.core.components.material.padding
+ import tachiyomi.presentation.core.i18n.stringResource
+@@ -85,6 +87,15 @@ internal class StorageStep : OnboardingStep {
+                 ) {
+                     Text(stringResource(MR.strings.onboarding_storage_action_select))
+                 }
++
++                // Harmony -->
++                Button(
++                    modifier = Modifier.fillMaxWidth(),
++                    onClick = { useAppPrivateStorage(context, storagePref) },
++                ) {
++                    Text(stringResource(AMR.strings.pref_storage_use_app_private))
++                }
++                // Harmony <--
+             }
+ 
+             HorizontalDivider(
+diff --git a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDataScreen.kt b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDataScreen.kt
+index ca0439b..ec6d306 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDataScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDataScreen.kt
+@@ -84,7 +84,10 @@ import tachiyomi.domain.backup.service.BackupPreferences
+ import tachiyomi.domain.manga.interactor.GetFavorites
+ import tachiyomi.domain.manga.model.Manga
+ import tachiyomi.domain.storage.service.StorageManager.Companion.allowAccessStorage
++import tachiyomi.domain.storage.service.StorageManager.Companion.appPrivateStorageDirectory
+ import tachiyomi.domain.storage.service.StorageManager.Companion.directoryAccessible
++import tachiyomi.domain.storage.service.StorageManager.Companion.isAppPrivateStorage
++import tachiyomi.domain.storage.service.StorageManager.Companion.useAppPrivateStorage
+ import tachiyomi.domain.storage.service.StoragePreferences
+ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.aniyomi.AYMR
+@@ -128,6 +131,9 @@ object SettingsDataScreen : SearchableSettings {
+ 
+         return persistentListOf(
+             getStorageLocationPref(storagePreferences = storagePreferences),
++            // Harmony -->
++            getAppPrivateStoragePref(storagePreferences = storagePreferences),
++            // Harmony <--
+             Preference.PreferenceItem.InfoPreference(stringResource(AMR.strings.pref_storage_location_info_anime)),
+             getBackupAndRestoreGroup(backupPreferences = backupPreferences),
+             // AM (FILE_SIZE) -->
+@@ -228,6 +234,35 @@ object SettingsDataScreen : SearchableSettings {
+         )
+     }
+ 
++    // Harmony -->
++    /**
++     * One-tap alternative to the folder picker: store everything in the app-specific external
++     * directory, which bypasses the Storage Access Framework (broken for ffmpeg output and
++     * renameDocument on HarmonyOS ZhuoyiTong) and is never indexed by gallery apps.
++     */
++    @Composable
++    private fun getAppPrivateStoragePref(
++        storagePreferences: StoragePreferences,
++    ): Preference.PreferenceItem.TextPreference {
++        val context = LocalContext.current
++        val storagePref = storagePreferences.baseStorageDirectory()
++        val storageDir by storagePref.collectAsState()
++        val privateDir = remember { appPrivateStorageDirectory(context) }
++        val isActive = remember(storageDir) { isAppPrivateStorage(context, storageDir) }
++
++        return Preference.PreferenceItem.TextPreference(
++            title = stringResource(AMR.strings.pref_storage_use_app_private),
++            subtitle = if (isActive) {
++                stringResource(AMR.strings.pref_storage_use_app_private_active)
++            } else {
++                stringResource(AMR.strings.pref_storage_use_app_private_summary, privateDir.absolutePath)
++            },
++            enabled = !isActive,
++            onClick = { useAppPrivateStorage(context, storagePref) },
++        )
++    }
++    // Harmony <--
++
+     @Composable
+     private fun getBackupAndRestoreGroup(backupPreferences: BackupPreferences): Preference.PreferenceGroup {
+         val context = LocalContext.current
+diff --git a/domain/src/main/java/tachiyomi/domain/storage/service/StorageManager.kt b/domain/src/main/java/tachiyomi/domain/storage/service/StorageManager.kt
+index 60b39f9..d088458 100644
+--- a/domain/src/main/java/tachiyomi/domain/storage/service/StorageManager.kt
++++ b/domain/src/main/java/tachiyomi/domain/storage/service/StorageManager.kt
+@@ -226,13 +226,41 @@ class StorageManager(
+             context: Context,
+             storageDirPref: Preference<String>,
+         ) {
+-            val fallbackDir = File(context.getExternalFilesDir(null), context.stringResource(MR.strings.app_name))
++            val fallbackDir = appPrivateStorageDirectory(context)
+             if (!fallbackDir.exists()) fallbackDir.mkdirs()
+             storageDirPref.set("") // Trigger recompose
+             storageDirPref.set(fallbackDir.toUri().toString())
+             context.toast("Using default directory: ${fallbackDir.absolutePath}")
+         }
+ 
++        // Harmony -->
++        /**
++         * App-specific external directory (Android/data/<package>/files/<app name>). It is a plain
++         * filesystem path: no Storage Access Framework involved, never indexed by gallery apps,
++         * removed together with the app.
++         */
++        fun appPrivateStorageDirectory(context: Context): File {
++            return File(context.getExternalFilesDir(null), context.stringResource(MR.strings.app_name))
++        }
++
++        /**
++         * Whether [storageDir] (the raw preference value) points at [appPrivateStorageDirectory].
++         */
++        fun isAppPrivateStorage(context: Context, storageDir: String): Boolean {
++            return storageDir == appPrivateStorageDirectory(context).toUri().toString()
++        }
++
++        /**
++         * Switch the storage location to [appPrivateStorageDirectory] without a folder picker.
++         */
++        fun useAppPrivateStorage(
++            context: Context,
++            storageDirPref: Preference<String>,
++        ) {
++            fallbackToScopedStorage(context, storageDirPref)
++        }
++        // Harmony <--
++
+         /**
+          * Used to check if system is able to open contract [ActivityResultContracts.OpenDocumentTree]
+          * by checking if intent [Intent.ACTION_OPEN_DOCUMENT_TREE] is available and not being stub (on Android TV)
+diff --git a/i18n-ank/src/commonMain/moko-resources/base/strings.xml b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+index dbbe226..c9e04cd 100644
+--- a/i18n-ank/src/commonMain/moko-resources/base/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+@@ -239,4 +239,9 @@
+ 
+     <string name="action_clear_anime">Clear anime</string>
+     <string name="episodes_from_database">Episodes &amp; History from Database</string>
++
++    <!-- Harmony fork: app-private storage location -->
++    <string name="pref_storage_use_app_private">Use app-private storage</string>
++    <string name="pref_storage_use_app_private_summary">Keep downloads in %s. No folder picker or SAF needed, gallery apps never index it, deleted together with the app.</string>
++    <string name="pref_storage_use_app_private_active">App-private storage is in use</string>
+ </resources>
+diff --git a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+index e020733..c78cc51 100644
+--- a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+@@ -234,4 +234,9 @@
+     <string name="pref_discord_show_timestamp_summary_episode">显示已看/剩余时间</string>
+     <string name="action_clear_anime">清除动画</string>
+     <string name="episodes_from_database">数据库中的剧集与观看记录</string>
++
++    <!-- Harmony fork: app-private storage location -->
++    <string name="pref_storage_use_app_private">使用应用私有目录（鸿蒙推荐）</string>
++    <string name="pref_storage_use_app_private_summary">下载内容保存到 %s。无需选择文件夹、不经过 SAF，图库不会索引，卸载应用时一并删除。</string>
++    <string name="pref_storage_use_app_private_active">当前正在使用应用私有目录</string>
+ </resources>

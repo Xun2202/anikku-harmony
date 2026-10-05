@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 18:06:30 +0000
+Subject: [PATCH 1/4] downloads: fall back to copy+delete when SAF
+ renameDocument is unsupported
+
+ZhuoyiTong (HarmonyOS Android compatibility container) exposes a
+DocumentsProvider that does not implement renameDocument(). Anikku
+finalises every episode download by renaming "<episode>_tmp" to
+"<episode>" with UniFile.renameTo(); on those devices the rename silently
+fails, the episode stays in its _tmp directory and the download cache ends
+up pointing at a directory that does not exist.
+
+Add UniFile.renameToOrCopy(): try renameTo() first and, when it fails,
+copy the file or directory tree to the destination and delete the source.
+Devices whose provider supports rename keep the original code path.
+
+While at it, create the .nomedia marker in the final episode directory
+returned by renameToOrCopy() instead of the pre-rename handle.
+
+Ported from Xun2202/mihon-harmony patch 0001 (based on zsyou/mihon-harmony;
+upstream PR https://github.com/mihonapp/mihon/pull/3446).
+---
+ .../tachiyomi/data/download/Downloader.kt     |  5 +-
+ .../core/common/storage/UniFileExtensions.kt  | 72 +++++++++++++++++++
+ 2 files changed, 75 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 4647aee..ad0699a 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -54,6 +54,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
+ import logcat.LogPriority
+ import tachiyomi.core.common.i18n.stringResource
+ import tachiyomi.core.common.storage.extension
++import tachiyomi.core.common.storage.renameToOrCopy
+ import tachiyomi.core.common.util.lang.launchIO
+ import tachiyomi.core.common.util.lang.withIOContext
+ import tachiyomi.core.common.util.system.logcat
+@@ -400,11 +401,11 @@ class Downloader(
+             val filename = DiskUtil.buildValidFilename("${/* SY --> */ download.anime.ogTitle /* SY <-- */} - ${download.episode.name}")
+             tmpDir.findFile("$filename.tmp")?.delete()
+             tmpDir.findFile("${filename}_tmp.mkv")?.delete()
+-            tmpDir.renameTo(episodeDirname)
++            val episodeDir = tmpDir.renameToOrCopy(episodeDirname)
+ 
+             cache.addChapter(episodeDirname, animeDir, download.anime)
+ 
+-            DiskUtil.createNoMediaFile(tmpDir, context)
++            DiskUtil.createNoMediaFile(episodeDir, context)
+ 
+             download.status = Download.State.DOWNLOADED
+         } catch (error: Throwable) {
+diff --git a/core/common/src/main/kotlin/tachiyomi/core/common/storage/UniFileExtensions.kt b/core/common/src/main/kotlin/tachiyomi/core/common/storage/UniFileExtensions.kt
+index 8bbd9b3..80c9c93 100644
+--- a/core/common/src/main/kotlin/tachiyomi/core/common/storage/UniFileExtensions.kt
++++ b/core/common/src/main/kotlin/tachiyomi/core/common/storage/UniFileExtensions.kt
+@@ -1,6 +1,7 @@
+ package tachiyomi.core.common.storage
+ 
+ import com.hippo.unifile.UniFile
++import java.io.IOException
+ 
+ val UniFile.extension: String?
+     get() = name?.substringAfterLast('.')
+@@ -10,3 +11,74 @@ val UniFile.nameWithoutExtension: String?
+ 
+ val UniFile.displayablePath: String
+     get() = filePath ?: uri.toString()
++
++/**
++ * Renames this file, falling back to copying and deleting it when the storage provider does not
++ * support renaming documents.
++ *
++ * @return the renamed file, or the newly created file when the fallback is used.
++ */
++fun UniFile.renameToOrCopy(targetName: String): UniFile {
++    if (renameTo(targetName)) return this
++
++    val parent = parentFile
++        ?: throw IOException("Failed to rename $displayablePath: parent directory is unavailable")
++    if (parent.findFile(targetName) != null) {
++        throw IOException("Failed to rename $displayablePath: target '$targetName' already exists")
++    }
++
++    val target = createCopyTarget(parent, targetName)
++        ?: throw IOException("Failed to rename $displayablePath: could not create target '$targetName'")
++
++    try {
++        copyContentsTo(target)
++    } catch (e: Exception) {
++        val rollbackFailed = !target.deleteSafely()
++        val rollbackMessage = if (rollbackFailed) "; failed to remove incomplete target" else ""
++        throw IOException("Failed to copy $displayablePath to '$targetName'$rollbackMessage", e)
++    }
++
++    val sourceDeleted = try {
++        delete()
++    } catch (e: Exception) {
++        val rollbackFailed = !target.deleteSafely()
++        val rollbackMessage = if (rollbackFailed) "; failed to remove copied target" else ""
++        throw IOException("Copied $displayablePath to '$targetName', but failed to delete source$rollbackMessage", e)
++    }
++    if (!sourceDeleted) {
++        val rollbackFailed = !target.deleteSafely()
++        val rollbackMessage = if (rollbackFailed) "; failed to remove copied target" else ""
++        throw IOException("Copied $displayablePath to '$targetName', but failed to delete source$rollbackMessage")
++    }
++
++    return target
++}
++
++private fun UniFile.createCopyTarget(parent: UniFile, targetName: String): UniFile? =
++    if (isDirectory) parent.createDirectory(targetName) else parent.createFile(targetName)
++
++private fun UniFile.deleteSafely(): Boolean = try {
++    delete()
++} catch (_: Exception) {
++    false
++}
++
++private fun UniFile.copyContentsTo(target: UniFile) {
++    if (isDirectory) {
++        val children = listFiles()
++            ?: throw IOException("Failed to list directory $displayablePath")
++        children.forEach { child ->
++            val childName = child.name
++                ?: throw IOException("A file in $displayablePath has no name")
++            val childTarget = child.createCopyTarget(target, childName)
++                ?: throw IOException("Failed to create '$childName' in " + target.displayablePath)
++            child.copyContentsTo(childTarget)
++        }
++    } else {
++        openInputStream().use { input ->
++            target.openOutputStream().use { output ->
++                input.copyTo(output)
++            }
++        }
++    }
++}

@@ -1,0 +1,222 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 18:08:13 +0000
+Subject: [PATCH 2/4] downloads: mux videos into the private cache instead of a
+ SAF document
+
+ffmpeg-kit writes SAF outputs through its "saf:<id>" pseudo protocol:
+Downloader creates "<episode>.tmp" in the SAF download directory, hands
+the content URI to ffmpeg-kit and ffmpeg-kit opens it with
+ContentResolver.openFileDescriptor() from a native callback. On HarmonyOS
+ZhuoyiTong (and on some Motorola/Samsung firmwares, see
+aniyomiorg/aniyomi#2126) that open fails with
+
+  Failed to open SAF id: 8 ... IllegalArgumentException: Failed to
+  determine if primary:Documents/Anikku/downloads/<...>/Video_tmp/Video.tmp
+  is child of primary:Documents/Anikku: FileNotFoundException: Missing file
+
+so every attempt ends with "Error in ffmpeg!" and the episode is retried
+forever.
+
+Make ffmpeg write to a plain file in Context.cacheDir
+(harmony_download_tmp/<animeId>/<episode>.mkv) instead, then copy the
+finished video into the SAF directory as "<episode>.tmp" and rename it to
+"<episode>.mkv" with renameToOrCopy(). The copy uses the ordinary
+createFile()/openOutputStream() path that image downloads already rely on,
+so no SAF feature beyond the ones used elsewhere in the app is required.
+
+- The muxed file survives retries of the copy step so a SAF hiccup does not
+  re-download the whole video; a failed ffmpeg run is retried from scratch.
+- The cache file is always deleted afterwards, also on cancellation, and
+  the private cache is never indexed by gallery apps.
+- The external downloader path (1DM/ADM) is unchanged.
+---
+ .../tachiyomi/data/download/Downloader.kt     | 113 +++++++++++++-----
+ 1 file changed, 80 insertions(+), 33 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index ad0699a..3794d95 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -53,6 +53,7 @@ import kotlinx.coroutines.supervisorScope
+ import kotlinx.coroutines.suspendCancellableCoroutine
+ import logcat.LogPriority
+ import tachiyomi.core.common.i18n.stringResource
++import tachiyomi.core.common.storage.displayablePath
+ import tachiyomi.core.common.storage.extension
+ import tachiyomi.core.common.storage.renameToOrCopy
+ import tachiyomi.core.common.util.lang.launchIO
+@@ -68,6 +69,8 @@ import uy.kohesive.injekt.Injekt
+ import uy.kohesive.injekt.api.get
+ import uy.kohesive.injekt.injectLazy
+ import java.io.BufferedReader
++import java.io.File
++import java.io.IOException
+ import kotlin.coroutines.resume
+ import kotlin.coroutines.resumeWithException
+ 
+@@ -500,33 +503,81 @@ class Downloader(
+         tmpDir: UniFile,
+         filename: String,
+     ): UniFile {
+-        return flow {
+-            tmpDir.findFile("$filename.tmp")?.delete()
+-            val videoFile = tmpDir.createFile("$filename.tmp")!!
+-            try {
+-                if (isTor(download.video!!)) {
+-                    torrentDownload(download, tmpDir, videoFile, filename)
+-                } else {
+-                    ffmpegDownload(download, tmpDir, videoFile, filename)
++        // Harmony: ffmpeg-kit reaches SAF documents through its "saf:<id>" protocol, which fails on
++        // several devices (HarmonyOS ZhuoyiTong, some Motorola/Samsung firmwares) because the
++        // DocumentsProvider cannot find the document that was created a moment earlier
++        // ("Failed to determine if ... is child of ...: Missing file"). Mux into a plain file in the
++        // private cache instead and copy the finished video into the download directory.
++        val cacheFile = createCacheOutputFile(download, filename)
++        var muxed = false
++        try {
++            return flow {
++                tmpDir.findFile("$filename.tmp")?.delete()
++                if (!muxed) {
++                    cacheFile.delete()
++                    if (isTor(download.video!!)) {
++                        torrentDownload(download, cacheFile)
++                    } else {
++                        ffmpegDownload(download, cacheFile)
++                    }
++                    muxed = true
+                 }
+-            } catch (e: Exception) {
+-                videoFile.delete()
+-                throw e
++
++                emit(copyIntoDownloadDir(cacheFile, tmpDir, filename))
+             }
++                // Retry 3 times, waiting 2, 4 and 8 seconds between attempts.
++                .retryWhen { _, attempt ->
++                    if (attempt < 3) {
++                        delay((2L shl attempt.toInt()) * 1000)
++                        true
++                    } else {
++                        false
++                    }
++                }
++                .flowOn(Dispatchers.IO)
++                .first()
++        } finally {
++            cacheFile.delete()
++            // Only succeeds when no other download of the same anime is in progress.
++            cacheFile.parentFile?.delete()
++        }
++    }
++
++    /**
++     * Returns the (not yet existing) file in the private cache directory that ffmpeg writes to.
++     * The private cache is never indexed by gallery apps and is a plain filesystem path, so
++     * ffmpeg does not have to go through the Storage Access Framework.
++     */
++    private fun createCacheOutputFile(download: Download, filename: String): File {
++        val dir = File(context.cacheDir, "$CACHE_DOWNLOAD_DIR/${download.anime.id}")
++        dir.mkdirs()
++        return File(dir, "$filename.mkv").also { it.delete() }
++    }
+ 
+-            emit(videoFile)
++    /**
++     * Copies the muxed video into [tmpDir] as "<filename>.tmp" and renames it to "<filename>.mkv"
++     * once the copy is complete, so an interrupted copy is never mistaken for a finished download.
++     */
++    private fun copyIntoDownloadDir(cacheFile: File, tmpDir: UniFile, filename: String): UniFile {
++        if (!cacheFile.isFile || cacheFile.length() == 0L) {
++            throw IOException("ffmpeg produced no output for $filename")
+         }
+-            // Retry 3 times, waiting 2, 4 and 8 seconds between attempts.
+-            .retryWhen { _, attempt ->
+-                if (attempt < 3) {
+-                    delay((2L shl attempt.toInt()) * 1000)
+-                    true
+-                } else {
+-                    false
++
++        tmpDir.findFile("$filename.tmp")?.delete()
++        val tmpFile = tmpDir.createFile("$filename.tmp")
++            ?: throw IOException("Failed to create $filename.tmp in ${tmpDir.displayablePath}")
++        try {
++            cacheFile.inputStream().use { input ->
++                tmpFile.openOutputStream().use { output ->
++                    input.copyTo(output)
+                 }
+             }
+-            .flowOn(Dispatchers.IO)
+-            .first()
++        } catch (e: Exception) {
++            tmpFile.delete()
++            throw e
++        }
++
++        return tmpFile.renameToOrCopy("$filename.mkv")
+     }
+ 
+     private fun isTor(video: Video): Boolean {
+@@ -535,9 +586,7 @@ class Downloader(
+ 
+     private suspend fun torrentDownload(
+         download: Download,
+-        tmpDir: UniFile,
+-        videoFile: UniFile,
+-        filename: String,
++        outputFile: File,
+     ) {
+         val video = download.video!!
+         TorrentServerService.start()
+@@ -554,26 +603,25 @@ class Downloader(
+         }
+         val torrentUrl = TorrentServerUtils.getTorrentPlayLink(currentTorrent, index)
+         video.videoUrl = torrentUrl
+-        return ffmpegDownload(download, tmpDir, videoFile, filename)
++        return ffmpegDownload(download, outputFile)
+     }
+ 
+     // ffmpeg is always on safe mode
+     private suspend fun ffmpegDownload(
+         download: Download,
+-        tmpDir: UniFile,
+-        videoFile: UniFile,
+-        filename: String,
++        outputFile: File,
+     ) {
+         val video = download.video!!
+ 
+-        val ffmpegFilename = { videoFile.uri.toFFmpegString(context) }
++        // Plain path in the private cache; see downloadVideo() for why SAF is avoided here.
++        val ffmpegFilename = outputFile.absolutePath.replace("\"", "\\\"")
+ 
+         val headers = video.headers ?: download.source.headers
+         val headerOptions = headers.joinToString("", "-headers '", "'") {
+             "${it.first}: ${it.second}\r\n"
+         }
+ 
+-        val ffmpegOptions = getFFmpegOptions(video, headerOptions, ffmpegFilename())
++        val ffmpegOptions = getFFmpegOptions(video, headerOptions, ffmpegFilename)
+         val duration = getDuration(video.videoUrl, headerOptions)?.toLong() ?: 0L
+ 
+         val logCallback = LogCallback { log ->
+@@ -597,9 +645,6 @@ class Downloader(
+                 ffmpegOptions,
+                 {
+                     if (it.returnCode.isValueSuccess) {
+-                        tmpDir.findFile("$filename.tmp")?.apply {
+-                            renameTo("$filename.mkv")
+-                        }
+                         continuation.resume(it)
+                     } else {
+                         continuation.resumeWithException(Exception("Error in ffmpeg!"))
+@@ -925,6 +970,8 @@ class Downloader(
+ 
+     companion object {
+         const val TMP_DIR_SUFFIX = "_tmp"
++        // Harmony: sub-directory of Context.cacheDir that holds videos while ffmpeg muxes them.
++        private const val CACHE_DOWNLOAD_DIR = "harmony_download_tmp"
+         const val WARNING_NOTIF_TIMEOUT_MS = 30_000L
+         const val EPISODES_PER_SOURCE_QUEUE_WARNING_THRESHOLD = 10
+         private const val DOWNLOADS_QUEUED_WARNING_THRESHOLD = 20
