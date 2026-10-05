@@ -35,6 +35,7 @@ patches/
   0002-downloads-mux-video-in-private-cache.patch   核心: ffmpeg 写私有缓存再复制
   0003-updater-use-harmony-fork-releases.patch      更新器指向本仓库
   0004-storage-app-private-location-option.patch    「使用应用私有目录」选项
+  0005-build-flexible-adapter-from-maven-central.patch  临时回迁: FlexibleAdapter 改从 Maven Central 取
 scripts/prepare-source.sh                  套补丁 + 改版本号 (CI 与本地通用)
 .github/workflows/harmony_preview.yml      编译、重签、发布
 .github/workflows/check_patches.yml        只验证补丁能否套到最新稳定版 / master
@@ -49,7 +50,8 @@ docs/MAINTENANCE.md                        本文件
 2. 若同名 Release 已存在且不是 `dry_run`，直接结束（定时任务每天跑，靠这一步幂等）。
 3. 校验四个 Secrets 非空。
 4. `git clone --branch <tag> --single-branch` 官方源码到 `$RUNNER_TEMP/anikku`（完整历史，`getCommitCount()` 要用）。
-5. `scripts/prepare-source.sh`：按 `series` 顺序 `git apply --3way`，每个补丁一个 commit；把 `AppUpdateChecker.kt` 里的
+5. `scripts/prepare-source.sh`：按 `series` 顺序 `git apply --3way`，每个补丁一个 commit（能 `--reverse` 干净套回去的补丁
+   视为上游已合入，自动跳过——回迁类补丁靠这个在新版上自然失效）；把 `AppUpdateChecker.kt` 里的
    `Xun2202/anikku-harmony` 换成 `${{ github.repository }}`（fork 本仓库时自动指向 fork）；改写 `versionCode` / `versionName`。
 6. JDK 17 + `gradle/actions/setup-gradle`，`./gradlew assemblePreview -Penable-updater --stacktrace`。
    不带 `-Pinclude-telemetry`，所以不需要官方的 `google-services.json` / Firebase；`client_secrets.json`（Google Drive 同步）也不需要。
@@ -93,6 +95,10 @@ git format-patch -o /tmp/new-patches --no-signature --zero-commit v0.3.0..HEAD
   能解析 `-harmony-preview.N`、不接受非 harmony tag。`ReleaseServiceImpl` 目前不用改（Anikku 已经列 `/releases` 并取第一个非 prerelease）。
 - 0004 改 `StorageManager.kt`、`SettingsDataScreen.kt`、`StorageStep.kt` 和 `i18n-ank` 的 base / zh-rCN 字符串。
   字符串 key：`pref_storage_use_app_private`、`pref_storage_use_app_private_summary`（带一个 `%s`）、`pref_storage_use_app_private_active`。
+- 0005 只改 `gradle/libs.versions.toml` 一行，是上游 komikku-app/anikku@c44eb6f2d5 的原样回迁：JitPack 对
+  `com.github.arkon.FlexibleAdapter:flexible-adapter:c8013533` 的构建状态自 2026-02 起就是 Error，没有 Gradle 缓存的机器
+  （比如本仓库第一次跑 CI）会在 `:app:mergePreviewNativeLibs` 报 `Could not find`。官方 CI 没炸只是因为 Actions 里有旧缓存。
+  下一个包含 c44eb6f2d5 的官方稳定版（v0.2.0 之后）上它会被 `prepare-source.sh` 自动跳过，届时直接从 `series` 和 `patches/` 删掉即可。
 
 ### 5.2 加新补丁
 
@@ -141,6 +147,7 @@ gh release list --repo Xun2202/anikku-harmony
 | 编译报错在 `Downloader.kt` | 补丁 0001 / 0002 的改动点被上游重构，按 §5.1 的要点重做 |
 | 编译报错在 `AppUpdateChecker.kt` / `GetApplicationRelease.kt` | 上游改了更新器，重做 0003 |
 | 编译报错 `Unresolved reference: pref_storage_use_app_private` | `i18n-ank` 字符串没套上（0004 的 xml hunk 冲突），检查 `i18n-ank/src/commonMain/moko-resources/base/strings.xml` |
+| Gradle 报 `Could not find com.github.xxx:yyy`（搜索位置里有 `jitpack.io`） | JitPack 对该版本的构建已失效，本地 `curl https://jitpack.io/api/builds/<group>/<artifact>` 可确认。先查上游 master 是否已换坐标（0005 就是这么来的），有就回迁；没有就自己 fork 该库到 JitPack 能构建的分支 |
 | 重签步骤找不到 `app-arm64-v8a-preview.apk` | 上游改了 ABI split 或输出命名，看 `ls -la $apk_dir` 的输出调整文件名 |
 | 下载仍然失败，日志里仍有 `Failed to open SAF id` | 说明跑的不是本构建（看 关于 页版本号应含 `harmony`）；或上游新增了别的 SAF 写入点 |
 | 下载在「复制」阶段失败（日志 `Failed to create <集>.tmp` 或 `openOutputStream` 异常） | 该设备连普通 SAF 写入都不行；让用户切到「使用应用私有目录」 |
@@ -162,3 +169,5 @@ gh release list --repo Xun2202/anikku-harmony
 
 - 2026-10-05 根据用户上传的崩溃日志定位根因（ffmpeg-kit SAF open 失败 + renameDocument 不支持），写出补丁 0001–0004，
   建立本仓库和流水线；生成签名密钥并存入 `Xun2202/keystores/anikku-harmony/`，写入四个 Secrets。
+  首次 dry_run 在依赖解析阶段失败（JitPack 不再提供 FlexibleAdapter c8013533），加入回迁补丁 0005，并让 `prepare-source.sh`
+  自动跳过上游已合入的补丁。

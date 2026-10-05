@@ -47,7 +47,9 @@ Anikku 先在用户选择的 SAF 目录里创建 `Video.tmp`，再把这个 `con
 | [`0003-updater-use-harmony-fork-releases.patch`](./patches/0003-updater-use-harmony-fork-releases.patch) | 应用内更新改查本仓库的 GitHub Releases，版本按 `(x, y, z, N)` 四元组比较；harmony 构建不会接受非 harmony 的 tag。否则官方逻辑会因解析不了 `0.2.0-harmony.1` 而抛 `NumberFormatException`，或推送签名不同、装不上的官方 APK。 |
 | [`0004-storage-app-private-location-option.patch`](./patches/0004-storage-app-private-location-option.patch) | 设置页与新手引导增加「使用应用私有目录」。复用上游给 Fire TV 准备的回退逻辑（`Android/data/<包名>/files/<应用名>`），是普通文件路径，`UniFile` 直接走 `java.io.File`，ffmpeg 与改名都不再碰 SAF。字符串加在 `i18n-ank`（英文 + 简体中文）。 |
 
-补丁按 [`patches/series`](./patches/series) 的顺序套用。
+| [`0005-build-flexible-adapter-from-maven-central.patch`](./patches/0005-build-flexible-adapter-from-maven-central.patch) | **临时回迁**，不改功能。v0.2.0 仍从 JitPack 取 `com.github.arkon.FlexibleAdapter:flexible-adapter:c8013533`，而 JitPack 已不再提供该产物，冷缓存编译必失败；上游 master 已改为 Maven Central 的 `eu.davidea:flexible-adapter:5.1.0`（[c44eb6f](https://github.com/komikku-app/anikku/commit/c44eb6f2d5)），这里原样回迁。下个官方稳定版包含该提交后脚本会自动跳过它。 |
+
+补丁按 [`patches/series`](./patches/series) 的顺序套用；已被官方合入的补丁会被 `prepare-source.sh` 自动跳过。
 
 ## 版本号规则
 

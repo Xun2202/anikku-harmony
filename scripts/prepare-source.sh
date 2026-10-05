@@ -37,6 +37,12 @@ echo "==> Applying patches from $patches_dir/series"
 while IFS= read -r patch || [[ -n "$patch" ]]; do
   [[ -z "$patch" || "$patch" == \#* ]] && continue
   echo "    $patch"
+  # Backports (patches that copy an upstream commit onto an older tag) become no-ops once the
+  # pinned tag contains that commit; a clean reverse apply is how we detect that state.
+  if git apply --check --reverse "$patches_dir/$patch" >/dev/null 2>&1; then
+    echo "    (already present in $upstream_tag, skipping)"
+    continue
+  fi
   # --3way lets git resolve context drift as long as the pre-image blobs exist in the checkout.
   if ! git apply --3way "$patches_dir/$patch"; then
     echo "Patch $patch does not apply to $upstream_tag; rebase it against the new upstream." >&2
