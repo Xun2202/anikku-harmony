@@ -43,13 +43,20 @@ patches/
   0010-downloads-notification-speed-and-progress.patch        下载通知统一为 Animeko 样式: 数量标题 + 速度/进度 + 进度条
   0011-updater-no-background-auto-download-and-apk-cleanup.patch  去掉后台自动下载 (卡住更新页的元凶) + 启动时删已安装的 update.apk
   0012-about-match-mihon-update-ui.patch                        去掉装完后的「已更新至」对话框, 「更新日志」改开 Release 网页 (与 Mihon 一致)
+  0013-updater-regular-work-request.patch                       更新下载改普通 WorkManager 任务 (卓易通不派发 expedited 任务) + 更新页看门狗
+  0014-updater-release-mirror.patch                             检查更新先读 repo 分支的 releases.json 镜像, 再退回 api.github.com; 修 lastChecked
 scripts/prepare-source.sh                  套补丁 + 改版本号 (CI 与本地通用)
-.github/workflows/harmony_preview.yml      编译、重签、发布
+scripts/write-release-index.sh             把 Releases 接口返回写到 repo 分支 (releases.json / latest.json)
+.github/workflows/harmony_preview.yml      编译、重签、发布, 然后写 Release 索引
+.github/workflows/release_index.yml        Release 被手动增删改时重写索引 (也可手动触发)
 .github/workflows/check_patches.yml        只验证补丁能否套到最新稳定版 / master
 docs/MAINTENANCE.md                        本文件
 ```
 
 仓库里**没有** Anikku 源码；需要对照源码时在本地 clone 官方仓库。
+
+孤儿分支 **`repo`** 只放 `write-release-index.sh` 生成的 `releases.json` / `latest.json` / `README.md`（`GET /repos/<repo>/releases?per_page=30` 的原样返回），
+应用内更新器（0014 起）优先从 `https://raw.githubusercontent.com/Xun2202/anikku-harmony/repo/releases.json` 读它，不要手改、不要往里放别的东西。
 
 ## 4. 构建流程（`harmony_preview.yml` 做了什么）
 
@@ -66,6 +73,9 @@ docs/MAINTENANCE.md                        本文件
    打印证书 SHA-256（对照 §2 的值）。只处理 `app-arm64-v8a-preview.apk` 和 `app-universal-preview.apk`。
 8. 上传 artifact；生成中文 Release 说明（补丁列表取自每个 patch 的 Subject，附安装/迁移说明和 SHA-256）；
    `gh release create --target $GITHUB_SHA`，**不是 prerelease**（Anikku 更新器会过滤 prerelease）。
+9. `scripts/write-release-index.sh`：`gh api repos/<repo>/releases?per_page=30` 原样存成 `releases.json`，`jq` 取出最新正式版存成 `latest.json`，
+   连同说明 `README.md` 提交到孤儿分支 `repo`（已存在则在远端分支之上提交；被并发推送拒绝就重取重写，最多 3 次）。
+   `GITHUB_TOKEN` 创建的 Release 不触发 `release` 事件，所以必须在这里写；手动改 Release 时由 `release_index.yml` 兜底。
 
 约 15–25 分钟（Anikku 比 Mihon 大，带 mpv/ffmpeg 原生库）。
 
@@ -146,6 +156,15 @@ git format-patch -o /tmp/new-patches --no-signature --zero-commit v0.3.0..HEAD
   `didMigration` 不再需要，`Migrator.awaitAndRelease()` 像 Mihon 一样直接调用；`AboutScreen` 的「更新日志」条目改为 `uriHandler.openUri(RELEASE_URL)`，
   删掉 companion 里的 `getReleaseNotes()`（唯一的两个调用方都没了）。`WhatsNewDialog.kt` / `WhatsNewScreen.kt`、`AppUpdateChecker.getReleaseNotes()`、
   `GetApplicationRelease.awaitReleaseNotes()` 留在树里不删（减少 rebase 冲突面）。上游若把「已更新至」对话框改成别的形式，照 Mihon 的 `MainActivity` 对齐即可。
+- 0013 改两处：`AppUpdateDownloadJob.start()` 非 scheduled 分支删掉 `setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)`（与 Mihon 的 `start()` 一致；
+  `OutOfQuotaPolicy` import 一并删）；`NewUpdateScreenModel` 加 `downloadRequested` / `workerStarted` / `startTimedOut` 三个标志和 20 秒看门狗：
+  打开页面时看到 pending（无 url、未结束、带 `TAG_INTERACTIVE`）但本页没点过「下载」→ `stop()` 并显示 Available；点过「下载」20 秒内 worker 没汇报 url →
+  `stop()` 并显示 Failed（按钮「重试」）。上游若改 `start()` 的构造方式，保留「不 expedited」这一点即可。
+- 0014 改两处：`ReleaseServiceImpl` 新增 `listReleases(repository)`（镜像 URL `https://raw.githubusercontent.com/$repository/repo/releases.json`，
+  `networkService.client.newBuilder()` 三个超时都 10 秒；`CancellationException` 直接抛，其他异常 `logcat(WARN)` 后退回原 API URL），`releaseNotes()` 改调它
+  （`with(json)` 外壳去掉，lambda 体整体少缩进 4 格，所以 diff 看着大）；`GetApplicationRelease.await()` 的 `lastChecked.set(now)` 移到 `service.releaseNotes()` 之后、
+  `getLatest() ?: return NoNewUpdate` 之前。`latest()` 没有调用方（只有单元测试 `coVerify(exactly = 0)`），保持原样。镜像文件格式必须保持是接口原样返回，
+  `GithubRelease` 的字段（`tag_name` / `body` / `html_url` / `assets[].name` / `assets[].browser_download_url` / `prerelease` / `draft`）一个都不能少。
 
 ### 5.2 加新补丁
 
@@ -203,11 +222,15 @@ gh release list --repo Xun2202/anikku-harmony
 | 同一视频在另一个收藏夹里不显示已下载 | 确认 设置 → 下载 → 「不同条目间共用已下载的视频」开着；两条记录的 `url` 必须完全相同（同一来源）；条目页要重新进一次才会重算 |
 | Release 步骤失败 `refusing to allow a GitHub App to create or update workflow` | 有人把推 tag 的逻辑加回来了。保持 `gh release create --target $GITHUB_SHA`，不要 `git push` tag |
 | 定时任务不跑 | 仓库 60 天无提交被 GitHub 暂停，到 Actions 页面手动 Enable |
-| App 内检查不到更新 | 确认 Release 不是 draft / prerelease、tag 含 `-harmony-preview.`、资产文件名含 `-arm64-v8a`；App 最多每 2 天自动查一次，可在「关于」页手动检查 |
+| App 内检查不到更新 | 确认 Release 不是 draft / prerelease、tag 含 `-harmony-preview.`、资产文件名含 `-arm64-v8a`，且 `repo` 分支的 `releases.json` 里已有它（0014 起 App 先读镜像）；App 最多每 2 天自动查一次（0014 起已是最新时也会记录检查时间），可在「关于」页手动检查 |
 | 安装提示签名冲突 | 设备上还装着官方 Preview（同包名 `app.anikku.beta`）。先备份，卸载官方，再装 |
 | 点「检查更新」→「下载」后页面直接退回、之后没任何反应 | preview.2 及之前的旧流程（通知 + 静默安装会话，卓易通都不显示）。升级到 preview.3 起的版本 |
 | 更新页一进来（还没点下载）就停在「正在下载… (0%)」，一直不动 | preview.3 / preview.4：「检查更新」排了一个 10 分钟后才跑的后台自动下载，页面把它当成自己的下载（见 0011）。升级到 preview.5；preview.5 之后若再出现，看 `adb shell dumpsys jobscheduler` 里 `AppUpdateDownload` 任务是不是别处排进来的（通知栏「下载」动作、`ComingUpdatesScreen`） |
 | 刚装完新版就弹「已更新至 v…」对话框，「更新日志」页面写着「最新: v…-preview.N – 当前: …-harmony.N」，像在推送同一个版本 | preview.5 及之前的 KMK 行为（Mihon 没有这个对话框）。0012 起对话框去掉，「更新日志」直接开当前版本的 Release 网页。「检查更新」在已是最新时一直都是 toast「没有新版本」，若真的弹出更新页，先对比 `GetApplicationRelease.HARMONY_VERSION_REGEX` 与 `BuildConfig.VERSION_NAME` / tag 的格式 |
+| 点「下载」后停在「正在下载… (0%)」、按钮灰掉，一直不动（preview.5 / preview.6 也会） | 更新下载是 WorkManager expedited 任务，卓易通从不派发，worker 没跑过（见 0013；这才是 0011 之后还卡住的原因）。升级到 preview.7 起的版本。升级后若 20 秒变「重试」，说明普通任务也没被派发：设置 → 高级 → 转储崩溃日志，看 logcat 里有没有 `WM-WorkerWrapper` 启动 `AppUpdateDownloadJob` 的记录 |
+| 「检查更新」toast「HTTP error 403」 | 匿名 `api.github.com` 的配额（每个出口 IP 每小时 60 次）被用完，NAT / 代理后面所有人共用；仓库本身公开可访问。等一小时或换网络；preview.7 起先读 `repo` 分支的镜像（`raw.githubusercontent.com`），一般不会再撞上。仍 403 说明镜像也读不到（被墙 / 超时 10 秒），看 logcat 里的 `Release mirror unavailable` |
+| 刚发版几分钟内「检查更新」说「没有新版本」 | `raw.githubusercontent.com` 对 `releases.json` 有最多约 5 分钟缓存，加上 OkHttp 本地缓存；等几分钟再点。确认 `repo` 分支的 `releases.json` 已包含新 tag（发版 workflow 最后一步「Update the release index」） |
+| `repo` 分支的 `releases.json` 没更新 / 不存在 | 发版 workflow 的最后一步失败，或 Release 是手动改的而 `release_index.yml` 没跑。到 Actions 手动运行「Release index」；本地也可 `GH_TOKEN=... scripts/write-release-index.sh Xun2202/anikku-harmony` |
 | 「安装」后系统提示「解析软件包时出现问题」 | 旧版本的 `update.apk` 没删干净，`downloadFileWithResume` 把新包接在了后面（0011 起每次下载前先删）。清除 Anikku 缓存后重试 |
 | 后台下载停住 / 切回 App 才继续 | 卓易通冻结后台进程。确认 设置 → 下载 →「后台保持运行（鸿蒙）」开着（preview.3 起默认开）；logcat 里应有 `Background keep-alive started`。若鸿蒙后续版本连静音音频也拦，只能等上游 / 系统变化 |
 | 闪退 `ForegroundServiceDidNotStopInTimeException ... type dataSync` | Android 15 对 dataSync 前台服务的 6 小时限制，通常是后台被冻结、服务空转耗光额度。开着「后台保持运行（鸿蒙）」时下载服务是 `mediaPlayback` 类型不受限；关着就隔几小时切回前台重置额度 |
@@ -239,3 +262,7 @@ gh release list --repo Xun2202/anikku-harmony
   顺带回答「更新完的 APK 会不会一直占空间」：此前不会删，0011 起启动时自动删。加入补丁 0011，`dry_run` 验证后发布 `v0.2.0-harmony-preview.5`（versionCode 805）。
 - 同日（夜） 用户装上 preview.5 后反馈「点检查更新也弹出来个 5，Mihon 会显示没有新版本」。版本比较本身正确（dex 里确认），用户看到的是 KMK 装完新版后的
   「已更新至 vX」对话框和「更新日志」页面的「最新 / 当前」标题。加入补丁 0012 与 Mihon 对齐，`dry_run` 验证后发布 `v0.2.0-harmony-preview.6`（versionCode 806）。
+- 同日（深夜） 用户反馈「检查更新」报「HTTP error 403」（匿名 GitHub 接口配额，三个 App 同病），随后又反馈 preview.5 点「下载」仍停在「正在下载 0%」、按钮灰掉。
+  后者的真正原因是 KMK 把更新下载排成 expedited WorkManager 任务、卓易通不派发（0011 去掉的后台自动下载是同时存在的另一个阻塞点，但不是全部）。
+  加入补丁 0013（普通任务 + 更新页看门狗）和 0014（先读 `repo` 分支的 Release 索引镜像 + 修 `lastChecked`），流水线新增 `write-release-index.sh` / `release_index.yml`，
+  三个鸿蒙版仓库同步建立 `repo` 分支。`dry_run` 验证后发布 `v0.2.0-harmony-preview.7`（versionCode 807）。
