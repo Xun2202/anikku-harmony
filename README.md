@@ -41,6 +41,9 @@ Anikku 先在用户选择的 SAF 目录里创建 `Video.tmp`，再把这个 `con
 - harmony-preview 版本之间可直接覆盖安装；应用内「检查更新」已改为检查本仓库的 Release，不会再提示安装官方 APK。
   preview.3 起点「下载」后页面会留在原地显示进度，下载完按钮变成「安装」，点它交给系统安装器（和 Mihon 一样）；
   之前那种点完就退回、只靠通知栏和静默安装的流程在卓易通里什么都看不到。
+  preview.4 及之前进更新页会直接卡在「正在下载… (0%)」：「检查更新」顺手排了一个 10 分钟后才跑的后台自动下载任务，
+  更新页把它当成了自己的下载。preview.5 起不再排这个后台任务（卓易通里它本来也装不上），
+  更新页只认自己发起的下载；装完后残留在缓存里的 `update.apk` 会在下次启动时自动删除。
 - 后台下载：卓易通会在 App 切到后台几秒后冻结进程，下载队列和番剧库更新都会停住。preview.3 起默认开启 设置 → 下载 →「**后台保持运行（鸿蒙）**」：
   下载 / 更新期间播放一段静音音轨并持有唤醒锁，卓易通就不会冻结进程；不影响其他 App 的声音，不需要时可关闭。
   关闭后回到官方行为，另受 Android 15 的限制：数据同步类前台服务后台累计 6 小时会被系统强制停止（表现为闪退），隔几小时切回前台可重置额度。
@@ -70,6 +73,7 @@ Anikku 先在用户选择的 SAF 目录里创建 `Video.tmp`，再把这个 `con
 | [`0008-updater-in-screen-download-progress-and-install.patch`](./patches/0008-updater-in-screen-download-progress-and-install.patch) | 应用内更新改成 Mihon 的流程：新版本页面不再点「下载」就退出，而是用 Voyager `StateScreenModel` 订阅 `AppUpdateDownloadJob` 的 WorkInfo，按钮依次显示「下载」→「正在下载… (xx%)」→「安装」（`ACTION_VIEW` 交给系统安装器，卓易通里可用）→ 失败时「重试」；下载中退出页面会取消下载。`AppUpdateDownloadJob` 通过 `setProgress` / 输出数据上报进度和 URL，新增 `interactive` 输入：从页面发起的下载跳过 API 31 的静默 `PackageInstaller` 会话和「点击安装」通知（卓易通都不显示）；通知栏 / 定时自动更新发起的下载保持原行为。 |
 | [`0009-downloads-background-keep-alive-silent-audio.patch`](./patches/0009-downloads-background-keep-alive-silent-audio.patch) | 与 mihon-harmony 补丁 0005 相同。卓易通在 App 退到后台几秒后冻结进程，dataSync 前台服务、唤醒锁、电池优化白名单都拦不住，只有音频输出能让容器继续跑（Animeko 上验证）。新增 `BackgroundKeepAlive`：下载队列 / 番剧库更新运行期间循环播放静音 PCM（`AudioTrack` MODE_STATIC，不占 CPU、不抢音频焦点）并持有部分唤醒锁；下载服务改为声明 `mediaPlayback` 类型（无 Android 15 的 6 小时限制）。设置 → 下载 →「后台保持运行（鸿蒙）」可关闭。 |
 | [`0010-downloads-notification-speed-and-progress.patch`](./patches/0010-downloads-notification-speed-and-progress.patch) | 三个鸿蒙版应用的下载通知统一成 Animeko 的样式：标题「正在下载 N 个剧集」（排队 + 进行中），正文「下载：<速度>/s · <进度>%」，确定型进度条，展开后第二行显示当前「番剧 - 剧集」（「隐藏通知内容」开启时省略）。速度来自 ffmpeg `StatisticsCallback` 的已写字节增量，经与 mihon-harmony 0006 同一份 `DownloadSpeedMeter`（近 3 秒滑动平均）平滑；上游每 50 ms 轮询一次通知的做法换成下载器里的 1 Hz 定时器，同一剧集 700 ms 内的重复更新丢弃。ffmpeg 尚未给出百分比或时长未知时只显示速度和不定型进度条。 |
+| [`0011-updater-no-background-auto-download-and-apk-cleanup.patch`](./patches/0011-updater-no-background-auto-download-and-apk-cleanup.patch) | 修复更新页一进来就停在「正在下载… (0%)」：KMK 的 `AppUpdateChecker` 在每次检查到新版本时都会 `enqueueUniqueWork(REPLACE)` 一个定时自动下载（10 分钟延迟 + Wi-Fi / 电量约束，完成后走静默 `PackageInstaller` 会话），它和更新页发起的下载同名，0008 的页面把这个还没开始的任务当成了自己的下载。本补丁去掉这个后台自动下载及其「自动更新 App」限制条件设置项（卓易通里既拿不到安装权限、静默会话也会被拦，它从来没成功过）；更新页发起的下载额外打 `TAG_INTERACTIVE` 标签，页面只把带标签的待运行任务当作「正在下载」；每次下载前先删掉旧的 `update.apk`（KMK 的断点续传会把新包接在旧版本文件后面，产出损坏的 APK）；`App.onCreate` 里 `deleteInstalledApk()` 在版本已安装（或文件读不出来）时删除残留安装包。与 mihon-harmony 0007 的清理逻辑相同。 |
 
 补丁按 [`patches/series`](./patches/series) 的顺序套用；已被官方合入的补丁会被 `prepare-source.sh` 自动跳过。
 

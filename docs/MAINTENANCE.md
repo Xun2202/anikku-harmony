@@ -41,6 +41,7 @@ patches/
   0008-updater-in-screen-download-progress-and-install.patch  更新页面留在原地显示进度 + 「安装」按钮 (Mihon 流程)
   0009-downloads-background-keep-alive-silent-audio.patch     后台保活: 静音 AudioTrack + 唤醒锁, 下载服务 mediaPlayback
   0010-downloads-notification-speed-and-progress.patch        下载通知统一为 Animeko 样式: 数量标题 + 速度/进度 + 进度条
+  0011-updater-no-background-auto-download-and-apk-cleanup.patch  去掉后台自动下载 (卡住更新页的元凶) + 启动时删已安装的 update.apk
 scripts/prepare-source.sh                  套补丁 + 改版本号 (CI 与本地通用)
 .github/workflows/harmony_preview.yml      编译、重签、发布
 .github/workflows/check_patches.yml        只验证补丁能否套到最新稳定版 / master
@@ -133,6 +134,13 @@ git format-patch -o /tmp/new-patches --no-signature --zero-commit v0.3.0..HEAD
   删掉上游 50 ms 的 `progressJob` 轮询并给首次调用传 `remainingDownloads()`、`ffmpegDownload()` 的 `statCallback` 里按 `s.size`
   增量喂速度、新增 `remainingDownloads()`；`i18n-ank` 两条字符串 + 新建的 `plurals.xml`（base / zh-rCN，该模块此前没有复数资源）。
   上游若改成不经 ffmpeg 的直连下载，速度要改从响应流计数（Mihon 的 `countingInto` 已在同一文件里备好）。
+- 0011 改四处：`AppUpdateChecker.checkForUpdate()` 删掉 KMK 的 `autoUpdate` 参数和 `AppUpdateDownloadJob.start(scheduled = true)` 块
+  （这是更新页卡在 0% 的根因：定时任务与页面发起的下载共用 unique work name `AppUpdateDownload`，`REPLACE` 还会取消正在进行的下载）；
+  `SettingsAdvancedScreen` 删掉「自动更新 App」的 `MultiSelectListPreference`（`AppUpdateJob.setupTask` 仍在 `MainActivity` 用）；
+  `AppUpdateDownloadJob`：`TAG_INTERACTIVE` 常量 + `start(interactive = true)` 时 `addTag`、`downloadApk()` 里下载前 `apkFile.delete()`、
+  companion 里的 `deleteInstalledApk()`（`getPackageArchiveInfo` 读版本号，≤ 当前或读不出就删）；`NewUpdateScreenModel` 的 pending 判断
+  多一个 `TAG_INTERACTIVE in workInfo.tags`；`App.onCreate` 在 WorkManager 初始化后 `scope.launch(Dispatchers.IO) { deleteInstalledApk }`。
+  `deleteInstalledApk` 与 mihon-harmony 0007 逐字相同。上游若换掉 `downloadFileWithResume`，删文件那一行可以跟着去掉。
 
 ### 5.2 加新补丁
 
@@ -192,7 +200,9 @@ gh release list --repo Xun2202/anikku-harmony
 | 定时任务不跑 | 仓库 60 天无提交被 GitHub 暂停，到 Actions 页面手动 Enable |
 | App 内检查不到更新 | 确认 Release 不是 draft / prerelease、tag 含 `-harmony-preview.`、资产文件名含 `-arm64-v8a`；App 最多每 2 天自动查一次，可在「关于」页手动检查 |
 | 安装提示签名冲突 | 设备上还装着官方 Preview（同包名 `app.anikku.beta`）。先备份，卸载官方，再装 |
-| 点「检查更新」→「下载」后页面直接退回、之后没任何反应 | preview.2 及之前的旧流程（通知 + 静默安装会话，卓易通都不显示）。升级到 preview.3 起的版本；若已是新版但按钮一直停在「正在下载… (0%)」，看 logcat 的 `AppUpdateDownload` 是否被网络限制挡住 |
+| 点「检查更新」→「下载」后页面直接退回、之后没任何反应 | preview.2 及之前的旧流程（通知 + 静默安装会话，卓易通都不显示）。升级到 preview.3 起的版本 |
+| 更新页一进来（还没点下载）就停在「正在下载… (0%)」，一直不动 | preview.3 / preview.4：「检查更新」排了一个 10 分钟后才跑的后台自动下载，页面把它当成自己的下载（见 0011）。升级到 preview.5；preview.5 之后若再出现，看 `adb shell dumpsys jobscheduler` 里 `AppUpdateDownload` 任务是不是别处排进来的（通知栏「下载」动作、`ComingUpdatesScreen`） |
+| 「安装」后系统提示「解析软件包时出现问题」 | 旧版本的 `update.apk` 没删干净，`downloadFileWithResume` 把新包接在了后面（0011 起每次下载前先删）。清除 Anikku 缓存后重试 |
 | 后台下载停住 / 切回 App 才继续 | 卓易通冻结后台进程。确认 设置 → 下载 →「后台保持运行（鸿蒙）」开着（preview.3 起默认开）；logcat 里应有 `Background keep-alive started`。若鸿蒙后续版本连静音音频也拦，只能等上游 / 系统变化 |
 | 闪退 `ForegroundServiceDidNotStopInTimeException ... type dataSync` | Android 15 对 dataSync 前台服务的 6 小时限制，通常是后台被冻结、服务空转耗光额度。开着「后台保持运行（鸿蒙）」时下载服务是 `mediaPlayback` 类型不受限；关着就隔几小时切回前台重置额度 |
 | 下载时其他 App 的音乐被暂停 / 变小声 | 不应发生：keep-alive 不请求音频焦点。若出现，检查 `BackgroundKeepAlive.kt` 是否被改成了 `requestAudioFocus` |
@@ -219,3 +229,5 @@ gh release list --repo Xun2202/anikku-harmony
   下载服务改 `mediaPlayback`，设置开关），发布 `v0.2.0-harmony-preview.3`（versionCode 803）。
 - 同日 用户要求三个鸿蒙版应用的下载通知统一成 Animeko 的样式（速度 + 进度）。加入补丁 0010（与 mihon-harmony 0006 同源的
   `DownloadSpeedMeter`、通知重写、1 Hz 刷新替代 50 ms 轮询），`dry_run` 验证后发布 `v0.2.0-harmony-preview.4`（versionCode 804）。
+- 2026-10-06（晚） 用户反馈 preview.4 应用内更新「一直卡在正在下载，进度不动」。根因是 KMK 的定时后台自动下载与更新页下载同名（见 0011）；
+  顺带回答「更新完的 APK 会不会一直占空间」：此前不会删，0011 起启动时自动删。加入补丁 0011，`dry_run` 验证后发布 `v0.2.0-harmony-preview.5`（versionCode 805）。
