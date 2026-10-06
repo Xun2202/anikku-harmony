@@ -1,0 +1,446 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 05:35:32 +0000
+Subject: [PATCH 1/2] updater: keep the update screen open with progress and an
+ Install button
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Tapping "Download" on the new-version screen used to pop the screen at once
+and continue in the background: a progress notification, then a silent
+PackageInstaller session (API 31+) with a "tap to install" notification as
+fallback. Under HarmonyOS 卓易通 neither the notifications nor the installer
+session show up, so after tapping Download nothing visible happens and the
+user never gets to install the update.
+
+Port Mihon's flow instead. The screen now has a Voyager StateScreenModel
+that observes the AppUpdateDownloadJob work info: the button turns into
+"Downloading… (xx%)" while the APK downloads, "Install" when it is ready
+(the file is handed to the system installer with ACTION_VIEW, which does
+work in 卓易通) and "Retry" if the download failed. Leaving the screen
+while downloading cancels the download, like Mihon.
+
+AppUpdateDownloadJob publishes progress and the URL through setProgress /
+the output data, exposes TAG, PROGRESS and updateApk(), and takes an
+`interactive` flag: downloads started from the screen skip the
+PackageInstaller session and the install notification, because the screen
+handles installing. Notification- and scheduled-run downloads keep the old
+behaviour.
+---
+ .../presentation/more/NewUpdateScreen.kt      |  21 +++-
+ .../data/updater/AppUpdateDownloadJob.kt      |  64 ++++++++--
+ .../tachiyomi/ui/more/NewUpdateScreen.kt      |  33 +++--
+ .../tachiyomi/ui/more/NewUpdateScreenModel.kt | 113 ++++++++++++++++++
+ .../moko-resources/base/strings.xml           |   3 +
+ .../moko-resources/zh-rCN/strings.xml         |   3 +
+ 6 files changed, 213 insertions(+), 24 deletions(-)
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreenModel.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/more/NewUpdateScreen.kt b/app/src/main/java/eu/kanade/presentation/more/NewUpdateScreen.kt
+index d4c6c3e..03a04f3 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/NewUpdateScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/NewUpdateScreen.kt
+@@ -17,8 +17,10 @@ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.tooling.preview.PreviewLightDark
+ import eu.kanade.presentation.manga.components.MarkdownRender
+ import eu.kanade.presentation.theme.TachiyomiPreviewTheme
++import eu.kanade.tachiyomi.ui.more.NewUpdateScreenModel
+ import org.intellij.markdown.flavours.gfm.GFMFlavourDescriptor
+ import tachiyomi.i18n.MR
++import tachiyomi.i18n.ank.AMR
+ import tachiyomi.i18n.sy.SYMR
+ import tachiyomi.presentation.core.components.material.padding
+ import tachiyomi.presentation.core.i18n.stringResource
+@@ -28,6 +30,10 @@ import tachiyomi.presentation.core.screens.InfoScreen
+ fun NewUpdateScreen(
+     versionName: String,
+     changelogInfo: String,
++    // Harmony -->
++    stage: NewUpdateScreenModel.Stage,
++    downloadProgress: () -> Int,
++    // Harmony <--
+     onOpenInBrowser: () -> Unit,
+     onRejectUpdate: () -> Unit,
+     onAcceptUpdate: () -> Unit,
+@@ -36,8 +42,19 @@ fun NewUpdateScreen(
+         icon = Icons.Outlined.NewReleases,
+         headingText = stringResource(MR.strings.update_check_notification_update_available),
+         subtitleText = stringResource(SYMR.strings.latest_, versionName),
+-        acceptText = stringResource(MR.strings.update_check_confirm),
++        // Harmony -->
++        acceptText = when (stage) {
++            NewUpdateScreenModel.Stage.Available -> stringResource(MR.strings.update_check_confirm)
++            NewUpdateScreenModel.Stage.Downloading -> stringResource(
++                AMR.strings.update_downloading_with_progress,
++                downloadProgress(),
++            )
++            NewUpdateScreenModel.Stage.Downloaded -> stringResource(MR.strings.action_install)
++            NewUpdateScreenModel.Stage.Failed -> stringResource(MR.strings.action_retry)
++        },
+         onAcceptClick = onAcceptUpdate,
++        canAccept = stage != NewUpdateScreenModel.Stage.Downloading,
++        // Harmony <--
+         rejectText = stringResource(MR.strings.action_not_now),
+         onRejectClick = onRejectUpdate,
+     ) {
+@@ -77,6 +94,8 @@ private fun NewUpdateScreenPreview() {
+                 - Hello
+                 - World
+             """.trimIndent(),
++            stage = NewUpdateScreenModel.Stage.Available,
++            downloadProgress = { 0 },
+             onOpenInBrowser = {},
+             onRejectUpdate = {},
+             onAcceptUpdate = {},
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateDownloadJob.kt b/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateDownloadJob.kt
+index 016f0d4..710a854 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateDownloadJob.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateDownloadJob.kt
+@@ -19,6 +19,7 @@ import androidx.work.NetworkType
+ import androidx.work.OneTimeWorkRequestBuilder
+ import androidx.work.OutOfQuotaPolicy
+ import androidx.work.WorkerParameters
++import androidx.work.workDataOf
+ import eu.kanade.tachiyomi.BuildConfig
+ import eu.kanade.tachiyomi.data.notification.Notifications
+ import eu.kanade.tachiyomi.network.NetworkHelper
+@@ -102,15 +103,23 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
+         instance = WeakReference(this)
+         // KMK <--
+ 
+-        withIOContext {
+-            downloadApk(title, url)
++        // Harmony -->
++        val interactive = inputData.getBoolean(EXTRA_INTERACTIVE, false)
++        val downloaded = withIOContext {
++            downloadApk(title, url, interactive)
+         }
+ 
+         // KMK -->
+         instance = null
+         // KMK <--
+ 
+-        return Result.success()
++        // The update screen observes this work: progress while running, the url + 100% when the APK is ready.
++        return if (downloaded) {
++            Result.success(workDataOf(PROGRESS to 100, EXTRA_DOWNLOAD_URL to url))
++        } else {
++            Result.failure(workDataOf(EXTRA_DOWNLOAD_URL to url))
++        }
++        // Harmony <--
+     }
+ 
+     override suspend fun getForegroundInfo(): ForegroundInfo {
+@@ -130,7 +139,13 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
+      *
+      * @param url url location of file
+      */
+-    private suspend fun downloadApk(title: String, url: String) = coroutineScope {
++    private suspend fun downloadApk(
++        title: String,
++        url: String,
++        // Harmony -->
++        interactive: Boolean,
++        // Harmony <--
++    ): Boolean = coroutineScope {
+         // Show notification download starting.
+         with(notifier) {
+             onDownloadStarted(title)
+@@ -167,30 +182,39 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
+                     savedProgress = progress
+                     lastTick = currentTime
+                     notifier.onProgressChange(progress)
++                    // Harmony -->
++                    setProgressAsync(workDataOf(PROGRESS to progress, EXTRA_DOWNLOAD_URL to url))
++                    // Harmony <--
+                 }
+             }
+         }
+ 
+         try {
+             // File where the apk will be saved.
+-            val apkFile = File(context.externalCacheDir, "update.apk")
++            val apkFile = updateApk(context)
+ 
+             // KMK -->
+             network.downloadFileWithResume(url, apkFile, progressListener)
+             if (isStopped) {
+                 cancel()
+-                return@coroutineScope
++                return@coroutineScope false
+             }
+             // KMK <--
+ 
+             notifier.cancel()
+-            // KMK -->
+-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+-                startInstalling(apkFile, title)
+-            } else {
++            when {
++                // Harmony -->
++                // Started from the update screen: the screen itself offers an Install button that hands the
++                // APK to the system installer (ACTION_VIEW), like Mihon does. The silent PackageInstaller
++                // session and the "tap to install" notification are skipped because 卓易通 tends to drop both.
++                interactive -> Unit
++                // Harmony <--
++                // KMK -->
++                Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> startInstalling(apkFile, title)
+                 // KMK <--
+-                notifier.promptInstall(apkFile.getUriCompat(context))
++                else -> notifier.promptInstall(apkFile.getUriCompat(context))
+             }
++            true
+         } catch (e: Exception) {
+             xLogE("App update stopped:", e)
+             val shouldCancel = e is CancellationException ||
+@@ -206,6 +230,7 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
+                     // KMK <--
+                 )
+             }
++            false
+         }
+     }
+ 
+@@ -265,7 +290,16 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
+     // KMK <--
+ 
+     companion object {
+-        private const val TAG = "AppUpdateDownload"
++        // Harmony -->
++        const val TAG = "AppUpdateDownload"
++
++        const val PROGRESS = "progress"
++
++        /** Set when the download was started from the update screen, which then handles the install. */
++        private const val EXTRA_INTERACTIVE = "interactive"
++
++        fun updateApk(context: Context): File = File(context.externalCacheDir, "update.apk")
++        // Harmony <--
+ 
+         // KMK -->
+         const val PACKAGE_INSTALLED_ACTION =
+@@ -288,10 +322,16 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
+             // KMK -->
+             scheduled: Boolean = false,
+             // KMK <--
++            // Harmony -->
++            interactive: Boolean = false,
++            // Harmony <--
+         ) {
+             val data = Data.Builder()
+             data.putString(EXTRA_DOWNLOAD_URL, url)
+             data.putString(EXTRA_DOWNLOAD_TITLE, title)
++            // Harmony -->
++            data.putBoolean(EXTRA_INTERACTIVE, interactive)
++            // Harmony <--
+             val request = OneTimeWorkRequestBuilder<AppUpdateDownloadJob>()
+                 .addTag(TAG)
+                 .apply {
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreen.kt
+index f3f1082..d244c92 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreen.kt
+@@ -1,13 +1,14 @@
+ package eu.kanade.tachiyomi.ui.more
+ 
+ import androidx.compose.runtime.Composable
+-import androidx.compose.runtime.remember
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
+ import androidx.compose.ui.platform.LocalContext
++import cafe.adriel.voyager.core.model.rememberScreenModel
+ import cafe.adriel.voyager.navigator.LocalNavigator
+ import cafe.adriel.voyager.navigator.currentOrThrow
+ import eu.kanade.presentation.more.NewUpdateScreen
+ import eu.kanade.presentation.util.Screen
+-import eu.kanade.tachiyomi.data.updater.AppUpdateDownloadJob
+ import eu.kanade.tachiyomi.util.system.openInBrowser
+ 
+ class NewUpdateScreen(
+@@ -21,23 +22,33 @@ class NewUpdateScreen(
+     override fun Content() {
+         val navigator = LocalNavigator.currentOrThrow
+         val context = LocalContext.current
+-        val changelogInfoNoChecksum = remember {
+-            changelogInfo
++        // Harmony -->
++        val screenModel = rememberScreenModel {
++            NewUpdateScreenModel(
++                changelogInfo = changelogInfo,
++                downloadLink = downloadLink,
++                versionName = versionName,
++            )
+         }
++        val state by screenModel.state.collectAsState()
+ 
+         NewUpdateScreen(
+             versionName = versionName,
+-            changelogInfo = changelogInfoNoChecksum,
++            changelogInfo = state.changelogInfo,
++            stage = state.stage,
++            downloadProgress = { state.downloadProgress },
+             onOpenInBrowser = { context.openInBrowser(releaseLink) },
+             onRejectUpdate = navigator::pop,
+             onAcceptUpdate = {
+-                AppUpdateDownloadJob.start(
+-                    context = context,
+-                    url = downloadLink,
+-                    title = versionName,
+-                )
+-                navigator.pop()
++                when (state.stage) {
++                    NewUpdateScreenModel.Stage.Available,
++                    NewUpdateScreenModel.Stage.Failed,
++                    -> screenModel.startDownload()
++                    NewUpdateScreenModel.Stage.Downloaded -> screenModel.installUpdate()
++                    NewUpdateScreenModel.Stage.Downloading -> Unit
++                }
+             },
+         )
++        // Harmony <--
+     }
+ }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreenModel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreenModel.kt
+new file mode 100644
+index 0000000..7570559
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreenModel.kt
+@@ -0,0 +1,113 @@
++package eu.kanade.tachiyomi.ui.more
++
++import android.app.Application
++import android.content.Context
++import android.content.Intent
++import androidx.compose.runtime.Immutable
++import androidx.work.WorkInfo
++import cafe.adriel.voyager.core.model.StateScreenModel
++import cafe.adriel.voyager.core.model.screenModelScope
++import eu.kanade.tachiyomi.data.updater.AppUpdateDownloadJob
++import eu.kanade.tachiyomi.extension.util.ExtensionInstaller
++import eu.kanade.tachiyomi.util.storage.getUriCompat
++import eu.kanade.tachiyomi.util.system.workManager
++import kotlinx.coroutines.flow.distinctUntilChanged
++import kotlinx.coroutines.flow.launchIn
++import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.flow.mapNotNull
++import kotlinx.coroutines.flow.onEach
++import kotlinx.coroutines.flow.update
++import uy.kohesive.injekt.Injekt
++import uy.kohesive.injekt.api.get
++
++/**
++ * Drives the in-app update screen the way Mihon does: the screen stays open while the APK downloads, shows the
++ * progress and finally offers an Install button that hands the file to the system installer. The previous flow
++ * (pop the screen, rely on notifications and a silent PackageInstaller session) left HarmonyOS 卓易通 users with
++ * nothing visible after tapping Download, since the host neither shows those notifications nor allows the session.
++ */
++class NewUpdateScreenModel(
++    changelogInfo: String,
++    private val downloadLink: String,
++    private val versionName: String,
++    private val context: Context = Injekt.get<Application>(),
++) : StateScreenModel<NewUpdateScreenModel.State>(State(changelogInfo = changelogInfo)) {
++
++    init {
++        context.workManager.getWorkInfosByTagFlow(AppUpdateDownloadJob.TAG)
++            .mapNotNull { it.firstOrNull() }
++            .map { workInfo ->
++                val data = if (workInfo.state.isFinished) workInfo.outputData else workInfo.progress
++                val progress = data.getInt(AppUpdateDownloadJob.PROGRESS, 0)
++                val url = data.getString(AppUpdateDownloadJob.EXTRA_DOWNLOAD_URL)
++
++                if (url != downloadLink) {
++                    return@map 0 to Stage.Available
++                }
++
++                val stage = when {
++                    workInfo.state == WorkInfo.State.FAILED -> Stage.Failed
++                    workInfo.state.isFinished && progress == 100 -> {
++                        if (AppUpdateDownloadJob.updateApk(context).exists()) {
++                            Stage.Downloaded
++                        } else {
++                            Stage.Available
++                        }
++                    }
++                    workInfo.state in listOf(WorkInfo.State.ENQUEUED, WorkInfo.State.RUNNING) -> Stage.Downloading
++                    else -> Stage.Available
++                }
++                progress to stage
++            }
++            .distinctUntilChanged()
++            .onEach { (progress, stage) ->
++                mutableState.update {
++                    it.copy(
++                        downloadProgress = progress,
++                        stage = stage,
++                    )
++                }
++            }
++            .launchIn(screenModelScope)
++    }
++
++    fun startDownload() {
++        mutableState.update { it.copy(downloadProgress = 0, stage = Stage.Downloading) }
++        AppUpdateDownloadJob.start(
++            context = context,
++            url = downloadLink,
++            title = versionName,
++            interactive = true,
++        )
++    }
++
++    fun installUpdate() {
++        val apkFile = AppUpdateDownloadJob.updateApk(context)
++        val intent = Intent(Intent.ACTION_VIEW).apply {
++            setDataAndType(apkFile.getUriCompat(context), ExtensionInstaller.APK_MIME)
++            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION
++        }
++        context.startActivity(intent)
++    }
++
++    override fun onDispose() {
++        // Leaving the screen abandons a download that is still running, same as Mihon.
++        if (state.value.stage == Stage.Downloading) {
++            AppUpdateDownloadJob.stop(context)
++        }
++    }
++
++    @Immutable
++    data class State(
++        val changelogInfo: String,
++        val downloadProgress: Int = 0,
++        val stage: Stage = Stage.Available,
++    )
++
++    enum class Stage {
++        Available,
++        Downloading,
++        Downloaded,
++        Failed,
++    }
++}
+diff --git a/i18n-ank/src/commonMain/moko-resources/base/strings.xml b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+index d26d349..aff232c 100644
+--- a/i18n-ank/src/commonMain/moko-resources/base/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+@@ -257,4 +257,7 @@
+     <!-- Harmony fork: reuse a download that another entry of the same source already holds -->
+     <string name="pref_share_downloads_across_entries">Reuse downloads across entries</string>
+     <string name="pref_share_downloads_across_entries_summary">When the same video is already downloaded under another entry of the same source (for example another favourites folder), show it as downloaded here too and play that file instead of downloading it again.</string>
++
++    <!-- Harmony fork: the update screen stays open while the new APK downloads -->
++    <string name="update_downloading_with_progress">Downloading… (%d%%)</string>
+ </resources>
+diff --git a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+index af54b38..141c619 100644
+--- a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+@@ -252,4 +252,7 @@
+     <!-- Harmony fork: reuse a download that another entry of the same source already holds -->
+     <string name="pref_share_downloads_across_entries">不同条目间共用已下载的视频</string>
+     <string name="pref_share_downloads_across_entries_summary">同一来源里，如果某个视频已经在另一个条目（比如另一个收藏夹）下载过，这里也显示为已下载并直接播放那份文件，不再重复下载。</string>
++
++    <!-- Harmony fork: the update screen stays open while the new APK downloads -->
++    <string name="update_downloading_with_progress">正在下载… (%d%%)</string>
+ </resources>

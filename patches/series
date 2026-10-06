@@ -5,3 +5,5 @@
 0005-build-flexible-adapter-from-maven-central.patch
 0006-downloads-hide-videos-from-gallery-with-unknown-extension.patch
 0007-downloads-share-downloads-across-entries-by-url.patch
+0008-updater-in-screen-download-progress-and-install.patch
+0009-downloads-background-keep-alive-silent-audio.patch
