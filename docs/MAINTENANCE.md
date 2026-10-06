@@ -40,6 +40,7 @@ patches/
   0007-downloads-share-downloads-across-entries-by-url.patch  同一来源内按 url 共用已下载的视频
   0008-updater-in-screen-download-progress-and-install.patch  更新页面留在原地显示进度 + 「安装」按钮 (Mihon 流程)
   0009-downloads-background-keep-alive-silent-audio.patch     后台保活: 静音 AudioTrack + 唤醒锁, 下载服务 mediaPlayback
+  0010-downloads-notification-speed-and-progress.patch        下载通知统一为 Animeko 样式: 数量标题 + 速度/进度 + 进度条
 scripts/prepare-source.sh                  套补丁 + 改版本号 (CI 与本地通用)
 .github/workflows/harmony_preview.yml      编译、重签、发布
 .github/workflows/check_patches.yml        只验证补丁能否套到最新稳定版 / master
@@ -126,6 +127,12 @@ git format-patch -o /tmp/new-patches --no-signature --zero-commit v0.3.0..HEAD
   `setForegroundSafely()` 之后一行 `acquireForCurrentJob`，`DownloadJob.getForegroundInfo()` 开关开时返回 `FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK`；
   manifest 加 `FOREGROUND_SERVICE_MEDIA_PLAYBACK` 权限、`SystemForegroundService` 类型 `dataSync|mediaPlayback`；`DownloadPreferences.keepAliveInBackground()`
   （默认 true）、`SettingsDownloadScreen` 开关、`i18n-ank` 两条字符串。rebase 时通常只需重新定位插入点。
+- 0010 与 mihon-harmony 0006 同源：新文件 `data/download/DownloadSpeedMeter.kt` 与 Mihon 的逐字节相同（改一份要同步另一份）；
+  `DownloadNotifier.onProgressChange()` 整段重写（签名多了 `remaining: Int`，`onPaused()` / `onComplete()` 各加一行复位）；
+  `Downloader.kt` 四处：`launchDownloaderJob()` 开头的 `DownloadSpeedMeter.reset()` + 1 Hz 定时器、`getOrDownloadVideoFile()` 里
+  删掉上游 50 ms 的 `progressJob` 轮询并给首次调用传 `remainingDownloads()`、`ffmpegDownload()` 的 `statCallback` 里按 `s.size`
+  增量喂速度、新增 `remainingDownloads()`；`i18n-ank` 两条字符串 + 新建的 `plurals.xml`（base / zh-rCN，该模块此前没有复数资源）。
+  上游若改成不经 ffmpeg 的直连下载，速度要改从响应流计数（Mihon 的 `countingInto` 已在同一文件里备好）。
 
 ### 5.2 加新补丁
 
@@ -189,6 +196,7 @@ gh release list --repo Xun2202/anikku-harmony
 | 后台下载停住 / 切回 App 才继续 | 卓易通冻结后台进程。确认 设置 → 下载 →「后台保持运行（鸿蒙）」开着（preview.3 起默认开）；logcat 里应有 `Background keep-alive started`。若鸿蒙后续版本连静音音频也拦，只能等上游 / 系统变化 |
 | 闪退 `ForegroundServiceDidNotStopInTimeException ... type dataSync` | Android 15 对 dataSync 前台服务的 6 小时限制，通常是后台被冻结、服务空转耗光额度。开着「后台保持运行（鸿蒙）」时下载服务是 `mediaPlayback` 类型不受限；关着就隔几小时切回前台重置额度 |
 | 下载时其他 App 的音乐被暂停 / 变小声 | 不应发生：keep-alive 不请求音频焦点。若出现，检查 `BackgroundKeepAlive.kt` 是否被改成了 `requestAudioFocus` |
+| 下载通知一直只有速度、没有百分比 / 进度条在滚动 | ffmpeg 的 `StatisticsCallback` 还没报出时间，或 `getDuration()` 拿不到时长（部分 HLS 源），这是预期显示；速度一直 0 B/s 则看 ffmpeg 是否真的在写文件（`s.size` 不增长） |
 
 ## 8. 不要做的事
 
@@ -209,3 +217,5 @@ gh release list --repo Xun2202/anikku-harmony
 - 2026-10-06 用户反馈应用内更新点「下载」后页面直接退回、没法安装，以及（与 Mihon 相同的）切后台下载停住。加入补丁 0008
   （更新页面留在原地：进度 + 「安装」按钮，跳过卓易通不支持的静默安装会话）和 0009（后台保活：静音 `AudioTrack` + 唤醒锁，
   下载服务改 `mediaPlayback`，设置开关），发布 `v0.2.0-harmony-preview.3`（versionCode 803）。
+- 同日 用户要求三个鸿蒙版应用的下载通知统一成 Animeko 的样式（速度 + 进度）。加入补丁 0010（与 mihon-harmony 0006 同源的
+  `DownloadSpeedMeter`、通知重写、1 Hz 刷新替代 50 ms 轮询），`dry_run` 验证后发布 `v0.2.0-harmony-preview.4`（versionCode 804）。

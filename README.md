@@ -44,6 +44,8 @@ Anikku 先在用户选择的 SAF 目录里创建 `Video.tmp`，再把这个 `con
 - 后台下载：卓易通会在 App 切到后台几秒后冻结进程，下载队列和番剧库更新都会停住。preview.3 起默认开启 设置 → 下载 →「**后台保持运行（鸿蒙）**」：
   下载 / 更新期间播放一段静音音轨并持有唤醒锁，卓易通就不会冻结进程；不影响其他 App 的声音，不需要时可关闭。
   关闭后回到官方行为，另受 Android 15 的限制：数据同步类前台服务后台累计 6 小时会被系统强制停止（表现为闪退），隔几小时切回前台可重置额度。
+- 下载通知（preview.4 起）与 Animeko / Mihon 的鸿蒙版统一：标题「正在下载 N 个剧集」，正文「下载：<速度>/s · <进度>%」+ 进度条，
+  下拉展开显示当前的「番剧 - 剧集」（开启「隐藏通知内容」时不显示）。ffmpeg 还没报出百分比（或视频时长未知）时只显示速度和滚动进度条。
 - **存储位置**：继续用 `Documents/Anikku` 这类自选文件夹即可（和 Mihon 一样，换机、重装都方便）。
   设置 → 下载 → 「**下载的视频对系统图库隐藏**」默认开启，新下载会存成 `<集>.mkv.anikku`，鸿蒙图库不再收录。
   升级前已经下载的 `.mkv` 还是旧名字，点一下同一页的「**按上述设置重命名已下载的视频**」统一补上后缀（下载进行中时不能点，先暂停）。
@@ -67,6 +69,7 @@ Anikku 先在用户选择的 SAF 目录里创建 `Video.tmp`，再把这个 `con
 | [`0007-downloads-share-downloads-across-entries-by-url.patch`](./patches/0007-downloads-share-downloads-across-entries-by-url.patch) | 同一来源里按剧集 `url` 共用下载：`episodes.sq` 新增 `getEpisodesByUrls`（每 500 条一批，避开 SQLite 变量上限），`DownloadManager.findSharedDownloads()` 为未下载的集找出其他条目下已下载的同 url 文件，条目页把它们显示为已下载，播放器与「自动下载后几集」用同一份判断直接播放那份文件。设置 → 下载 新增开关「不同条目间共用已下载的视频」（默认开）。本地源与合并条目不参与。 |
 | [`0008-updater-in-screen-download-progress-and-install.patch`](./patches/0008-updater-in-screen-download-progress-and-install.patch) | 应用内更新改成 Mihon 的流程：新版本页面不再点「下载」就退出，而是用 Voyager `StateScreenModel` 订阅 `AppUpdateDownloadJob` 的 WorkInfo，按钮依次显示「下载」→「正在下载… (xx%)」→「安装」（`ACTION_VIEW` 交给系统安装器，卓易通里可用）→ 失败时「重试」；下载中退出页面会取消下载。`AppUpdateDownloadJob` 通过 `setProgress` / 输出数据上报进度和 URL，新增 `interactive` 输入：从页面发起的下载跳过 API 31 的静默 `PackageInstaller` 会话和「点击安装」通知（卓易通都不显示）；通知栏 / 定时自动更新发起的下载保持原行为。 |
 | [`0009-downloads-background-keep-alive-silent-audio.patch`](./patches/0009-downloads-background-keep-alive-silent-audio.patch) | 与 mihon-harmony 补丁 0005 相同。卓易通在 App 退到后台几秒后冻结进程，dataSync 前台服务、唤醒锁、电池优化白名单都拦不住，只有音频输出能让容器继续跑（Animeko 上验证）。新增 `BackgroundKeepAlive`：下载队列 / 番剧库更新运行期间循环播放静音 PCM（`AudioTrack` MODE_STATIC，不占 CPU、不抢音频焦点）并持有部分唤醒锁；下载服务改为声明 `mediaPlayback` 类型（无 Android 15 的 6 小时限制）。设置 → 下载 →「后台保持运行（鸿蒙）」可关闭。 |
+| [`0010-downloads-notification-speed-and-progress.patch`](./patches/0010-downloads-notification-speed-and-progress.patch) | 三个鸿蒙版应用的下载通知统一成 Animeko 的样式：标题「正在下载 N 个剧集」（排队 + 进行中），正文「下载：<速度>/s · <进度>%」，确定型进度条，展开后第二行显示当前「番剧 - 剧集」（「隐藏通知内容」开启时省略）。速度来自 ffmpeg `StatisticsCallback` 的已写字节增量，经与 mihon-harmony 0006 同一份 `DownloadSpeedMeter`（近 3 秒滑动平均）平滑；上游每 50 ms 轮询一次通知的做法换成下载器里的 1 Hz 定时器，同一剧集 700 ms 内的重复更新丢弃。ffmpeg 尚未给出百分比或时长未知时只显示速度和不定型进度条。 |
 
 补丁按 [`patches/series`](./patches/series) 的顺序套用；已被官方合入的补丁会被 `prepare-source.sh` 自动跳过。
 
