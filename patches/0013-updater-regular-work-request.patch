@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 18:21:40 +0000
+Subject: [PATCH] updater: download updates as a regular work request
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The download started from the update screen was enqueued as an expedited
+WorkManager request. On 卓易通 such a request is never dispatched: the
+work stays ENQUEUED, the worker never runs and the update screen sits at
+"downloading 0%" with the button disabled. Mihon's updater uses a plain
+request with the same network constraint and runs fine there, so do the
+same.
+
+The screen also stops trusting a pending request forever:
+
+- a request still waiting when the screen opens was not started by this
+  screen (leaving the screen cancels its download) and can never report
+  progress, so it is cancelled and the Download button is shown;
+- a request this screen started that has not reported anything after 20
+  seconds is cancelled and the button turns into Retry.
+---
+ .../data/updater/AppUpdateDownloadJob.kt      |  8 ++-
+ .../tachiyomi/ui/more/NewUpdateScreenModel.kt | 58 ++++++++++++++++++-
+ 2 files changed, 63 insertions(+), 3 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateDownloadJob.kt b/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateDownloadJob.kt
+index 4060d8b..8eb68b6 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateDownloadJob.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateDownloadJob.kt
+@@ -18,7 +18,6 @@ import androidx.work.ExistingWorkPolicy
+ import androidx.work.ForegroundInfo
+ import androidx.work.NetworkType
+ import androidx.work.OneTimeWorkRequestBuilder
+-import androidx.work.OutOfQuotaPolicy
+ import androidx.work.WorkerParameters
+ import androidx.work.workDataOf
+ import eu.kanade.tachiyomi.BuildConfig
+@@ -401,7 +400,12 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
+                         setInitialDelay(10, TimeUnit.MINUTES)
+                         setBackoffCriteria(BackoffPolicy.LINEAR, 10, TimeUnit.MINUTES)
+                     } else {
+-                        setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
++                        // Harmony -->
++                        // Upstream marks this request as expedited. On 卓易通 an expedited request is never
++                        // dispatched: the work stays ENQUEUED and the update screen sits at "downloading 0%".
++                        // Mihon's updater uses a plain request with the same network constraint and runs fine
++                        // there, so do the same; the worker still promotes itself to a foreground service.
++                        // Harmony <--
+                         // KMK <--
+                         setConstraints(
+                             Constraints(
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreenModel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreenModel.kt
+index cea709c..f12b13f 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreenModel.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreenModel.kt
+@@ -11,14 +11,20 @@ import eu.kanade.tachiyomi.data.updater.AppUpdateDownloadJob
+ import eu.kanade.tachiyomi.extension.util.ExtensionInstaller
+ import eu.kanade.tachiyomi.util.storage.getUriCompat
+ import eu.kanade.tachiyomi.util.system.workManager
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.delay
+ import kotlinx.coroutines.flow.distinctUntilChanged
+ import kotlinx.coroutines.flow.launchIn
+ import kotlinx.coroutines.flow.map
+ import kotlinx.coroutines.flow.mapNotNull
+ import kotlinx.coroutines.flow.onEach
+ import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.launch
++import logcat.LogPriority
++import tachiyomi.core.common.util.system.logcat
+ import uy.kohesive.injekt.Injekt
+ import uy.kohesive.injekt.api.get
++import kotlin.time.Duration.Companion.seconds
+ 
+ /**
+  * Drives the in-app update screen the way Mihon does: the screen stays open while the APK downloads, shows the
+@@ -33,6 +39,17 @@ class NewUpdateScreenModel(
+     private val context: Context = Injekt.get<Application>(),
+ ) : StateScreenModel<NewUpdateScreenModel.State>(State(changelogInfo = changelogInfo)) {
+ 
++    /** Set by [startDownload]; a pending download observed before that was left behind by an earlier session. */
++    private var downloadRequested = false
++
++    /** Set once the worker reported this screen's url, i.e. WorkManager really started it. */
++    private var workerStarted = false
++
++    /** Set by [startWatchdog] when the worker was never started; cleared by the next [startDownload]. */
++    private var startTimedOut = false
++
++    private var watchdog: Job? = null
++
+     init {
+         context.workManager.getWorkInfosByTagFlow(AppUpdateDownloadJob.TAG)
+             .mapNotNull { it.firstOrNull() }
+@@ -49,9 +66,22 @@ class NewUpdateScreenModel(
+                     val pending = url == null &&
+                         !workInfo.state.isFinished &&
+                         AppUpdateDownloadJob.TAG_INTERACTIVE in workInfo.tags
+-                    return@map 0 to if (pending) Stage.Downloading else Stage.Available
++                    if (pending && !downloadRequested) {
++                        // Leaving the screen cancels its download, so a request still waiting when the screen
++                        // opens was never run (e.g. enqueued by an earlier version); nothing will ever report
++                        // progress for it. Clear it instead of showing it as a download in progress.
++                        logcat(LogPriority.WARN) { "Dropping an update download that never started" }
++                        AppUpdateDownloadJob.stop(context)
++                        return@map 0 to Stage.Available
++                    }
++                    return@map 0 to when {
++                        startTimedOut -> Stage.Failed
++                        pending -> Stage.Downloading
++                        else -> Stage.Available
++                    }
+                 }
+ 
++                workerStarted = true
+                 val stage = when {
+                     workInfo.state == WorkInfo.State.FAILED -> Stage.Failed
+                     workInfo.state.isFinished && progress == 100 -> {
+@@ -79,6 +109,9 @@ class NewUpdateScreenModel(
+     }
+ 
+     fun startDownload() {
++        downloadRequested = true
++        startTimedOut = false
++        workerStarted = false
+         mutableState.update { it.copy(downloadProgress = 0, stage = Stage.Downloading) }
+         AppUpdateDownloadJob.start(
+             context = context,
+@@ -86,6 +119,25 @@ class NewUpdateScreenModel(
+             title = versionName,
+             interactive = true,
+         )
++        startWatchdog()
++    }
++
++    /**
++     * WorkManager normally starts the worker within a second or two, and the worker publishes the url as its
++     * very first progress. When nothing has happened after [START_TIMEOUT] the request is stuck (as 卓易通 did
++     * with expedited requests); give the user a Retry button instead of a disabled "downloading 0%" forever.
++     */
++    private fun startWatchdog() {
++        watchdog?.cancel()
++        watchdog = screenModelScope.launch {
++            delay(START_TIMEOUT)
++            if (!workerStarted && state.value.stage == Stage.Downloading) {
++                logcat(LogPriority.ERROR) { "Update download was not started within $START_TIMEOUT; giving up" }
++                startTimedOut = true
++                AppUpdateDownloadJob.stop(context)
++                mutableState.update { it.copy(downloadProgress = 0, stage = Stage.Failed) }
++            }
++        }
+     }
+ 
+     fun installUpdate() {
+@@ -117,4 +169,8 @@ class NewUpdateScreenModel(
+         Downloaded,
+         Failed,
+     }
++
++    private companion object {
++        val START_TIMEOUT = 20.seconds
++    }
+ }

@@ -1,0 +1,34 @@
+name: Release index
+
+# Release 被手动增删改 (或手动触发本 workflow) 时, 重新生成 repo 分支上的 releases.json / latest.json.
+# 应用内更新器优先读 raw.githubusercontent.com/<repo>/repo/releases.json, 以绕开匿名 api.github.com
+# 每个 IP 每小时 60 次的配额. 流水线自己创建的 Release 不会触发 release 事件 (GITHUB_TOKEN 创建的
+# 事件不触发其他 workflow), 所以发版 workflow 在创建 Release 之后也直接调用同一个脚本.
+
+on:
+  release:
+    types: [published, edited, deleted, released, prereleased, unpublished]
+  workflow_dispatch:
+
+concurrency:
+  group: release-index
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  index:
+    name: Write releases.json to the repo branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write release index
+        run: scripts/write-release-index.sh

@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 18:23:26 +0000
+Subject: [PATCH] updater: read the release list from the repo-branch mirror
+ first
+
+Checking for updates listed the fork's releases through api.github.com,
+whose anonymous quota is 60 requests per hour per IP address. Phones
+behind carrier NAT or a shared proxy exhaust it within minutes and the
+check fails with "HTTP error 403".
+
+The fork's CI now mirrors the "list releases" response to the `repo`
+branch of the release repository (releases.json). Read it from
+raw.githubusercontent.com first (a plain CDN, no such quota), with short
+timeouts, and fall back to the API when the mirror is unreachable.
+
+Also record the time of a check as soon as the releases were fetched:
+upstream only did so after finding a newer release, so an up-to-date app
+re-checked on every start and burned the quota for nothing.
+---
+ .../data/release/ReleaseServiceImpl.kt        | 104 ++++++++++++------
+ .../interactor/GetApplicationRelease.kt       |   7 +-
+ 2 files changed, 79 insertions(+), 32 deletions(-)
+
+diff --git a/data/src/main/java/tachiyomi/data/release/ReleaseServiceImpl.kt b/data/src/main/java/tachiyomi/data/release/ReleaseServiceImpl.kt
+index f7ad03b..10a6b79 100644
+--- a/data/src/main/java/tachiyomi/data/release/ReleaseServiceImpl.kt
++++ b/data/src/main/java/tachiyomi/data/release/ReleaseServiceImpl.kt
+@@ -6,15 +6,55 @@ import eu.kanade.tachiyomi.network.NetworkHelper
+ import eu.kanade.tachiyomi.network.awaitSuccess
+ import eu.kanade.tachiyomi.network.parseAs
+ import kotlinx.serialization.json.Json
++import logcat.LogPriority
++import tachiyomi.core.common.util.system.logcat
+ import tachiyomi.domain.release.interactor.GetApplicationRelease
+ import tachiyomi.domain.release.model.Release
+ import tachiyomi.domain.release.service.ReleaseService
++import java.util.concurrent.TimeUnit
++import kotlin.coroutines.cancellation.CancellationException
+ 
+ class ReleaseServiceImpl(
+     private val networkService: NetworkHelper,
+     private val json: Json,
+ ) : ReleaseService {
+ 
++    // Harmony -->
++    /**
++     * Lists the releases of the fork repository.
++     *
++     * The fork's CI mirrors the GitHub "list releases" response to the `repo` branch of the release repository.
++     * raw.githubusercontent.com is a plain CDN without the anonymous api.github.com quota of 60 requests per
++     * hour per IP, which phones behind carrier NAT or a shared proxy exhaust within minutes (HTTP 403). The API
++     * stays as the fallback for when the mirror is unreachable or has not been written yet.
++     */
++    private suspend fun listReleases(repository: String): List<GithubRelease> {
++        val mirrorClient = networkService.client.newBuilder()
++            .connectTimeout(MIRROR_TIMEOUT_SECONDS, TimeUnit.SECONDS)
++            .readTimeout(MIRROR_TIMEOUT_SECONDS, TimeUnit.SECONDS)
++            .callTimeout(MIRROR_TIMEOUT_SECONDS, TimeUnit.SECONDS)
++            .build()
++        return try {
++            with(json) {
++                mirrorClient
++                    .newCall(GET("https://raw.githubusercontent.com/$repository/repo/releases.json"))
++                    .awaitSuccess()
++                    .parseAs<List<GithubRelease>>()
++            }
++        } catch (e: CancellationException) {
++            throw e
++        } catch (e: Exception) {
++            logcat(LogPriority.WARN, e) { "Release mirror unavailable, falling back to the GitHub API" }
++            with(json) {
++                networkService.client
++                    .newCall(GET("https://api.github.com/repos/$repository/releases"))
++                    .awaitSuccess()
++                    .parseAs<List<GithubRelease>>()
++            }
++        }
++    }
++    // Harmony <--
++
+     override suspend fun latest(arguments: GetApplicationRelease.Arguments): Release? {
+         val release = with(json) {
+             networkService.client
+@@ -37,39 +77,36 @@ class ReleaseServiceImpl(
+ 
+     // KMK -->
+     override suspend fun releaseNotes(arguments: GetApplicationRelease.Arguments): List<Release> {
+-        return with(json) {
+-            networkService.client
+-                .newCall(GET("https://api.github.com/repos/${arguments.repository}/releases"))
+-                .awaitSuccess()
+-                .parseAs<List<GithubRelease>>()
+-                .mapNotNull { release ->
+-                    val downloadLink = getDownloadLink(release = release, isFoss = arguments.isFoss) ?: return@mapNotNull null
++        // Harmony -->
++        return listReleases(arguments.repository)
++            // Harmony <--
++            .mapNotNull { release ->
++                val downloadLink = getDownloadLink(release = release, isFoss = arguments.isFoss) ?: return@mapNotNull null
+ 
+-                    Release(
+-                        version = release.version,
+-                        info = release.info.replace(gitHubUsernameMentionRegex) { mention ->
+-                            "[${mention.value}](https://github.com/${mention.value.substring(1)})"
+-                        }
+-                            .substringBeforeLast("<!-->")
+-                            // KMK -->
+-                            .replace(getHubDownloadBadgeRegex, "")
+-                            .replace(gitHubCommitsCompareRegex) { matchResult ->
+-                                val owner = matchResult.groups["owner"]!!.value
+-                                val repo = matchResult.groups["repo"]!!.value
+-                                val from = matchResult.groups["from"]!!.value
+-                                val to = matchResult.groups["to"]!!.value
+-                                "[$owner/$repo@$from...$to](https://github.com/$owner/$repo/compare/$from...$to)"
+-                            },
+-                        // KMK <--
+-                        releaseLink = release.releaseLink,
+-                        downloadLink = downloadLink,
++                Release(
++                    version = release.version,
++                    info = release.info.replace(gitHubUsernameMentionRegex) { mention ->
++                        "[${mention.value}](https://github.com/${mention.value.substring(1)})"
++                    }
++                        .substringBeforeLast("<!-->")
+                         // KMK -->
+-                        preRelease = release.preRelease,
+-                        draft = release.draft,
+-                        // KMK <--
+-                    )
+-                }
+-        }
++                        .replace(getHubDownloadBadgeRegex, "")
++                        .replace(gitHubCommitsCompareRegex) { matchResult ->
++                            val owner = matchResult.groups["owner"]!!.value
++                            val repo = matchResult.groups["repo"]!!.value
++                            val from = matchResult.groups["from"]!!.value
++                            val to = matchResult.groups["to"]!!.value
++                            "[$owner/$repo@$from...$to](https://github.com/$owner/$repo/compare/$from...$to)"
++                        },
++                    // KMK <--
++                    releaseLink = release.releaseLink,
++                    downloadLink = downloadLink,
++                    // KMK -->
++                    preRelease = release.preRelease,
++                    draft = release.draft,
++                    // KMK <--
++                )
++            }
+     }
+     // KMK <--
+ 
+@@ -89,6 +126,11 @@ class ReleaseServiceImpl(
+         private const val FOSS = "foss"
+         private val BUILD_TYPES = listOf(FOSS, "arm64-v8a", "armeabi-v7a", "x86_64", "x86")
+ 
++        // Harmony -->
++        /** Short timeouts for the mirror: when it is blocked, fall back to the API without a long wait. */
++        private const val MIRROR_TIMEOUT_SECONDS = 10L
++        // Harmony <--
++
+         /**
+          * Regular expression that matches a mention to a valid GitHub username, like it's
+          * done in GitHub Flavored Markdown. It follows these constraints:
+diff --git a/domain/src/main/java/tachiyomi/domain/release/interactor/GetApplicationRelease.kt b/domain/src/main/java/tachiyomi/domain/release/interactor/GetApplicationRelease.kt
+index 1c40a83..706ddcb 100644
+--- a/domain/src/main/java/tachiyomi/domain/release/interactor/GetApplicationRelease.kt
++++ b/domain/src/main/java/tachiyomi/domain/release/interactor/GetApplicationRelease.kt
+@@ -37,10 +37,15 @@ class GetApplicationRelease(
+                     )
+             }
+ 
++        // Harmony -->
++        // Record the check as soon as the releases were fetched. Upstream only did so after finding a newer
++        // release, so an up-to-date app re-checked on every start, which burns the anonymous GitHub API quota.
++        lastChecked.set(now.toEpochMilli())
++        // Harmony <--
++
+         val latest = releases.getLatest() ?: return Result.NoNewUpdate
+         // KMK <--
+ 
+-        lastChecked.set(now.toEpochMilli())
+ 
+         // Check if latest version is different from current version
+         val isNewVersion = isNewVersion(

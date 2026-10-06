@@ -10,3 +10,5 @@
 0010-downloads-notification-speed-and-progress.patch
 0011-updater-no-background-auto-download-and-apk-cleanup.patch
 0012-about-match-mihon-update-ui.patch
+0013-updater-regular-work-request.patch
+0014-updater-release-mirror.patch
