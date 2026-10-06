@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 17:36:09 +0000
+Subject: [PATCH] about: match Mihon's update UI (no post-update dialog,
+ release page for What's new)
+
+KMK shows an "Updated to vX" dialog on the first launch after an update,
+and both its "What's new" button and the About screen's "What's new" entry
+open an in-app screen that fetches the newest GitHub release and shows
+"Latest: <tag> - Current: <versionName>". Right after installing that very
+version this reads like the app offering the same version again, and it
+differs from Mihon, which has no such dialog and opens the release page of
+the installed version in the browser.
+
+- MainActivity: drop the WhatsNewDialog block and the preview_last_version_code
+  bookkeeping; Migrator.awaitAndRelease() is called as in Mihon.
+- AboutScreen: "What's new" opens RELEASE_URL; remove the getReleaseNotes
+  helper that only served the removed flows.
+
+"Check for updates" is unchanged: it already compares the (major, minor,
+patch, harmony) tuple and toasts "No new updates available" when the
+installed build is the latest release.
+---
+ .../more/settings/screen/about/AboutScreen.kt | 67 +++---------------
+ .../kanade/tachiyomi/ui/main/MainActivity.kt  | 70 ++-----------------
+ 2 files changed, 15 insertions(+), 122 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/presentation/more/settings/screen/about/AboutScreen.kt b/app/src/main/java/eu/kanade/presentation/more/settings/screen/about/AboutScreen.kt
+index 8dbafcf..1121f38 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/settings/screen/about/AboutScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/settings/screen/about/AboutScreen.kt
+@@ -30,9 +30,9 @@ import eu.kanade.presentation.util.LocalBackPress
+ import eu.kanade.presentation.util.Screen
+ import eu.kanade.tachiyomi.BuildConfig
+ import eu.kanade.tachiyomi.data.updater.AppUpdateChecker
++import eu.kanade.tachiyomi.data.updater.RELEASE_URL
+ import eu.kanade.tachiyomi.ui.more.ComingUpdatesScreen
+ import eu.kanade.tachiyomi.ui.more.NewUpdateScreen
+-import eu.kanade.tachiyomi.ui.more.WhatsNewScreen
+ import eu.kanade.tachiyomi.util.CrashLogUtil
+ import eu.kanade.tachiyomi.util.lang.toDateTimestampString
+ import eu.kanade.tachiyomi.util.system.copyToClipboard
+@@ -76,7 +76,6 @@ class AboutScreen : Screen() {
+         var isCheckingUpdates by remember { mutableStateOf(false) }
+ 
+         // KMK -->
+-        var isCheckingWhatsNew by remember { mutableStateOf(false) }
+         var isCheckingWhatsComing by remember { mutableStateOf(false) }
+         // KMK <--
+ 
+@@ -146,44 +145,19 @@ class AboutScreen : Screen() {
+                     }
+                 }
+ 
+-                // KMK -->
++                // Harmony -->
++                // Same as Mihon: open the release page of the installed version. KMK's in-app "What's new"
++                // screen fetches the newest release and shows "Latest: <tag> - Current: <versionName>", which
++                // reads like an update prompt right after installing that very version.
+                 item {
+                     TextPreferenceWidget(
+                         title = stringResource(MR.strings.whats_new),
+-                        widget = {
+-                            AnimatedVisibility(visible = isCheckingWhatsNew) {
+-                                CircularProgressIndicator(
+-                                    modifier = Modifier.size(28.dp),
+-                                    strokeWidth = 3.dp,
+-                                )
+-                            }
+-                        },
+-                        onPreferenceClick = {
+-                            if (!isCheckingWhatsNew) {
+-                                scope.launch {
+-                                    isCheckingWhatsNew = true
+-
+-                                    getReleaseNotes(
+-                                        context = context,
+-                                        onAvailableUpdate = { result ->
+-                                            val whatsNewScreen = WhatsNewScreen(
+-                                                currentVersion = BuildConfig.VERSION_NAME,
+-                                                versionName = result.release.version,
+-                                                changelogInfo = result.release.info,
+-                                                releaseLink = result.release.releaseLink,
+-                                            )
+-                                            navigator.push(whatsNewScreen)
+-                                        },
+-                                        onFinish = {
+-                                            isCheckingWhatsNew = false
+-                                        },
+-                                    )
+-                                }
+-                            }
+-                        },
++                        onPreferenceClick = { uriHandler.openUri(RELEASE_URL) },
+                     )
+                 }
++                // Harmony <--
+ 
++                // KMK -->
+                 if (isReleaseBuildType || isDebugBuildType) {
+                     item {
+                         TextPreferenceWidget(
+@@ -332,31 +306,6 @@ class AboutScreen : Screen() {
+     }
+ 
+     companion object {
+-        // KMK -->
+-        suspend fun getReleaseNotes(
+-            context: Context,
+-            onAvailableUpdate: (GetApplicationRelease.Result.NewUpdate) -> Unit,
+-            onFinish: () -> Unit,
+-        ) {
+-            val updateChecker = AppUpdateChecker()
+-            withUIContext {
+-                try {
+-                    when (val result = withIOContext { updateChecker.getReleaseNotes() }) {
+-                        is GetApplicationRelease.Result.NewUpdate -> {
+-                            onAvailableUpdate(result)
+-                        }
+-                        else -> {}
+-                    }
+-                } catch (e: Exception) {
+-                    context.toast(e.message)
+-                    logcat(LogPriority.ERROR, e)
+-                } finally {
+-                    onFinish()
+-                }
+-            }
+-        }
+-        // KMK <--
+-
+         fun getVersionName(withBuildDate: Boolean): String {
+             return when {
+                 isDebugBuildType -> {
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/main/MainActivity.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/main/MainActivity.kt
+index ff983ff..c15afe9 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/main/MainActivity.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/main/MainActivity.kt
+@@ -67,13 +67,10 @@ import eu.kanade.presentation.components.IndexingBannerBackgroundColor
+ import eu.kanade.presentation.components.RestoringBannerBackgroundColor
+ import eu.kanade.presentation.components.SyncingBannerBackgroundColor
+ import eu.kanade.presentation.components.UpdatingBannerBackgroundColor
+-import eu.kanade.presentation.more.settings.screen.about.AboutScreen.Companion.getReleaseNotes
+-import eu.kanade.presentation.more.settings.screen.about.WhatsNewDialog
+ import eu.kanade.presentation.more.settings.screen.browse.ExtensionReposScreen
+ import eu.kanade.presentation.more.settings.screen.data.RestoreBackupScreen
+ import eu.kanade.presentation.util.AssistContentScreen
+ import eu.kanade.presentation.util.DefaultNavigatorScreenTransition
+-import eu.kanade.tachiyomi.BuildConfig
+ import eu.kanade.tachiyomi.animesource.model.Hoster
+ import eu.kanade.tachiyomi.animesource.model.Video
+ import eu.kanade.tachiyomi.data.BackupRestoreStatus
+@@ -97,13 +94,10 @@ import eu.kanade.tachiyomi.ui.home.HomeScreen
+ import eu.kanade.tachiyomi.ui.manga.MangaScreen
+ import eu.kanade.tachiyomi.ui.more.NewUpdateScreen
+ import eu.kanade.tachiyomi.ui.more.OnboardingScreen
+-import eu.kanade.tachiyomi.ui.more.WhatsNewScreen
+ import eu.kanade.tachiyomi.ui.player.ExternalIntents
+ import eu.kanade.tachiyomi.ui.player.PlayerActivity
+ import eu.kanade.tachiyomi.util.system.dpToPx
+ import eu.kanade.tachiyomi.util.system.isNavigationBarNeedsScrim
+-import eu.kanade.tachiyomi.util.system.isPreviewBuildType
+-import eu.kanade.tachiyomi.util.system.isReleaseBuildType
+ import eu.kanade.tachiyomi.util.system.toast
+ import eu.kanade.tachiyomi.util.system.updaterEnabled
+ import eu.kanade.tachiyomi.util.view.setComposeContent
+@@ -120,11 +114,8 @@ import kotlinx.coroutines.runBlocking
+ import kotlinx.coroutines.withContext
+ import logcat.LogPriority
+ import mihon.core.migration.Migrator
+-import mihon.core.migration.Migrator.scope
+ import tachiyomi.core.common.Constants
+ import tachiyomi.core.common.i18n.stringResource
+-import tachiyomi.core.common.preference.Preference
+-import tachiyomi.core.common.preference.PreferenceStore
+ import tachiyomi.core.common.util.lang.launchIO
+ import tachiyomi.core.common.util.lang.withUIContext
+ import tachiyomi.core.common.util.system.logcat
+@@ -177,10 +168,8 @@ class MainActivity : BaseActivity() {
+ 
+         super.onCreate(savedInstanceState)
+ 
+-        val didMigration = if (isLaunch) {
++        if (isLaunch) {
+             Migrator.awaitAndRelease()
+-        } else {
+-            false
+         }
+ 
+         // Do not let the launcher create a new activity http://stackoverflow.com/questions/16283079
+@@ -349,57 +338,12 @@ class MainActivity : BaseActivity() {
+                 ShowOnboarding()
+             }
+ 
+-            // KMK -->
+-            val previewLastVersion = Injekt.get<PreferenceStore>().getInt(
+-                Preference.appStateKey("preview_last_version_code"),
+-                0,
+-            )
+-            val previewCurrentVersion = BuildConfig.COMMIT_COUNT.toInt()
+-            var isCheckingWhatsNew by remember { mutableStateOf(false) }
+-            // KMK <--
+-
+-            var showChangelog by remember {
+-                mutableStateOf(
+-                    // KMK -->
+-                    (isReleaseBuildType && didMigration) ||
+-                        (isPreviewBuildType && previewCurrentVersion > previewLastVersion.get()),
+-                    // KMK <--
+-                )
+-            }
+-            if (showChangelog) {
+-                // KMK -->
+-                WhatsNewDialog(
+-                    onDismissRequest = { showChangelog = false },
+-                    onOpenWhatsNew = {
+-                        showChangelog = false
+-                        if (!isCheckingWhatsNew) {
+-                            scope.launch {
+-                                isCheckingWhatsNew = true
+-
+-                                getReleaseNotes(
+-                                    context = context,
+-                                    onAvailableUpdate = { result ->
+-                                        val whatsNewScreen = WhatsNewScreen(
+-                                            currentVersion = BuildConfig.VERSION_NAME,
+-                                            versionName = result.release.version,
+-                                            changelogInfo = result.release.info,
+-                                            releaseLink = result.release.releaseLink,
+-                                        )
+-                                        navigator?.push(whatsNewScreen)
+-                                    },
+-                                    onFinish = {
+-                                        isCheckingWhatsNew = false
+-                                    },
+-                                )
+-                            }
+-                        }
+-                    },
+-                )
+-                // KMK <--
+-            }
+-            // KMK -->
+-            previewLastVersion.set(previewCurrentVersion)
+-            // KMK <--
++            // Harmony -->
++            // KMK shows an "Updated to vX" dialog on the first launch after an update, whose "What's new"
++            // button opens a screen titled "Latest: <tag> - Current: <versionName>" for the release that was
++            // just installed. Users read that as the app offering the same version again. Mihon has no such
++            // dialog, and this fork keeps the update UI identical to Mihon's.
++            // Harmony <--
+         }
+ 
+         val startTime = System.currentTimeMillis()
