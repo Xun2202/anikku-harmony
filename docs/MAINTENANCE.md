@@ -36,6 +36,8 @@ patches/
   0003-updater-use-harmony-fork-releases.patch      更新器指向本仓库
   0004-storage-app-private-location-option.patch    「使用应用私有目录」选项
   0005-build-flexible-adapter-from-maven-central.patch  临时回迁: FlexibleAdapter 改从 Maven Central 取
+  0006-downloads-hide-videos-from-gallery-...patch       视频存成 <集>.mkv.anikku, 鸿蒙图库不收录 + 设置开关/批量改名
+  0007-downloads-share-downloads-across-entries-by-url.patch  同一来源内按 url 共用已下载的视频
 scripts/prepare-source.sh                  套补丁 + 改版本号 (CI 与本地通用)
 .github/workflows/harmony_preview.yml      编译、重签、发布
 .github/workflows/check_patches.yml        只验证补丁能否套到最新稳定版 / master
@@ -99,6 +101,17 @@ git format-patch -o /tmp/new-patches --no-signature --zero-commit v0.3.0..HEAD
   `com.github.arkon.FlexibleAdapter:flexible-adapter:c8013533` 的构建状态自 2026-02 起就是 Error，没有 Gradle 缓存的机器
   （比如本仓库第一次跑 CI）会在 `:app:mergePreviewNativeLibs` 报 `Could not find`。官方 CI 没炸只是因为 Actions 里有旧缓存。
   下一个包含 c44eb6f2d5 的官方稳定版（v0.2.0 之后）上它会被 `prepare-source.sh` 自动跳过，届时直接从 `series` 和 `patches/` 删掉即可。
+- 0006 改 `Downloader.kt`（`copyIntoDownloadDir` 的最终文件名、常量 `HIDDEN_VIDEO_SUFFIX = ".anikku"`）、`DownloadManager.kt`
+  （`buildVideo` 的文件过滤、新增 `applyGalleryVisibilityToDownloads()`）、`DownloadPreferences.kt`（`hideDownloadedVideosFromGallery()`，默认 true）、
+  `SettingsDownloadScreen.kt` 和 `i18n-ank` 字符串。重做要点：**只改文件名，不改目录名**——`DownloadCache` 按 `<集>` 目录名判断“已下载”，
+  目录名一变缓存就全失效；续传检测 `startsWith("$filename.mkv")` 与 `isDownloadSuccessful`（只排除 `.tmp`）天然兼容后缀，
+  上游若改成精确匹配 `.mkv` 要同步放宽。为什么是改扩展名而不是 `.nomedia`：鸿蒙媒体扫描不认 `.nomedia`，只按扩展名归类。
+- 0007 改 `episodes.sq`（`getEpisodesByUrls`，`IN :episodeUrls`）、`ChapterRepository(.Impl)`（`getChaptersByUrls`，每 500 个 url 一批）、
+  `DownloadPreferences.kt`（`shareDownloadsAcrossEntries()`）、`DownloadManager.kt`（`SharedDownload` / `findSharedDownloads` / `buildVideoOrShared`，
+  构造函数新增 `ChapterRepository`、`GetManga` 两个带默认值的注入参数）、`MangaScreenModel.toChapterListItems`（改成 `suspend`，
+  两个调用点本来就在协程里）、`EpisodeLoader`（`isDownloadOrShared`、`getHostersOnDownloaded` 改 `suspend`）和 `PlayerViewModel.downloadNextEpisodes`。
+  语义：只在**同一来源**内共用，本地源与合并条目不参与；“共用来的”集显示为已下载但文件不归它，删除是空操作。
+  上游若把 `Chapter.url` 改名或把 `toChapterListItems` 改成非挂起上下文，这里要跟着改。
 
 ### 5.2 加新补丁
 
@@ -151,7 +164,9 @@ gh release list --repo Xun2202/anikku-harmony
 | 重签步骤找不到 `app-arm64-v8a-preview.apk` | 上游改了 ABI split 或输出命名，看 `ls -la $apk_dir` 的输出调整文件名 |
 | 下载仍然失败，日志里仍有 `Failed to open SAF id` | 说明跑的不是本构建（看 关于 页版本号应含 `harmony`）；或上游新增了别的 SAF 写入点 |
 | 下载在「复制」阶段失败（日志 `Failed to create <集>.tmp` 或 `openOutputStream` 异常） | 该设备连普通 SAF 写入都不行；让用户切到「使用应用私有目录」 |
-| 鸿蒙图库里能看到视频 | 用户用的是 `Documents/...` 自选目录且系统不认 `.nomedia`；切到「使用应用私有目录」 |
+| 鸿蒙图库里能看到视频 | 鸿蒙不认 `.nomedia`，只按扩展名归类。确认 设置 → 下载 → 「下载的视频对系统图库隐藏」开着（preview.2 起默认开），并对升级前的存量文件点一次「按上述设置重命名已下载的视频」；图库可能还缓存着旧索引，重启或等它重扫。仍不行再切「使用应用私有目录」 |
+| 下载的视频名字以 `.anikku` 结尾、别的播放器打不开 | 预期行为（见 0006）。去掉后缀即可；或关掉上面的开关并点「按上述设置重命名已下载的视频」把后缀全部去掉 |
+| 同一视频在另一个收藏夹里不显示已下载 | 确认 设置 → 下载 → 「不同条目间共用已下载的视频」开着；两条记录的 `url` 必须完全相同（同一来源）；条目页要重新进一次才会重算 |
 | Release 步骤失败 `refusing to allow a GitHub App to create or update workflow` | 有人把推 tag 的逻辑加回来了。保持 `gh release create --target $GITHUB_SHA`，不要 `git push` tag |
 | 定时任务不跑 | 仓库 60 天无提交被 GitHub 暂停，到 Actions 页面手动 Enable |
 | App 内检查不到更新 | 确认 Release 不是 draft / prerelease、tag 含 `-harmony-preview.`、资产文件名含 `-arm64-v8a`；App 最多每 2 天自动查一次，可在「关于」页手动检查 |
@@ -170,4 +185,6 @@ gh release list --repo Xun2202/anikku-harmony
 - 2026-10-05 根据用户上传的崩溃日志定位根因（ffmpeg-kit SAF open 失败 + renameDocument 不支持），写出补丁 0001–0004，
   建立本仓库和流水线；生成签名密钥并存入 `Xun2202/keystores/anikku-harmony/`，写入四个 Secrets。
   首次 dry_run 在依赖解析阶段失败（JitPack 不再提供 FlexibleAdapter c8013533），加入回迁补丁 0005，并让 `prepare-source.sh`
-  自动跳过上游已合入的补丁。
+  自动跳过上游已合入的补丁。发布 `v0.2.0-harmony-preview.1`（versionCode 801），用户确认下载可用。
+- 2026-10-05 用户反馈鸿蒙图库仍收录下载的 `.mkv`（`.nomedia` 无效），以及 XvXun 多个收藏夹里同一视频下载状态不互通。
+  加入补丁 0006（`<集>.mkv.anikku` + 设置开关 + 存量改名）和 0007（同一来源按 url 共用下载），发布 `v0.2.0-harmony-preview.2`（versionCode 802）。

@@ -1,0 +1,367 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 03:51:16 +0000
+Subject: [PATCH 2/2] downloads: reuse a download held by another entry with
+ the same url
+
+Sources such as XvXun expose each favourites folder as its own entry, so
+the same video can appear under several entries. Downloads were keyed on
+(entry title, episode name) only, so a video downloaded in one folder
+showed as "not downloaded" everywhere else and would be fetched again.
+
+- episodes.sq / ChapterRepository: getChaptersByUrls (batched IN query,
+  500 urls per statement to stay under SQLite's variable limit).
+- DownloadManager.findSharedDownloads: for not-downloaded episodes, find
+  a finished download of the same url under another entry of the same
+  source; buildVideoOrShared plays that file.
+- Entry screen marks such episodes as downloaded (skipped for local and
+  merged entries); the player and download-ahead use the same lookup.
+- New switch "Reuse downloads across entries" (default on) in
+  Settings > Downloads.
+
+Deleting the episode from the entry that does not own the file is a
+no-op; delete it from the entry that downloaded it.
+---
+ .../settings/screen/SettingsDownloadScreen.kt |  5 ++
+ .../data/download/DownloadManager.kt          | 76 +++++++++++++++++++
+ .../tachiyomi/ui/manga/MangaScreenModel.kt    | 13 +++-
+ .../tachiyomi/ui/player/PlayerViewModel.kt    |  4 +-
+ .../ui/player/loader/EpisodeLoader.kt         | 22 +++++-
+ .../data/chapter/ChapterRepositoryImpl.kt     | 14 ++++
+ .../sqldelight/tachiyomi/data/episodes.sq     |  7 ++
+ .../chapter/repository/ChapterRepository.kt   |  5 ++
+ .../download/service/DownloadPreferences.kt   |  9 +++
+ .../moko-resources/base/strings.xml           |  4 +
+ .../moko-resources/zh-rCN/strings.xml         |  4 +
+ 11 files changed, 157 insertions(+), 6 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDownloadScreen.kt b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDownloadScreen.kt
+index 8acb7f0..207c7a2 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDownloadScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDownloadScreen.kt
+@@ -91,6 +91,11 @@ object SettingsDownloadScreen : SearchableSettings {
+                     }
+                 },
+             ),
++            Preference.PreferenceItem.SwitchPreference(
++                preference = downloadPreferences.shareDownloadsAcrossEntries(),
++                title = stringResource(AMR.strings.pref_share_downloads_across_entries),
++                subtitle = stringResource(AMR.strings.pref_share_downloads_across_entries_summary),
++            ),
+             // Harmony <--
+             getDeleteChaptersGroup(
+                 downloadPreferences = downloadPreferences,
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
+index f736389..146be94 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
+@@ -24,8 +24,10 @@ import tachiyomi.core.common.util.system.logcat
+ import tachiyomi.domain.anime.model.Anime
+ import tachiyomi.domain.category.interactor.GetCategories
+ import tachiyomi.domain.chapter.model.Chapter
++import tachiyomi.domain.chapter.repository.ChapterRepository
+ import tachiyomi.domain.download.service.DownloadPreferences
+ import tachiyomi.domain.episode.model.Episode
++import tachiyomi.domain.manga.interactor.GetManga
+ import tachiyomi.domain.manga.model.Manga
+ import tachiyomi.domain.source.service.SourceManager
+ import tachiyomi.domain.storage.service.StorageManager
+@@ -50,6 +52,10 @@ class DownloadManager(
+     private val getCategories: GetCategories = Injekt.get(),
+     private val sourceManager: SourceManager = Injekt.get(),
+     private val downloadPreferences: DownloadPreferences = Injekt.get(),
++    // Harmony -->
++    private val chapterRepository: ChapterRepository = Injekt.get(),
++    private val getManga: GetManga = Injekt.get(),
++    // Harmony <--
+ ) {
+ 
+     /**
+@@ -240,6 +246,76 @@ class DownloadManager(
+         skipCache: Boolean = false,
+     ) = isChapterDownloaded(episodeName, episodeScanlator, animeTitle, sourceId, skipCache)
+ 
++    // Harmony -->
++    /**
++     * A finished download that lives under another entry of the same source but holds the same
++     * episode url, e.g. one video that was favourited into several XvXun folders.
++     */
++    data class SharedDownload(val anime: Anime, val episode: Episode)
++
++    /**
++     * For every episode of [anime] that is not downloaded itself, looks for a downloaded episode
++     * with the same url under another entry of the same source.
++     *
++     * @return episode id to the download that can be played instead.
++     */
++    suspend fun findSharedDownloads(anime: Anime, episodes: List<Episode>): Map<Long, SharedDownload> {
++        if (!downloadPreferences.shareDownloadsAcrossEntries().get()) return emptyMap()
++        if (anime.isLocal()) return emptyMap()
++
++        val candidates = episodes.filter { episode ->
++            episode.url.isNotBlank() &&
++                !isChapterDownloaded(episode.name, episode.scanlator, anime.ogTitle, anime.source)
++        }
++        if (candidates.isEmpty()) return emptyMap()
++
++        val othersByUrl = chapterRepository.getChaptersByUrls(candidates.map { it.url })
++            .filter { it.mangaId != anime.id }
++            .groupBy { it.url }
++        if (othersByUrl.isEmpty()) return emptyMap()
++
++        val otherAnimes = othersByUrl.values.asSequence().flatten()
++            .map { it.mangaId }
++            .distinct()
++            .mapNotNull { getManga.await(it) }
++            .filter { it.source == anime.source }
++            .associateBy { it.id }
++        if (otherAnimes.isEmpty()) return emptyMap()
++
++        return buildMap {
++            for (episode in candidates) {
++                val shared = othersByUrl[episode.url].orEmpty().firstNotNullOfOrNull { other ->
++                    val otherAnime = otherAnimes[other.mangaId] ?: return@firstNotNullOfOrNull null
++                    val downloaded = isChapterDownloaded(
++                        other.name,
++                        other.scanlator,
++                        otherAnime.ogTitle,
++                        otherAnime.source,
++                    )
++                    if (downloaded) SharedDownload(otherAnime, other) else null
++                }
++                if (shared != null) put(episode.id, shared)
++            }
++        }
++    }
++
++    suspend fun findSharedDownload(anime: Anime, episode: Episode): SharedDownload? {
++        return findSharedDownloads(anime, listOf(episode))[episode.id]
++    }
++
++    /**
++     * Like [buildVideo], but when the episode itself is not downloaded, plays the download of the
++     * same url that another entry of the same source holds (see [findSharedDownloads]).
++     */
++    suspend fun buildVideoOrShared(source: Source, anime: Anime, episode: Episode): Video {
++        if (isChapterDownloaded(episode.name, episode.scanlator, anime.ogTitle, anime.source)) {
++            return buildVideo(source, anime, episode)
++        }
++        val shared = findSharedDownload(anime, episode) ?: return buildVideo(source, anime, episode)
++        return buildVideo(source, shared.anime, shared.episode)
++    }
++    // Harmony <--
++
+     /**
+      * Returns the amount of downloaded chapters.
+      */
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/manga/MangaScreenModel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/manga/MangaScreenModel.kt
+index 00e65cc..ecc0be1 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/manga/MangaScreenModel.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/manga/MangaScreenModel.kt
+@@ -1111,13 +1111,21 @@ class MangaScreenModel(
+         }
+     }
+ 
+-    private fun List<Chapter>.toChapterListItems(
++    private suspend fun List<Chapter>.toChapterListItems(
+         manga: Manga,
+         // SY -->
+         mergedData: MergedMangaData?,
+         // SY <--
+     ): List<ChapterList.Item> {
+         val isLocal = manga.isLocal()
++        // Harmony -->
++        // Episodes whose url is already downloaded under another entry of the same source.
++        val sharedDownloads: Map<Long, DownloadManager.SharedDownload> = if (isLocal || mergedData != null) {
++            emptyMap()
++        } else {
++            downloadManager.findSharedDownloads(manga, this)
++        }
++        // Harmony <--
+         return map { chapter ->
+             val activeDownload = if (isLocal) {
+                 null
+@@ -1145,6 +1153,9 @@ class MangaScreenModel(
+             val downloadState = when {
+                 activeDownload != null -> activeDownload.status
+                 downloaded -> Download.State.DOWNLOADED
++                // Harmony -->
++                chapter.id in sharedDownloads -> Download.State.DOWNLOADED
++                // Harmony <--
+                 else -> Download.State.NOT_DOWNLOADED
+             }
+ 
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerViewModel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerViewModel.kt
+index bec1c69..de5e2ce 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerViewModel.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerViewModel.kt
+@@ -2075,8 +2075,8 @@ class PlayerViewModel @JvmOverloads constructor(
+ 
+         viewModelScope.launchIO {
+             val episodesAreDownloaded =
+-                EpisodeLoader.isDownload(currentEpisode.toDomainEpisode()!!, anime) &&
+-                    EpisodeLoader.isDownload(nextEpisode.toDomainEpisode()!!, anime)
++                EpisodeLoader.isDownloadOrShared(currentEpisode.toDomainEpisode()!!, anime) &&
++                    EpisodeLoader.isDownloadOrShared(nextEpisode.toDomainEpisode()!!, anime)
+ 
+             if (!episodesAreDownloaded) return@launchIO
+ 
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/loader/EpisodeLoader.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/loader/EpisodeLoader.kt
+index 8593fbf..12a5a99 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/loader/EpisodeLoader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/loader/EpisodeLoader.kt
+@@ -42,7 +42,8 @@ class EpisodeLoader {
+             mergedReferences: List<MergedMangaReference> = emptyList(),
+             mergedManga: Map<Long, Anime>? = null,
+         ): List<Hoster> {
+-            val isDownloaded = isDownload(episode, anime)
++            // Harmony: also play a download of the same url held by another entry of the source.
++            val isDownloaded = isDownloadOrShared(episode, anime)
+             return when {
+                 // SY -->
+                 source is MergedSource -> {
+@@ -91,6 +92,18 @@ class EpisodeLoader {
+             )
+         }
+ 
++        // Harmony -->
++        /**
++         * Returns true if the [episode] is downloaded, or if another entry of the same source
++         * holds a finished download for the same episode url.
++         */
++        suspend fun isDownloadOrShared(episode: Episode, anime: Anime): Boolean {
++            if (isDownload(episode, anime)) return true
++            val downloadManager: DownloadManager = Injekt.get()
++            return downloadManager.findSharedDownload(anime, episode) != null
++        }
++        // Harmony <--
++
+         private fun checkHasHosters(source: AnimeHttpSource): Boolean {
+             var current: Class<in AnimeHttpSource> = source.javaClass
+             while (true) {
+@@ -136,15 +149,18 @@ class EpisodeLoader {
+          * @param anime the anime of the episode.
+          * @param source the source of the anime.
+          */
+-        private fun getHostersOnDownloaded(
++        private suspend fun getHostersOnDownloaded(
+             episode: Episode,
+             anime: Anime,
+             source: AnimeSource,
+         ): List<Hoster> {
+             val downloadManager: DownloadManager = Injekt.get()
+             return try {
+-                val video = downloadManager.buildVideo(source, anime, episode)
++                // Harmony: falls back to the same url downloaded under another entry.
++                val video = downloadManager.buildVideoOrShared(source, anime, episode)
+                 listOf(video).toHosterList()
++            } catch (e: CancellationException) {
++                throw e
+             } catch (_: Throwable) {
+                 emptyList()
+             }
+diff --git a/data/src/main/java/tachiyomi/data/chapter/ChapterRepositoryImpl.kt b/data/src/main/java/tachiyomi/data/chapter/ChapterRepositoryImpl.kt
+index 7200cc0..e6f3e73 100644
+--- a/data/src/main/java/tachiyomi/data/chapter/ChapterRepositoryImpl.kt
++++ b/data/src/main/java/tachiyomi/data/chapter/ChapterRepositoryImpl.kt
+@@ -165,6 +165,20 @@ class ChapterRepositoryImpl(
+         return handler.awaitList { episodesQueries.getEpisodeByUrl(url, ChapterMapper::mapChapter) }
+     }
+ 
++    // Harmony -->
++    override suspend fun getChaptersByUrls(urls: List<String>): List<Chapter> {
++        if (urls.isEmpty()) return emptyList()
++        // SQLite caps the number of bound variables, so look the urls up in slices.
++        return urls.distinct().chunked(URL_LOOKUP_CHUNK_SIZE).flatMap { chunk ->
++            handler.awaitList { episodesQueries.getEpisodesByUrls(chunk, ChapterMapper::mapChapter) }
++        }
++    }
++
++    private companion object {
++        const val URL_LOOKUP_CHUNK_SIZE = 500
++    }
++    // Harmony <--
++
+     override suspend fun getMergedChapterByMangaId(mangaId: Long, applyFilter: Boolean): List<Chapter> {
+         return handler.awaitList {
+             episodesQueries.getMergedEpisodesByAnimeId(
+diff --git a/data/src/main/sqldelight/tachiyomi/data/episodes.sq b/data/src/main/sqldelight/tachiyomi/data/episodes.sq
+index 5ac69fc..0dd2d81 100644
+--- a/data/src/main/sqldelight/tachiyomi/data/episodes.sq
++++ b/data/src/main/sqldelight/tachiyomi/data/episodes.sq
+@@ -104,6 +104,13 @@ FROM episodes
+ WHERE url = :episodeUrl
+ AND anime_id = :animeId;
+ 
++-- Harmony -->
++getEpisodesByUrls:
++SELECT *
++FROM episodes
++WHERE url IN :episodeUrls;
++-- Harmony <--
++
+ getMergedEpisodesByAnimeId:
+ SELECT EP.*
+ FROM (
+diff --git a/domain/src/main/java/tachiyomi/domain/chapter/repository/ChapterRepository.kt b/domain/src/main/java/tachiyomi/domain/chapter/repository/ChapterRepository.kt
+index be3f803..2d681c9 100644
+--- a/domain/src/main/java/tachiyomi/domain/chapter/repository/ChapterRepository.kt
++++ b/domain/src/main/java/tachiyomi/domain/chapter/repository/ChapterRepository.kt
+@@ -31,6 +31,11 @@ interface ChapterRepository {
+     // SY -->
+     suspend fun getChapterByUrl(url: String): List<Chapter>
+ 
++    // Harmony -->
++    /** Every chapter, from any manga, whose url is one of [urls]. */
++    suspend fun getChaptersByUrls(urls: List<String>): List<Chapter>
++    // Harmony <--
++
+     suspend fun getMergedChapterByMangaId(mangaId: Long, applyFilter: Boolean = false): List<Chapter>
+ 
+     suspend fun getMergedChapterByMangaIdAsFlow(
+diff --git a/domain/src/main/java/tachiyomi/domain/download/service/DownloadPreferences.kt b/domain/src/main/java/tachiyomi/domain/download/service/DownloadPreferences.kt
+index 2908a9b..053b880 100644
+--- a/domain/src/main/java/tachiyomi/domain/download/service/DownloadPreferences.kt
++++ b/domain/src/main/java/tachiyomi/domain/download/service/DownloadPreferences.kt
+@@ -59,6 +59,15 @@ class DownloadPreferences(
+         "pref_hide_downloaded_videos_from_gallery",
+         true,
+     )
++
++    /**
++     * Treat an episode as downloaded when another entry of the same source already holds a
++     * download for the same episode url (e.g. one video saved in several favourite folders).
++     */
++    fun shareDownloadsAcrossEntries() = preferenceStore.getBoolean(
++        "pref_share_downloads_across_entries",
++        true,
++    )
+     // Harmony <--
+ 
+     companion object {
+diff --git a/i18n-ank/src/commonMain/moko-resources/base/strings.xml b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+index ca33f06..d26d349 100644
+--- a/i18n-ank/src/commonMain/moko-resources/base/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+@@ -253,4 +253,8 @@
+     <string name="gallery_visibility_downloader_running">Pause downloads first</string>
+     <string name="gallery_visibility_started">Renaming downloaded videos in the background…</string>
+     <string name="gallery_visibility_done">%d video(s) renamed</string>
++
++    <!-- Harmony fork: reuse a download that another entry of the same source already holds -->
++    <string name="pref_share_downloads_across_entries">Reuse downloads across entries</string>
++    <string name="pref_share_downloads_across_entries_summary">When the same video is already downloaded under another entry of the same source (for example another favourites folder), show it as downloaded here too and play that file instead of downloading it again.</string>
+ </resources>
+diff --git a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+index 9191dbd..af54b38 100644
+--- a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+@@ -248,4 +248,8 @@
+     <string name="gallery_visibility_downloader_running">请先暂停下载</string>
+     <string name="gallery_visibility_started">正在后台重命名已下载的视频…</string>
+     <string name="gallery_visibility_done">已重命名 %d 个视频</string>
++
++    <!-- Harmony fork: reuse a download that another entry of the same source already holds -->
++    <string name="pref_share_downloads_across_entries">不同条目间共用已下载的视频</string>
++    <string name="pref_share_downloads_across_entries_summary">同一来源里，如果某个视频已经在另一个条目（比如另一个收藏夹）下载过，这里也显示为已下载并直接播放那份文件，不再重复下载。</string>
+ </resources>

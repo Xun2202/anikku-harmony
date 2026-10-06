@@ -1,0 +1,272 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 03:46:02 +0000
+Subject: [PATCH 1/2] downloads: hide videos from gallery apps with an unknown
+ file extension
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+HarmonyOS indexes the whole "兼容应用数据" tree that 卓易通 maps SAF
+folders to, and its media scanner ignores .nomedia. It decides what is a
+video purely by file extension, so finished downloads are now stored as
+"<name>.mkv.anikku" (application/octet-stream) when the new
+"Hide downloaded videos from the gallery" switch is on (default).
+
+- Downloader.copyIntoDownloadDir appends HIDDEN_VIDEO_SUFFIX to the final
+  name; resume detection and success checks already tolerate it.
+- DownloadManager.buildVideo accepts both plain videos and suffixed files;
+  playback goes through a content fd, so the extension is irrelevant.
+- DownloadManager.applyGalleryVisibilityToDownloads renames existing files
+  in both directions (uses renameToOrCopy for SAF providers that cannot
+  rename); exposed in Settings > Downloads as "Rename existing downloads".
+- Download cache is keyed on directory names, so nothing else changes.
+---
+ .../settings/screen/SettingsDownloadScreen.kt | 36 ++++++++++++++++
+ .../data/download/DownloadManager.kt          | 42 ++++++++++++++++++-
+ .../tachiyomi/data/download/Downloader.kt     | 17 +++++++-
+ .../download/service/DownloadPreferences.kt   | 11 +++++
+ .../moko-resources/base/strings.xml           |  9 ++++
+ .../moko-resources/zh-rCN/strings.xml         |  9 ++++
+ 6 files changed, 121 insertions(+), 3 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDownloadScreen.kt b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDownloadScreen.kt
+index bdb2b79..8acb7f0 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDownloadScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDownloadScreen.kt
+@@ -6,17 +6,24 @@ import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.runtime.saveable.rememberSaveable
+ import androidx.compose.runtime.setValue
++import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.util.fastMap
+ import eu.kanade.domain.base.BasePreferences
+ import eu.kanade.presentation.category.visualName
+ import eu.kanade.presentation.more.settings.Preference
+ import eu.kanade.presentation.more.settings.widget.TriStateListDialog
++import eu.kanade.tachiyomi.data.download.DownloadManager
++import eu.kanade.tachiyomi.util.system.toast
+ import kotlinx.collections.immutable.persistentListOf
+ import kotlinx.collections.immutable.persistentMapOf
+ import kotlinx.collections.immutable.toImmutableMap
+ import kotlinx.collections.immutable.toPersistentMap
++import tachiyomi.core.common.i18n.stringResource
++import tachiyomi.core.common.util.lang.launchIO
++import tachiyomi.core.common.util.lang.withUIContext
+ import tachiyomi.domain.category.interactor.GetCategories
+ import tachiyomi.domain.category.model.Category
+ import tachiyomi.domain.download.service.DownloadPreferences
+@@ -45,6 +52,11 @@ object SettingsDownloadScreen : SearchableSettings {
+         val downloadPreferences = remember { Injekt.get<DownloadPreferences>() }
+         val parallelSourceLimit by downloadPreferences.parallelSourceLimit().collectAsState()
+         val basePreferences = remember { Injekt.get<BasePreferences>() }
++        // Harmony -->
++        val context = LocalContext.current
++        val scope = rememberCoroutineScope()
++        val downloadManager = remember { Injekt.get<DownloadManager>() }
++        // Harmony <--
+         return listOf(
+             Preference.PreferenceItem.SwitchPreference(
+                 preference = downloadPreferences.downloadOnlyOverWifi(),
+@@ -56,6 +68,30 @@ object SettingsDownloadScreen : SearchableSettings {
+                 title = stringResource(MR.strings.pref_download_concurrent_sources),
+                 onValueChanged = { downloadPreferences.parallelSourceLimit().set(it) },
+             ),
++            // Harmony -->
++            Preference.PreferenceItem.SwitchPreference(
++                preference = downloadPreferences.hideDownloadedVideosFromGallery(),
++                title = stringResource(AMR.strings.pref_hide_downloaded_videos_from_gallery),
++                subtitle = stringResource(AMR.strings.pref_hide_downloaded_videos_from_gallery_summary),
++            ),
++            Preference.PreferenceItem.TextPreference(
++                title = stringResource(AMR.strings.pref_apply_gallery_visibility_to_downloads),
++                subtitle = stringResource(AMR.strings.pref_apply_gallery_visibility_to_downloads_summary),
++                onClick = {
++                    if (downloadManager.isRunning) {
++                        context.toast(AMR.strings.gallery_visibility_downloader_running)
++                    } else {
++                        context.toast(AMR.strings.gallery_visibility_started)
++                        scope.launchIO {
++                            val renamed = downloadManager.applyGalleryVisibilityToDownloads()
++                            withUIContext {
++                                context.toast(context.stringResource(AMR.strings.gallery_visibility_done, renamed))
++                            }
++                        }
++                    }
++                },
++            ),
++            // Harmony <--
+             getDeleteChaptersGroup(
+                 downloadPreferences = downloadPreferences,
+                 categories = allCategories,
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
+index ed2f977..f736389 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
+@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.onStart
+ import kotlinx.coroutines.runBlocking
+ import logcat.LogPriority
+ import tachiyomi.core.common.i18n.stringResource
++import tachiyomi.core.common.storage.renameToOrCopy
+ import tachiyomi.core.common.util.lang.launchIO
+ import tachiyomi.core.common.util.system.logcat
+ import tachiyomi.domain.anime.model.Anime
+@@ -197,7 +198,8 @@ class DownloadManager(
+                 source,
+             )
+         val files = episodeDir?.listFiles().orEmpty()
+-            .filter { "video" in it.type.orEmpty() }
++            // Harmony: videos hidden from the gallery carry an unknown extension, see Downloader.
++            .filter { "video" in it.type.orEmpty() || it.name.orEmpty().endsWith(Downloader.HIDDEN_VIDEO_SUFFIX) }
+ 
+         if (files.isEmpty()) {
+             throw Exception(context.stringResource(AYMR.strings.video_list_empty_error))
+@@ -581,6 +583,44 @@ class DownloadManager(
+         }
+     }
+ 
++    // Harmony -->
++    /**
++     * Renames every downloaded video so it matches [DownloadPreferences.hideDownloadedVideosFromGallery]:
++     * adds [Downloader.HIDDEN_VIDEO_SUFFIX] to recognised video files, or strips it again.
++     * Directory names are untouched, so the download cache stays valid.
++     *
++     * @return the number of files that were renamed.
++     */
++    suspend fun applyGalleryVisibilityToDownloads(): Int {
++        val hide = downloadPreferences.hideDownloadedVideosFromGallery().get()
++        val suffix = Downloader.HIDDEN_VIDEO_SUFFIX
++        var renamed = 0
++        val sourceDirs = storageManager.getDownloadsDirectory()?.listFiles().orEmpty().filter { it.isDirectory }
++        for (sourceDir in sourceDirs) {
++            for (mangaDir in sourceDir.listFiles().orEmpty().filter { it.isDirectory }) {
++                for (chapterDir in mangaDir.listFiles().orEmpty().filter { it.isDirectory }) {
++                    if (chapterDir.name.orEmpty().endsWith(Downloader.TMP_DIR_SUFFIX)) continue
++                    for (file in chapterDir.listFiles().orEmpty().filter { it.isFile }) {
++                        val name = file.name ?: continue
++                        val newName = when {
++                            hide && !name.endsWith(suffix) && "video" in file.type.orEmpty() -> name + suffix
++                            !hide && name.endsWith(suffix) -> name.removeSuffix(suffix)
++                            else -> continue
++                        }
++                        try {
++                            file.renameToOrCopy(newName)
++                            renamed++
++                        } catch (e: Exception) {
++                            logcat(LogPriority.ERROR, e) { "Could not rename downloaded video $name" }
++                        }
++                    }
++                }
++            }
++        }
++        return renamed
++    }
++    // Harmony <--
++
+     // AY -->
+     private fun getEpisodesToDownload(episodes: List<Episode>): List<Episode> {
+         return if (!downloadPreferences.downloadFillermarkedEpisodes().get()) {
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 3794d95..eed0a5c 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -555,8 +555,13 @@ class Downloader(
+     }
+ 
+     /**
+-     * Copies the muxed video into [tmpDir] as "<filename>.tmp" and renames it to "<filename>.mkv"
++     * Copies the muxed video into [tmpDir] as "<filename>.tmp" and renames it to its final name
+      * once the copy is complete, so an interrupted copy is never mistaken for a finished download.
++     *
++     * The final name is "<filename>.mkv", or "<filename>.mkv.anikku" when the user asked to hide
++     * downloads from the gallery: the unknown extension gives the document an
++     * application/octet-stream MIME type, so scanners that ignore .nomedia (HarmonyOS) do not treat
++     * it as a video. [DownloadManager.buildVideo] accepts both names.
+      */
+     private fun copyIntoDownloadDir(cacheFile: File, tmpDir: UniFile, filename: String): UniFile {
+         if (!cacheFile.isFile || cacheFile.length() == 0L) {
+@@ -577,7 +582,12 @@ class Downloader(
+             throw e
+         }
+ 
+-        return tmpFile.renameToOrCopy("$filename.mkv")
++        val finalName = if (preferences.hideDownloadedVideosFromGallery().get()) {
++            "$filename.mkv$HIDDEN_VIDEO_SUFFIX"
++        } else {
++            "$filename.mkv"
++        }
++        return tmpFile.renameToOrCopy(finalName)
+     }
+ 
+     private fun isTor(video: Video): Boolean {
+@@ -972,6 +982,9 @@ class Downloader(
+         const val TMP_DIR_SUFFIX = "_tmp"
+         // Harmony: sub-directory of Context.cacheDir that holds videos while ffmpeg muxes them.
+         private const val CACHE_DOWNLOAD_DIR = "harmony_download_tmp"
++
++        // Harmony: appended to "<name>.mkv" when downloads should stay out of gallery apps.
++        const val HIDDEN_VIDEO_SUFFIX = ".anikku"
+         const val WARNING_NOTIF_TIMEOUT_MS = 30_000L
+         const val EPISODES_PER_SOURCE_QUEUE_WARNING_THRESHOLD = 10
+         private const val DOWNLOADS_QUEUED_WARNING_THRESHOLD = 20
+diff --git a/domain/src/main/java/tachiyomi/domain/download/service/DownloadPreferences.kt b/domain/src/main/java/tachiyomi/domain/download/service/DownloadPreferences.kt
+index ff5fecf..2908a9b 100644
+--- a/domain/src/main/java/tachiyomi/domain/download/service/DownloadPreferences.kt
++++ b/domain/src/main/java/tachiyomi/domain/download/service/DownloadPreferences.kt
+@@ -50,6 +50,17 @@ class DownloadPreferences(
+     fun downloadCacheRenewInterval() = preferenceStore.getInt("download_cache_renew_interval", 1)
+     // KMK <--
+ 
++    // Harmony -->
++    /**
++     * Store finished downloads as "<name>.mkv.anikku". The unknown extension keeps media scanners
++     * that ignore .nomedia (HarmonyOS gallery) from listing the videos; playback is unaffected.
++     */
++    fun hideDownloadedVideosFromGallery() = preferenceStore.getBoolean(
++        "pref_hide_downloaded_videos_from_gallery",
++        true,
++    )
++    // Harmony <--
++
+     companion object {
+         private const val REMOVE_EXCLUDE_CATEGORIES_PREF_KEY = "remove_exclude_anime_categories"
+         private const val DOWNLOAD_NEW_CATEGORIES_PREF_KEY = "download_new_anime_categories"
+diff --git a/i18n-ank/src/commonMain/moko-resources/base/strings.xml b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+index c9e04cd..ca33f06 100644
+--- a/i18n-ank/src/commonMain/moko-resources/base/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+@@ -244,4 +244,13 @@
+     <string name="pref_storage_use_app_private">Use app-private storage</string>
+     <string name="pref_storage_use_app_private_summary">Keep downloads in %s. No folder picker or SAF needed, gallery apps never index it, deleted together with the app.</string>
+     <string name="pref_storage_use_app_private_active">App-private storage is in use</string>
++
++    <!-- Harmony fork: keep downloaded videos out of gallery apps -->
++    <string name="pref_hide_downloaded_videos_from_gallery">Hide downloaded videos from the gallery</string>
++    <string name="pref_hide_downloaded_videos_from_gallery_summary">New downloads are saved as “name.mkv.anikku”. Gallery apps that ignore .nomedia (HarmonyOS) stop listing them; playback in Anikku is unchanged. Remove the “.anikku” suffix to open a file elsewhere.</string>
++    <string name="pref_apply_gallery_visibility_to_downloads">Rename existing downloads to match</string>
++    <string name="pref_apply_gallery_visibility_to_downloads_summary">Adds or removes the “.anikku” suffix on every downloaded video. Runs in the background; storage that cannot rename files is handled by copying, which takes longer.</string>
++    <string name="gallery_visibility_downloader_running">Pause downloads first</string>
++    <string name="gallery_visibility_started">Renaming downloaded videos in the background…</string>
++    <string name="gallery_visibility_done">%d video(s) renamed</string>
+ </resources>
+diff --git a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+index c78cc51..9191dbd 100644
+--- a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+@@ -239,4 +239,13 @@
+     <string name="pref_storage_use_app_private">使用应用私有目录（鸿蒙推荐）</string>
+     <string name="pref_storage_use_app_private_summary">下载内容保存到 %s。无需选择文件夹、不经过 SAF，图库不会索引，卸载应用时一并删除。</string>
+     <string name="pref_storage_use_app_private_active">当前正在使用应用私有目录</string>
++
++    <!-- Harmony fork: keep downloaded videos out of gallery apps -->
++    <string name="pref_hide_downloaded_videos_from_gallery">下载的视频对系统图库隐藏</string>
++    <string name="pref_hide_downloaded_videos_from_gallery_summary">新下载的视频保存为「名称.mkv.anikku」。不认 .nomedia 的图库（如鸿蒙）不会再收录它们；在 Anikku 内播放不受影响。要在别处打开，把末尾的 .anikku 去掉即可。</string>
++    <string name="pref_apply_gallery_visibility_to_downloads">按上述设置重命名已下载的视频</string>
++    <string name="pref_apply_gallery_visibility_to_downloads_summary">给所有已下载视频加上或去掉 .anikku 后缀。在后台运行；不支持改名的存储会改为复制，耗时更长。</string>
++    <string name="gallery_visibility_downloader_running">请先暂停下载</string>
++    <string name="gallery_visibility_started">正在后台重命名已下载的视频…</string>
++    <string name="gallery_visibility_done">已重命名 %d 个视频</string>
+ </resources>
