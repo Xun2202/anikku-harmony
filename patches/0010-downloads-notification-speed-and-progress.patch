@@ -1,0 +1,399 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 10:38:56 +0000
+Subject: [PATCH] downloads: Animeko-style progress notification with speed and
+ progress
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Unify the download notification with the HarmonyOS builds of Animeko
+and Mihon so that the three apps read alike in the notification shade:
+
+- title: "Downloading N episodes" (queued + active)
+- text: "Download: <speed>/s · <progress>%" with a determinate progress
+  bar; while ffmpeg has not reported a percentage yet (or the duration is
+  unknown) the text shows the speed alone over an indeterminate bar
+- expanded text additionally shows the current "<anime> - <episode>"
+  (omitted when "hide notification content" is enabled)
+
+Speed comes from DownloadSpeedMeter (3 s sliding window, same file as
+Mihon) fed with the byte deltas of ffmpeg's StatisticsCallback. The
+per-download 50 ms ticker is replaced by a single 1 Hz ticker in the
+downloader job, and the notifier drops updates for the same episode
+that arrive within 700 ms.
+---
+ .../data/download/DownloadNotifier.kt         | 58 +++++++++++----
+ .../data/download/DownloadSpeedMeter.kt       | 70 +++++++++++++++++++
+ .../tachiyomi/data/download/Downloader.kt     | 39 +++++++----
+ .../moko-resources/base/plurals.xml           |  8 +++
+ .../moko-resources/base/strings.xml           |  4 ++
+ .../moko-resources/zh-rCN/plurals.xml         |  7 ++
+ .../moko-resources/zh-rCN/strings.xml         |  4 ++
+ 7 files changed, 164 insertions(+), 26 deletions(-)
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadSpeedMeter.kt
+ create mode 100644 i18n-ank/src/commonMain/moko-resources/base/plurals.xml
+ create mode 100644 i18n-ank/src/commonMain/moko-resources/zh-rCN/plurals.xml
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadNotifier.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadNotifier.kt
+index a257e40..9256d27 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadNotifier.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadNotifier.kt
+@@ -3,6 +3,8 @@ package eu.kanade.tachiyomi.data.download
+ import android.app.PendingIntent
+ import android.content.Context
+ import android.graphics.BitmapFactory
++import android.os.SystemClock
++import android.text.format.Formatter
+ import androidx.core.app.NotificationCompat
+ import androidx.core.content.ContextCompat
+ import eu.kanade.tachiyomi.R
+@@ -15,8 +17,10 @@ import eu.kanade.tachiyomi.util.lang.chop
+ import eu.kanade.tachiyomi.util.system.cancelNotification
+ import eu.kanade.tachiyomi.util.system.notificationBuilder
+ import eu.kanade.tachiyomi.util.system.notify
++import tachiyomi.core.common.i18n.pluralStringResource
+ import tachiyomi.core.common.i18n.stringResource
+ import tachiyomi.i18n.MR
++import tachiyomi.i18n.ank.AMR
+ import tachiyomi.i18n.aniyomi.AYMR
+ import uy.kohesive.injekt.injectLazy
+ import java.util.regex.Pattern
+@@ -52,6 +56,10 @@ internal class DownloadNotifier(private val context: Context) {
+      */
+     private var isDownloading = false
+ 
++    // Harmony: the progress notification is posted when a download starts and by a 1 Hz ticker; cap the rate.
++    private var lastProgressPostedAt = 0L
++    private var lastProgressEpisodeId: Long? = null
++
+     /**
+      * Shows a notification from this builder.
+      *
+@@ -82,9 +90,21 @@ internal class DownloadNotifier(private val context: Context) {
+     /**
+      * Called when download progress changes.
+      *
++     * Harmony: same layout as Animeko's download service notification so that the three apps read
++     * alike in the HarmonyOS shade: title "Downloading N episodes", text "Download: <speed>/s · <progress>%",
++     * a progress bar, and (unless notification content is hidden) the current entry in the expanded text.
++     *
+      * @param download download object containing download information.
++     * @param remaining number of queued or active downloads.
+      */
+-    fun onProgressChange(download: Download) {
++    fun onProgressChange(download: Download, remaining: Int) {
++        val now = SystemClock.elapsedRealtime()
++        if (download.episode.id == lastProgressEpisodeId && now - lastProgressPostedAt < MIN_PROGRESS_INTERVAL_MS) {
++            return
++        }
++        lastProgressPostedAt = now
++        lastProgressEpisodeId = download.episode.id
++
+         with(progressNotificationBuilder) {
+             if (!isDownloading) {
+                 setSmallIcon(android.R.drawable.stat_sys_download)
+@@ -105,30 +125,33 @@ internal class DownloadNotifier(private val context: Context) {
+                 )
+             }
+ 
+-            val downloadingProgressText = if (download.progress == 0) {
+-                context.stringResource(MR.strings.update_check_notification_download_in_progress)
++            val progress = download.progress.coerceIn(0, 100)
++            val speed = Formatter.formatFileSize(context, DownloadSpeedMeter.bytesPerSecond())
++            // ffmpeg reports no progress until it has probed the stream (or when the duration is
++            // unknown); show the speed alone and an indeterminate bar until the first percent arrives.
++            val statusText = if (progress == 0) {
++                context.stringResource(AMR.strings.download_notifier_speed, speed)
+             } else {
+-                context.stringResource(AYMR.strings.episode_downloading_progress, download.progress)
++                context.stringResource(AMR.strings.download_notifier_speed_progress, speed, progress)
+             }
+ 
++            setContentTitle(
++                context.pluralStringResource(AMR.plurals.download_notifier_downloading_count, remaining, remaining),
++            )
++            setContentText(statusText)
++
+             if (preferences.hideNotificationContent().get()) {
+-                setContentTitle(downloadingProgressText)
+-                setContentText(null)
++                setStyle(null)
+             } else {
+-                val title = download.manga.title.chop(15)
++                val title = download.manga.title.chop(40)
+                 val quotedTitle = Pattern.quote(title)
+                 val chapter = download.chapter.name.replaceFirst(
+                     "$quotedTitle\\s*-*\\s*".toRegex(RegexOption.IGNORE_CASE),
+                     "",
+                 )
+-                setContentTitle("$title - $chapter".chop(30))
+-                setContentText(downloadingProgressText)
+-            }
+-            if (download.progress == 0) {
+-                setProgress(100, download.progress, true)
+-            } else {
+-                setProgress(100, download.progress, false)
++                setStyle(NotificationCompat.BigTextStyle().bigText("$statusText\n${"$title - $chapter".chop(80)}"))
+             }
++            setProgress(100, progress, progress == 0)
+             setOngoing(true)
+ 
+             show(Notifications.ID_DOWNLOAD_EPISODE_PROGRESS)
+@@ -139,7 +162,9 @@ internal class DownloadNotifier(private val context: Context) {
+      * Show notification when download is paused.
+      */
+     fun onPaused() {
++        lastProgressEpisodeId = null
+         with(progressNotificationBuilder) {
++            setStyle(null)
+             setContentTitle(context.stringResource(AYMR.strings.download_paused))
+             setContentText(context.stringResource(AYMR.strings.download_notifier_download_paused_episodes))
+             setSmallIcon(R.drawable.ic_pause_24dp)
+@@ -178,6 +203,7 @@ internal class DownloadNotifier(private val context: Context) {
+ 
+         // Reset states to default
+         isDownloading = false
++        lastProgressEpisodeId = null
+     }
+ 
+     /**
+@@ -247,4 +273,8 @@ internal class DownloadNotifier(private val context: Context) {
+         // Reset download information
+         isDownloading = false
+     }
++
++    companion object {
++        private const val MIN_PROGRESS_INTERVAL_MS = 700L
++    }
+ }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadSpeedMeter.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadSpeedMeter.kt
+new file mode 100644
+index 0000000..f8aacab
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadSpeedMeter.kt
+@@ -0,0 +1,70 @@
++package eu.kanade.tachiyomi.data.download
++
++import android.os.SystemClock
++import okio.Buffer
++import okio.BufferedSource
++import okio.ForwardingSource
++import okio.buffer
++
++/**
++ * Sliding-window download speed for the download queue notification.
++ *
++ * Every byte the downloader receives is reported through [addBytes] (or by reading through
++ * [countingInto]); [bytesPerSecond] averages the last [WINDOW_SECONDS] whole seconds, so the value
++ * is stable at the 1 Hz the notification is refreshed with and drops to zero within a few seconds of
++ * a stall. Shared by the HarmonyOS builds of Mihon and Anikku so that both notifications read the same.
++ */
++object DownloadSpeedMeter {
++
++    private const val BUCKETS = 8
++    private const val WINDOW_SECONDS = 3
++
++    private val lock = Any()
++    private val bucketBytes = LongArray(BUCKETS)
++    private val bucketSecond = LongArray(BUCKETS) { -1L }
++
++    fun addBytes(bytes: Long) {
++        if (bytes <= 0) return
++        val second = SystemClock.elapsedRealtime() / 1000
++        synchronized(lock) {
++            val index = (second % BUCKETS).toInt()
++            if (bucketSecond[index] != second) {
++                bucketSecond[index] = second
++                bucketBytes[index] = 0
++            }
++            bucketBytes[index] += bytes
++        }
++    }
++
++    /** Bytes per second averaged over the last whole seconds; the current, partial second is excluded. */
++    fun bytesPerSecond(): Long {
++        val now = SystemClock.elapsedRealtime() / 1000
++        synchronized(lock) {
++            var sum = 0L
++            for (second in (now - WINDOW_SECONDS) until now) {
++                val index = (second % BUCKETS).toInt()
++                if (bucketSecond[index] == second) sum += bucketBytes[index]
++            }
++            return sum / WINDOW_SECONDS
++        }
++    }
++
++    fun reset() {
++        synchronized(lock) {
++            bucketSecond.fill(-1L)
++            bucketBytes.fill(0L)
++        }
++    }
++
++    /** Wraps a source so that everything read from it is counted by this meter. */
++    fun BufferedSource.countingInto(meter: DownloadSpeedMeter): BufferedSource {
++        val delegate = this
++        return object : ForwardingSource(delegate) {
++            override fun read(sink: Buffer, byteCount: Long): Long {
++                val read = super.read(sink, byteCount)
++                if (read > 0) meter.addBytes(read)
++                return read
++            }
++        }.buffer()
++    }
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index eed0a5c..bffcc4b 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -207,6 +207,17 @@ class Downloader(
+         if (isRunning) return
+ 
+         downloaderJob = scope.launch {
++            // Harmony: refresh the notification once a second so the speed and the progress keep
++            // moving while ffmpeg runs. Cancelled together with the downloader job.
++            DownloadSpeedMeter.reset()
++            launch {
++                while (true) {
++                    delay(1_000)
++                    val active = queueState.value.firstOrNull { it.status == Download.State.DOWNLOADING } ?: continue
++                    notifier.onProgressChange(active, remainingDownloads())
++                }
++            }
++
+             val activeDownloadsFlow = combine(
+                 queueState,
+                 downloadPreferences.parallelSourceLimit().changes(),
+@@ -439,8 +450,6 @@ class Downloader(
+ 
+         video.status = Video.State.LoadVideo
+ 
+-        var progressJob: Job? = null
+-
+         // Get filename from download info
+         val filename = DiskUtil.buildValidFilename(download.episode.name)
+ 
+@@ -455,20 +464,14 @@ class Downloader(
+             val file = when {
+                 videoFile != null -> videoFile
+                 else -> {
+-                    notifier.onProgressChange(download)
++                    notifier.onProgressChange(download, remainingDownloads())
+ 
+                     download.status = Download.State.DOWNLOADING
+                     download.progress = 0
+ 
+                     // If videoFile is not existing then download it
+                     if (preferences.useExternalDownloader().get() == download.changeDownloader) {
+-                        progressJob = scope.launch {
+-                            while (download.status == Download.State.DOWNLOADING) {
+-                                delay(50)
+-                                notifier.onProgressChange(download)
+-                            }
+-                        }
+-
++                        // Progress and speed are pushed by the 1 Hz ticker in launchDownloaderJob().
+                         downloadVideo(download, tmpDir, filename)
+                     } else {
+                         val betterFileName = DiskUtil.buildValidFilename(
+@@ -482,12 +485,10 @@ class Downloader(
+             video.videoUrl = file.uri.path ?: ""
+             download.progress = 100
+             video.status = Video.State.Ready
+-            progressJob?.cancel()
+         } catch (e: Exception) {
+             if (e is CancellationException) throw e
+             video.status = Video.State.Error(e)
+             notifier.onError(e.message, download.episode.name, /* SY --> */ download.anime.ogTitle /* SY <-- */, download.anime.id)
+-            progressJob?.cancel()
+         }
+     }
+ 
+@@ -642,12 +643,21 @@ class Downloader(
+             }
+         }
+ 
++        var muxedBytes = 0L
+         val statCallback = StatisticsCallback { s ->
+             val outTime = (s.time / 1000.0).toLong()
+ 
+             if (duration != 0L && outTime > 0) {
+                 download.progress = (100 * outTime / duration).toInt()
+             }
++
++            // Harmony: ffmpeg copies the streams, so bytes muxed ≈ bytes downloaded. The delta feeds
++            // the speed shown in the notification.
++            val size = s.size.toLong()
++            if (size > muxedBytes) {
++                DownloadSpeedMeter.addBytes(size - muxedBytes)
++                muxedBytes = size
++            }
+         }
+ 
+         suspendCancellableCoroutine { continuation ->
+@@ -900,6 +910,11 @@ class Downloader(
+         return queueState.value.none { it.status.value <= Download.State.DOWNLOADING.value }
+     }
+ 
++    /** Queued or active downloads, shown as the count in the progress notification. */
++    private fun remainingDownloads(): Int {
++        return queueState.value.count { it.status.value <= Download.State.DOWNLOADING.value }
++    }
++
+     private fun addAllToQueue(downloads: List<Download>) {
+         _queueState.update {
+             downloads.forEach { download ->
+diff --git a/i18n-ank/src/commonMain/moko-resources/base/plurals.xml b/i18n-ank/src/commonMain/moko-resources/base/plurals.xml
+new file mode 100644
+index 0000000..5e00171
+--- /dev/null
++++ b/i18n-ank/src/commonMain/moko-resources/base/plurals.xml
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <!-- Harmony fork: download notification shared with Mihon / Animeko -->
++    <plurals name="download_notifier_downloading_count">
++        <item quantity="one">Downloading %1$d episode</item>
++        <item quantity="other">Downloading %1$d episodes</item>
++    </plurals>
++</resources>
+diff --git a/i18n-ank/src/commonMain/moko-resources/base/strings.xml b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+index 2577e68..830cdf8 100644
+--- a/i18n-ank/src/commonMain/moko-resources/base/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+@@ -264,4 +264,8 @@
+     <!-- Harmony fork: keep the process alive while downloading / updating the library -->
+     <string name="pref_harmony_keep_alive">Keep running in the background (HarmonyOS)</string>
+     <string name="pref_harmony_keep_alive_summary">Plays a silent audio track while downloading or updating the library so that 卓易通 does not suspend the app. Other apps\' audio is not affected.</string>
++
++    <!-- Harmony fork: download notification shared with Mihon / Animeko -->
++    <string name="download_notifier_speed">Download: %1$s/s</string>
++    <string name="download_notifier_speed_progress">Download: %1$s/s · %2$d%%</string>
+ </resources>
+diff --git a/i18n-ank/src/commonMain/moko-resources/zh-rCN/plurals.xml b/i18n-ank/src/commonMain/moko-resources/zh-rCN/plurals.xml
+new file mode 100644
+index 0000000..a5880b7
+--- /dev/null
++++ b/i18n-ank/src/commonMain/moko-resources/zh-rCN/plurals.xml
+@@ -0,0 +1,7 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <!-- Harmony fork: download notification shared with Mihon / Animeko -->
++    <plurals name="download_notifier_downloading_count">
++        <item quantity="other">正在下载 %1$d 个剧集</item>
++    </plurals>
++</resources>
+diff --git a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+index cffc3e0..c8780bf 100644
+--- a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+@@ -259,4 +259,8 @@
+     <!-- Harmony fork: keep the process alive while downloading / updating the library -->
+     <string name="pref_harmony_keep_alive">后台保持运行（鸿蒙）</string>
+     <string name="pref_harmony_keep_alive_summary">下载或更新番剧库时播放一段静音音轨，防止卓易通冻结应用；不影响其他应用的声音。</string>
++
++    <!-- Harmony fork: download notification shared with Mihon / Animeko -->
++    <string name="download_notifier_speed">下载：%1$s/s</string>
++    <string name="download_notifier_speed_progress">下载：%1$s/s · %2$d%%</string>
+ </resources>
