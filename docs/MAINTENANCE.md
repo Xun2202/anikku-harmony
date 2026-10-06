@@ -115,9 +115,11 @@ git format-patch -o /tmp/new-patches --no-signature --zero-commit v0.3.0..HEAD
   语义：只在**同一来源**内共用，本地源与合并条目不参与；“共用来的”集显示为已下载但文件不归它，删除是空操作。
   上游若把 `Chapter.url` 改名或把 `toChapterListItems` 改成非挂起上下文，这里要跟着改。
 - 0008 改 `ui/more/NewUpdateScreen.kt`（改用 `rememberScreenModel`）、新文件 `ui/more/NewUpdateScreenModel.kt`（Voyager `StateScreenModel`，
-  订阅 `workManager.getWorkInfosByTagFlow(TAG)`，`onDispose` 时若仍在下载则 `stop`）、`presentation/more/NewUpdateScreen.kt`
+  订阅 `workManager.getWorkInfosByTagFlow(TAG)`；任务刚入队、还没有进度数据时按「下载中」显示，避免按钮闪回「下载」；
+  `onDispose` 时若仍在下载则 `stop`）、`presentation/more/NewUpdateScreen.kt`
   （新增 `stage` / `downloadProgress` 参数，按钮文案随阶段变化，`canAccept`）、`AppUpdateDownloadJob.kt`（`TAG`/`PROGRESS` 公开、
-  `updateApk()`、`setProgressAsync`、`Result.success/failure` 带输出数据、`interactive` 输入跳过 `startInstalling`）和 `i18n-ank`
+  `updateApk()`、`doWork` 开头先 `setProgress(PROGRESS=0, url)`、下载中 `setProgressAsync`、`Result.success/failure` 带输出数据、
+  `interactive` 输入跳过 `startInstalling`）和 `i18n-ank`
   的 `update_downloading_with_progress`。`ComingUpdatesScreen`（KMK 的“即将到来的更新”页）没动，仍是旧流程。
   上游若把更新页改成别的导航框架，照 Mihon 的 `NewUpdateScreenModel` 重做即可。
 - 0009 与 mihon-harmony 0005 同源：新文件 `util/system/BackgroundKeepAlive.kt` 无依赖；`DownloadJob.kt` / `LibraryUpdateJob.kt` 在
