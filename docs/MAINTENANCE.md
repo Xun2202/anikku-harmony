@@ -38,6 +38,8 @@ patches/
   0005-build-flexible-adapter-from-maven-central.patch  临时回迁: FlexibleAdapter 改从 Maven Central 取
   0006-downloads-hide-videos-from-gallery-...patch       视频存成 <集>.mkv.anikku, 鸿蒙图库不收录 + 设置开关/批量改名
   0007-downloads-share-downloads-across-entries-by-url.patch  同一来源内按 url 共用已下载的视频
+  0008-updater-in-screen-download-progress-and-install.patch  更新页面留在原地显示进度 + 「安装」按钮 (Mihon 流程)
+  0009-downloads-background-keep-alive-silent-audio.patch     后台保活: 静音 AudioTrack + 唤醒锁, 下载服务 mediaPlayback
 scripts/prepare-source.sh                  套补丁 + 改版本号 (CI 与本地通用)
 .github/workflows/harmony_preview.yml      编译、重签、发布
 .github/workflows/check_patches.yml        只验证补丁能否套到最新稳定版 / master
@@ -112,6 +114,16 @@ git format-patch -o /tmp/new-patches --no-signature --zero-commit v0.3.0..HEAD
   两个调用点本来就在协程里）、`EpisodeLoader`（`isDownloadOrShared`、`getHostersOnDownloaded` 改 `suspend`）和 `PlayerViewModel.downloadNextEpisodes`。
   语义：只在**同一来源**内共用，本地源与合并条目不参与；“共用来的”集显示为已下载但文件不归它，删除是空操作。
   上游若把 `Chapter.url` 改名或把 `toChapterListItems` 改成非挂起上下文，这里要跟着改。
+- 0008 改 `ui/more/NewUpdateScreen.kt`（改用 `rememberScreenModel`）、新文件 `ui/more/NewUpdateScreenModel.kt`（Voyager `StateScreenModel`，
+  订阅 `workManager.getWorkInfosByTagFlow(TAG)`，`onDispose` 时若仍在下载则 `stop`）、`presentation/more/NewUpdateScreen.kt`
+  （新增 `stage` / `downloadProgress` 参数，按钮文案随阶段变化，`canAccept`）、`AppUpdateDownloadJob.kt`（`TAG`/`PROGRESS` 公开、
+  `updateApk()`、`setProgressAsync`、`Result.success/failure` 带输出数据、`interactive` 输入跳过 `startInstalling`）和 `i18n-ank`
+  的 `update_downloading_with_progress`。`ComingUpdatesScreen`（KMK 的“即将到来的更新”页）没动，仍是旧流程。
+  上游若把更新页改成别的导航框架，照 Mihon 的 `NewUpdateScreenModel` 重做即可。
+- 0009 与 mihon-harmony 0005 同源：新文件 `util/system/BackgroundKeepAlive.kt` 无依赖；`DownloadJob.kt` / `LibraryUpdateJob.kt` 在
+  `setForegroundSafely()` 之后一行 `acquireForCurrentJob`，`DownloadJob.getForegroundInfo()` 开关开时返回 `FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK`；
+  manifest 加 `FOREGROUND_SERVICE_MEDIA_PLAYBACK` 权限、`SystemForegroundService` 类型 `dataSync|mediaPlayback`；`DownloadPreferences.keepAliveInBackground()`
+  （默认 true）、`SettingsDownloadScreen` 开关、`i18n-ank` 两条字符串。rebase 时通常只需重新定位插入点。
 
 ### 5.2 加新补丁
 
@@ -171,6 +183,10 @@ gh release list --repo Xun2202/anikku-harmony
 | 定时任务不跑 | 仓库 60 天无提交被 GitHub 暂停，到 Actions 页面手动 Enable |
 | App 内检查不到更新 | 确认 Release 不是 draft / prerelease、tag 含 `-harmony-preview.`、资产文件名含 `-arm64-v8a`；App 最多每 2 天自动查一次，可在「关于」页手动检查 |
 | 安装提示签名冲突 | 设备上还装着官方 Preview（同包名 `app.anikku.beta`）。先备份，卸载官方，再装 |
+| 点「检查更新」→「下载」后页面直接退回、之后没任何反应 | preview.2 及之前的旧流程（通知 + 静默安装会话，卓易通都不显示）。升级到 preview.3 起的版本；若已是新版但按钮一直停在「正在下载… (0%)」，看 logcat 的 `AppUpdateDownload` 是否被网络限制挡住 |
+| 后台下载停住 / 切回 App 才继续 | 卓易通冻结后台进程。确认 设置 → 下载 →「后台保持运行（鸿蒙）」开着（preview.3 起默认开）；logcat 里应有 `Background keep-alive started`。若鸿蒙后续版本连静音音频也拦，只能等上游 / 系统变化 |
+| 闪退 `ForegroundServiceDidNotStopInTimeException ... type dataSync` | Android 15 对 dataSync 前台服务的 6 小时限制，通常是后台被冻结、服务空转耗光额度。开着「后台保持运行（鸿蒙）」时下载服务是 `mediaPlayback` 类型不受限；关着就隔几小时切回前台重置额度 |
+| 下载时其他 App 的音乐被暂停 / 变小声 | 不应发生：keep-alive 不请求音频焦点。若出现，检查 `BackgroundKeepAlive.kt` 是否被改成了 `requestAudioFocus` |
 
 ## 8. 不要做的事
 
@@ -188,3 +204,6 @@ gh release list --repo Xun2202/anikku-harmony
   自动跳过上游已合入的补丁。发布 `v0.2.0-harmony-preview.1`（versionCode 801），用户确认下载可用。
 - 2026-10-05 用户反馈鸿蒙图库仍收录下载的 `.mkv`（`.nomedia` 无效），以及 XvXun 多个收藏夹里同一视频下载状态不互通。
   加入补丁 0006（`<集>.mkv.anikku` + 设置开关 + 存量改名）和 0007（同一来源按 url 共用下载），发布 `v0.2.0-harmony-preview.2`（versionCode 802）。
+- 2026-10-06 用户反馈应用内更新点「下载」后页面直接退回、没法安装，以及（与 Mihon 相同的）切后台下载停住。加入补丁 0008
+  （更新页面留在原地：进度 + 「安装」按钮，跳过卓易通不支持的静默安装会话）和 0009（后台保活：静音 `AudioTrack` + 唤醒锁，
+  下载服务改 `mediaPlayback`，设置开关），发布 `v0.2.0-harmony-preview.3`（versionCode 803）。
