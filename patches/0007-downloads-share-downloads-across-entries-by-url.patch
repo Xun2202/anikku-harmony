@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
-Date: Tue, 6 Oct 2026 03:59:00 +0000
-Subject: [PATCH] downloads: reuse a download held by another entry with the
- same url
+Date: Tue, 6 Oct 2026 04:01:19 +0000
+Subject: [PATCH 2/2] downloads: reuse a download held by another entry with
+ the same url
 
 Sources such as XvXun expose each favourites folder as its own entry, so
 the same video can appear under several entries. Downloads were keyed on
@@ -52,7 +52,7 @@ index 8acb7f0..207c7a2 100644
              getDeleteChaptersGroup(
                  downloadPreferences = downloadPreferences,
 diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
-index f736389..3160d7c 100644
+index 5b3c083..551b054 100644
 --- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
 +++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
 @@ -24,8 +24,10 @@ import tachiyomi.core.common.util.system.logcat
@@ -77,7 +77,7 @@ index f736389..3160d7c 100644
  ) {
  
      /**
-@@ -240,6 +246,77 @@ class DownloadManager(
+@@ -241,6 +247,77 @@ class DownloadManager(
          skipCache: Boolean = false,
      ) = isChapterDownloaded(episodeName, episodeScanlator, animeTitle, sourceId, skipCache)
  

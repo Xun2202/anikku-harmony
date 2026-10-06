@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
-Date: Tue, 6 Oct 2026 03:46:02 +0000
+Date: Tue, 6 Oct 2026 04:01:19 +0000
 Subject: [PATCH 1/2] downloads: hide videos from gallery apps with an unknown
  file extension
 MIME-Version: 1.0
@@ -23,12 +23,12 @@ video purely by file extension, so finished downloads are now stored as
 - Download cache is keyed on directory names, so nothing else changes.
 ---
  .../settings/screen/SettingsDownloadScreen.kt | 36 ++++++++++++++++
- .../data/download/DownloadManager.kt          | 42 ++++++++++++++++++-
+ .../data/download/DownloadManager.kt          | 43 ++++++++++++++++++-
  .../tachiyomi/data/download/Downloader.kt     | 17 +++++++-
  .../download/service/DownloadPreferences.kt   | 11 +++++
  .../moko-resources/base/strings.xml           |  9 ++++
  .../moko-resources/zh-rCN/strings.xml         |  9 ++++
- 6 files changed, 121 insertions(+), 3 deletions(-)
+ 6 files changed, 122 insertions(+), 3 deletions(-)
 
 diff --git a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDownloadScreen.kt b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDownloadScreen.kt
 index bdb2b79..8acb7f0 100644
@@ -103,7 +103,7 @@ index bdb2b79..8acb7f0 100644
                  downloadPreferences = downloadPreferences,
                  categories = allCategories,
 diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
-index ed2f977..f736389 100644
+index ed2f977..5b3c083 100644
 --- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
 +++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
 @@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.onStart
@@ -114,17 +114,18 @@ index ed2f977..f736389 100644
  import tachiyomi.core.common.util.lang.launchIO
  import tachiyomi.core.common.util.system.logcat
  import tachiyomi.domain.anime.model.Anime
-@@ -197,7 +198,8 @@ class DownloadManager(
+@@ -197,7 +198,9 @@ class DownloadManager(
                  source,
              )
          val files = episodeDir?.listFiles().orEmpty()
 -            .filter { "video" in it.type.orEmpty() }
-+            // Harmony: videos hidden from the gallery carry an unknown extension, see Downloader.
-+            .filter { "video" in it.type.orEmpty() || it.name.orEmpty().endsWith(Downloader.HIDDEN_VIDEO_SUFFIX) }
++            // Harmony: videos hidden from the gallery carry an unknown extension, see Downloader. `contains`
++            // rather than `endsWith` so a provider that insists on appending its own extension still matches.
++            .filter { "video" in it.type.orEmpty() || Downloader.HIDDEN_VIDEO_SUFFIX in it.name.orEmpty() }
  
          if (files.isEmpty()) {
              throw Exception(context.stringResource(AYMR.strings.video_list_empty_error))
-@@ -581,6 +583,44 @@ class DownloadManager(
+@@ -581,6 +584,44 @@ class DownloadManager(
          }
      }
  
@@ -148,7 +149,7 @@ index ed2f977..f736389 100644
 +                    for (file in chapterDir.listFiles().orEmpty().filter { it.isFile }) {
 +                        val name = file.name ?: continue
 +                        val newName = when {
-+                            hide && !name.endsWith(suffix) && "video" in file.type.orEmpty() -> name + suffix
++                            hide && suffix !in name && "video" in file.type.orEmpty() -> name + suffix
 +                            !hide && name.endsWith(suffix) -> name.removeSuffix(suffix)
 +                            else -> continue
 +                        }
