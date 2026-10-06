@@ -42,6 +42,7 @@ patches/
   0009-downloads-background-keep-alive-silent-audio.patch     后台保活: 静音 AudioTrack + 唤醒锁, 下载服务 mediaPlayback
   0010-downloads-notification-speed-and-progress.patch        下载通知统一为 Animeko 样式: 数量标题 + 速度/进度 + 进度条
   0011-updater-no-background-auto-download-and-apk-cleanup.patch  去掉后台自动下载 (卡住更新页的元凶) + 启动时删已安装的 update.apk
+  0012-about-match-mihon-update-ui.patch                        去掉装完后的「已更新至」对话框, 「更新日志」改开 Release 网页 (与 Mihon 一致)
 scripts/prepare-source.sh                  套补丁 + 改版本号 (CI 与本地通用)
 .github/workflows/harmony_preview.yml      编译、重签、发布
 .github/workflows/check_patches.yml        只验证补丁能否套到最新稳定版 / master
@@ -141,6 +142,10 @@ git format-patch -o /tmp/new-patches --no-signature --zero-commit v0.3.0..HEAD
   companion 里的 `deleteInstalledApk()`（`getPackageArchiveInfo` 读版本号，≤ 当前或读不出就删）；`NewUpdateScreenModel` 的 pending 判断
   多一个 `TAG_INTERACTIVE in workInfo.tags`；`App.onCreate` 在 WorkManager 初始化后 `scope.launch(Dispatchers.IO) { deleteInstalledApk }`。
   `deleteInstalledApk` 与 mihon-harmony 0007 逐字相同。上游若换掉 `downloadFileWithResume`，删文件那一行可以跟着去掉。
+- 0012 改两处：`MainActivity.onCreate` 删掉 `setComposeContent` 末尾的 KMK 块（`previewLastVersion` 偏好、`showChangelog`、`WhatsNewDialog`），
+  `didMigration` 不再需要，`Migrator.awaitAndRelease()` 像 Mihon 一样直接调用；`AboutScreen` 的「更新日志」条目改为 `uriHandler.openUri(RELEASE_URL)`，
+  删掉 companion 里的 `getReleaseNotes()`（唯一的两个调用方都没了）。`WhatsNewDialog.kt` / `WhatsNewScreen.kt`、`AppUpdateChecker.getReleaseNotes()`、
+  `GetApplicationRelease.awaitReleaseNotes()` 留在树里不删（减少 rebase 冲突面）。上游若把「已更新至」对话框改成别的形式，照 Mihon 的 `MainActivity` 对齐即可。
 
 ### 5.2 加新补丁
 
@@ -202,6 +207,7 @@ gh release list --repo Xun2202/anikku-harmony
 | 安装提示签名冲突 | 设备上还装着官方 Preview（同包名 `app.anikku.beta`）。先备份，卸载官方，再装 |
 | 点「检查更新」→「下载」后页面直接退回、之后没任何反应 | preview.2 及之前的旧流程（通知 + 静默安装会话，卓易通都不显示）。升级到 preview.3 起的版本 |
 | 更新页一进来（还没点下载）就停在「正在下载… (0%)」，一直不动 | preview.3 / preview.4：「检查更新」排了一个 10 分钟后才跑的后台自动下载，页面把它当成自己的下载（见 0011）。升级到 preview.5；preview.5 之后若再出现，看 `adb shell dumpsys jobscheduler` 里 `AppUpdateDownload` 任务是不是别处排进来的（通知栏「下载」动作、`ComingUpdatesScreen`） |
+| 刚装完新版就弹「已更新至 v…」对话框，「更新日志」页面写着「最新: v…-preview.N – 当前: …-harmony.N」，像在推送同一个版本 | preview.5 及之前的 KMK 行为（Mihon 没有这个对话框）。0012 起对话框去掉，「更新日志」直接开当前版本的 Release 网页。「检查更新」在已是最新时一直都是 toast「没有新版本」，若真的弹出更新页，先对比 `GetApplicationRelease.HARMONY_VERSION_REGEX` 与 `BuildConfig.VERSION_NAME` / tag 的格式 |
 | 「安装」后系统提示「解析软件包时出现问题」 | 旧版本的 `update.apk` 没删干净，`downloadFileWithResume` 把新包接在了后面（0011 起每次下载前先删）。清除 Anikku 缓存后重试 |
 | 后台下载停住 / 切回 App 才继续 | 卓易通冻结后台进程。确认 设置 → 下载 →「后台保持运行（鸿蒙）」开着（preview.3 起默认开）；logcat 里应有 `Background keep-alive started`。若鸿蒙后续版本连静音音频也拦，只能等上游 / 系统变化 |
 | 闪退 `ForegroundServiceDidNotStopInTimeException ... type dataSync` | Android 15 对 dataSync 前台服务的 6 小时限制，通常是后台被冻结、服务空转耗光额度。开着「后台保持运行（鸿蒙）」时下载服务是 `mediaPlayback` 类型不受限；关着就隔几小时切回前台重置额度 |
@@ -231,3 +237,5 @@ gh release list --repo Xun2202/anikku-harmony
   `DownloadSpeedMeter`、通知重写、1 Hz 刷新替代 50 ms 轮询），`dry_run` 验证后发布 `v0.2.0-harmony-preview.4`（versionCode 804）。
 - 2026-10-06（晚） 用户反馈 preview.4 应用内更新「一直卡在正在下载，进度不动」。根因是 KMK 的定时后台自动下载与更新页下载同名（见 0011）；
   顺带回答「更新完的 APK 会不会一直占空间」：此前不会删，0011 起启动时自动删。加入补丁 0011，`dry_run` 验证后发布 `v0.2.0-harmony-preview.5`（versionCode 805）。
+- 同日（夜） 用户装上 preview.5 后反馈「点检查更新也弹出来个 5，Mihon 会显示没有新版本」。版本比较本身正确（dex 里确认），用户看到的是 KMK 装完新版后的
+  「已更新至 vX」对话框和「更新日志」页面的「最新 / 当前」标题。加入补丁 0012 与 Mihon 对齐，`dry_run` 验证后发布 `v0.2.0-harmony-preview.6`（versionCode 806）。
