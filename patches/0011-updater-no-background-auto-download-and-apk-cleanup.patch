@@ -1,0 +1,280 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 16:39:29 +0000
+Subject: [PATCH] updater: keep the background auto-download from blocking the
+ update screen
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Checking for updates (About screen button, app start, periodic job) also
+enqueued a scheduled background download under the same unique work name as
+the download started from the update screen. On 卓易通 that job can never
+finish an update (no install permission, the silent PackageInstaller session
+is dropped), but its ENQUEUED state made the update screen show
+"downloading 0%" forever with no way to start the real download.
+
+- Drop the background auto-download and the "auto update app" restrictions
+  preference that configured it; updates are downloaded from the update
+  screen only.
+- Tag downloads started from the update screen and only treat those as a
+  pending download while they carry no progress data yet.
+- Start every download from scratch instead of resuming into a leftover
+  update.apk from an earlier version, which produced a corrupt APK.
+- Delete update.apk on startup once the version it holds is installed, so the
+  cache directory no longer keeps the last installer around.
+---
+ .../settings/screen/SettingsAdvancedScreen.kt | 26 +++------------
+ app/src/main/java/eu/kanade/tachiyomi/App.kt  |  9 ++++++
+ .../data/updater/AppUpdateChecker.kt          | 32 +++++--------------
+ .../data/updater/AppUpdateDownloadJob.kt      | 31 ++++++++++++++++++
+ .../tachiyomi/ui/more/NewUpdateScreenModel.kt |  8 +++--
+ 5 files changed, 58 insertions(+), 48 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsAdvancedScreen.kt b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsAdvancedScreen.kt
+index b828c9c..5150479 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsAdvancedScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsAdvancedScreen.kt
+@@ -24,7 +24,6 @@ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.platform.LocalResources
+ import androidx.compose.ui.platform.LocalUriHandler
+ import androidx.compose.ui.window.DialogProperties
+-import androidx.core.content.ContextCompat
+ import androidx.core.net.toUri
+ import androidx.core.text.HtmlCompat
+ import cafe.adriel.voyager.navigator.LocalNavigator
+@@ -40,7 +39,6 @@ import eu.kanade.tachiyomi.core.security.SecurityPreferences
+ import eu.kanade.tachiyomi.data.download.DownloadCache
+ import eu.kanade.tachiyomi.data.download.DownloadManager
+ import eu.kanade.tachiyomi.data.library.MetadataUpdateJob
+-import eu.kanade.tachiyomi.data.updater.AppUpdateJob
+ import eu.kanade.tachiyomi.network.NetworkHelper
+ import eu.kanade.tachiyomi.network.NetworkPreferences
+ import eu.kanade.tachiyomi.network.PREF_DOH_360
+@@ -84,7 +82,6 @@ import tachiyomi.domain.chapter.interactor.GetChaptersByMangaId
+ import tachiyomi.domain.library.service.LibraryPreferences
+ import tachiyomi.domain.manga.interactor.GetAllManga
+ import tachiyomi.domain.manga.interactor.ResetViewerFlags
+-import tachiyomi.domain.release.service.AppUpdatePolicy
+ import tachiyomi.domain.source.service.SourceManager
+ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.ank.AMR
+@@ -114,7 +111,6 @@ object SettingsAdvancedScreen : SearchableSettings {
+         val basePreferences = remember { Injekt.get<BasePreferences>() }
+         val networkPreferences = remember { Injekt.get<NetworkPreferences>() }
+         val libraryPreferences = remember { Injekt.get<LibraryPreferences>() }
+-        val exhPreferences = remember { Injekt.get<ExhPreferences>() }
+ 
+         return listOf(
+             Preference.PreferenceItem.TextPreference(
+@@ -152,24 +148,10 @@ object SettingsAdvancedScreen : SearchableSettings {
+                     context.startActivity(intent)
+                 },
+             ),
+-            // KMK -->
+-            Preference.PreferenceItem.MultiSelectListPreference(
+-                preference = exhPreferences.appShouldAutoUpdate(),
+-                entries = persistentMapOf(
+-                    AppUpdatePolicy.DEVICE_ONLY_ON_WIFI to stringResource(MR.strings.connected_to_wifi),
+-                    AppUpdatePolicy.DEVICE_NETWORK_NOT_METERED to stringResource(MR.strings.network_not_metered),
+-                    AppUpdatePolicy.DEVICE_CHARGING to stringResource(MR.strings.charging),
+-                    AppUpdatePolicy.DISABLE_AUTO_DOWNLOAD to stringResource(KMR.strings.auto_update_app_disable_auto_download),
+-                ),
+-                title = stringResource(KMR.strings.auto_update_app),
+-                subtitle = stringResource(MR.strings.restrictions),
+-                onValueChanged = {
+-                    // Post to event looper to allow the preference to be updated.
+-                    ContextCompat.getMainExecutor(context).execute { AppUpdateJob.setupTask(context) }
+-                    true
+-                },
+-            ),
+-            // KMK <--
++            // Harmony -->
++            // The "auto update app" restrictions preference is gone together with the background
++            // auto-download it configured (see AppUpdateChecker).
++            // Harmony <--
+             getBackgroundActivityGroup(),
+             getDataGroup(),
+             getNetworkGroup(networkPreferences = networkPreferences),
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/App.kt b/app/src/main/java/eu/kanade/tachiyomi/App.kt
+index fde74bf..9c8aa04 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/App.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/App.kt
+@@ -54,6 +54,7 @@ import eu.kanade.tachiyomi.data.coil.TachiyomiImageDecoder
+ import eu.kanade.tachiyomi.data.connections.discord.DiscordRPCService
+ import eu.kanade.tachiyomi.data.notification.Notifications
+ import eu.kanade.tachiyomi.data.sync.SyncDataJob
++import eu.kanade.tachiyomi.data.updater.AppUpdateDownloadJob
+ import eu.kanade.tachiyomi.di.AppModule
+ import eu.kanade.tachiyomi.di.PreferenceModule
+ import eu.kanade.tachiyomi.di.SYPreferenceModule
+@@ -77,6 +78,7 @@ import exh.log.xLogD
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.flow.launchIn
+ import kotlinx.coroutines.flow.onEach
++import kotlinx.coroutines.launch
+ import logcat.AndroidLogcatLogger
+ import logcat.LogPriority
+ import logcat.LogcatLogger
+@@ -217,6 +219,13 @@ class App : Application(), DefaultLifecycleObserver, SingletonImageLoader.Factor
+             WorkManager.initialize(this, Configuration.Builder().build())
+         }
+ 
++        // Harmony -->
++        // The in-app updater leaves the installed APK in the cache directory; drop it once it is installed.
++        scope.launch(Dispatchers.IO) {
++            AppUpdateDownloadJob.deleteInstalledApk(this@App)
++        }
++        // Harmony <--
++
+         initializeMigrator()
+ 
+         val syncPreferences: SyncPreferences = Injekt.get()
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateChecker.kt b/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateChecker.kt
+index dea5839..1a2d91f 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateChecker.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateChecker.kt
+@@ -1,16 +1,11 @@
+ package eu.kanade.tachiyomi.data.updater
+ 
+ import android.content.Context
+-import android.os.Build
+ import eu.kanade.tachiyomi.BuildConfig
+ import eu.kanade.tachiyomi.util.system.isFossBuildType
+ import eu.kanade.tachiyomi.util.system.isPreviewBuildType
+-import exh.source.ExhPreferences
+ import tachiyomi.core.common.util.lang.withIOContext
+ import tachiyomi.domain.release.interactor.GetApplicationRelease
+-import tachiyomi.domain.release.service.AppUpdatePolicy
+-import uy.kohesive.injekt.Injekt
+-import uy.kohesive.injekt.api.get
+ import uy.kohesive.injekt.injectLazy
+ 
+ class AppUpdateChecker(
+@@ -21,16 +16,9 @@ class AppUpdateChecker(
+ 
+     private val getApplicationRelease: GetApplicationRelease by injectLazy()
+ 
+-    // KMK -->
+-    private val exhPreferences by lazy { Injekt.get<ExhPreferences>() }
+-    // KMK <--
+-
+     suspend fun checkForUpdate(
+         context: Context,
+         forceCheck: Boolean = false,
+-        // KMK -->
+-        autoUpdate: Boolean = AppUpdatePolicy.DISABLE_AUTO_DOWNLOAD !in exhPreferences.appShouldAutoUpdate().get(),
+-        // KMK <--
+     ): GetApplicationRelease.Result {
+         return withIOContext {
+             val result = getApplicationRelease.await(
+@@ -58,18 +46,14 @@ class AppUpdateChecker(
+                     else -> {}
+                 }
+ 
+-                // KMK -->
+-                if (autoUpdate && result is GetApplicationRelease.Result.NewUpdate) {
+-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+-                        AppUpdateDownloadJob.start(
+-                            context = context,
+-                            url = result.release.downloadLink,
+-                            title = result.release.version,
+-                            scheduled = true,
+-                        )
+-                    }
+-                }
+-                // KMK <--
++                // Harmony -->
++                // Upstream also enqueues a scheduled background download here (10 min delay, Wi-Fi/charging
++                // constraints) that ends in a silent PackageInstaller session. On 卓易通 that session is dropped
++                // and the install permission is never granted, so the download could never complete an update.
++                // Worse, it shares the unique work name with the download started from the update screen, so
++                // its pending state made that screen show "downloading 0%" with no way to start the real
++                // download. Updates are downloaded from the update screen only.
++                // Harmony <--
+             }
+ 
+             result
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateDownloadJob.kt b/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateDownloadJob.kt
+index eb8e421..4060d8b 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateDownloadJob.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateDownloadJob.kt
+@@ -9,6 +9,7 @@ import android.net.NetworkCapabilities
+ import android.net.NetworkRequest
+ import android.os.Build
+ import androidx.annotation.RequiresApi
++import androidx.core.content.pm.PackageInfoCompat
+ import androidx.work.BackoffPolicy
+ import androidx.work.Constraints
+ import androidx.work.CoroutineWorker
+@@ -198,6 +199,13 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
+             // File where the apk will be saved.
+             val apkFile = updateApk(context)
+ 
++            // Harmony -->
++            // downloadFileWithResume continues from whatever is already in the file. A leftover from an
++            // earlier version would turn into a corrupt APK, so every download starts from scratch; the
++            // resume logic still covers connection drops within this download.
++            apkFile.delete()
++            // Harmony <--
++
+             // KMK -->
+             network.downloadFileWithResume(url, apkFile, progressListener)
+             if (isStopped) {
+@@ -303,7 +311,25 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
+         /** Set when the download was started from the update screen, which then handles the install. */
+         private const val EXTRA_INTERACTIVE = "interactive"
+ 
++        /** Extra tag on downloads started from the update screen, so the screen can tell them apart. */
++        const val TAG_INTERACTIVE = "AppUpdateDownloadInteractive"
++
+         fun updateApk(context: Context): File = File(context.externalCacheDir, "update.apk")
++
++        /**
++         * Deletes the downloaded APK once it is installed (or turned out unreadable). Nothing else removes
++         * it: the system installer does not touch the file, so it would otherwise sit in the cache
++         * directory until the next update overwrote it.
++         */
++        fun deleteInstalledApk(context: Context) {
++            val apkFile = updateApk(context)
++            if (!apkFile.exists()) return
++            val downloadedVersionCode = context.packageManager.getPackageArchiveInfo(apkFile.absolutePath, 0)
++                ?.let { PackageInfoCompat.getLongVersionCode(it) }
++            if (downloadedVersionCode == null || downloadedVersionCode <= BuildConfig.VERSION_CODE) {
++                apkFile.delete()
++            }
++        }
+         // Harmony <--
+ 
+         // KMK -->
+@@ -340,6 +366,11 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
+             val request = OneTimeWorkRequestBuilder<AppUpdateDownloadJob>()
+                 .addTag(TAG)
+                 .apply {
++                    // Harmony -->
++                    if (interactive) {
++                        addTag(TAG_INTERACTIVE)
++                    }
++                    // Harmony <--
+                     // KMK -->
+                     if (scheduled) {
+                         data.putBoolean(SCHEDULED_RUN, true)
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreenModel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreenModel.kt
+index 120dd90..cea709c 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreenModel.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreenModel.kt
+@@ -43,8 +43,12 @@ class NewUpdateScreenModel(
+ 
+                 if (url != downloadLink) {
+                     // Between enqueue and the first progress report the work carries no data yet; keep showing
+-                    // "downloading" instead of flipping back to the Download button for a moment.
+-                    val pending = url == null && !workInfo.state.isFinished
++                    // "downloading" instead of flipping back to the Download button for a moment. Only a
++                    // download this screen started qualifies: anything else waiting under the same work name
++                    // (e.g. a download enqueued elsewhere) must not lock the screen in "downloading 0%".
++                    val pending = url == null &&
++                        !workInfo.state.isFinished &&
++                        AppUpdateDownloadJob.TAG_INTERACTIVE in workInfo.tags
+                     return@map 0 to if (pending) Stage.Downloading else Stage.Available
+                 }
+ 
