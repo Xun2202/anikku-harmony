@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
-Date: Tue, 6 Oct 2026 05:35:32 +0000
-Subject: [PATCH 1/2] updater: keep the update screen open with progress and an
+Date: Tue, 6 Oct 2026 05:52:17 +0000
+Subject: [PATCH] updater: keep the update screen open with progress and an
  Install button
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -29,12 +29,12 @@ handles installing. Notification- and scheduled-run downloads keep the old
 behaviour.
 ---
  .../presentation/more/NewUpdateScreen.kt      |  21 +++-
- .../data/updater/AppUpdateDownloadJob.kt      |  64 ++++++++--
+ .../data/updater/AppUpdateDownloadJob.kt      |  69 +++++++++--
  .../tachiyomi/ui/more/NewUpdateScreen.kt      |  33 +++--
- .../tachiyomi/ui/more/NewUpdateScreenModel.kt | 113 ++++++++++++++++++
+ .../tachiyomi/ui/more/NewUpdateScreenModel.kt | 116 ++++++++++++++++++
  .../moko-resources/base/strings.xml           |   3 +
  .../moko-resources/zh-rCN/strings.xml         |   3 +
- 6 files changed, 213 insertions(+), 24 deletions(-)
+ 6 files changed, 221 insertions(+), 24 deletions(-)
  create mode 100644 app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreenModel.kt
 
 diff --git a/app/src/main/java/eu/kanade/presentation/more/NewUpdateScreen.kt b/app/src/main/java/eu/kanade/presentation/more/NewUpdateScreen.kt
@@ -94,7 +94,7 @@ index d4c6c3e..03a04f3 100644
              onRejectUpdate = {},
              onAcceptUpdate = {},
 diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateDownloadJob.kt b/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateDownloadJob.kt
-index 016f0d4..710a854 100644
+index 016f0d4..eb8e421 100644
 --- a/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateDownloadJob.kt
 +++ b/app/src/main/java/eu/kanade/tachiyomi/data/updater/AppUpdateDownloadJob.kt
 @@ -19,6 +19,7 @@ import androidx.work.NetworkType
@@ -105,7 +105,17 @@ index 016f0d4..710a854 100644
  import eu.kanade.tachiyomi.BuildConfig
  import eu.kanade.tachiyomi.data.notification.Notifications
  import eu.kanade.tachiyomi.network.NetworkHelper
-@@ -102,15 +103,23 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
+@@ -97,20 +98,33 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
+             return Result.failure()
+         }
+ 
++        // Harmony -->
++        // Publish the url right away so the update screen can tell this download is the one it started.
++        setProgress(workDataOf(PROGRESS to 0, EXTRA_DOWNLOAD_URL to url))
++        // Harmony <--
++
+         setForegroundSafely()
+         // KMK -->
          instance = WeakReference(this)
          // KMK <--
  
@@ -132,7 +142,7 @@ index 016f0d4..710a854 100644
      }
  
      override suspend fun getForegroundInfo(): ForegroundInfo {
-@@ -130,7 +139,13 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
+@@ -130,7 +144,13 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
       *
       * @param url url location of file
       */
@@ -147,7 +157,7 @@ index 016f0d4..710a854 100644
          // Show notification download starting.
          with(notifier) {
              onDownloadStarted(title)
-@@ -167,30 +182,39 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
+@@ -167,30 +187,39 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
                      savedProgress = progress
                      lastTick = currentTime
                      notifier.onProgressChange(progress)
@@ -194,7 +204,7 @@ index 016f0d4..710a854 100644
          } catch (e: Exception) {
              xLogE("App update stopped:", e)
              val shouldCancel = e is CancellationException ||
-@@ -206,6 +230,7 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
+@@ -206,6 +235,7 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
                      // KMK <--
                  )
              }
@@ -202,7 +212,7 @@ index 016f0d4..710a854 100644
          }
      }
  
-@@ -265,7 +290,16 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
+@@ -265,7 +295,16 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
      // KMK <--
  
      companion object {
@@ -220,7 +230,7 @@ index 016f0d4..710a854 100644
  
          // KMK -->
          const val PACKAGE_INSTALLED_ACTION =
-@@ -288,10 +322,16 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
+@@ -288,10 +327,16 @@ class AppUpdateDownloadJob(private val context: Context, workerParams: WorkerPar
              // KMK -->
              scheduled: Boolean = false,
              // KMK <--
@@ -303,10 +313,10 @@ index f3f1082..d244c92 100644
  }
 diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreenModel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreenModel.kt
 new file mode 100644
-index 0000000..7570559
+index 0000000..120dd90
 --- /dev/null
 +++ b/app/src/main/java/eu/kanade/tachiyomi/ui/more/NewUpdateScreenModel.kt
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,116 @@
 +package eu.kanade.tachiyomi.ui.more
 +
 +import android.app.Application
@@ -351,7 +361,10 @@ index 0000000..7570559
 +                val url = data.getString(AppUpdateDownloadJob.EXTRA_DOWNLOAD_URL)
 +
 +                if (url != downloadLink) {
-+                    return@map 0 to Stage.Available
++                    // Between enqueue and the first progress report the work carries no data yet; keep showing
++                    // "downloading" instead of flipping back to the Download button for a moment.
++                    val pending = url == null && !workInfo.state.isFinished
++                    return@map 0 to if (pending) Stage.Downloading else Stage.Available
 +                }
 +
 +                val stage = when {
