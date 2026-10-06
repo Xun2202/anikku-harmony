@@ -1,9 +1,9 @@
 {
-  "url": "https://api.github.com/repos/Xun2202/anikku-harmony/releases/405000084",
-  "assets_url": "https://api.github.com/repos/Xun2202/anikku-harmony/releases/405000084/assets",
-  "upload_url": "https://uploads.github.com/repos/Xun2202/anikku-harmony/releases/405000084/assets{?name,label}",
-  "html_url": "https://github.com/Xun2202/anikku-harmony/releases/tag/v0.2.0-harmony-preview.6",
-  "id": 405000084,
+  "url": "https://api.github.com/repos/Xun2202/anikku-harmony/releases/405037445",
+  "assets_url": "https://api.github.com/repos/Xun2202/anikku-harmony/releases/405037445/assets",
+  "upload_url": "https://uploads.github.com/repos/Xun2202/anikku-harmony/releases/405037445/assets{?name,label}",
+  "html_url": "https://github.com/Xun2202/anikku-harmony/releases/tag/v0.2.0-harmony-preview.7",
+  "id": 405037445,
   "author": {
     "login": "github-actions[bot]",
     "id": 41898282,
@@ -25,22 +25,22 @@
     "user_view_type": "public",
     "site_admin": false
   },
-  "node_id": "RE_kwDOU9D-tM4YI8-U",
-  "tag_name": "v0.2.0-harmony-preview.6",
-  "target_commitish": "321fc099648f954edd1455a92047d7dbba801746",
-  "name": "Anikku Harmony Preview v0.2.0-harmony-preview.6",
+  "node_id": "RE_kwDOU9D-tM4YJGGF",
+  "tag_name": "v0.2.0-harmony-preview.7",
+  "target_commitish": "b08bd8fbacde2d208c75f7dc976bcd6f88ae88d7",
+  "name": "Anikku Harmony Preview v0.2.0-harmony-preview.7",
   "draft": false,
   "immutable": false,
   "prerelease": false,
-  "created_at": "2026-10-06T17:36:32Z",
-  "updated_at": "2026-10-06T17:55:43Z",
-  "published_at": "2026-10-06T17:55:43Z",
+  "created_at": "2026-10-06T18:27:34Z",
+  "updated_at": "2026-10-06T18:45:01Z",
+  "published_at": "2026-10-06T18:45:01Z",
   "assets": [
     {
-      "url": "https://api.github.com/repos/Xun2202/anikku-harmony/releases/assets/616240662",
-      "id": 616240662,
-      "node_id": "RA_kwDOU9D-tM4kuxYW",
-      "name": "Anikku-v0.2.0-harmony-preview.6-arm64-v8a.apk",
+      "url": "https://api.github.com/repos/Xun2202/anikku-harmony/releases/assets/616352861",
+      "id": 616352861,
+      "node_id": "RA_kwDOU9D-tM4kvMxd",
+      "name": "Anikku-v0.2.0-harmony-preview.7-arm64-v8a.apk",
       "label": "",
       "uploader": {
         "login": "github-actions[bot]",
@@ -66,17 +66,17 @@
       "content_type": "application/vnd.android.package-archive",
       "state": "uploaded",
       "size": 90128501,
-      "digest": "sha256:8457571aa4684cfe0e780455601e813d618965fade1aaba73572e24cd802113f",
-      "download_count": 1,
-      "created_at": "2026-10-06T17:55:33Z",
-      "updated_at": "2026-10-06T17:55:36Z",
-      "browser_download_url": "https://github.com/Xun2202/anikku-harmony/releases/download/v0.2.0-harmony-preview.6/Anikku-v0.2.0-harmony-preview.6-arm64-v8a.apk"
+      "digest": "sha256:a3d4129b0e5e341e2473d24c0d52cffb1e932df615359109dac7ebb9313ac630",
+      "download_count": 0,
+      "created_at": "2026-10-06T18:44:48Z",
+      "updated_at": "2026-10-06T18:44:52Z",
+      "browser_download_url": "https://github.com/Xun2202/anikku-harmony/releases/download/v0.2.0-harmony-preview.7/Anikku-v0.2.0-harmony-preview.7-arm64-v8a.apk"
     },
     {
-      "url": "https://api.github.com/repos/Xun2202/anikku-harmony/releases/assets/616240664",
-      "id": 616240664,
-      "node_id": "RA_kwDOU9D-tM4kuxYY",
-      "name": "Anikku-v0.2.0-harmony-preview.6.apk",
+      "url": "https://api.github.com/repos/Xun2202/anikku-harmony/releases/assets/616352854",
+      "id": 616352854,
+      "node_id": "RA_kwDOU9D-tM4kvMxW",
+      "name": "Anikku-v0.2.0-harmony-preview.7.apk",
       "label": "",
       "uploader": {
         "login": "github-actions[bot]",
@@ -102,14 +102,14 @@
       "content_type": "application/vnd.android.package-archive",
       "state": "uploaded",
       "size": 282125111,
-      "digest": "sha256:4d0f3e4418689597d280ccc4dcb0c6e1efec7fd895f91a772c27bd4627178907",
+      "digest": "sha256:840fb47bcd5138df6707d55f4f9cbb3b1cca1b009cc6e2cad068c46b81fa26f2",
       "download_count": 0,
-      "created_at": "2026-10-06T17:55:33Z",
-      "updated_at": "2026-10-06T17:55:42Z",
-      "browser_download_url": "https://github.com/Xun2202/anikku-harmony/releases/download/v0.2.0-harmony-preview.6/Anikku-v0.2.0-harmony-preview.6.apk"
+      "created_at": "2026-10-06T18:44:48Z",
+      "updated_at": "2026-10-06T18:45:00Z",
+      "browser_download_url": "https://github.com/Xun2202/anikku-harmony/releases/download/v0.2.0-harmony-preview.7/Anikku-v0.2.0-harmony-preview.7.apk"
     }
   ],
-  "tarball_url": "https://api.github.com/repos/Xun2202/anikku-harmony/tarball/v0.2.0-harmony-preview.6",
-  "zipball_url": "https://api.github.com/repos/Xun2202/anikku-harmony/zipball/v0.2.0-harmony-preview.6",
-  "body": "基于 [Anikku v0.2.0](https://github.com/komikku-app/anikku/releases/tag/v0.2.0) 的非官方 HarmonyOS / 卓易通 兼容构建 (preview 构建类型)。\n\n## 本构建包含的补丁\n\n- `0001-downloads-rename-fallback-for-saf-without-renamedocument.patch`: downloads: fall back to copy+delete when SAF renameDocument is unsupported\n- `0002-downloads-mux-video-in-private-cache.patch`: downloads: mux videos into the private cache instead of a SAF document\n- `0003-updater-use-harmony-fork-releases.patch`: updater: check this fork's GitHub releases for -harmony-preview builds\n- `0004-storage-app-private-location-option.patch`: storage: offer the app-private directory as a one-tap storage location\n- `0005-build-flexible-adapter-from-maven-central.patch`: build: resolve FlexibleAdapter from Maven Central instead of JitPack\n- `0006-downloads-hide-videos-from-gallery-with-unknown-extension.patch`: downloads: hide videos from gallery apps with an unknown file extension\n- `0007-downloads-share-downloads-across-entries-by-url.patch`: downloads: reuse a download held by another entry with the same url\n- `0008-updater-in-screen-download-progress-and-install.patch`: updater: keep the update screen open with progress and an Install button\n- `0009-downloads-background-keep-alive-silent-audio.patch`: downloads: keep the process alive in the background on HarmonyOS (silent audio + wake lock)\n- `0010-downloads-notification-speed-and-progress.patch`: downloads: Animeko-style progress notification with speed and progress\n- `0011-updater-no-background-auto-download-and-apk-cleanup.patch`: updater: keep the background auto-download from blocking the update screen\n- `0012-about-match-mihon-update-ui.patch`: about: match Mihon's update UI (no post-update dialog, release page for What's new)\n\n## 安装说明\n\n- 下载 `Anikku-v0.2.0-harmony-preview.6-arm64-v8a.apk`（华为设备均为 arm64）。\n- 包名为 `app.anikku.beta`，与官方 Anikku Preview 相同，但签名不同：**第一次安装前必须先卸载官方 Preview**。卸载前先在 设置 → 数据与存储 → 创建备份 导出备份，装好后再恢复；下载目录里已下载的视频不会丢，重新选择同一个存储位置即可。\n- harmony-preview 版本之间可直接覆盖安装；应用内更新会检查本仓库的 Release，而不是官方更新服务器。\n- 继续使用 Documents/Anikku 这类自选文件夹即可：本构建已把 ffmpeg 输出改到应用私有缓存再复制过去，并在目录重命名失败时自动改为复制。\n- 鸿蒙图库：设置 → 下载 → 「下载的视频对系统图库隐藏」默认开启，新下载存成 `<集>.mkv.anikku`（鸿蒙不认 .nomedia、只看扩展名）。升级前已下载的视频点同一页的「按上述设置重命名已下载的视频」补上后缀（下载进行中时先暂停）。\n- 同一视频收藏进多个文件夹（如 XvXun）：设置 → 下载 → 「不同条目间共用已下载的视频」默认开启，任一条目下载过的视频在其他条目里也显示为已下载并直接播放；删除请到实际下载它的条目里操作。\n- 不想在文件管理里看到任何下载内容，可改用 设置 → 数据与存储 → 「使用应用私有目录（鸿蒙推荐）」；代价是卸载应用时会一并删除。\n\n## 校验 (SHA-256)\n\n```\n8457571aa4684cfe0e780455601e813d618965fade1aaba73572e24cd802113f  Anikku-v0.2.0-harmony-preview.6-arm64-v8a.apk\n4d0f3e4418689597d280ccc4dcb0c6e1efec7fd895f91a772c27bd4627178907  Anikku-v0.2.0-harmony-preview.6.apk\n```\n"
+  "tarball_url": "https://api.github.com/repos/Xun2202/anikku-harmony/tarball/v0.2.0-harmony-preview.7",
+  "zipball_url": "https://api.github.com/repos/Xun2202/anikku-harmony/zipball/v0.2.0-harmony-preview.7",
+  "body": "基于 [Anikku v0.2.0](https://github.com/komikku-app/anikku/releases/tag/v0.2.0) 的非官方 HarmonyOS / 卓易通 兼容构建 (preview 构建类型)。\n\n## 本构建包含的补丁\n\n- `0001-downloads-rename-fallback-for-saf-without-renamedocument.patch`: downloads: fall back to copy+delete when SAF renameDocument is unsupported\n- `0002-downloads-mux-video-in-private-cache.patch`: downloads: mux videos into the private cache instead of a SAF document\n- `0003-updater-use-harmony-fork-releases.patch`: updater: check this fork's GitHub releases for -harmony-preview builds\n- `0004-storage-app-private-location-option.patch`: storage: offer the app-private directory as a one-tap storage location\n- `0005-build-flexible-adapter-from-maven-central.patch`: build: resolve FlexibleAdapter from Maven Central instead of JitPack\n- `0006-downloads-hide-videos-from-gallery-with-unknown-extension.patch`: downloads: hide videos from gallery apps with an unknown file extension\n- `0007-downloads-share-downloads-across-entries-by-url.patch`: downloads: reuse a download held by another entry with the same url\n- `0008-updater-in-screen-download-progress-and-install.patch`: updater: keep the update screen open with progress and an Install button\n- `0009-downloads-background-keep-alive-silent-audio.patch`: downloads: keep the process alive in the background on HarmonyOS (silent audio + wake lock)\n- `0010-downloads-notification-speed-and-progress.patch`: downloads: Animeko-style progress notification with speed and progress\n- `0011-updater-no-background-auto-download-and-apk-cleanup.patch`: updater: keep the background auto-download from blocking the update screen\n- `0012-about-match-mihon-update-ui.patch`: about: match Mihon's update UI (no post-update dialog, release page for What's new)\n- `0013-updater-regular-work-request.patch`: updater: download updates as a regular work request\n- `0014-updater-release-mirror.patch`: updater: read the release list from the repo-branch mirror first\n\n## 安装说明\n\n- 下载 `Anikku-v0.2.0-harmony-preview.7-arm64-v8a.apk`（华为设备均为 arm64）。\n- 包名为 `app.anikku.beta`，与官方 Anikku Preview 相同，但签名不同：**第一次安装前必须先卸载官方 Preview**。卸载前先在 设置 → 数据与存储 → 创建备份 导出备份，装好后再恢复；下载目录里已下载的视频不会丢，重新选择同一个存储位置即可。\n- harmony-preview 版本之间可直接覆盖安装；应用内更新会检查本仓库的 Release，而不是官方更新服务器。\n- 继续使用 Documents/Anikku 这类自选文件夹即可：本构建已把 ffmpeg 输出改到应用私有缓存再复制过去，并在目录重命名失败时自动改为复制。\n- 鸿蒙图库：设置 → 下载 → 「下载的视频对系统图库隐藏」默认开启，新下载存成 `<集>.mkv.anikku`（鸿蒙不认 .nomedia、只看扩展名）。升级前已下载的视频点同一页的「按上述设置重命名已下载的视频」补上后缀（下载进行中时先暂停）。\n- 同一视频收藏进多个文件夹（如 XvXun）：设置 → 下载 → 「不同条目间共用已下载的视频」默认开启，任一条目下载过的视频在其他条目里也显示为已下载并直接播放；删除请到实际下载它的条目里操作。\n- 不想在文件管理里看到任何下载内容，可改用 设置 → 数据与存储 → 「使用应用私有目录（鸿蒙推荐）」；代价是卸载应用时会一并删除。\n\n## 校验 (SHA-256)\n\n```\na3d4129b0e5e341e2473d24c0d52cffb1e932df615359109dac7ebb9313ac630  Anikku-v0.2.0-harmony-preview.7-arm64-v8a.apk\n840fb47bcd5138df6707d55f4f9cbb3b1cca1b009cc6e2cad068c46b81fa26f2  Anikku-v0.2.0-harmony-preview.7.apk\n```\n"
 }
