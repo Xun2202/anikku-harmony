@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 06:32:07 +0000
+Subject: [PATCH] library: panorama comfortable grid sizes cells to wide covers
+
+The library's "Panorama comfortable grid" kept the 2:3 book-shaped cell
+and only switched the image to ContentScale.Fit, so a 16:9 thumbnail
+(every XVideos cover, for instance) was letterboxed with large empty
+bands above and below and ended up smaller than in the plain grid. The
+browse grid already passes fitToPanoramaCover = true, which turns the
+cell itself into the 3:2 panorama shape; do the same in the library.
+Portrait covers (ratio > 0.75) are unaffected.
+
+Harmony-only: Mihon has no panorama cover feature, Animeko has no such grid.
+---
+ .../presentation/library/components/LibraryComfortableGrid.kt  | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt
+index 828685a..0ddf28f 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt
+@@ -71,6 +71,9 @@ internal fun LibraryComfortableGrid(
+                 },
+                 // KMK -->
+                 usePanoramaCover = usePanoramaCover,
++                // Harmony: size the cell to the wide cover like the browse grid does, instead of
++                // letterboxing a 16:9 thumbnail inside a 2:3 book-shaped cell.
++                fitToPanoramaCover = true,
+                 // KMK <--
+             )
+         }
