@@ -47,6 +47,7 @@ patches/
   0014-updater-release-mirror.patch                             检查更新先读 repo 分支的 releases.json 镜像, 再退回 api.github.com; 修 lastChecked
   0015-library-panorama-grid-fit-wide-covers.patch              书架「全景松散网格」按 3:2 横版排格子 (fitToPanoramaCover = true, 与浏览页一致)
   0016-downloads-finalize-with-fewer-saf-copies-and-error-reasons.patch  下载收尾少抄两遍视频 (直接写最终名 + 标记, 目录用 moveDocument/合并), 队列显示失败原因
+  0017-updater-stable-release-notes-while-downloading.patch   更新页 remember { GFMFlavourDescriptor() } (说明文字下载时不再闪烁); ffmpeg 原因去掉 [tcp @ 0x…] 前缀
 scripts/prepare-source.sh                  套补丁 + 改版本号 (CI 与本地通用)
 scripts/write-release-index.sh             把 Releases 接口返回写到 repo 分支 (releases.json / latest.json)
 .github/workflows/harmony_preview.yml      编译、重签、发布, 然后写 Release 索引
@@ -179,6 +180,11 @@ git format-patch -o /tmp/new-patches --no-signature --zero-commit v0.3.0..HEAD
   （集名 + 「出错：…」，`maxLines = 3`），`DownloadQueueScreenModel.onStatusChange` 的 ERROR 分支补调 `onUpdateDownloadedPages`。`getDuration` 失败返回 null。
   字符串 `harmony_download_unexpected_files` / `harmony_download_error_prefix` / `harmony_download_interrupted`（i18n-ank base + zh-rCN）。
   上游若重写 `Downloader.downloadVideo`，保留「ffmpeg 写私有缓存 → 一次复制到最终名 → 目录改名」这条链和 `.tmp` 标记语义即可。
+- 0017 改两处。`NewUpdateScreen`：`MarkdownRender(flavour = remember { GFMFlavourDescriptor() })`——multiplatform-markdown-renderer（0.39.x）的
+  `rememberMarkdownState` 把 `flavour` / `parser` 作为 `Input` 的一部分，flavour 实例变了就 `updateInput()` → 状态回到 Loading → 异步重新解析，
+  而更新页按钮文字读 `downloadProgress()`，下载期间每个 tick 都重组，于是说明文字闪。Mihon v0.20.4 上游（`NewUpdateScreen.kt`）本来就是 `remember`，
+  KMK 的那份漏了；上游若合入同样的 `remember`，脚本会自动跳过。`Downloader` 的 ffmpeg `LogCallback`：`FFMPEG_CONTEXT_PREFIX` 正则去掉
+  `[tcp @ 0x…] ` 之类前缀后再进 `recentLogs`，与上一条相同则丢弃。
 
 ### 5.2 加新补丁
 
@@ -244,6 +250,7 @@ gh release list --repo Xun2202/anikku-harmony
 | 点「下载」后停在「正在下载… (0%)」、按钮灰掉，一直不动（preview.5 / preview.6 也会） | 更新下载是 WorkManager expedited 任务，卓易通从不派发，worker 没跑过（见 0013；这才是 0011 之后还卡住的原因）。升级到 preview.7 起的版本。升级后若 20 秒变「重试」，说明普通任务也没被派发：设置 → 高级 → 转储崩溃日志，看 logcat 里有没有 `WM-WorkerWrapper` 启动 `AppUpdateDownloadJob` 的记录 |
 | 「检查更新」toast「HTTP error 403」 | 匿名 `api.github.com` 的配额（每个出口 IP 每小时 60 次）被用完，NAT / 代理后面所有人共用；仓库本身公开可访问。等一小时或换网络；preview.7 起先读 `repo` 分支的镜像（`raw.githubusercontent.com`），一般不会再撞上。仍 403 说明镜像也读不到（被墙 / 超时 10 秒），看 logcat 里的 `Release mirror unavailable` |
 | 下载进度到 100% 后变成「!」，重试还是一样；日志里成对出现 `DocumentsContractApi21: Failed to renameTo …/<集>_tmp/<集>.mkv.anikku` 与 `…/<集>` | preview.7 及之前：卓易通 SAF 不支持 `renameDocument`，0001 的回退把整段视频在 SAF 里再复制两遍，失败又没有提示（见 0016）。升级到 preview.8 起的版本；之后再出错，下载队列的那一行会直接写出原因（「出错：…」），把这句话连同崩溃日志一起发来。残留的 `<集>_tmp` 目录不用手动删，重新下载会合并 / 覆盖 |
+| 更新页点「下载」后，上面的版本说明文字随进度一直闪烁 / 短暂变空 | preview.8 及之前：每个进度 tick 都新建 `GFMFlavourDescriptor()`，Markdown 渲染库当成内容变了重新解析（见 0017）。升级到 preview.9 起的版本；按钮上的百分比照常跳动即可，说明文字不应再变 |
 | 刚发版几分钟内「检查更新」说「没有新版本」 | `raw.githubusercontent.com` 对 `releases.json` 有最多约 5 分钟缓存，加上 OkHttp 本地缓存；等几分钟再点。确认 `repo` 分支的 `releases.json` 已包含新 tag（发版 workflow 最后一步「Update the release index」） |
 | `repo` 分支的 `releases.json` 没更新 / 不存在 | 发版 workflow 的最后一步失败，或 Release 是手动改的而 `release_index.yml` 没跑。到 Actions 手动运行「Release index」；本地也可 `GH_TOKEN=... scripts/write-release-index.sh Xun2202/anikku-harmony` |
 | 「安装」后系统提示「解析软件包时出现问题」 | 旧版本的 `update.apk` 没删干净，`downloadFileWithResume` 把新包接在了后面（0011 起每次下载前先删）。清除 Anikku 缓存后重试 |
@@ -293,3 +300,8 @@ gh release list --repo Xun2202/anikku-harmony
   队列行显示「Error: ffmpeg: [tcp @ …] Connection to tcp://hls-cdn77… failed: Network is unreachable」，解除封锁后点「继续」重试成功。
   正式发版 run 38128844399 → `v0.2.0-harmony-preview.8`（versionCode 808，versionName `0.2.0-harmony.8-8907`，签名 `cf7a2adc…d829`，
   `repo` 分支 `8b43542` 已含 preview.8）。卓易通特有的「`renameDocument` 不支持 → `moveDocument` / 复制合并」分支模拟器复现不了，等用户真机。
+- 同日 用户装上 preview.8 后反馈：更新页点「下载」时，新版本的说明文字一直闪烁。读 multiplatform-markdown-renderer 0.39.2 源码确认
+  `rememberMarkdownState` 以 flavour 为输入键，而 KMK 的 `NewUpdateScreen` 每次重组都新建 `GFMFlavourDescriptor()`（Mihon 上游是 `remember`）。
+  加入补丁 0017（`remember` + ffmpeg 原因去 `[tcp @ 0x…]` 前缀）；本地 `assemblePreview -Penable-updater` 编译通过，干净 v0.2.0 上 `prepare-source.sh … 9`
+  套用 17 张补丁后与本地树 `cmp` 一致。同时把 Mihon 的同病（矩阵 #25）移植为 mihon-harmony 0010 并发布 `v0.20.4-harmony-preview.9`。
+  正式发版 → `v0.2.0-harmony-preview.9`（versionCode 809）。闪烁本身在无 GPU 的 TCG 模拟器上截不到稳定画面，按代码分析 + 与 Mihon 相同写法确认。

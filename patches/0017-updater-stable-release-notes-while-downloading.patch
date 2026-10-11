@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 13:03:50 +0000
+Subject: [PATCH] updater: keep the release notes stable while downloading;
+ tidy ffmpeg failure text
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+NewUpdateScreen recomposes on every progress tick while the in-app updater
+downloads (acceptText reads downloadProgress()). It passed a brand-new
+GFMFlavourDescriptor() to MarkdownRender on each composition, and
+multiplatform-markdown-renderer's rememberMarkdownState keys its input on the
+flavour, so every tick reset the state to "loading" and re-parsed the notes
+asynchronously — the release notes blanked and flickered for the whole
+download. Mihon upstream already wraps the flavour in remember { }; Anikku
+(KMK) missed it. Remember the descriptor so the parsed markdown survives
+recompositions.
+
+Also strip the ffmpeg context prefix ("[tcp @ 0x7dad…] ") from the warning
+lines kept for the download-queue failure reason and drop consecutive
+duplicates, so the reason reads "Connection failed" instead of a pointer dump.
+---
+ .../java/eu/kanade/presentation/more/NewUpdateScreen.kt     | 6 +++++-
+ .../java/eu/kanade/tachiyomi/data/download/Downloader.kt    | 6 +++++-
+ 2 files changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/presentation/more/NewUpdateScreen.kt b/app/src/main/java/eu/kanade/presentation/more/NewUpdateScreen.kt
+index 03a04f3..5a05c9e 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/NewUpdateScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/NewUpdateScreen.kt
+@@ -13,6 +13,7 @@ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Text
+ import androidx.compose.material3.TextButton
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.tooling.preview.PreviewLightDark
+ import eu.kanade.presentation.manga.components.MarkdownRender
+@@ -63,9 +64,12 @@ fun NewUpdateScreen(
+                 .fillMaxWidth()
+                 .padding(vertical = MaterialTheme.padding.large),
+         ) {
++            // Harmony: this screen recomposes on every progress tick while downloading. A new flavour
++            // instance per composition makes rememberMarkdownState re-parse (and blank) the notes.
++            val flavour = remember { GFMFlavourDescriptor() }
+             MarkdownRender(
+                 content = changelogInfo.trimIndent(),
+-                flavour = GFMFlavourDescriptor(),
++                flavour = flavour,
+             )
+ 
+             TextButton(
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 93d89e4..8ecc7b8 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -713,9 +713,12 @@ class Downloader(
+             if (log.level <= Level.AV_LOG_WARNING) {
+                 log.message?.trim()?.takeIf { it.isNotEmpty() }?.let {
+                     logcat(LogPriority.ERROR) { it }
++                    // "[tcp @ 0x7dad…] Connection failed" → "Connection failed": the pointer means nothing to users.
++                    val readable = it.replace(FFMPEG_CONTEXT_PREFIX, "").ifEmpty { it }
+                     synchronized(recentLogs) {
++                        if (recentLogs.lastOrNull() == readable) return@let
+                         if (recentLogs.size >= FFMPEG_LOG_TAIL) recentLogs.removeFirst()
+-                        recentLogs.addLast(it)
++                        recentLogs.addLast(readable)
+                     }
+                 }
+             }
+@@ -1081,6 +1084,7 @@ class Downloader(
+         // Harmony: sub-directory of Context.cacheDir that holds videos while ffmpeg muxes them.
+         private const val CACHE_DOWNLOAD_DIR = "harmony_download_tmp"
+         private const val FFMPEG_LOG_TAIL = 4
++        private val FFMPEG_CONTEXT_PREFIX = Regex("""^(\[[^\]]*@ 0x[0-9a-fA-F]+\]\s*)+""")
+         private const val MUXED_MARKER_SUFFIX = ".muxed"
+ 
+         // Harmony: appended to "<name>.mkv" when downloads should stay out of gallery apps.
