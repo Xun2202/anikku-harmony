@@ -45,6 +45,8 @@ patches/
   0012-about-match-mihon-update-ui.patch                        去掉装完后的「已更新至」对话框, 「更新日志」改开 Release 网页 (与 Mihon 一致)
   0013-updater-regular-work-request.patch                       更新下载改普通 WorkManager 任务 (卓易通不派发 expedited 任务) + 更新页看门狗
   0014-updater-release-mirror.patch                             检查更新先读 repo 分支的 releases.json 镜像, 再退回 api.github.com; 修 lastChecked
+  0015-library-panorama-grid-fit-wide-covers.patch              书架「全景松散网格」按 3:2 横版排格子 (fitToPanoramaCover = true, 与浏览页一致)
+  0016-downloads-finalize-with-fewer-saf-copies-and-error-reasons.patch  下载收尾少抄两遍视频 (直接写最终名 + 标记, 目录用 moveDocument/合并), 队列显示失败原因
 scripts/prepare-source.sh                  套补丁 + 改版本号 (CI 与本地通用)
 scripts/write-release-index.sh             把 Releases 接口返回写到 repo 分支 (releases.json / latest.json)
 .github/workflows/harmony_preview.yml      编译、重签、发布, 然后写 Release 索引
@@ -165,6 +167,18 @@ git format-patch -o /tmp/new-patches --no-signature --zero-commit v0.3.0..HEAD
   （`with(json)` 外壳去掉，lambda 体整体少缩进 4 格，所以 diff 看着大）；`GetApplicationRelease.await()` 的 `lastChecked.set(now)` 移到 `service.releaseNotes()` 之后、
   `getLatest() ?: return NoNewUpdate` 之前。`latest()` 没有调用方（只有单元测试 `coVerify(exactly = 0)`），保持原样。镜像文件格式必须保持是接口原样返回，
   `GithubRelease` 的字段（`tag_name` / `body` / `html_url` / `assets[].name` / `assets[].browser_download_url` / `prerelease` / `draft`）一个都不能少。
+- 0015 只改一处：`LibraryComfortableGrid` 调 `MangaComfortableGridItem` 时加 `fitToPanoramaCover = true`（原来没传，默认 `false`）。
+  `BrowseSourceComfortableGrid` 一直是 `true`，所以浏览页的全景网格本来就是横格子；`LibraryCompactGrid` / `LibraryList` 没有全景分支，不用动。
+  上游若把参数名改掉或在 `MangaComfortableGridItem` 里统一处理，直接按浏览页的调用方式对齐即可。
+- 0016 改五处。`UniFileExtensions.renameToOrCopy(targetName, resolver = null)`：目录回退 = 先 `moveDocument` 每个子项、再 createFile+copy，目标已存在的目录合并、
+  同名同大小的子文件跳过，复制后校验 `length()`（只信任正数：有的 provider 要刷新元数据才有大小），删源失败只记日志不回滚（数据已在目标里）。
+  `Downloader.copyIntoDownloadDir`：先删同名 `<集>.mkv*`，建空 `<集>.tmp` 标记，直接 `createFile(finalName)` 写入，校验大小，删标记；
+  `getOrDownloadVideoFile` 开头若发现 `<集>.tmp` 就连同旁边的 `<集>.mkv*` 一起删（兼容旧版的半成品 `.tmp` 数据文件）。
+  `downloadVideo`：缓存文件旁多一个 `.muxed` 标记，复制失败（非取消）时两者都保留，下次直接复制；成功或取消时删除。`retryStorageOperation` 只重试 `IOException`。
+  `Download.error` + `fail(message)`（`status` 设回非 ERROR 时自动清空），`DownloadHolder.notifyDownloadedPages` 在 ERROR 时把 `chapterTitle` 改成两行
+  （集名 + 「出错：…」，`maxLines = 3`），`DownloadQueueScreenModel.onStatusChange` 的 ERROR 分支补调 `onUpdateDownloadedPages`。`getDuration` 失败返回 null。
+  字符串 `harmony_download_unexpected_files` / `harmony_download_error_prefix` / `harmony_download_interrupted`（i18n-ank base + zh-rCN）。
+  上游若重写 `Downloader.downloadVideo`，保留「ffmpeg 写私有缓存 → 一次复制到最终名 → 目录改名」这条链和 `.tmp` 标记语义即可。
 
 ### 5.2 加新补丁
 
@@ -266,3 +280,11 @@ gh release list --repo Xun2202/anikku-harmony
   后者的真正原因是 KMK 把更新下载排成 expedited WorkManager 任务、卓易通不派发（0011 去掉的后台自动下载是同时存在的另一个阻塞点，但不是全部）。
   加入补丁 0013（普通任务 + 更新页看门狗）和 0014（先读 `repo` 分支的 Release 索引镜像 + 修 `lastChecked`），流水线新增 `write-release-index.sh` / `release_index.yml`，
   三个鸿蒙版仓库同步建立 `repo` 分支。`dry_run` 验证后发布 `v0.2.0-harmony-preview.7`（versionCode 807）。
+- 2026-10-11 用户反馈 XvXun 这类 16:9 封面在书架里都是竖版显示，切到「全景松散网格」后封面反而更小、上下有两条看不见的空边。
+  根因是 `LibraryComfortableGrid` 没传 `fitToPanoramaCover`，格子仍按 2:3 竖版算高度。加入补丁 0015（与浏览页对齐），`dry_run` 验证后
+  在 Android 14 x86_64 模拟器里装上 dry_run APK + XvXun 对比截图确认格子变成横版。
+- 同日 用户反馈下载「进度满了变成惊叹号」并提供日志：`DocumentsContractApi21: Failed to renameTo …/Video_tmp/Video.mkv.anikku` 和两秒后的
+  `…/Varesa/Video`，说明 0001 的改名回退在收尾处连续触发（卓易通 SAF 不支持 `renameDocument`），每次都是整段视频再复制一遍，之后的失败没有任何可见原因
+  （出错路径之一不通知不记日志，ffmpeg 失败只有 "Error in ffmpeg!"）。加入补丁 0016（直接写最终名 + 标记、目录 `moveDocument`/合并、收尾重试、缓存保留、
+  队列显示原因）。模拟器上用 SAF 文件夹验证新流程产物正确（`Video_tmp/Video.tmp` 标记 → `Video/Video.mkv.anikku` + `.nomedia`），用 iptables 封 CDN 验证
+  队列能显示失败原因。`dry_run` 验证后与 0015 一起发布 `v0.2.0-harmony-preview.8`（versionCode 808）。

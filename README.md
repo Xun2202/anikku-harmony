@@ -67,6 +67,14 @@ Anikku 先在用户选择的 SAF 目录里创建 `Video.tmp`，再把这个 `con
 - **同一视频收藏进多个文件夹**（XvXun 这类把收藏夹当“剧集”的源）：设置 → 下载 → 「**不同条目间共用已下载的视频**」默认开启，
   一个视频只要在同一来源的任一条目下载过，其他条目里也显示为已下载并直接播放那份文件；「下载未看/下载后 N 集」也会跳过它们。
   删除时请到真正下载它的那个条目里删——在别的条目里点删除不会有效果（文件不属于它）。
+- **横版封面（XvXun 这类 16:9 缩略图的源）**：书架 → 筛选 → 显示 → 显示模式 选「**全景松散网格**」。preview.7 及之前这个模式只是把 16:9 的图塞进
+  2:3 的竖格子里，上下留两条看不见的空边，封面反而更小；preview.8 起书架的格子按 3:2 横版排（和「浏览」页的全景网格一样），封面铺满格子、一行仍是同样的列数。
+  源目录 / 浏览页的全景网格、条目详情页的「全景封面」（设置 → 外观）原本就正常，不受影响。
+- **下载到 100% 后变成「!」**（preview.7 及之前）：进度条只反映 ffmpeg 写完视频这一步，之后还要把视频搬进下载文件夹。卓易通的文件夹不支持改名，
+  原来的三次改名在那里实际上是**把整段视频再抄三遍**（`.tmp` → `.mkv.anikku` → `<集>_tmp/` → `<集>/`），期间看起来卡在 100%，任何一步失败就变成「!」，
+  而且既没有可见的通知也没有日志能说明原因。preview.8 起：视频直接以最终文件名写入（只多一个空的 `.tmp` 标记文件），目录改名优先用系统的「移动」
+  （不经过 App 复制），都失败才复制，并自动重试两次；已经下好的视频会留在私有缓存里，点「!」重试不会重新下载。
+  下载队列里出错的条目会在集名下面直接显示原因（ffmpeg 的最后几行报错 / 目录里多了什么文件 / 「下载被中断」），不用再导日志。
 - APK 被交给「出境易」而提示「暂不支持安装该应用」时，把 APK 复制到本机存储后用系统「文件管理」打开即可由卓易通安装（详细步骤见 [animeko-harmony 的说明](https://github.com/Xun2202/animeko-harmony#安装步骤鸿蒙-next--6--7)，两者相同）。
 
 ## 包含的补丁
@@ -87,6 +95,8 @@ Anikku 先在用户选择的 SAF 目录里创建 `Video.tmp`，再把这个 `con
 | [`0012-about-match-mihon-update-ui.patch`](./patches/0012-about-match-mihon-update-ui.patch) | 更新界面与 Mihon 统一：去掉 KMK 装完新版后首次启动的「已更新至 vX」对话框（`MainActivity` 的 `WhatsNewDialog` 块及 `preview_last_version_code` 记录），关于页「更新日志」从 KMK 的应用内页面（拉最新 Release，标题「最新: <tag> – 当前: <versionName>」，刚装完同一版时像在推送同一版）改为和 Mihon 一样打开当前版本的 Release 网页（`RELEASE_URL`）；删掉只为这两处服务的 `AboutScreen.getReleaseNotes()`。「检查更新」逻辑不变：四元组相等即「没有新版本」。 |
 | [`0013-updater-regular-work-request.patch`](./patches/0013-updater-regular-work-request.patch) | 修复点「下载」后一直停在「正在下载… (0%)」、按钮灰掉（0011 之后仍然存在）：KMK 把更新页发起的下载排成 WorkManager **expedited** 任务（`setExpedited(RUN_AS_NON_EXPEDITED_WORK_REQUEST)`），卓易通从不派发它，worker 一次都没跑；Mihon 用的是普通任务且在同一台机器上正常，于是改成普通任务（网络约束不变，worker 仍自行升级为前台服务）。更新页另加两道保险：打开时若发现一个从未开始的待处理请求（上个版本遗留的，离开更新页本来就会取消下载，所以它不可能是自己的）直接取消并显示「下载」；自己发起的请求 20 秒内没有汇报 URL 则取消并变成「重试」。 |
 | [`0014-updater-release-mirror.patch`](./patches/0014-updater-release-mirror.patch) | 修复「检查更新」报「HTTP error 403」：匿名 `api.github.com` 每个出口 IP 每小时只有 60 次，NAT / 代理后面是所有人共用。`ReleaseServiceImpl.listReleases()` 优先读 `https://raw.githubusercontent.com/<repo>/repo/releases.json`（流水线写的接口原样镜像，连接 / 读取 / 整体超时各 10 秒），失败再退回 `api.github.com/repos/<repo>/releases`。另把 `GetApplicationRelease.await()` 的 `lastChecked.set()` 提前到拉完列表之后：KMK 只在发现新版本时才记录，已是最新的 App 每次启动都重新检查，白白消耗配额。 |
+| [`0015-library-panorama-grid-fit-wide-covers.patch`](./patches/0015-library-panorama-grid-fit-wide-covers.patch) | 书架「全景松散网格」改为横版格子。KMK 的 `LibraryComfortableGrid` 调 `MangaComfortableGridItem` 时没传 `fitToPanoramaCover`（默认 `false`），格子仍按 2:3 竖版算高度，16:9 的封面在格子里上下留黑边、显示面积反而变小；浏览页的 `BrowseSourceComfortableGrid` 一直传的是 `true`。改成与浏览页一致（一行代码），列数、间距、角标、长按选择都不变。仅鸿蒙版需要：Mihon 没有全景封面功能，Animeko 没有这种网格。 |
+| [`0016-downloads-finalize-with-fewer-saf-copies-and-error-reasons.patch`](./patches/0016-downloads-finalize-with-fewer-saf-copies-and-error-reasons.patch) | 修复「下载到 100% 后变成 !」。卓易通的 SAF 不支持 `renameDocument`，0001 的改名回退在下载收尾处被触发三次，每次都是整段视频经 App 再复制一遍，失败后只有一个「!」。`copyIntoDownloadDir` 改为直接写最终文件名 + 空 `<集>.tmp` 标记（复制完校验大小后删标记；重试时发现标记就丢弃旁边的半成品），省掉文件改名；`renameToOrCopy(name, resolver)` 的目录回退先对每个子项试 `DocumentsContract.moveDocument`（不经 App 搬数据），目标目录已存在则合并，复制后校验大小，只有删源失败时保留副本不再回滚；收尾改名自动重试（2 s / 4 s）；ffmpeg 产物在复制失败时留在私有缓存（`.muxed` 标记），重试不重下。新增 `Download.error` / `fail()`：所有出错路径都记录原因，下载队列的条目在集名下方显示「出错：…」（ffmpeg 最后 4 行警告 / 目录内容 / 「下载被中断」）；ffprobe 失败不再以空消息中止下载。Mihon 同病待修（章节目录同样走复制回退，只是文件小）；Animeko 不适用。 |
 
 补丁按 [`patches/series`](./patches/series) 的顺序套用；已被官方合入的补丁会被 `prepare-source.sh` 自动跳过。
 

@@ -1,0 +1,638 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 09:12:12 +0000
+Subject: [PATCH] downloads: finish videos with fewer SAF copies and show why a
+ download failed
+
+On HarmonyOS ZhuoyiTong the download folder's DocumentsProvider does not
+support renameDocument, so every rename in the download pipeline silently
+became a full copy of the video: cache -> "<ep>.tmp", "<ep>.tmp" ->
+"<ep>.mkv.anikku" and finally "<ep>_tmp/" -> "<ep>/". A finished video was
+written three times through SAF after ffmpeg reported 100%, and any failure
+in that stretch left the episode with an exclamation mark, no notification
+that is visible in the container, and no log line (one path set ERROR
+without reporting at all; ffmpeg failures said only "Error in ffmpeg!").
+
+- copyIntoDownloadDir writes the final name directly while an empty
+  "<ep>.tmp" marker exists and deletes the marker after verifying the size;
+  getOrDownloadVideoFile treats a leftover marker as "interrupted" and
+  discards the video next to it (also covers the old partial ".tmp" file).
+- renameToOrCopy(targetName, resolver): directory fallback first tries
+  DocumentsContract.moveDocument for each child (no data through the app),
+  merges into an existing target directory instead of failing, verifies
+  copied sizes, and keeps the copy when only the source delete fails.
+- The final directory rename is retried (2 s, 4 s) and the muxed video
+  stays in the private cache behind a ".muxed" marker when the copy into
+  the download folder fails, so retrying does not download again.
+- Download.error / Download.fail(): every ERROR path records a reason; the
+  download queue row shows it under the episode name ("Error: ..."),
+  including the last ffmpeg warnings, the unexpected directory contents, or
+  "interrupted" when the job was stopped.
+- A failed ffprobe no longer aborts the download with an empty message; the
+  duration is only used for the progress percentage.
+
+Harmony-only: Mihon has the same renameToOrCopy fallback for chapter
+directories (same framework, smaller files) and should get the move/merge
+part; Animeko has its own downloader.
+---
+ .../tachiyomi/data/download/Downloader.kt     | 155 ++++++++++++++----
+ .../tachiyomi/data/download/model/Download.kt |  13 ++
+ .../tachiyomi/ui/download/DownloadHolder.kt   |  24 ++-
+ .../ui/download/DownloadQueueScreenModel.kt   |   5 +-
+ .../core/common/storage/UniFileExtensions.kt  | 118 ++++++++-----
+ .../moko-resources/base/strings.xml           |   3 +
+ .../moko-resources/zh-rCN/strings.xml         |   3 +
+ 7 files changed, 243 insertions(+), 78 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index bffcc4b..93d89e4 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -65,6 +65,7 @@ import tachiyomi.domain.episode.model.Episode
+ import tachiyomi.domain.source.service.SourceManager
+ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.aniyomi.AYMR
++import tachiyomi.i18n.ank.AMR
+ import uy.kohesive.injekt.Injekt
+ import uy.kohesive.injekt.api.get
+ import uy.kohesive.injekt.injectLazy
+@@ -164,7 +165,7 @@ class Downloader(
+         cancelDownloaderJob()
+         queueState.value
+             .filter { it.status == Download.State.DOWNLOADING }
+-            .forEach { it.status = Download.State.ERROR }
++            .forEach { it.fail(reason ?: context.stringResource(AMR.strings.harmony_download_interrupted)) }
+ 
+         if (reason != null) {
+             notifier.onWarning(reason)
+@@ -365,7 +366,7 @@ class Downloader(
+      */
+     private suspend fun downloadEpisode(download: Download) {
+         val animeDir = provider.getMangaDir(/* SY --> */ download.manga.ogTitle /* SY <-- */, download.source).getOrElse { e ->
+-            download.status = Download.State.ERROR
++            download.fail(e.message)
+             notifier.onError(
+                 e.message,
+                 download.chapter.name,
+@@ -377,7 +378,7 @@ class Downloader(
+ 
+         val availSpace = DiskUtil.getAvailableStorageSpace(animeDir)
+         if (availSpace != -1L && availSpace < MIN_DISK_SPACE) {
+-            download.status = Download.State.ERROR
++            download.fail(context.stringResource(MR.strings.download_insufficient_space))
+             notifier.onError(
+                 context.stringResource(MR.strings.download_insufficient_space),
+                 download.chapter.name,
+@@ -407,7 +408,18 @@ class Downloader(
+             }
+ 
+             if (!isDownloadSuccessful(download, tmpDir)) {
+-                download.status = Download.State.ERROR
++                // The video step already reported why it failed; otherwise describe what is there.
++                val alreadyReported = download.error != null
++                val message = download.error
++                    ?: context.stringResource(
++                        AMR.strings.harmony_download_unexpected_files,
++                        tmpDir.listFiles().orEmpty().mapNotNull { it.name }.joinToString(", ").ifEmpty { "-" },
++                    )
++                logcat(LogPriority.ERROR) { "Download of ${download.episode.name} failed: $message" }
++                download.fail(message)
++                if (!alreadyReported) {
++                    notifier.onError(message, download.episode.name, download.anime.title, download.anime.id)
++                }
+                 return
+             }
+ 
+@@ -415,7 +427,12 @@ class Downloader(
+             val filename = DiskUtil.buildValidFilename("${/* SY --> */ download.anime.ogTitle /* SY <-- */} - ${download.episode.name}")
+             tmpDir.findFile("$filename.tmp")?.delete()
+             tmpDir.findFile("${filename}_tmp.mkv")?.delete()
+-            val episodeDir = tmpDir.renameToOrCopy(episodeDirname)
++            // Harmony: on SAF without renameDocument this is a move or copy of the finished video,
++            // which can fail transiently (provider restarted while the app was frozen in the
++            // background). The video stays in the _tmp directory, so retrying is cheap.
++            val episodeDir = retryStorageOperation {
++                tmpDir.renameToOrCopy(episodeDirname, context.contentResolver)
++            }
+ 
+             cache.addChapter(episodeDirname, animeDir, download.anime)
+ 
+@@ -426,7 +443,7 @@ class Downloader(
+             if (error is CancellationException) throw error
+             // If the video threw, it will resume here
+             logcat(LogPriority.ERROR, error)
+-            download.status = Download.State.ERROR
++            download.fail(error.message ?: error.javaClass.simpleName)
+             notifier.onError(
+                 error.message,
+                 download.chapter.name,
+@@ -453,8 +470,13 @@ class Downloader(
+         // Get filename from download info
+         val filename = DiskUtil.buildValidFilename(download.episode.name)
+ 
+-        // Delete temp file if it exists
+-        tmpDir.findFile("$filename.tmp")?.delete()
++        // Harmony: "<filename>.tmp" is the "copy in progress" marker written by copyIntoDownloadDir()
++        // (or the partially copied file itself in builds before preview.8). If it is still there the
++        // previous attempt was interrupted and the video next to it cannot be trusted.
++        tmpDir.findFile("$filename.tmp")?.let { marker ->
++            marker.delete()
++            tmpDir.listFiles()?.filter { it.name!!.startsWith("$filename.mkv") }?.forEach { it.delete() }
++        }
+ 
+         // Try to find the video file
+         val videoFile = tmpDir.listFiles()?.firstOrNull { it.name!!.startsWith("$filename.mkv") }
+@@ -487,7 +509,9 @@ class Downloader(
+             video.status = Video.State.Ready
+         } catch (e: Exception) {
+             if (e is CancellationException) throw e
++            logcat(LogPriority.ERROR, e) { "Failed to download ${download.episode.name}" }
+             video.status = Video.State.Error(e)
++            download.error = e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
+             notifier.onError(e.message, download.episode.name, /* SY --> */ download.anime.ogTitle /* SY <-- */, download.anime.id)
+         }
+     }
+@@ -509,18 +533,24 @@ class Downloader(
+         // DocumentsProvider cannot find the document that was created a moment earlier
+         // ("Failed to determine if ... is child of ...: Missing file"). Mux into a plain file in the
+         // private cache instead and copy the finished video into the download directory.
+-        val cacheFile = createCacheOutputFile(download, filename)
+-        var muxed = false
++        val cacheFile = cacheOutputFile(download, filename)
++        // Written next to the cache file once ffmpeg finished, so a muxed video whose copy into the
++        // download directory failed is reused by the next attempt instead of being downloaded again.
++        val muxedMarker = File(cacheFile.path + MUXED_MARKER_SUFFIX)
++        var muxed = muxedMarker.isFile && cacheFile.isFile && cacheFile.length() > 0L
++        var copied = false
+         try {
+             return flow {
+                 tmpDir.findFile("$filename.tmp")?.delete()
+                 if (!muxed) {
+                     cacheFile.delete()
++                    muxedMarker.delete()
+                     if (isTor(download.video!!)) {
+                         torrentDownload(download, cacheFile)
+                     } else {
+                         ffmpegDownload(download, cacheFile)
+                     }
++                    muxedMarker.createNewFile()
+                     muxed = true
+                 }
+ 
+@@ -537,27 +567,39 @@ class Downloader(
+                 }
+                 .flowOn(Dispatchers.IO)
+                 .first()
++                .also { copied = true }
++        } catch (e: CancellationException) {
++            // The user gave up on this episode; do not keep a video nobody will ask for again.
++            muxed = false
++            throw e
+         } finally {
+-            cacheFile.delete()
++            if (copied || !muxed) {
++                cacheFile.delete()
++                muxedMarker.delete()
++            }
+             // Only succeeds when no other download of the same anime is in progress.
+             cacheFile.parentFile?.delete()
+         }
+     }
+ 
+     /**
+-     * Returns the (not yet existing) file in the private cache directory that ffmpeg writes to.
+-     * The private cache is never indexed by gallery apps and is a plain filesystem path, so
+-     * ffmpeg does not have to go through the Storage Access Framework.
++     * Returns the file in the private cache directory that ffmpeg writes to. The private cache is
++     * never indexed by gallery apps and is a plain filesystem path, so ffmpeg does not have to go
++     * through the Storage Access Framework. An existing file is left alone: [downloadVideo] reuses
++     * it when its muxed marker is present and deletes it otherwise.
+      */
+-    private fun createCacheOutputFile(download: Download, filename: String): File {
++    private fun cacheOutputFile(download: Download, filename: String): File {
+         val dir = File(context.cacheDir, "$CACHE_DOWNLOAD_DIR/${download.anime.id}")
+         dir.mkdirs()
+-        return File(dir, "$filename.mkv").also { it.delete() }
++        return File(dir, "$filename.mkv")
+     }
+ 
+     /**
+-     * Copies the muxed video into [tmpDir] as "<filename>.tmp" and renames it to its final name
+-     * once the copy is complete, so an interrupted copy is never mistaken for a finished download.
++     * Copies the muxed video into [tmpDir] under its final name while an empty "<filename>.tmp"
++     * marker exists; the marker is removed once the copy is complete and verified, so an
++     * interrupted copy is never mistaken for a finished download (see [getOrDownloadVideoFile]).
++     * Writing the final name directly saves a rename, which on SAF providers without
++     * renameDocument (HarmonyOS ZhuoyiTong) would be a second full copy of the video.
+      *
+      * The final name is "<filename>.mkv", or "<filename>.mkv.anikku" when the user asked to hide
+      * downloads from the gallery: the unknown extension gives the document an
+@@ -569,26 +611,56 @@ class Downloader(
+             throw IOException("ffmpeg produced no output for $filename")
+         }
+ 
+-        tmpDir.findFile("$filename.tmp")?.delete()
+-        val tmpFile = tmpDir.createFile("$filename.tmp")
++        val finalName = if (preferences.hideDownloadedVideosFromGallery().get()) {
++            "$filename.mkv$HIDDEN_VIDEO_SUFFIX"
++        } else {
++            "$filename.mkv"
++        }
++
++        tmpDir.listFiles()?.filter { it.name!!.startsWith("$filename.mkv") }?.forEach { it.delete() }
++        val marker = tmpDir.findFile("$filename.tmp")
++            ?: tmpDir.createFile("$filename.tmp")
+             ?: throw IOException("Failed to create $filename.tmp in ${tmpDir.displayablePath}")
++        val target = tmpDir.createFile(finalName)
++            ?: throw IOException("Failed to create $finalName in ${tmpDir.displayablePath}")
+         try {
+             cacheFile.inputStream().use { input ->
+-                tmpFile.openOutputStream().use { output ->
++                target.openOutputStream().use { output ->
+                     input.copyTo(output)
+                 }
+             }
++            val copied = target.length()
++            if (copied > 0 && copied != cacheFile.length()) {
++                throw IOException("Copied $copied of ${cacheFile.length()} bytes of $finalName")
++            }
+         } catch (e: Exception) {
+-            tmpFile.delete()
++            target.delete()
+             throw e
+         }
+ 
+-        val finalName = if (preferences.hideDownloadedVideosFromGallery().get()) {
+-            "$filename.mkv$HIDDEN_VIDEO_SUFFIX"
+-        } else {
+-            "$filename.mkv"
++        if (!marker.delete() && tmpDir.findFile("$filename.tmp") != null) {
++            target.delete()
++            throw IOException("Failed to remove $filename.tmp in ${tmpDir.displayablePath}")
++        }
++        return target
++    }
++
++    /**
++     * Runs a storage operation up to three times, waiting 2 and 4 seconds in between, for providers
++     * that fail transiently right after the app was frozen or the provider process restarted.
++     */
++    private suspend fun <T> retryStorageOperation(block: () -> T): T {
++        var attempt = 0
++        while (true) {
++            try {
++                return block()
++            } catch (e: IOException) {
++                attempt++
++                if (attempt >= 3) throw e
++                logcat(LogPriority.WARN, e) { "Storage operation failed, retrying ($attempt)" }
++                delay((1L shl attempt) * 1000)
++            }
+         }
+-        return tmpFile.renameToOrCopy(finalName)
+     }
+ 
+     private fun isTor(video: Video): Boolean {
+@@ -635,10 +707,16 @@ class Downloader(
+         val ffmpegOptions = getFFmpegOptions(video, headerOptions, ffmpegFilename)
+         val duration = getDuration(video.videoUrl, headerOptions)?.toLong() ?: 0L
+ 
++        // Harmony: keep the last few warnings so a failure can say more than "Error in ffmpeg!".
++        val recentLogs = ArrayDeque<String>()
+         val logCallback = LogCallback { log ->
+             if (log.level <= Level.AV_LOG_WARNING) {
+-                log.message?.let {
++                log.message?.trim()?.takeIf { it.isNotEmpty() }?.let {
+                     logcat(LogPriority.ERROR) { it }
++                    synchronized(recentLogs) {
++                        if (recentLogs.size >= FFMPEG_LOG_TAIL) recentLogs.removeFirst()
++                        recentLogs.addLast(it)
++                    }
+                 }
+             }
+         }
+@@ -667,7 +745,9 @@ class Downloader(
+                     if (it.returnCode.isValueSuccess) {
+                         continuation.resume(it)
+                     } else {
+-                        continuation.resumeWithException(Exception("Error in ffmpeg!"))
++                        val tail = synchronized(recentLogs) { recentLogs.joinToString(" | ") }
++                        val detail = if (tail.isEmpty()) "rc=${it.returnCode}" else tail
++                        continuation.resumeWithException(Exception("ffmpeg: $detail"))
+                     }
+                 },
+                 logCallback,
+@@ -760,16 +840,19 @@ class Downloader(
+             ).joinToString(" "),
+         )
+ 
+-        suspendCancellableCoroutine { continuation ->
++        // Harmony: the duration only drives the progress percentage. A failed probe (network hiccup,
++        // "-v quiet" leaves its output empty) must not abort the download with a blank error; ffmpeg
++        // itself reports a real message if the stream is actually unreachable.
++        val probed = suspendCancellableCoroutine { continuation ->
+             val session = FFprobeKit.executeWithArgumentsAsync(ffprobeCommand) {
+-                if (it.returnCode.isValueSuccess) {
+-                    continuation.resume(it)
+-                } else {
+-                    continuation.resumeWithException(Exception(it.output))
+-                }
++                continuation.resume(it.returnCode.isValueSuccess)
+             }
+             continuation.invokeOnCancellation { session.cancel() }
+         }
++        if (!probed) {
++            logcat(LogPriority.WARN) { "ffprobe could not read the duration of $videoUrl" }
++            return null
++        }
+ 
+         return durationFile.bufferedReader().use(BufferedReader::readText).trim().toFloatOrNull()
+     }
+@@ -997,6 +1080,8 @@ class Downloader(
+         const val TMP_DIR_SUFFIX = "_tmp"
+         // Harmony: sub-directory of Context.cacheDir that holds videos while ffmpeg muxes them.
+         private const val CACHE_DOWNLOAD_DIR = "harmony_download_tmp"
++        private const val FFMPEG_LOG_TAIL = 4
++        private const val MUXED_MARKER_SUFFIX = ".muxed"
+ 
+         // Harmony: appended to "<name>.mkv" when downloads should stay out of gallery apps.
+         const val HIDDEN_VIDEO_SUFFIX = ".anikku"
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt
+index 8dc73e8..dfa37d7 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt
+@@ -31,9 +31,22 @@ data class Download(
+     var status: State
+         get() = _statusFlow.value
+         set(status) {
++            if (status != State.ERROR) error = null
+             _statusFlow.value = status
+         }
+ 
++    /**
++     * Why the download ended in [State.ERROR]; shown in the download queue because error
++     * notifications are not displayed inside HarmonyOS ZhuoyiTong.
++     */
++    @Transient
++    var error: String? = null
++
++    fun fail(message: String?) {
++        error = message?.takeIf { it.isNotBlank() }
++        _statusFlow.value = State.ERROR
++    }
++
+     @Transient
+     private val progressStateFlow = MutableStateFlow(0)
+ 
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
+index ada74e3..336cba2 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
+@@ -11,6 +11,7 @@ import eu.kanade.tachiyomi.util.view.popupMenu
+ import tachiyomi.core.common.i18n.stringResource
+ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.aniyomi.AYMR
++import tachiyomi.i18n.ank.AMR
+ 
+ /**
+  * Class used to hold the data of a download.
+@@ -40,13 +41,14 @@ class DownloadHolder(private val view: View, val adapter: DownloadAdapter) :
+         this.download = download
+         // Update the chapter name.
+         binding.chapterTitle.text = download.chapter.name
++        binding.chapterTitle.maxLines = 1
+ 
+         // Update the manga title
+         binding.mangaFullTitle.text = download.manga.title
+ 
+         // Update the progress bar and the number of downloaded pages
+         val video = download.video
+-        if (video == null) {
++        if (video == null && download.status != Download.State.ERROR) {
+             binding.downloadProgress.progress = 0
+             binding.downloadProgress.max = 1
+             binding.downloadProgressText.text = ""
+@@ -79,10 +81,24 @@ class DownloadHolder(private val view: View, val adapter: DownloadAdapter) :
+      * Updates the text field of the number of downloaded pages.
+      */
+     fun notifyDownloadedPages() {
+-        binding.downloadProgressText.text = if (download.progress == 0) {
+-            view.context.stringResource(MR.strings.update_check_notification_download_in_progress)
++        binding.downloadProgressText.text = when {
++            download.status == Download.State.ERROR -> {
++                view.context.stringResource(MR.strings.download_notifier_title_error)
++            }
++            download.progress == 0 -> {
++                view.context.stringResource(MR.strings.update_check_notification_download_in_progress)
++            }
++            else -> view.context.stringResource(AYMR.strings.episode_download_progress, download.progress)
++        }
++        // Harmony: error notifications are not shown inside 卓易通, so put the reason in the row itself.
++        val error = download.error.takeIf { download.status == Download.State.ERROR }
++        if (error != null) {
++            binding.chapterTitle.maxLines = 3
++            binding.chapterTitle.text = download.chapter.name + "\n" +
++                view.context.stringResource(AMR.strings.harmony_download_error_prefix, error)
+         } else {
+-            view.context.stringResource(AYMR.strings.episode_download_progress, download.progress)
++            binding.chapterTitle.maxLines = 1
++            binding.chapterTitle.text = download.chapter.name
+         }
+     }
+ 
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreenModel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreenModel.kt
+index 7c10111..a07917b 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreenModel.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreenModel.kt
+@@ -211,7 +211,10 @@ class DownloadQueueScreenModel(
+                 onUpdateProgress(download)
+                 onUpdateDownloadedPages(download)
+             }
+-            Download.State.ERROR -> cancelProgressJob(download)
++            Download.State.ERROR -> {
++                cancelProgressJob(download)
++                onUpdateDownloadedPages(download)
++            }
+             else -> {
+                 /* unused */
+             }
+diff --git a/core/common/src/main/kotlin/tachiyomi/core/common/storage/UniFileExtensions.kt b/core/common/src/main/kotlin/tachiyomi/core/common/storage/UniFileExtensions.kt
+index 80c9c93..8834377 100644
+--- a/core/common/src/main/kotlin/tachiyomi/core/common/storage/UniFileExtensions.kt
++++ b/core/common/src/main/kotlin/tachiyomi/core/common/storage/UniFileExtensions.kt
+@@ -1,5 +1,7 @@
+ package tachiyomi.core.common.storage
+ 
++import android.content.ContentResolver
++import android.provider.DocumentsContract
+ import com.hippo.unifile.UniFile
+ import java.io.IOException
+ 
+@@ -14,42 +16,44 @@ val UniFile.displayablePath: String
+ 
+ /**
+  * Renames this file, falling back to copying and deleting it when the storage provider does not
+- * support renaming documents.
++ * support renaming documents (HarmonyOS ZhuoyiTong's SAF bridge, some OEM providers).
+  *
++ * For directories the fallback first tries to move the children into the new directory with
++ * [DocumentsContract.moveDocument] (a metadata operation on providers that support it) and only
++ * streams the data through the app when that is unsupported as well. An existing target directory
++ * is reused (merged into) so a previously interrupted fallback can be completed. When the copy
++ * succeeded but the source could not be deleted the copy is kept and the stale source is left
++ * behind: callers that already have the finished data must not lose it over a failed delete.
++ *
++ * @param resolver used for [DocumentsContract.moveDocument]; without it the fallback always copies.
+  * @return the renamed file, or the newly created file when the fallback is used.
+  */
+-fun UniFile.renameToOrCopy(targetName: String): UniFile {
++fun UniFile.renameToOrCopy(targetName: String, resolver: ContentResolver? = null): UniFile {
+     if (renameTo(targetName)) return this
+ 
+     val parent = parentFile
+         ?: throw IOException("Failed to rename $displayablePath: parent directory is unavailable")
+-    if (parent.findFile(targetName) != null) {
+-        throw IOException("Failed to rename $displayablePath: target '$targetName' already exists")
++    val existing = parent.findFile(targetName)
++    val target = when {
++        existing == null -> createCopyTarget(parent, targetName)
++            ?: throw IOException("Failed to rename $displayablePath: could not create target '$targetName'")
++        isDirectory && existing.isDirectory -> existing
++        else -> throw IOException("Failed to rename $displayablePath: target '$targetName' already exists")
+     }
+ 
+-    val target = createCopyTarget(parent, targetName)
+-        ?: throw IOException("Failed to rename $displayablePath: could not create target '$targetName'")
+-
+     try {
+-        copyContentsTo(target)
++        transferContentsTo(target, resolver)
+     } catch (e: Exception) {
+-        val rollbackFailed = !target.deleteSafely()
+-        val rollbackMessage = if (rollbackFailed) "; failed to remove incomplete target" else ""
+-        throw IOException("Failed to copy $displayablePath to '$targetName'$rollbackMessage", e)
++        if (existing == null) {
++            val rollbackFailed = !target.deleteSafely()
++            val rollbackMessage = if (rollbackFailed) "; failed to remove incomplete target" else ""
++            throw IOException("Failed to copy $displayablePath to '$targetName'$rollbackMessage", e)
++        }
++        throw IOException("Failed to copy $displayablePath into existing '$targetName'", e)
+     }
+ 
+-    val sourceDeleted = try {
+-        delete()
+-    } catch (e: Exception) {
+-        val rollbackFailed = !target.deleteSafely()
+-        val rollbackMessage = if (rollbackFailed) "; failed to remove copied target" else ""
+-        throw IOException("Copied $displayablePath to '$targetName', but failed to delete source$rollbackMessage", e)
+-    }
+-    if (!sourceDeleted) {
+-        val rollbackFailed = !target.deleteSafely()
+-        val rollbackMessage = if (rollbackFailed) "; failed to remove copied target" else ""
+-        throw IOException("Copied $displayablePath to '$targetName', but failed to delete source$rollbackMessage")
+-    }
++    // The data is safe in the target now; a leftover source only wastes space.
++    deleteSafely()
+ 
+     return target
+ }
+@@ -63,22 +67,60 @@ private fun UniFile.deleteSafely(): Boolean = try {
+     false
+ }
+ 
+-private fun UniFile.copyContentsTo(target: UniFile) {
+-    if (isDirectory) {
+-        val children = listFiles()
+-            ?: throw IOException("Failed to list directory $displayablePath")
+-        children.forEach { child ->
+-            val childName = child.name
+-                ?: throw IOException("A file in $displayablePath has no name")
+-            val childTarget = child.createCopyTarget(target, childName)
+-                ?: throw IOException("Failed to create '$childName' in " + target.displayablePath)
+-            child.copyContentsTo(childTarget)
+-        }
+-    } else {
+-        openInputStream().use { input ->
+-            target.openOutputStream().use { output ->
+-                input.copyTo(output)
++private fun UniFile.transferContentsTo(target: UniFile, resolver: ContentResolver?) {
++    if (!isDirectory) {
++        copyFileTo(target)
++        return
++    }
++
++    val children = listFiles()
++        ?: throw IOException("Failed to list directory $displayablePath")
++    children.forEach { child ->
++        val childName = child.name
++            ?: throw IOException("A file in $displayablePath has no name")
++        val existing = target.findFile(childName)
++        if (existing != null) {
++            // Left behind by an interrupted earlier attempt: keep it when it is complete.
++            if (!child.isDirectory && !existing.isDirectory && existing.length() == child.length()) {
++                return@forEach
+             }
++            existing.deleteSafely()
++        }
++        if (resolver != null && child.moveInto(target, resolver)) {
++            return@forEach
+         }
++        val childTarget = child.createCopyTarget(target, childName)
++            ?: throw IOException("Failed to create '$childName' in " + target.displayablePath)
++        child.transferContentsTo(childTarget, resolver)
++    }
++}
++
++/**
++ * Moves this document into [newParent] without streaming its data through the app. Returns false
++ * when the documents are not SAF documents or the provider does not support moving.
++ */
++private fun UniFile.moveInto(newParent: UniFile, resolver: ContentResolver): Boolean {
++    val source = uri
++    val oldParent = parentFile?.uri ?: return false
++    if (source.scheme != ContentResolver.SCHEME_CONTENT) return false
++    if (newParent.uri.scheme != ContentResolver.SCHEME_CONTENT) return false
++    return try {
++        DocumentsContract.moveDocument(resolver, source, oldParent, newParent.uri) != null
++    } catch (_: Exception) {
++        false
++    }
++}
++
++private fun UniFile.copyFileTo(target: UniFile) {
++    openInputStream().use { input ->
++        target.openOutputStream().use { output ->
++            input.copyTo(output)
++        }
++    }
++    val expected = length()
++    val actual = target.length()
++    // Some providers report 0 / -1 until their metadata is refreshed; only trust a positive size.
++    if (expected > 0 && actual > 0 && actual != expected) {
++        throw IOException("Copied ${target.displayablePath} is $actual bytes, expected $expected")
+     }
+ }
+diff --git a/i18n-ank/src/commonMain/moko-resources/base/strings.xml b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+index 830cdf8..007e5d3 100644
+--- a/i18n-ank/src/commonMain/moko-resources/base/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+@@ -268,4 +268,7 @@
+     <!-- Harmony fork: download notification shared with Mihon / Animeko -->
+     <string name="download_notifier_speed">Download: %1$s/s</string>
+     <string name="download_notifier_speed_progress">Download: %1$s/s · %2$d%%</string>
++    <string name="harmony_download_unexpected_files">Download folder has unexpected contents: %1$s</string>
++    <string name="harmony_download_error_prefix">Error: %1$s</string>
++    <string name="harmony_download_interrupted">Interrupted (network lost or downloader stopped); tap the episode to download again</string>
+ </resources>
+diff --git a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+index c8780bf..64711f5 100644
+--- a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+@@ -263,4 +263,7 @@
+     <!-- Harmony fork: download notification shared with Mihon / Animeko -->
+     <string name="download_notifier_speed">下载：%1$s/s</string>
+     <string name="download_notifier_speed_progress">下载：%1$s/s · %2$d%%</string>
++    <string name="harmony_download_unexpected_files">下载目录内容异常：%1$s</string>
++    <string name="harmony_download_error_prefix">出错：%1$s</string>
++    <string name="harmony_download_interrupted">下载被中断（网络断开或下载服务被停止），点一下该集重新下载</string>
+ </resources>
