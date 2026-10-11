@@ -243,6 +243,7 @@ gh release list --repo Xun2202/anikku-harmony
 | 刚装完新版就弹「已更新至 v…」对话框，「更新日志」页面写着「最新: v…-preview.N – 当前: …-harmony.N」，像在推送同一个版本 | preview.5 及之前的 KMK 行为（Mihon 没有这个对话框）。0012 起对话框去掉，「更新日志」直接开当前版本的 Release 网页。「检查更新」在已是最新时一直都是 toast「没有新版本」，若真的弹出更新页，先对比 `GetApplicationRelease.HARMONY_VERSION_REGEX` 与 `BuildConfig.VERSION_NAME` / tag 的格式 |
 | 点「下载」后停在「正在下载… (0%)」、按钮灰掉，一直不动（preview.5 / preview.6 也会） | 更新下载是 WorkManager expedited 任务，卓易通从不派发，worker 没跑过（见 0013；这才是 0011 之后还卡住的原因）。升级到 preview.7 起的版本。升级后若 20 秒变「重试」，说明普通任务也没被派发：设置 → 高级 → 转储崩溃日志，看 logcat 里有没有 `WM-WorkerWrapper` 启动 `AppUpdateDownloadJob` 的记录 |
 | 「检查更新」toast「HTTP error 403」 | 匿名 `api.github.com` 的配额（每个出口 IP 每小时 60 次）被用完，NAT / 代理后面所有人共用；仓库本身公开可访问。等一小时或换网络；preview.7 起先读 `repo` 分支的镜像（`raw.githubusercontent.com`），一般不会再撞上。仍 403 说明镜像也读不到（被墙 / 超时 10 秒），看 logcat 里的 `Release mirror unavailable` |
+| 下载进度到 100% 后变成「!」，重试还是一样；日志里成对出现 `DocumentsContractApi21: Failed to renameTo …/<集>_tmp/<集>.mkv.anikku` 与 `…/<集>` | preview.7 及之前：卓易通 SAF 不支持 `renameDocument`，0001 的回退把整段视频在 SAF 里再复制两遍，失败又没有提示（见 0016）。升级到 preview.8 起的版本；之后再出错，下载队列的那一行会直接写出原因（「出错：…」），把这句话连同崩溃日志一起发来。残留的 `<集>_tmp` 目录不用手动删，重新下载会合并 / 覆盖 |
 | 刚发版几分钟内「检查更新」说「没有新版本」 | `raw.githubusercontent.com` 对 `releases.json` 有最多约 5 分钟缓存，加上 OkHttp 本地缓存；等几分钟再点。确认 `repo` 分支的 `releases.json` 已包含新 tag（发版 workflow 最后一步「Update the release index」） |
 | `repo` 分支的 `releases.json` 没更新 / 不存在 | 发版 workflow 的最后一步失败，或 Release 是手动改的而 `release_index.yml` 没跑。到 Actions 手动运行「Release index」；本地也可 `GH_TOKEN=... scripts/write-release-index.sh Xun2202/anikku-harmony` |
 | 「安装」后系统提示「解析软件包时出现问题」 | 旧版本的 `update.apk` 没删干净，`downloadFileWithResume` 把新包接在了后面（0011 起每次下载前先删）。清除 Anikku 缓存后重试 |
@@ -281,10 +282,14 @@ gh release list --repo Xun2202/anikku-harmony
   加入补丁 0013（普通任务 + 更新页看门狗）和 0014（先读 `repo` 分支的 Release 索引镜像 + 修 `lastChecked`），流水线新增 `write-release-index.sh` / `release_index.yml`，
   三个鸿蒙版仓库同步建立 `repo` 分支。`dry_run` 验证后发布 `v0.2.0-harmony-preview.7`（versionCode 807）。
 - 2026-10-11 用户反馈 XvXun 这类 16:9 封面在书架里都是竖版显示，切到「全景松散网格」后封面反而更小、上下有两条看不见的空边。
-  根因是 `LibraryComfortableGrid` 没传 `fitToPanoramaCover`，格子仍按 2:3 竖版算高度。加入补丁 0015（与浏览页对齐），`dry_run` 验证后
-  在 Android 14 x86_64 模拟器里装上 dry_run APK + XvXun 对比截图确认格子变成横版。
+  根因是 `LibraryComfortableGrid` 没传 `fitToPanoramaCover`，格子仍按 2:3 竖版算高度。加入补丁 0015（与浏览页对齐），`dry_run`（run 38118421200，versionCode 815）
+  编译通过；在 Android 14 x86_64 模拟器（TCG，无 KVM）里装本地构建 + XvXun 两个条目，普通网格 vs 全景松散网格对比截图确认格子变成 3:2 横版、无空边。
 - 同日 用户反馈下载「进度满了变成惊叹号」并提供日志：`DocumentsContractApi21: Failed to renameTo …/Video_tmp/Video.mkv.anikku` 和两秒后的
   `…/Varesa/Video`，说明 0001 的改名回退在收尾处连续触发（卓易通 SAF 不支持 `renameDocument`），每次都是整段视频再复制一遍，之后的失败没有任何可见原因
   （出错路径之一不通知不记日志，ffmpeg 失败只有 "Error in ffmpeg!"）。加入补丁 0016（直接写最终名 + 标记、目录 `moveDocument`/合并、收尾重试、缓存保留、
-  队列显示原因）。模拟器上用 SAF 文件夹验证新流程产物正确（`Video_tmp/Video.tmp` 标记 → `Video/Video.mkv.anikku` + `.nomedia`），用 iptables 封 CDN 验证
-  队列能显示失败原因。`dry_run` 验证后与 0015 一起发布 `v0.2.0-harmony-preview.8`（versionCode 808）。
+  队列显示原因）。这一张没有单独跑 `dry_run`：本地 `./gradlew :app:assemblePreview -Penable-updater` 编译同一棵树（与 `prepare-source.sh` 干净套用后的
+  `Downloader.kt` / `UniFileExtensions.kt` `cmp` 一致），装进模拟器用 SAF 文件夹验证：新流程产物正确（`Video_tmp/Video.tmp` 标记 → `Video/Video.mkv.anikku` +
+  `.nomedia`，`_tmp` 目录消失）；iptables 只封 CDN 一个 IP 时首次 ffmpeg I/O error、2 秒后重试换到另一 IP 成功；封整个 CDN 网段时 4 次尝试全失败，
+  队列行显示「Error: ffmpeg: [tcp @ …] Connection to tcp://hls-cdn77… failed: Network is unreachable」，解除封锁后点「继续」重试成功。
+  正式发版 run 38128844399 → `v0.2.0-harmony-preview.8`（versionCode 808，versionName `0.2.0-harmony.8-8907`，签名 `cf7a2adc…d829`，
+  `repo` 分支 `8b43542` 已含 preview.8）。卓易通特有的「`renameDocument` 不支持 → `moveDocument` / 复制合并」分支模拟器复现不了，等用户真机。
