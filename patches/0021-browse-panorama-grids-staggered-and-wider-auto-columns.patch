@@ -1,0 +1,658 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 15:12:10 +0000
+Subject: [PATCH] browse: panorama comfortable grids flow as staggered grids
+ with wider auto columns
+
+The source browse page and the related-manga grid had the same two problems
+as the library "Panorama comfortable grid" (previous commit):
+
+- Auto columns used GridCells.Adaptive(128.dp), so a 3:2 cover was as wide as
+  a book cover and only about two thirds as tall. Panorama mode now uses a
+  168 dp minimum when the column count is auto. A fixed count stays fixed.
+- LazyVerticalGrid makes every row as tall as its tallest cell, so a 2:3 cover
+  beside a 3:2 cover left a hole under the wide one. Panorama mode now uses
+  LazyVerticalStaggeredGrid (with the staggered fast scroller added for the
+  library). Section headers and paging placeholders span the full line.
+
+GridCells.Fixed.count is not readable, so the column preference is carried on
+a GridCells that still lays out like Adaptive(128.dp) / Fixed for every
+non-panorama mode. Season selection still builds a plain GridCells; that grid
+falls back to the same library column preference.
+
+Cover orientation is cached per manga (shared with the library) so a cell
+keeps its shape when it scrolls back into view. In panorama mode an unknown
+cover is assumed 16:9.
+
+Harmony-only (follow-up to 0020): Mihon has no panorama cover feature, Animeko has no such grid.
+---
+ .../components/BrowseSourceComfortableGrid.kt |  49 ++++
+ .../RelatedMangasComfortableGrid.kt           | 220 ++++++++++++------
+ .../library/components/LazyLibraryGrid.kt     |   9 +-
+ .../components/LibraryComfortableGrid.kt      |  38 ---
+ .../library/components/PanoramaGrid.kt        | 105 +++++++++
+ .../source/browse/BrowseSourceScreenModel.kt  |   9 +-
+ .../tachiyomi/ui/manga/RelatedMangasScreen.kt |   7 +-
+ 7 files changed, 317 insertions(+), 120 deletions(-)
+ create mode 100644 app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
+index 96ec9db..13858bb 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
+@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.foundation.lazy.grid.GridCells
+ import androidx.compose.foundation.lazy.grid.GridItemSpan
+ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
++import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridItemSpan
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.collectAsState
+@@ -15,12 +16,15 @@ import androidx.paging.LoadState
+ import androidx.paging.compose.LazyPagingItems
+ import eu.kanade.presentation.library.components.CommonMangaItemDefaults
+ import eu.kanade.presentation.library.components.MangaComfortableGridItem
++import eu.kanade.presentation.library.components.panoramaStaggeredColumns
++import eu.kanade.presentation.library.components.rememberCoverRatio
+ import exh.metadata.metadata.RaisedSearchMetadata
+ import exh.metadata.metadata.RankedSearchMetadata
+ import kotlinx.coroutines.flow.StateFlow
+ import tachiyomi.domain.manga.model.Manga
+ import tachiyomi.domain.manga.model.MangaCover
+ import tachiyomi.presentation.core.components.Badge
++import tachiyomi.presentation.core.components.FastScrollLazyVerticalStaggeredGrid
+ import tachiyomi.presentation.core.util.plus
+ 
+ @Composable
+@@ -35,6 +39,49 @@ fun BrowseSourceComfortableGrid(
+     usePanoramaCover: Boolean = false,
+     // KMK <--
+ ) {
++    // Harmony -->
++    // Panorama mode mixes 3:2 and 2:3 cells. A regular grid makes every row as tall as its tallest
++    // cell, which leaves a hole under each wide cover; a staggered grid lets each lane flow on its
++    // own. Auto columns use a wider minimum than the 128 dp meant for book covers.
++    if (usePanoramaCover) {
++        FastScrollLazyVerticalStaggeredGrid(
++            columns = columns.panoramaStaggeredColumns(),
++            contentPadding = contentPadding + PaddingValues(8.dp),
++            topContentPadding = contentPadding.calculateTopPadding(),
++            bottomContentPadding = contentPadding.calculateBottomPadding(),
++            verticalItemSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
++            horizontalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridHorizontalSpacer),
++        ) {
++            if (mangaList.loadState.prepend is LoadState.Loading) {
++                item(span = StaggeredGridItemSpan.FullLine) {
++                    BrowseSourceLoadingItem()
++                }
++            }
++
++            items(count = mangaList.itemCount) { index ->
++                val pair by mangaList[index]?.collectAsState() ?: return@items
++                val manga = pair.first
++                val metadata = pair.second
++
++                BrowseSourceComfortableGridItem(
++                    manga = manga,
++                    metadata = metadata,
++                    onClick = { onMangaClick(manga) },
++                    onLongClick = { onMangaLongClick(manga) },
++                    isSelected = selection.fastAny { selected -> selected.id == manga.id },
++                    usePanoramaCover = true,
++                )
++            }
++
++            if (mangaList.loadState.refresh is LoadState.Loading || mangaList.loadState.append is LoadState.Loading) {
++                item(span = StaggeredGridItemSpan.FullLine) {
++                    BrowseSourceLoadingItem()
++                }
++            }
++        }
++        return
++    }
++    // Harmony <--
+     LazyVerticalGrid(
+         columns = columns,
+         contentPadding = contentPadding + PaddingValues(8.dp),
+@@ -100,6 +147,8 @@ internal fun BrowseSourceComfortableGridItem(
+         ),
+         // KMK -->
+         isSelected = isSelected,
++        // Harmony: keep the decoded cover shape so a cell doesn't flip when it scrolls back.
++        coverRatio = rememberCoverRatio(manga.id, usePanoramaCover),
+         usePanoramaCover = usePanoramaCover,
+         fitToPanoramaCover = true,
+         // KMK <--
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt
+index 9674edb..06da953 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt
+@@ -7,6 +7,9 @@ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.lazy.grid.GridCells
++import androidx.compose.foundation.lazy.staggeredgrid.LazyStaggeredGridItemScope
++import androidx.compose.foundation.lazy.staggeredgrid.LazyStaggeredGridScope
++import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridItemSpan
+ import androidx.compose.material3.HorizontalDivider
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
+@@ -18,11 +21,13 @@ import eu.kanade.presentation.browse.RelatedMangaTitle
+ import eu.kanade.presentation.browse.RelatedMangasLoadingItem
+ import eu.kanade.presentation.browse.header
+ import eu.kanade.presentation.library.components.CommonMangaItemDefaults
++import eu.kanade.presentation.library.components.panoramaStaggeredColumns
+ import eu.kanade.tachiyomi.ui.manga.RelatedManga
+ import tachiyomi.domain.manga.model.Manga
+ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.kmk.KMR
+ import tachiyomi.presentation.core.components.FastScrollLazyVerticalGrid
++import tachiyomi.presentation.core.components.FastScrollLazyVerticalStaggeredGrid
+ import tachiyomi.presentation.core.components.material.padding
+ import tachiyomi.presentation.core.i18n.stringResource
+ import tachiyomi.presentation.core.util.plus
+@@ -40,85 +45,160 @@ fun RelatedMangasComfortableGrid(
+     selection: List<Manga>,
+     usePanoramaCover: Boolean = false,
+ ) {
++    val gridPadding = contentPadding + PaddingValues(horizontal = MaterialTheme.padding.small) // padding for scrollbar
++    // Harmony -->
++    // Same two panorama problems as the library and the source browse grid: a shared row height
++    // leaves a hole under a wide cover, and auto columns at 128 dp make that cover cramped.
++    if (usePanoramaCover) {
++        FastScrollLazyVerticalStaggeredGrid(
++            columns = columns.panoramaStaggeredColumns(),
++            contentPadding = gridPadding,
++            topContentPadding = contentPadding.calculateTopPadding(),
++            verticalItemSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
++            horizontalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridHorizontalSpacer),
++        ) {
++            addRelatedSections(
++                relatedMangas = relatedMangas,
++                getManga = getManga,
++                onMangaClick = onMangaClick,
++                onMangaLongClick = onMangaLongClick,
++                onKeywordClick = onKeywordClick,
++                onKeywordLongClick = onKeywordLongClick,
++                selection = selection,
++                usePanoramaCover = true,
++                fullWidth = { key, content -> fullWidthItem(key) { content() } },
++                cells = { count, key, item ->
++                    items(count = count, key = key) { index -> item(index) }
++                },
++            )
++        }
++        return
++    }
++    // Harmony <--
+     FastScrollLazyVerticalGrid(
+         columns = columns,
+-        contentPadding = contentPadding + PaddingValues(horizontal = MaterialTheme.padding.small), // padding for scrollbar
++        contentPadding = gridPadding,
+         topContentPadding = contentPadding.calculateTopPadding(),
+         verticalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridVerticalSpacer),
+         horizontalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridHorizontalSpacer),
+     ) {
+-        relatedMangas.forEach { relatedManga ->
+-            when (relatedManga) {
+-                is RelatedManga.Loading -> {
+-                    header(key = "${relatedManga.hashCode()}#header") {
+-                        Column(
+-                            modifier = Modifier
+-                                .fillMaxWidth()
+-                                .background(MaterialTheme.colorScheme.background),
+-                        ) {
+-                            HorizontalDivider()
+-                            RelatedMangaTitle(
+-                                title = stringResource(MR.strings.loading),
+-                                subtitle = null,
+-                                onClick = {},
+-                                onLongClick = null,
+-                                modifier = Modifier
+-                                    .padding(
+-                                        start = MaterialTheme.padding.small,
+-                                        end = MaterialTheme.padding.small,
+-                                    ),
+-                            )
+-                        }
+-                    }
+-                    header(key = "${relatedManga.hashCode()}#loading") { RelatedMangasLoadingItem() }
++        addRelatedSections(
++            relatedMangas = relatedMangas,
++            getManga = getManga,
++            onMangaClick = onMangaClick,
++            onMangaLongClick = onMangaLongClick,
++            onKeywordClick = onKeywordClick,
++            onKeywordLongClick = onKeywordLongClick,
++            selection = selection,
++            usePanoramaCover = false,
++            fullWidth = { key, content ->
++                header(key) { content() }
++            },
++            cells = { count, key, item ->
++                items(count = count, key = key) { index -> item(index) }
++            },
++        )
++    }
++}
++
++private fun addRelatedSections(
++    relatedMangas: List<RelatedManga>,
++    getManga: @Composable (Manga) -> State<Manga>,
++    onMangaClick: (Manga) -> Unit,
++    onMangaLongClick: (Manga) -> Unit,
++    onKeywordClick: (String) -> Unit,
++    onKeywordLongClick: (String) -> Unit,
++    selection: List<Manga>,
++    usePanoramaCover: Boolean,
++    fullWidth: (key: String, content: @Composable () -> Unit) -> Unit,
++    cells: (count: Int, key: (Int) -> Any, item: @Composable (Int) -> Unit) -> Unit,
++) {
++    relatedMangas.forEach { relatedManga ->
++        when (relatedManga) {
++            is RelatedManga.Loading -> {
++                fullWidth("${relatedManga.hashCode()}#header") {
++                    RelatedMangaSectionHeader(
++                        title = stringResource(MR.strings.loading),
++                        onClick = {},
++                        onLongClick = null,
++                    )
++                }
++                fullWidth("${relatedManga.hashCode()}#loading") { RelatedMangasLoadingItem() }
++            }
++            is RelatedManga.Success -> {
++                val hasKeyword = relatedManga.keyword.isNotBlank()
++                fullWidth("${relatedManga.hashCode()}#header") {
++                    RelatedMangaSectionHeader(
++                        title = if (hasKeyword) {
++                            stringResource(KMR.strings.related_mangas_more)
++                        } else {
++                            stringResource(KMR.strings.related_mangas_website_suggestions)
++                        },
++                        showArrow = hasKeyword,
++                        onClick = {
++                            if (hasKeyword) onKeywordClick(relatedManga.keyword)
++                        },
++                        onLongClick = {
++                            if (hasKeyword) onKeywordLongClick(relatedManga.keyword)
++                        },
++                    )
+                 }
+-                is RelatedManga.Success -> {
+-                    val hasKeyword = relatedManga.keyword.isNotBlank()
+-                    header(key = "${relatedManga.hashCode()}#header") {
+-                        Column(
+-                            modifier = Modifier
+-                                .fillMaxWidth()
+-                                .background(MaterialTheme.colorScheme.background),
+-                        ) {
+-                            HorizontalDivider()
+-                            RelatedMangaTitle(
+-                                title = if (hasKeyword) {
+-                                    stringResource(KMR.strings.related_mangas_more)
+-                                } else {
+-                                    stringResource(KMR.strings.related_mangas_website_suggestions)
+-                                },
+-                                showArrow = hasKeyword,
+-                                subtitle = null,
+-                                onClick = {
+-                                    if (hasKeyword) onKeywordClick(relatedManga.keyword)
+-                                },
+-                                onLongClick = {
+-                                    if (hasKeyword) onKeywordLongClick(relatedManga.keyword)
+-                                },
+-                                modifier = Modifier
+-                                    .padding(
+-                                        start = MaterialTheme.padding.small,
+-                                        end = MaterialTheme.padding.small,
+-                                    ),
+-                            )
+-                        }
+-                    }
+-                    items(
+-                        key = { "related-comfort-${relatedManga.mangaList[it].id}" },
+-                        count = relatedManga.mangaList.size,
+-                    ) { index ->
+-                        val manga by getManga(relatedManga.mangaList[index])
+-                        BrowseSourceComfortableGridItem(
+-                            manga = manga,
+-                            onClick = { onMangaClick(manga) },
+-                            onLongClick = { onMangaLongClick(manga) },
+-                            isSelected = selection.fastAny { selected -> selected.id == manga.id },
+-                            metadata = null,
+-                            usePanoramaCover = usePanoramaCover,
+-                        )
+-                    }
++                cells(
++                    relatedManga.mangaList.size,
++                    { "related-comfort-${relatedManga.mangaList[it].id}" },
++                ) { index ->
++                    val manga by getManga(relatedManga.mangaList[index])
++                    BrowseSourceComfortableGridItem(
++                        manga = manga,
++                        onClick = { onMangaClick(manga) },
++                        onLongClick = { onMangaLongClick(manga) },
++                        isSelected = selection.fastAny { selected -> selected.id == manga.id },
++                        metadata = null,
++                        usePanoramaCover = usePanoramaCover,
++                    )
+                 }
+             }
+         }
+     }
+ }
++
++@Composable
++private fun RelatedMangaSectionHeader(
++    title: String,
++    onClick: () -> Unit,
++    onLongClick: (() -> Unit)?,
++    showArrow: Boolean = true,
++) {
++    Column(
++        modifier = Modifier
++            .fillMaxWidth()
++            .background(MaterialTheme.colorScheme.background),
++    ) {
++        HorizontalDivider()
++        RelatedMangaTitle(
++            title = title,
++            showArrow = showArrow,
++            subtitle = null,
++            onClick = onClick,
++            onLongClick = onLongClick,
++            modifier = Modifier
++                .padding(
++                    start = MaterialTheme.padding.small,
++                    end = MaterialTheme.padding.small,
++                ),
++        )
++    }
++}
++
++// Harmony -->
++private fun LazyStaggeredGridScope.fullWidthItem(
++    key: Any?,
++    content: @Composable LazyStaggeredGridItemScope.() -> Unit,
++) {
++    item(
++        key = key,
++        span = StaggeredGridItemSpan.FullLine,
++        content = content,
++    )
++}
++// Harmony <--
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt
+index c573546..469f621 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt
+@@ -6,11 +6,9 @@ import androidx.compose.foundation.lazy.grid.GridCells
+ import androidx.compose.foundation.lazy.grid.GridItemSpan
+ import androidx.compose.foundation.lazy.grid.LazyGridScope
+ import androidx.compose.foundation.lazy.staggeredgrid.LazyStaggeredGridScope
+-import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridCells
+ import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridItemSpan
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Modifier
+-import androidx.compose.ui.unit.Dp
+ import androidx.compose.ui.unit.dp
+ import tachiyomi.presentation.core.components.FastScrollLazyVerticalGrid
+ import tachiyomi.presentation.core.components.FastScrollLazyVerticalStaggeredGrid
+@@ -42,16 +40,11 @@ internal fun LazyLibraryGrid(
+ internal fun LazyLibraryStaggeredGrid(
+     modifier: Modifier = Modifier,
+     columns: Int,
+-    minColumnWidth: Dp,
+     contentPadding: PaddingValues,
+     content: LazyStaggeredGridScope.() -> Unit,
+ ) {
+     FastScrollLazyVerticalStaggeredGrid(
+-        columns = if (columns == 0) {
+-            StaggeredGridCells.Adaptive(minColumnWidth)
+-        } else {
+-            StaggeredGridCells.Fixed(columns)
+-        },
++        columns = panoramaStaggeredColumns(columns),
+         modifier = modifier,
+         contentPadding = contentPadding + PaddingValues(8.dp),
+         verticalItemSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt
+index 2d472a4..626eb03 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt
+@@ -5,18 +5,10 @@ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.lazy.grid.items
+ import androidx.compose.foundation.lazy.staggeredgrid.items
+ import androidx.compose.runtime.Composable
+-import androidx.compose.runtime.LaunchedEffect
+-import androidx.compose.runtime.MutableFloatState
+-import androidx.compose.runtime.mutableFloatStateOf
+-import androidx.compose.runtime.remember
+-import androidx.compose.runtime.snapshotFlow
+ import androidx.compose.ui.Modifier
+-import androidx.compose.ui.unit.dp
+ import eu.kanade.tachiyomi.ui.library.LibraryItem
+-import kotlinx.coroutines.flow.drop
+ import tachiyomi.domain.library.model.LibraryManga
+ import tachiyomi.domain.manga.model.MangaCover
+-import java.util.concurrent.ConcurrentHashMap
+ 
+ @Composable
+ internal fun LibraryComfortableGrid(
+@@ -42,7 +34,6 @@ internal fun LibraryComfortableGrid(
+         LazyLibraryStaggeredGrid(
+             modifier = Modifier.fillMaxSize(),
+             columns = columns,
+-            minColumnWidth = PanoramaGridMinColumnWidth,
+             contentPadding = contentPadding,
+         ) {
+             globalSearchItem(searchQuery, onGlobalSearchClicked)
+@@ -139,32 +130,3 @@ private fun LibraryComfortableGridItem(
+         // KMK <--
+     )
+ }
+-
+-// Harmony -->
+-/** Auto column width for the panorama grid; a 3:2 cover at this width is as tall as a 2:3 cover at 128 dp is wide. */
+-private val PanoramaGridMinColumnWidth = 168.dp
+-
+-/**
+- * Cover orientation (height / width) by manga id, kept for the process lifetime so a cell keeps
+- * its shape when it scrolls back into view instead of jumping from book to panorama once the
+- * image is decoded again. In panorama mode an unknown cover is assumed wide, since that is what
+- * the mode is for.
+- */
+-private val coverRatios = ConcurrentHashMap<Long, Float>()
+-
+-/** height / width of a 16:9 thumbnail, the common shape of video covers. */
+-private const val WIDE_COVER_RATIO = 9f / 16f
+-
+-@Composable
+-private fun rememberCoverRatio(mangaId: Long, usePanoramaCover: Boolean): MutableFloatState {
+-    val ratio = remember(mangaId) {
+-        mutableFloatStateOf(coverRatios[mangaId] ?: if (usePanoramaCover) WIDE_COVER_RATIO else 1f)
+-    }
+-    LaunchedEffect(mangaId) {
+-        snapshotFlow { ratio.floatValue }
+-            .drop(1)
+-            .collect { coverRatios[mangaId] = it }
+-    }
+-    return ratio
+-}
+-// Harmony <--
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
+new file mode 100644
+index 0000000..e5191cd
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
+@@ -0,0 +1,105 @@
++package eu.kanade.presentation.library.components
++
++import android.content.res.Configuration
++import androidx.compose.foundation.lazy.grid.GridCells
++import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridCells
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.Immutable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.MutableFloatState
++import androidx.compose.runtime.mutableFloatStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.snapshotFlow
++import androidx.compose.ui.platform.LocalConfiguration
++import androidx.compose.ui.unit.Density
++import androidx.compose.ui.unit.dp
++import kotlinx.coroutines.flow.drop
++import tachiyomi.domain.library.service.LibraryPreferences
++import uy.kohesive.injekt.Injekt
++import uy.kohesive.injekt.api.get
++import java.util.concurrent.ConcurrentHashMap
++
++// Harmony -->
++/** Auto column width for a panorama grid; a 3:2 cover at this width is as tall as a 2:3 cover at 128 dp is wide. */
++internal val PanoramaGridMinColumnWidth = 168.dp
++
++/** Auto column width of the book-shaped grids. Panorama mode does not use it. */
++private val BookGridMinColumnWidth = 128.dp
++
++/**
++ * [GridCells] that still lays out like the book grids, and also keeps the raw column count.
++ * [GridCells.Fixed.count] is not readable, and auto columns arrive as [GridCells.Adaptive] with
++ * [BookGridMinColumnWidth], which is too narrow for a 3:2 cover.
++ *
++ * @param columnCount 0 means auto.
++ */
++@Immutable
++internal data class CountedGridCells(
++    val columnCount: Int,
++) : GridCells {
++    override fun Density.calculateCrossAxisCellSizes(availableSize: Int, spacing: Int): List<Int> {
++        val delegate = if (columnCount == 0) {
++            GridCells.Adaptive(BookGridMinColumnWidth)
++        } else {
++            GridCells.Fixed(columnCount)
++        }
++        return with(delegate) { calculateCrossAxisCellSizes(availableSize, spacing) }
++    }
++}
++
++internal fun libraryGridCells(columnCount: Int): GridCells = CountedGridCells(columnCount)
++
++internal fun panoramaStaggeredColumns(columnCount: Int): StaggeredGridCells {
++    return if (columnCount == 0) {
++        StaggeredGridCells.Adaptive(PanoramaGridMinColumnWidth)
++    } else {
++        StaggeredGridCells.Fixed(columnCount)
++    }
++}
++
++/**
++ * Column spec for a panorama grid.
++ * Callers that still pass a plain [GridCells] (season selection) use the same library column
++ * preference those cells were built from.
++ */
++@Composable
++internal fun GridCells.panoramaStaggeredColumns(): StaggeredGridCells {
++    val orientation = LocalConfiguration.current.orientation
++    val columnCount = (this as? CountedGridCells)?.columnCount ?: libraryColumnCount(orientation)
++    return panoramaStaggeredColumns(columnCount)
++}
++
++private fun libraryColumnCount(orientation: Int): Int {
++    val preferences = Injekt.get<LibraryPreferences>()
++    val landscape = orientation == Configuration.ORIENTATION_LANDSCAPE
++    return if (landscape) {
++        preferences.landscapeColumns().get()
++    } else {
++        preferences.portraitColumns().get()
++    }
++}
++
++/**
++ * Cover orientation (height / width) by manga id, kept for the process lifetime so a cell keeps
++ * its shape when it scrolls back into view instead of jumping from book to panorama once the
++ * image is decoded again. In panorama mode an unknown cover is assumed wide, since that is what
++ * the mode is for.
++ */
++private val coverRatios = ConcurrentHashMap<Long, Float>()
++
++/** height / width of a 16:9 thumbnail, the common shape of video covers. */
++private const val WIDE_COVER_RATIO = 9f / 16f
++
++@Composable
++internal fun rememberCoverRatio(mangaId: Long, usePanoramaCover: Boolean): MutableFloatState {
++    val ratio = remember(mangaId) {
++        mutableFloatStateOf(coverRatios[mangaId] ?: if (usePanoramaCover) WIDE_COVER_RATIO else 1f)
++    }
++    LaunchedEffect(mangaId) {
++        snapshotFlow { ratio.floatValue }
++            .drop(1)
++            .collect { coverRatios[mangaId] = it }
++    }
++    return ratio
++}
++// Harmony <--
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreenModel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreenModel.kt
+index d0e6e14..d1dce68 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreenModel.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreenModel.kt
+@@ -7,7 +7,6 @@ import androidx.compose.runtime.Immutable
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.setValue
+-import androidx.compose.ui.unit.dp
+ import androidx.paging.Pager
+ import androidx.paging.PagingConfig
+ import androidx.paging.cachedIn
+@@ -26,6 +25,7 @@ import eu.kanade.domain.source.interactor.ToggleIncognito
+ import eu.kanade.domain.source.service.SourcePreferences
+ import eu.kanade.domain.track.interactor.AddTracks
+ import eu.kanade.domain.ui.UiPreferences
++import eu.kanade.presentation.library.components.libraryGridCells
+ import eu.kanade.presentation.util.ioCoroutineScope
+ import eu.kanade.tachiyomi.data.cache.BackgroundCache
+ import eu.kanade.tachiyomi.data.cache.CoverCache
+@@ -264,7 +264,12 @@ open class BrowseSourceScreenModel(
+         } else {
+             libraryPreferences.portraitColumns()
+         }.get()
+-        return if (columns == 0) GridCells.Adaptive(128.dp) else GridCells.Fixed(columns)
++        // Harmony -->
++        // Carry the raw count. GridCells.Fixed.count is not readable, and auto columns would
++        // otherwise be Adaptive(128.dp), which panorama replaces with a wider minimum.
++        // Non-panorama layout is unchanged: 0 is still Adaptive(128.dp), otherwise Fixed.
++        return libraryGridCells(columns)
++        // Harmony <--
+     }
+ 
+     // returns the number from the size slider
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/manga/RelatedMangasScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/manga/RelatedMangasScreen.kt
+index 96c1e5f..b34caba 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/manga/RelatedMangasScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/manga/RelatedMangasScreen.kt
+@@ -12,13 +12,13 @@ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.setValue
+ import androidx.compose.ui.platform.LocalConfiguration
+ import androidx.compose.ui.platform.LocalHapticFeedback
+-import androidx.compose.ui.unit.dp
+ import cafe.adriel.voyager.navigator.Navigator
+ import eu.kanade.core.preference.asState
+ import eu.kanade.domain.source.service.SourcePreferences
+ import eu.kanade.presentation.browse.RelatedMangasContent
+ import eu.kanade.presentation.browse.components.BrowseSourceSimpleToolbar
+ import eu.kanade.presentation.components.BulkSelectionToolbar
++import eu.kanade.presentation.library.components.libraryGridCells
+ import eu.kanade.tachiyomi.ui.browse.BulkFavoriteScreenModel
+ import eu.kanade.tachiyomi.ui.browse.source.browse.BrowseSourceScreen
+ import eu.kanade.tachiyomi.ui.browse.source.globalsearch.GlobalSearchScreen
+@@ -126,7 +126,10 @@ private fun getColumnsPreference(orientation: Int): GridCells {
+     } else {
+         libraryPreferences.portraitColumns()
+     }.get()
+-    return if (columns == 0) GridCells.Adaptive(128.dp) else GridCells.Fixed(columns)
++    // Harmony -->
++    // Same count carrier as the source browse grid. See BrowseSourceScreenModel.getColumnsPreference.
++    return libraryGridCells(columns)
++    // Harmony <--
+ }
+ 
+ // returns the number from the size slider
