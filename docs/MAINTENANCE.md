@@ -50,6 +50,7 @@ patches/
   0017-updater-stable-release-notes-while-downloading.patch   更新页 remember { GFMFlavourDescriptor() } (说明文字下载时不再闪烁); ffmpeg 原因去掉 [tcp @ 0x…] 前缀
   0018-downloads-never-skip-silently-reuse-or-replace-leftover-folders.patch  点「下载」不再被静默跳过: 按缓存判断已下载, 残留目录完整则登记/不完整则删, Snackbar 说明原因
   0019-crash-log-filter-harmony-noise-and-keep-app-log.patch  崩溃日志过滤卓易通图形层噪音 + 附应用自己的最近 600 行日志 (HarmonyLogBuffer)
+  0020-library-panorama-grid-staggered-and-wider-auto-columns.patch  全景松散网格改瀑布流 (LazyVerticalStaggeredGrid, 横竖混排不留空) + 自动列宽 168 dp + 封面比例缓存
 scripts/prepare-source.sh                  套补丁 + 改版本号 (CI 与本地通用)
 scripts/write-release-index.sh             把 Releases 接口返回写到 repo 分支 (releases.json / latest.json)
 .github/workflows/harmony_preview.yml      编译、重签、发布, 然后写 Release 索引
@@ -199,6 +200,7 @@ git format-patch -o /tmp/new-patches --no-signature --zero-commit v0.3.0..HEAD
 - 0019 改 `CrashLogUtil.kt`（`Runtime.exec(arrayOf("logcat", "*:E", "-d", "-v", "year", "-v", "zone"))` 读 stdout，`filterNoise()` 按 `HARMONY_NOISE_MARKERS` 六个子串过滤并计数，
   `logcatHeader()` 写「--- Logcat (N 卓易通 graphics-layer lines filtered: …) ---」，末尾追加「--- App log (last N lines …) ---」+ `HarmonyLogBuffer.snapshot()`）、
   新文件 `util/system/HarmonyLogBuffer.kt`（与 mihon-harmony 0012 的同名文件**逐字节相同**，改一处同步另一处）、`App.kt`（`LogcatLogger.loggers += HarmonyLogBuffer`，排在 XLog / Android logger 之后）。
+- 0020 改 `LibraryComfortableGrid.kt`（`usePanoramaCover` 为真时走新的 `LazyLibraryStaggeredGrid`，自动列宽 `PanoramaGridMinColumnWidth = 168.dp`，固定列数仍 `Fixed(columns)`；格子内容抽成私有 `LibraryComfortableGridItem`，两种网格共用；`rememberCoverRatio(mangaId, usePanoramaCover)` 从进程级 `ConcurrentHashMap<Long, Float>` 取初值、`snapshotFlow` 写回，全景模式未知封面默认 `9f / 16f`）、`LazyLibraryGrid.kt`（新增 `LazyLibraryStaggeredGrid` + `LazyStaggeredGridScope.globalSearchItem`，span `FullLine`）、`presentation-core` 的 `LazyGrid.kt`（`FastScrollLazyVerticalStaggeredGrid`）与 `VerticalFastScroller.kt`（`VerticalStaggeredGridFastScroller`：lane 数取可见项 `lane` 最大值 + 1，行高 = 可见项平均高度 + `mainAxisItemSpacing`，滚动范围 = ⌈总数 / lane 数⌉ × 行高 + 前后 padding，拖拽时 `scrollToItem(lane 数 × 行号, 行内偏移)`；拇指常量复用文件内的 private 值，所以放在同一个文件里）。上游 `MangaComfortableGridItem` 不动（0015 起已传 `fitToPanoramaCover = true`）。浏览页 / 相关作品页的全景网格仍是 `LazyVerticalGrid` + 128 dp，用户没提，若也要改照搬即可。
 
 ### 5.2 加新补丁
 
