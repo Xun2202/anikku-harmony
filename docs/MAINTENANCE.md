@@ -194,7 +194,8 @@ git format-patch -o /tmp/new-patches --no-signature --zero-commit v0.3.0..HEAD
   `DownloadManager.downloadChapters()/downloadEpisodes()`（返回 `QueueResult`，`fillermarked = episodes.size - filteredEpisodes.size`），
   `MangaScreenModel.downloadChapters()`（改 `suspend`，MergedSource 分支用私有 `plus` 累加，`result.skipped > 0` 时拼 Snackbar），
   六条字符串 `harmony_download_skipped*` / `harmony_download_leftover_delete_failed`（i18n-ank base + zh-rCN）。`PlayerViewModel` / `LibraryUpdateJob` 等调用方忽略返回值。
-  与 mihon-harmony 0011 的差异只在完整性规则（一个视频 vs 页数）和 `fillermarked` 一项。
+  队列里处于 ERROR 状态的剧集记为 `retried`（不计入 `skipped`；点「!」重试走的就是这条路，调用方随后 `startDownloads()`）。
+  与 mihon-harmony 0011 + 0013 的差异只在完整性规则（一个视频 vs 页数）和 `fillermarked` 一项。
 - 0019 改 `CrashLogUtil.kt`（`Runtime.exec(arrayOf("logcat", "*:E", "-d", "-v", "year", "-v", "zone"))` 读 stdout，`filterNoise()` 按 `HARMONY_NOISE_MARKERS` 六个子串过滤并计数，
   `logcatHeader()` 写「--- Logcat (N 卓易通 graphics-layer lines filtered: …) ---」，末尾追加「--- App log (last N lines …) ---」+ `HarmonyLogBuffer.snapshot()`）、
   新文件 `util/system/HarmonyLogBuffer.kt`（与 mihon-harmony 0012 的同名文件**逐字节相同**，改一处同步另一处）、`App.kt`（`LogcatLogger.loggers += HarmonyLogBuffer`，排在 XLog / Android logger 之后）。
