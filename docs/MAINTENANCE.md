@@ -323,3 +323,7 @@ gh release list --repo Xun2202/anikku-harmony
   正式发版 → `v0.2.0-harmony-preview.9`（versionCode 809）。闪烁本身在无 GPU 的 TCG 模拟器上截不到稳定画面，按代码分析 + 与 Mihon 相同写法确认。
 - 2026-10-12 Mihon 用户上报「点了下载按钮卡一下但没开始」+ crash log 全是卓易通图形层噪音。根因在 Tachiyomi 共享的 `queueChapters/queueEpisodes` 静默过滤（B 层），
   Anikku 同病：移植为 0018 / 0019（Mihon 为 0011 / 0012），本地 `:app:compilePreviewKotlin` 通过，干净 v0.2.0 上 19 张补丁套用后与开发树一致，`check_patches` run 38206407935 绿。
+  `dry_run` run 38206483876 绿后发起的第一次正式发版 run 38207083959 在发现「点『!』重试会被算成已在队列中」后主动取消（未产生 Release），
+  把 `retried` 的拆分并进 0018 重新导出 → `dry_run` run 38207400700 绿 → 正式 run 38208443188 → `v0.2.0-harmony-preview.10`（05:39 UTC，versionCode 810，
+  versionName `0.2.0-harmony.10-8910`，签名 `cf7a2adc…d829`，arm64 90,132,597 B，SHA-256 `f5b76768…58ca`，DEX 含 `HarmonyLogBuffer` / `already on disk as`，
+  `resources.arsc` 含 `harmony_download_skipped*`，`repo` 分支 `8abd41a`）。Mihon 同轮为 preview.10（0011 / 0012）+ preview.11（0013）。
