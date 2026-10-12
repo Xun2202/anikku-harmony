@@ -276,6 +276,7 @@ gh release list --repo Xun2202/anikku-harmony
 | 闪退 `ForegroundServiceDidNotStopInTimeException ... type dataSync` | Android 15 对 dataSync 前台服务的 6 小时限制，通常是后台被冻结、服务空转耗光额度。开着「后台保持运行（鸿蒙）」时下载服务是 `mediaPlayback` 类型不受限；关着就隔几小时切回前台重置额度 |
 | 下载时其他 App 的音乐被暂停 / 变小声 | 不应发生：keep-alive 不请求音频焦点。若出现，检查 `BackgroundKeepAlive.kt` 是否被改成了 `requestAudioFocus` |
 | 下载通知一直只有速度、没有百分比 / 进度条在滚动 | ffmpeg 的 `StatisticsCallback` 还没报出时间，或 `getDuration()` 拿不到时长（部分 HLS 源），这是预期显示；速度一直 0 B/s 则看 ffmpeg 是否真的在写文件（`s.size` 不增长） |
+| 书架「全景松散网格」每行「自动」时横版封面偏窄、挤；竖版和横版同一行时横版下面一大块空白 | preview.10 及之前：自动列宽沿用 128 dp、`LazyVerticalGrid` 整行按最高格子算。preview.11 起全景模式改瀑布流 `LazyVerticalStaggeredGrid` + 自动列宽 168 dp（补丁 0020）。手动设了每行数量的只有排布变化、宽度不变；浏览页的全景网格没改 |
 
 ## 8. 不要做的事
 
@@ -329,3 +330,10 @@ gh release list --repo Xun2202/anikku-harmony
   把 `retried` 的拆分并进 0018 重新导出 → `dry_run` run 38207400700 绿 → 正式 run 38208443188 → `v0.2.0-harmony-preview.10`（05:39 UTC，versionCode 810，
   versionName `0.2.0-harmony.10-8910`，签名 `cf7a2adc…d829`，arm64 90,132,597 B，SHA-256 `f5b76768…58ca`，DEX 含 `HarmonyLogBuffer` / `already on disk as`，
   `resources.arsc` 含 `harmony_download_skipped*`，`repo` 分支 `8abd41a`）。Mihon 同轮为 preview.10（0011 / 0012）+ preview.11（0013）。
+- 2026-10-12（下午） 用户：「全景松散网格每行自动时横着的封面默认宽度有点窄…像之前竖屏的宽度，很拥挤，但也别太宽；竖屏和横屏一排会把横屏下面挤出空隙，能不能排布下」。
+  根因两条：自动列宽是书形网格的 `GridCells.Adaptive(128.dp)`（3:2 格子只有 2:3 格子那么宽、三分之二高）；`LazyVerticalGrid` 每行按最高格子算高度，2:3 和 3:2 混排时横版下面空出约 0.8 个格宽。
+  补丁 0020：全景模式改 `LazyVerticalStaggeredGrid`（每列各自往下排，不留空），自动列宽 168 dp（手机两列，≈530 dp 起三列；固定列数不变），`presentation-core` 新增 `VerticalStaggeredGridFastScroller` / `FastScrollLazyVerticalStaggeredGrid`，
+  封面横竖比按作品缓存到进程生命周期（滚回视野不再先书形再跳横版，全景模式未知封面默认 16:9）。本机 `:app:compilePreviewKotlin` + `:presentation-core:spotlessCheck` 通过（`:app:spotlessCheck` 报的两处 import 顺序是 0010 / 0018 带进来的旧问题，CI 不跑 spotless，留待下次动那两张时顺手修）；
+  20 张补丁在干净 v0.2.0 上套用后与开发树只差版本号行。推 `main` `9cfb9c8` → `check_patches` run 38259301396 绿 → `dry_run` run 38259313780 绿（DEX 含 `VerticalStaggeredGridFastScroller` / `LazyLibraryStaggeredGrid` / `rememberCoverRatio`）→
+  正式 run 38261157970 → `v0.2.0-harmony-preview.11`（14:18 UTC，target `9cfb9c8`，versionCode 811，versionName `0.2.0-harmony.11-8911`，签名 `cf7a2adc…d829`，arm64 90,148,981 B，SHA-256 `283c05e4…c4d8`，universal 282,149,687 B，`repo` 分支 `2944494`）。
+  没有模拟器截图（用户 10-11 起要求真机验证排版）；待用户看：自动列数下横版封面是否两列、横竖混排是否不留空、拖快速滚动条是否大致准确。
