@@ -339,3 +339,9 @@ gh release list --repo Xun2202/anikku-harmony
   20 张补丁在干净 v0.2.0 上套用后与开发树只差版本号行。推 `main` `9cfb9c8` → `check_patches` run 38259301396 绿 → `dry_run` run 38259313780 绿（DEX 含 `VerticalStaggeredGridFastScroller` / `LazyLibraryStaggeredGrid` / `rememberCoverRatio`）→
   正式 run 38261157970 → `v0.2.0-harmony-preview.11`（14:18 UTC，target `9cfb9c8`，versionCode 811，versionName `0.2.0-harmony.11-8911`，签名 `cf7a2adc…d829`，arm64 90,148,981 B，SHA-256 `283c05e4…c4d8`，universal 282,149,687 B，`repo` 分支 `2944494`）。
   没有模拟器截图（用户 10-11 起要求真机验证排版）；待用户看：自动列数下横版封面是否两列、横竖混排是否不留空、拖快速滚动条是否大致准确。
+- 2026-10-12（晚） 用户：「插件浏览里面的全景好像还没同步一样的效果，能不能也加上，其他你也检查下」+ 要求改用「主代理解析意图、Grok 子代理执行、主代理复核」的流程（见 `/workspace/.cursor/rules/orchestration.mdc`）。
+  浏览页 / 相关作品页由子代理（grok-4.7-high）改为补丁 0021（瀑布流 + 168 dp，`CountedGridCells` 传列数）；主代理复核作者 / diff / 独立重跑 `:app:compilePreviewKotlin`。子代理顺带排查未改的网格：作品详情页季度网格从不走全景；`MigrateSeasonSelectScreenModel.getColumnsPreference()` 仍返回普通 `GridCells`（靠回退分支拿列数）；
+  `GlobalSearchCardRow` / `HistoryItem` / `UpdatesUiItem` / `MangaInfoHeader` / `DuplicateMangaDialog` / `EditMangaDialog` 不是网格，不动。21 张补丁在干净 v0.2.0 上套用后与开发树只差版本号行。
+  推 `main` `fcea12f` → `check_patches` run 38269247489 绿 → `dry_run` run 38269257912 绿 → 正式 run 38270583982 → `v0.2.0-harmony-preview.12`（15:37 UTC，target `fcea12f`，versionCode 812，versionName `0.2.0-harmony.12-8912`，签名 `cf7a2adc…d829`，
+  arm64 90,165,365 B，SHA-256 `e745c353…cdb9`，universal 282,166,071 B，DEX 含 `CountedGridCells` / `panoramaStaggeredColumns` / `VerticalStaggeredGridFastScroller` / `rememberCoverRatio`，`repo` 分支 `7a69d99`，`releases.json` 第一项即 preview.12，共 12 条）。
+  同轮 Mihon 新增显示模式「全景松散网格」（mihon-harmony 0014，`v0.21.0-harmony-preview.2`）。
