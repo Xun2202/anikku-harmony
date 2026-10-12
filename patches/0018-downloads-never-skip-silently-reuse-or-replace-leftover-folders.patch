@@ -31,15 +31,19 @@ renewal.
 - The anime screen shows a snackbar when episodes were not queued, with
   the reason.
 
+Episodes already in the queue in ERROR state are reported as `retried`,
+not as skipped: tapping a failed episode re-queues it through this path
+and the caller restarts the downloader (mihon-harmony 0011 + 0013).
+
 Differs from Mihon in the completeness rule: an episode is one video file
 (plus .nomedia), there is no page count to compare against.
 ---
  .../data/download/DownloadManager.kt          |   7 +-
- .../tachiyomi/data/download/Downloader.kt     | 108 ++++++++++++++++--
- .../tachiyomi/ui/manga/MangaScreenModel.kt    |  38 +++++-
+ .../tachiyomi/data/download/Downloader.kt     | 114 ++++++++++++++++--
+ .../tachiyomi/ui/manga/MangaScreenModel.kt    |  39 +++++-
  .../moko-resources/base/strings.xml           |   6 +
  .../moko-resources/zh-rCN/strings.xml         |   6 +
- 5 files changed, 149 insertions(+), 16 deletions(-)
+ 5 files changed, 156 insertions(+), 16 deletions(-)
 
 diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
 index 551b054..f6ba89e 100644
@@ -68,7 +72,7 @@ index 551b054..f6ba89e 100644
      }
  
 diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
-index 8ecc7b8..c116b3c 100644
+index 8ecc7b8..1d92b78 100644
 --- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
 +++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
 @@ -25,6 +25,7 @@ import eu.kanade.tachiyomi.torrentServer.TorrentServerUtils
@@ -79,7 +83,7 @@ index 8ecc7b8..c116b3c 100644
  import eu.kanade.tachiyomi.util.storage.toFFmpegString
  import eu.kanade.tachiyomi.util.system.copyToClipboard
  import eu.kanade.tachiyomi.util.system.createFileInCacheDir
-@@ -308,22 +309,33 @@ class Downloader(
+@@ -308,22 +309,35 @@ class Downloader(
          autoStart: Boolean,
          changeDownloader: Boolean = false,
          video: Video? = null,
@@ -109,8 +113,10 @@ index 8ecc7b8..c116b3c 100644
 +                skipCache = false,
 +            )
 +        }
-+        val queuedEpisodeIds = queueState.value.map { it.episode.id }.toSet()
-+        val (alreadyQueued, toQueue) = notDownloaded.partition { it.id in queuedEpisodeIds }
++        val queuedDownloads = queueState.value.associateBy { it.episode.id }
++        val (alreadyQueued, toQueue) = notDownloaded.partition { it.id in queuedDownloads }
++        // A failed download the user taps again is restarted by the caller (startDownloads), not skipped.
++        val (retried, stillQueued) = alreadyQueued.partition { queuedDownloads[it.id]?.status == Download.State.ERROR }
 +        val episodesToQueue = toQueue
              // Add episodes to queue from the start.
              .sortedByDescending { it.sourceOrder }
@@ -122,23 +128,27 @@ index 8ecc7b8..c116b3c 100644
  
          if (episodesToQueue.isNotEmpty()) {
              addAllToQueue(episodesToQueue)
-@@ -357,6 +369,26 @@ class Downloader(
+@@ -357,6 +371,30 @@ class Downloader(
                  DownloadJob.start(context)
              }
          }
 +        return QueueResult(
 +            queued = episodesToQueue.size,
++            retried = retried.size,
 +            alreadyDownloaded = alreadyDownloaded.size,
-+            alreadyQueued = alreadyQueued.size,
++            alreadyQueued = stillQueued.size,
 +        )
 +    }
 +
 +    /**
 +     * Harmony: outcome of [queueEpisodes], so callers can tell the user why nothing
 +     * started instead of silently dropping episodes.
++     *
++     * @property retried episodes already in the queue in ERROR state; the caller restarts them.
 +     */
 +    data class QueueResult(
 +        val queued: Int = 0,
++        val retried: Int = 0,
 +        val alreadyDownloaded: Int = 0,
 +        val alreadyQueued: Int = 0,
 +        val sourceUnavailable: Int = 0,
@@ -149,7 +159,7 @@ index 8ecc7b8..c116b3c 100644
      }
  
      /**
-@@ -389,9 +421,19 @@ class Downloader(
+@@ -389,9 +427,19 @@ class Downloader(
          }
  
          val episodeDirname = provider.getChapterDirName(download.episode.name, download.episode.scanlator)
@@ -170,7 +180,7 @@ index 8ecc7b8..c116b3c 100644
              if (download.video == null) {
                  // Pull video from network and add them to download object
                  val hosters = EpisodeLoader.getHosters(download.episode, download.anime, download.source)
-@@ -453,6 +495,52 @@ class Downloader(
+@@ -453,6 +501,52 @@ class Downloader(
          }
      }
  
@@ -224,7 +234,7 @@ index 8ecc7b8..c116b3c 100644
       * Gets the video file if already downloaded, otherwise downloads it
       *
 diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/manga/MangaScreenModel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/manga/MangaScreenModel.kt
-index ecc0be1..a47853f 100644
+index ecc0be1..f50cc9f 100644
 --- a/app/src/main/java/eu/kanade/tachiyomi/ui/manga/MangaScreenModel.kt
 +++ b/app/src/main/java/eu/kanade/tachiyomi/ui/manga/MangaScreenModel.kt
 @@ -60,6 +60,7 @@ import eu.kanade.tachiyomi.data.coil.getBestColor
@@ -252,7 +262,7 @@ index ecc0be1..a47853f 100644
          chapters: List<Chapter>,
          // AY -->
          altDownloader: Boolean = false,
-@@ -1657,19 +1659,49 @@ class MangaScreenModel(
+@@ -1657,19 +1659,50 @@ class MangaScreenModel(
      ) {
          // SY -->
          val state = successState ?: return
@@ -295,6 +305,7 @@ index ecc0be1..a47853f 100644
  
 +    private operator fun Downloader.QueueResult.plus(other: Downloader.QueueResult) = Downloader.QueueResult(
 +        queued = queued + other.queued,
++        retried = retried + other.retried,
 +        alreadyDownloaded = alreadyDownloaded + other.alreadyDownloaded,
 +        alreadyQueued = alreadyQueued + other.alreadyQueued,
 +        sourceUnavailable = sourceUnavailable + other.sourceUnavailable,
