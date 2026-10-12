@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 05:03:52 +0000
+Subject: [PATCH] =?UTF-8?q?crash=20log:=20filter=20=E5=8D=93=E6=98=93?=
+ =?UTF-8?q?=E9=80=9A=20graphics=20noise=20and=20keep=20the=20app's=20own?=
+ =?UTF-8?q?=20log=20lines?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Same change as mihon-harmony 0012. On HarmonyOS 卓易通 the system side of
+the process writes hundreds of graphics-layer errors per minute into the
+app's logcat (BLASTBufferQueue "Faking releaseBufferCallback",
+SurfaceDelegator "client is nullptr", HwViewRootImpl, HwAssetManagerEx,
+"Display : result is null"). They fill the logcat buffer within minutes,
+so a crash log dump rarely contains anything the app itself logged.
+
+- CrashLogUtil reads logcat through a pipe instead of letting logcat write
+  the file, drops lines matching the known noise markers and writes how
+  many of each were dropped in the section header.
+- HarmonyLogBuffer (byte-identical to the Mihon file) is a LogcatLogger
+  that keeps the last 600 lines logged through logcat {} by the app
+  (DEBUG and above, with timestamps); App.kt registers it next to
+  AndroidLogcatLogger / XLogLogcatLogger and the dump appends its
+  contents as an "App log" section.
+---
+ app/src/main/java/eu/kanade/tachiyomi/App.kt  |  3 +
+ .../eu/kanade/tachiyomi/util/CrashLogUtil.kt  | 55 ++++++++++++++++++-
+ .../tachiyomi/util/system/HarmonyLogBuffer.kt | 37 +++++++++++++
+ 3 files changed, 94 insertions(+), 1 deletion(-)
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyLogBuffer.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/App.kt b/app/src/main/java/eu/kanade/tachiyomi/App.kt
+index 9c8aa04..eea9651 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/App.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/App.kt
+@@ -63,6 +63,7 @@ import eu.kanade.tachiyomi.network.NetworkPreferences
+ import eu.kanade.tachiyomi.ui.base.delegate.SecureActivityDelegate
+ import eu.kanade.tachiyomi.util.CrashLogUtil
+ import eu.kanade.tachiyomi.util.system.DeviceUtil
++import eu.kanade.tachiyomi.util.system.HarmonyLogBuffer
+ import eu.kanade.tachiyomi.util.system.WebViewUtil
+ import eu.kanade.tachiyomi.util.system.animatorDurationScale
+ import eu.kanade.tachiyomi.util.system.cancelNotification
+@@ -157,6 +158,8 @@ class App : Application(), DefaultLifecycleObserver, SingletonImageLoader.Factor
+             LogcatLogger.install()
+             LogcatLogger.loggers += XLogLogcatLogger() // SY Redirect Logcat to XLog
+             LogcatLogger.loggers += AndroidLogcatLogger(minLogPriority)
++            // Harmony: keep the app's own log lines for the crash log dump (see HarmonyLogBuffer).
++            LogcatLogger.loggers += HarmonyLogBuffer
+         }
+ 
+         setupNotificationChannels()
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/util/CrashLogUtil.kt b/app/src/main/java/eu/kanade/tachiyomi/util/CrashLogUtil.kt
+index 3344b80..1d486ca 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/util/CrashLogUtil.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/util/CrashLogUtil.kt
+@@ -5,6 +5,7 @@ import android.os.Build
+ import eu.kanade.tachiyomi.BuildConfig
+ import eu.kanade.tachiyomi.extension.ExtensionManager
+ import eu.kanade.tachiyomi.util.storage.getUriCompat
++import eu.kanade.tachiyomi.util.system.HarmonyLogBuffer
+ import eu.kanade.tachiyomi.util.system.WebViewUtil
+ import eu.kanade.tachiyomi.util.system.createFileInCacheDir
+ import eu.kanade.tachiyomi.util.system.toShareIntent
+@@ -29,7 +30,18 @@ class CrashLogUtil(
+             getExtensionsInfo()?.let { file.appendText("$it\n\n") }
+             exception?.let { file.appendText("$it\n\n") }
+ 
+-            Runtime.getRuntime().exec("logcat *:E -d -v year -v zone -f ${file.absolutePath}").waitFor()
++            // Harmony: 卓易通 floods logcat with graphics-layer errors that bury the app's own
++            // lines, so filter them out of the dump and append the in-app log buffer.
++            val process = Runtime.getRuntime().exec(arrayOf("logcat", "*:E", "-d", "-v", "year", "-v", "zone"))
++            val (logcatLines, filteredCounts) = process.inputStream.bufferedReader().useLines { filterNoise(it) }
++            process.waitFor()
++
++            file.appendText(logcatHeader(filteredCounts) + "\n")
++            file.appendText(logcatLines.joinToString("\n", postfix = "\n\n"))
++
++            val appLines = HarmonyLogBuffer.snapshot()
++            file.appendText("--- App log (last ${appLines.size} lines logged by Anikku itself) ---\n")
++            file.appendText(appLines.joinToString("\n", postfix = "\n"))
+ 
+             val uri = file.getUriCompat(context)
+             context.startActivity(uri.toShareIntent(context, "text/plain"))
+@@ -38,6 +50,31 @@ class CrashLogUtil(
+         }
+     }
+ 
++    /**
++     * Harmony: drops the graphics-layer error spam 卓易通 writes into the app's logcat and
++     * counts what was dropped, so the dump still says how noisy the session was.
++     */
++    private fun filterNoise(lines: Sequence<String>): Pair<List<String>, Map<String, Int>> {
++        val kept = mutableListOf<String>()
++        val filtered = sortedMapOf<String, Int>()
++        lines.forEach { line ->
++            val marker = HARMONY_NOISE_MARKERS.firstOrNull { it in line }
++            if (marker == null) {
++                kept += line
++            } else {
++                filtered[marker] = (filtered[marker] ?: 0) + 1
++            }
++        }
++        return kept to filtered
++    }
++
++    private fun logcatHeader(filteredCounts: Map<String, Int>): String {
++        if (filteredCounts.isEmpty()) return "--- Logcat ---"
++        val total = filteredCounts.values.sum()
++        val detail = filteredCounts.entries.joinToString(", ") { (marker, count) -> "$marker ×$count" }
++        return "--- Logcat ($total 卓易通 graphics-layer lines filtered: $detail) ---"
++    }
++
+     fun getDebugInfo(): String {
+         return """
+             App ID: ${BuildConfig.APPLICATION_ID}
+@@ -87,4 +124,20 @@ class CrashLogUtil(
+             null
+         }
+     }
++
++    private companion object {
++        /**
++         * Substrings that identify 卓易通's in-process graphics / asset shim output
++         * (tags BLASTBufferQueue, HwViewRootImpl, HwAssetManagerEx, Display and the
++         * SurfaceDelegator lines logged under the app's own package name as tag).
++         */
++        val HARMONY_NOISE_MARKERS = listOf(
++            "BLASTBufferQueue",
++            "SurfaceDelegator",
++            "client is nullptr",
++            "HwViewRootImpl",
++            "HwAssetManagerEx",
++            "Display : result is null",
++        )
++    }
+ }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyLogBuffer.kt b/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyLogBuffer.kt
+new file mode 100644
+index 0000000..c98b2c4
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyLogBuffer.kt
+@@ -0,0 +1,37 @@
++package eu.kanade.tachiyomi.util.system
++
++import logcat.LogPriority
++import logcat.LogcatLogger
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++
++/**
++ * Harmony: keeps the last few hundred lines the app itself logged through `logcat {}`.
++ *
++ * On 卓易通 the system side of the process floods logcat with graphics-layer errors
++ * (`BLASTBufferQueue`, `SurfaceDelegator`, ...) that push the app's own lines out of the
++ * logcat buffer within minutes, so a crash log dump taken later shows none of them.
++ * This buffer only ever sees what the app logged, and is appended to the dump.
++ */
++object HarmonyLogBuffer : LogcatLogger {
++
++    private const val CAPACITY = 600
++
++    private val lines = ArrayDeque<String>(CAPACITY)
++    private val lock = Any()
++    private val timeFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
++
++    override fun isLoggable(priority: LogPriority): Boolean = priority >= LogPriority.DEBUG
++
++    override fun log(priority: LogPriority, tag: String, message: String) {
++        val timestamp = synchronized(timeFormat) { timeFormat.format(Date()) }
++        val entry = "$timestamp ${priority.name.first()} $tag: $message"
++        synchronized(lock) {
++            if (lines.size >= CAPACITY) lines.removeFirst()
++            lines.addLast(entry)
++        }
++    }
++
++    fun snapshot(): List<String> = synchronized(lock) { lines.toList() }
++}

@@ -15,3 +15,5 @@
 0015-library-panorama-grid-fit-wide-covers.patch
 0016-downloads-finalize-with-fewer-saf-copies-and-error-reasons.patch
 0017-updater-stable-release-notes-while-downloading.patch
+0018-downloads-never-skip-silently-reuse-or-replace-leftover-folders.patch
+0019-crash-log-filter-harmony-noise-and-keep-app-log.patch

@@ -1,0 +1,336 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 05:02:46 +0000
+Subject: [PATCH] downloads: never drop an episode silently; reuse or
+ replace folders left on disk
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Same change as mihon-harmony 0011. Tapping "download" on an episode did
+nothing when a folder for it already existed on disk although the episode
+list showed it as not downloaded: Downloader.queueEpisodes filtered such
+episodes out with a storage lookup, so the button flashed and the queue
+stayed empty. On 卓易通 this happens after an interrupted finalisation
+(process frozen or killed while the video was being moved into the final
+folder) because the download cache only learns about folders on its hourly
+renewal.
+
+- queueEpisodes decides "already downloaded" from the download cache (the
+  same information the episode list shows) and reports what happened:
+  queued / already downloaded / already in the queue / source not
+  installed. DownloadManager adds the count of fillermarked episodes it
+  dropped because of the "deny downloading of fillermarked episodes"
+  setting, which used to be silent as well.
+- downloadEpisode checks the disk before creating the temporary directory:
+  a folder with one non-empty video is registered in the cache as
+  downloaded without re-downloading; a video still waiting in the _tmp
+  directory means the move was interrupted, so the final copy is only
+  trusted when it has the same size. Anything else is removed and the
+  download starts again (reusing whatever is left in _tmp).
+- The anime screen shows a snackbar when episodes were not queued, with
+  the reason.
+
+Differs from Mihon in the completeness rule: an episode is one video file
+(plus .nomedia), there is no page count to compare against.
+---
+ .../data/download/DownloadManager.kt          |   7 +-
+ .../tachiyomi/data/download/Downloader.kt     | 108 ++++++++++++++++--
+ .../tachiyomi/ui/manga/MangaScreenModel.kt    |  38 +++++-
+ .../moko-resources/base/strings.xml           |   6 +
+ .../moko-resources/zh-rCN/strings.xml         |   6 +
+ 5 files changed, 149 insertions(+), 16 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
+index 551b054..f6ba89e 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
+@@ -157,17 +157,18 @@ class DownloadManager(
+         altDownloader: Boolean = false,
+         video: Video? = null,
+         // <-- AY
+-    ) = downloadEpisodes(manga, chapters, autoStart, altDownloader, video)
++    ): Downloader.QueueResult = downloadEpisodes(manga, chapters, autoStart, altDownloader, video)
+     fun downloadEpisodes(
+         anime: Anime,
+         episodes: List<Episode>,
+         autoStart: Boolean = true,
+         altDownloader: Boolean = false,
+         video: Video? = null,
+-    ) {
++    ): Downloader.QueueResult {
+         // AY -->
+         val filteredEpisodes = getEpisodesToDownload(episodes)
+-        downloader.queueEpisodes(anime, filteredEpisodes, autoStart, altDownloader, video)
++        return downloader.queueEpisodes(anime, filteredEpisodes, autoStart, altDownloader, video)
++            .copy(fillermarked = episodes.size - filteredEpisodes.size)
+         // <-- AY
+     }
+ 
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 8ecc7b8..c116b3c 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -25,6 +25,7 @@ import eu.kanade.tachiyomi.torrentServer.TorrentServerUtils
+ import eu.kanade.tachiyomi.ui.player.loader.EpisodeLoader
+ import eu.kanade.tachiyomi.ui.player.loader.HosterLoader
+ import eu.kanade.tachiyomi.util.storage.DiskUtil
++import eu.kanade.tachiyomi.util.storage.DiskUtil.NOMEDIA_FILE
+ import eu.kanade.tachiyomi.util.storage.toFFmpegString
+ import eu.kanade.tachiyomi.util.system.copyToClipboard
+ import eu.kanade.tachiyomi.util.system.createFileInCacheDir
+@@ -308,22 +309,33 @@ class Downloader(
+         autoStart: Boolean,
+         changeDownloader: Boolean = false,
+         video: Video? = null,
+-    ) {
+-        if (episodes.isEmpty()) return
++    ): QueueResult {
++        if (episodes.isEmpty()) return QueueResult()
+ 
+-        val source = sourceManager.get(anime.source) as? HttpSource ?: return
++        val source = sourceManager.get(anime.source) as? HttpSource
++            ?: return QueueResult(sourceUnavailable = episodes.size)
+         val wasEmpty = queueState.value.isEmpty()
+ 
+-        val episodesToQueue = episodes.asSequence()
+-            // Filter out those already downloaded.
+-            .filter { provider.findChapterDir(it.name, it.scanlator, /* SY --> */ anime.ogTitle /* SY <-- */, source) == null }
++        // Harmony: decide "already downloaded" from the download cache (what the episode
++        // list shows) instead of probing storage. A folder the cache does not know about
++        // (interrupted finalisation, stale cache) is handled by downloadEpisode, which
++        // reuses it when complete and replaces it otherwise.
++        val (alreadyDownloaded, notDownloaded) = episodes.partition {
++            cache.isChapterDownloaded(
++                it.name,
++                it.scanlator,
++                /* SY --> */ anime.ogTitle, /* SY <-- */
++                anime.source,
++                skipCache = false,
++            )
++        }
++        val queuedEpisodeIds = queueState.value.map { it.episode.id }.toSet()
++        val (alreadyQueued, toQueue) = notDownloaded.partition { it.id in queuedEpisodeIds }
++        val episodesToQueue = toQueue
+             // Add episodes to queue from the start.
+             .sortedByDescending { it.sourceOrder }
+-            // Filter out those already enqueued.
+-            .filter { episode -> queueState.value.none { it.episode.id == episode.id } }
+             // Create a download for each one.
+             .map { Download(source, anime, it, changeDownloader, video) }
+-            .toList()
+ 
+         if (episodesToQueue.isNotEmpty()) {
+             addAllToQueue(episodesToQueue)
+@@ -357,6 +369,26 @@ class Downloader(
+                 DownloadJob.start(context)
+             }
+         }
++        return QueueResult(
++            queued = episodesToQueue.size,
++            alreadyDownloaded = alreadyDownloaded.size,
++            alreadyQueued = alreadyQueued.size,
++        )
++    }
++
++    /**
++     * Harmony: outcome of [queueEpisodes], so callers can tell the user why nothing
++     * started instead of silently dropping episodes.
++     */
++    data class QueueResult(
++        val queued: Int = 0,
++        val alreadyDownloaded: Int = 0,
++        val alreadyQueued: Int = 0,
++        val sourceUnavailable: Int = 0,
++        val fillermarked: Int = 0,
++    ) {
++        val skipped: Int
++            get() = alreadyDownloaded + alreadyQueued + sourceUnavailable + fillermarked
+     }
+ 
+     /**
+@@ -389,9 +421,19 @@ class Downloader(
+         }
+ 
+         val episodeDirname = provider.getChapterDirName(download.episode.name, download.episode.scanlator)
+-        val tmpDir = animeDir.createDirectory(episodeDirname + TMP_DIR_SUFFIX)!!
+ 
+         try {
++            // Harmony: the episode may already be on disk without the cache knowing
++            // (finalisation interrupted by a process kill, stale cache). Reuse a complete
++            // copy, remove an incomplete one; never skip silently.
++            if (reuseOrRemoveExistingEpisode(download, animeDir, episodeDirname)) {
++                download.status = Download.State.DOWNLOADED
++                return
++            }
++
++            val tmpDir = animeDir.createDirectory(episodeDirname + TMP_DIR_SUFFIX)
++                ?: throw IOException("Failed to create '$episodeDirname$TMP_DIR_SUFFIX'")
++
+             if (download.video == null) {
+                 // Pull video from network and add them to download object
+                 val hosters = EpisodeLoader.getHosters(download.episode, download.anime, download.source)
+@@ -453,6 +495,52 @@ class Downloader(
+         }
+     }
+ 
++    /**
++     * Harmony: handles an episode folder that already exists on disk although the download
++     * cache did not list the episode as downloaded.
++     *
++     * A video still waiting in the `_tmp` directory means the move into the final folder was
++     * interrupted; the final copy is then only trusted when it has the same size.
++     *
++     * @return true when the existing folder holds a complete video and has been registered as
++     * downloaded; false when there was nothing on disk or the leftover was removed so the
++     * download can start from scratch (reusing whatever is left in the `_tmp` directory).
++     */
++    private suspend fun reuseOrRemoveExistingEpisode(download: Download, animeDir: UniFile, episodeDirname: String): Boolean {
++        val existing = provider
++            .getValidChapterDirNames(download.episode.name, download.episode.scanlator)
++            .firstNotNullOfOrNull { animeDir.findFile(it) }
++            ?: return false
++        val name = existing.name ?: return false
++
++        val videos = existing.listFiles().orEmpty().filterNot { it.name == NOMEDIA_FILE || it.extension == "tmp" }
++        val tmpDir = animeDir.findFile(episodeDirname + TMP_DIR_SUFFIX)
++        val pendingVideos = tmpDir?.listFiles().orEmpty().filterNot { it.extension == "tmp" }
++        val video = videos.singleOrNull()
++        val complete = video != null && video.length() > 0 &&
++            (pendingVideos.isEmpty() || pendingVideos.any { it.length() == video.length() })
++
++        if (complete) {
++            logcat(LogPriority.INFO) {
++                "'${download.episode.name}' already on disk as '$name' (${video!!.length()} bytes); registering it as downloaded"
++            }
++            DiskUtil.createNoMediaFile(existing, context)
++            cache.addChapter(name, animeDir, download.anime)
++            // Whatever an earlier attempt left in the temporary directory is no longer needed.
++            tmpDir?.delete()
++            return true
++        }
++
++        logcat(LogPriority.WARN) {
++            "Removing incomplete leftover '$name' of '${download.episode.name}' " +
++                "(${videos.size} file(s), ${pendingVideos.size} pending in $TMP_DIR_SUFFIX)"
++        }
++        if (!existing.delete()) {
++            throw IOException(context.stringResource(AMR.strings.harmony_download_leftover_delete_failed, name))
++        }
++        return false
++    }
++
+     /**
+      * Gets the video file if already downloaded, otherwise downloads it
+      *
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/manga/MangaScreenModel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/manga/MangaScreenModel.kt
+index ecc0be1..a47853f 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/manga/MangaScreenModel.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/manga/MangaScreenModel.kt
+@@ -60,6 +60,7 @@ import eu.kanade.tachiyomi.data.coil.getBestColor
+ import eu.kanade.tachiyomi.data.download.DownloadCache
+ import eu.kanade.tachiyomi.data.download.DownloadManager
+ import eu.kanade.tachiyomi.data.download.DownloadProvider
++import eu.kanade.tachiyomi.data.download.Downloader
+ import eu.kanade.tachiyomi.data.download.model.Download
+ import eu.kanade.tachiyomi.data.torrentServer.service.TorrentServerService
+ import eu.kanade.tachiyomi.data.track.EnhancedTracker
+@@ -175,6 +176,7 @@ import tachiyomi.domain.source.service.SourceManager
+ import tachiyomi.domain.storage.service.StoragePreferences
+ import tachiyomi.domain.track.interactor.GetTracks
+ import tachiyomi.i18n.MR
++import tachiyomi.i18n.ank.AMR
+ import tachiyomi.i18n.aniyomi.AYMR
+ import tachiyomi.i18n.kmk.KMR
+ import tachiyomi.source.local.LocalSource
+@@ -1648,7 +1650,7 @@ class MangaScreenModel(
+      * Downloads the given list of chapters with the manager.
+      * @param chapters the list of chapters to download.
+      */
+-    private fun downloadChapters(
++    private suspend fun downloadChapters(
+         chapters: List<Chapter>,
+         // AY -->
+         altDownloader: Boolean = false,
+@@ -1657,19 +1659,49 @@ class MangaScreenModel(
+     ) {
+         // SY -->
+         val state = successState ?: return
++        var result = Downloader.QueueResult()
+         if (state.source is MergedSource) {
+             chapters.groupBy { it.mangaId }.forEach { map ->
+                 val manga = state.mergedData?.manga?.get(map.key) ?: return@forEach
+-                downloadManager.downloadChapters(manga, map.value)
++                result += downloadManager.downloadChapters(manga, map.value)
+             }
+         } else {
+             // SY <--
+             val manga = state.manga
+-            downloadManager.downloadChapters(manga, chapters, true, altDownloader, video)
++            result = downloadManager.downloadChapters(manga, chapters, true, altDownloader, video)
+         }
+         toggleAllSelection(false)
++        // Harmony: say why episodes were not queued instead of leaving the button idle.
++        if (result.skipped > 0) {
++            val reasons = buildList {
++                if (result.alreadyDownloaded > 0) {
++                    add(context.stringResource(AMR.strings.harmony_download_skipped_downloaded, result.alreadyDownloaded))
++                }
++                if (result.alreadyQueued > 0) {
++                    add(context.stringResource(AMR.strings.harmony_download_skipped_queued, result.alreadyQueued))
++                }
++                if (result.sourceUnavailable > 0) {
++                    add(context.stringResource(AMR.strings.harmony_download_skipped_no_source, result.sourceUnavailable))
++                }
++                if (result.fillermarked > 0) {
++                    add(context.stringResource(AMR.strings.harmony_download_skipped_fillermarked, result.fillermarked))
++                }
++            }
++            snackbarHostState.showSnackbar(
++                message = context.stringResource(AMR.strings.harmony_download_skipped, reasons.joinToString(" · ")),
++                withDismissAction = true,
++            )
++        }
+     }
+ 
++    private operator fun Downloader.QueueResult.plus(other: Downloader.QueueResult) = Downloader.QueueResult(
++        queued = queued + other.queued,
++        alreadyDownloaded = alreadyDownloaded + other.alreadyDownloaded,
++        alreadyQueued = alreadyQueued + other.alreadyQueued,
++        sourceUnavailable = sourceUnavailable + other.sourceUnavailable,
++        fillermarked = fillermarked + other.fillermarked,
++    )
++
+     /**
+      * Bookmarks the given list of chapters.
+      * @param chapters the list of chapters to bookmark.
+diff --git a/i18n-ank/src/commonMain/moko-resources/base/strings.xml b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+index 007e5d3..4486c83 100644
+--- a/i18n-ank/src/commonMain/moko-resources/base/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+@@ -271,4 +271,10 @@
+     <string name="harmony_download_unexpected_files">Download folder has unexpected contents: %1$s</string>
+     <string name="harmony_download_error_prefix">Error: %1$s</string>
+     <string name="harmony_download_interrupted">Interrupted (network lost or downloader stopped); tap the episode to download again</string>
++    <string name="harmony_download_skipped">Not queued: %1$s</string>
++    <string name="harmony_download_skipped_downloaded">%1$d already downloaded</string>
++    <string name="harmony_download_skipped_queued">%1$d already in the queue</string>
++    <string name="harmony_download_skipped_no_source">%1$d from a source that is not installed</string>
++    <string name="harmony_download_skipped_fillermarked">%1$d fillermarked (download denied in settings)</string>
++    <string name="harmony_download_leftover_delete_failed">Could not remove the leftover \'%1$s\' from an earlier download</string>
+ </resources>
+diff --git a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+index 64711f5..c6e902a 100644
+--- a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+@@ -266,4 +266,10 @@
+     <string name="harmony_download_unexpected_files">下载目录内容异常：%1$s</string>
+     <string name="harmony_download_error_prefix">出错：%1$s</string>
+     <string name="harmony_download_interrupted">下载被中断（网络断开或下载服务被停止），点一下该集重新下载</string>
++    <string name="harmony_download_skipped">未加入下载队列：%1$s</string>
++    <string name="harmony_download_skipped_downloaded">%1$d 集已下载</string>
++    <string name="harmony_download_skipped_queued">%1$d 集已在队列中</string>
++    <string name="harmony_download_skipped_no_source">%1$d 集的来源未安装</string>
++    <string name="harmony_download_skipped_fillermarked">%1$d 集为「标记剧集」（下载设置中已选择不下载）</string>
++    <string name="harmony_download_leftover_delete_failed">无法删除上次下载残留的「%1$s」</string>
+ </resources>
