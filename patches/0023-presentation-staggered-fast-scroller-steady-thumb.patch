@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 17:09:17 +0000
+Subject: [PATCH] presentation: keep the staggered fast scroller thumb steady
+
+The thumb position was estimated from the average height of the items
+currently on screen. A panorama grid mixes 3:2 and 2:3 cells, so that
+average changed whenever the window did and the thumb jumped.
+
+Heights are now recorded per index as items are measured. The average
+moves only when a stored height changes, and items not seen yet use
+that average. Full-line rows (search bar, section header) are left out
+of the average; LazyStaggeredGridItemInfo does not expose the span, so
+a row is recognised by being wider than a lane cell. Lane count is the
+most columns observed so far. Dragging still maps the thumb to
+scrollToItem(laneCount * row, offset within the row).
+
+Item offset does not include beforeContentPadding (padding is applied
+at placement), so the scroll offset follows the content position and
+the padding is added only to the scroll range.
+
+Harmony-only: the estimate is line-identical in mihon-harmony 0016 and
+anikku-harmony 0023; Animeko does not use this scroller.
+---
+ .../core/components/VerticalFastScroller.kt   | 101 ++++++++++++++----
+ 1 file changed, 81 insertions(+), 20 deletions(-)
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+index 91c439a..5204200 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+@@ -28,6 +28,8 @@ import androidx.compose.foundation.systemGestureExclusion
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.State
++import androidx.compose.runtime.derivedStateOf
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableFloatStateOf
+ import androidx.compose.runtime.mutableStateMapOf
+@@ -56,6 +58,7 @@ import kotlinx.coroutines.flow.sample
+ import tachiyomi.presentation.core.components.Scroller.EXACT_HEIGHT_KEY_PREFIX
+ import tachiyomi.presentation.core.components.Scroller.STICKY_HEADER_KEY_PREFIX
+ import kotlin.math.abs
++import kotlin.math.ceil
+ import kotlin.math.max
+ import kotlin.math.min
+ import kotlin.math.roundToInt
+@@ -727,8 +730,9 @@ private fun computeScrollRange(
+ /**
+  * Draws a vertical fast scroller next to a [androidx.compose.foundation.lazy.staggeredgrid.LazyVerticalStaggeredGrid].
+  *
+- * Lanes of a staggered grid have independent heights, so the scroll range is estimated from the
+- * average visible item height: one "row" is [laneCount] items.
++ * Lanes have independent heights. The scroll range is estimated from item heights seen so far,
++ * not from the items currently on screen: a window average jumps whenever a 3:2 cell replaces a
++ * 2:3 cell, and the thumb jitters with it.
+  */
+ @Composable
+ fun VerticalStaggeredGridFastScroller(
+@@ -772,11 +776,12 @@ fun VerticalStaggeredGridFastScroller(
+                 state.layoutInfo.afterContentPadding
+             val thumbHeightPx = with(LocalDensity.current) { ThumbLength.toPx() }
+             val trackHeightPx = heightPx - thumbHeightPx
++            val estimate by rememberStaggeredGridEstimate(state)
+ 
+             // When thumb dragged
+             LaunchedEffect(thumbOffsetY) {
+                 if (layoutInfo.totalItemsCount == 0 || !isThumbDragged) return@LaunchedEffect
+-                val estimate = estimateStaggeredGrid(state) ?: return@LaunchedEffect
++                if (estimate.rowHeight <= 0f) return@LaunchedEffect
+ 
+                 val scrollRatio = (thumbOffsetY - thumbTopPadding) / trackHeightPx
+                 val scrollAmt = scrollRatio * (estimate.scrollRange - heightPx).coerceAtLeast(1f)
+@@ -793,7 +798,7 @@ fun VerticalStaggeredGridFastScroller(
+             // When list scrolled
+             LaunchedEffect(state.firstVisibleItemIndex, state.firstVisibleItemScrollOffset) {
+                 if (state.layoutInfo.totalItemsCount == 0 || isThumbDragged) return@LaunchedEffect
+-                val estimate = estimateStaggeredGrid(state) ?: return@LaunchedEffect
++                if (estimate.rowHeight <= 0f) return@LaunchedEffect
+                 val extraScrollRange = (estimate.scrollRange - heightPx).coerceAtLeast(1f)
+                 val proportion = (estimate.scrollOffset / extraScrollRange).coerceIn(0f, 1f)
+                 thumbOffsetY = trackHeightPx * proportion + thumbTopPadding
+@@ -871,22 +876,78 @@ private class StaggeredGridEstimate(
+     val scrollRange: Float,
+ )
+ 
+-private fun estimateStaggeredGrid(state: LazyStaggeredGridState): StaggeredGridEstimate? {
+-    val layoutInfo = state.layoutInfo
+-    val visibleItems = layoutInfo.visibleItemsInfo
+-    if (visibleItems.isEmpty() || layoutInfo.totalItemsCount == 0) return null
+-
+-    val laneCount = (visibleItems.maxOf { it.lane } + 1).coerceAtLeast(1)
+-    val rowHeight = visibleItems.sumOf { it.size.height }.toFloat() / visibleItems.size +
+-        layoutInfo.mainAxisItemSpacing
+-    if (rowHeight <= 0f) return null
+-
+-    val firstChild = visibleItems.minBy { it.index }
+-    val rowsBefore = firstChild.index / laneCount
+-    val scrollOffset = rowsBefore * rowHeight - firstChild.offset.y + layoutInfo.beforeContentPadding
+-    val totalRows = (layoutInfo.totalItemsCount + laneCount - 1) / laneCount
+-    val scrollRange = totalRows * rowHeight + layoutInfo.beforeContentPadding + layoutInfo.afterContentPadding
+-    return StaggeredGridEstimate(laneCount, rowHeight, scrollOffset, scrollRange)
++/**
++ * Heights seen so far, kept on the grid state so the average does not follow whichever mix of
++ * 3:2 and 2:3 cells happens to be on screen.
++ */
++private class StaggeredGridMeasurements {
++    val heights = HashMap<Int, Int>()
++    var heightSum = 0L
++    var laneCount = 1
++}
++
++@Composable
++private fun rememberStaggeredGridEstimate(state: LazyStaggeredGridState): State<StaggeredGridEstimate> {
++    val measurements = remember(state) { StaggeredGridMeasurements() }
++    return remember(state) {
++        derivedStateOf {
++            val layoutInfo = state.layoutInfo
++            val visibleItems = layoutInfo.visibleItemsInfo
++            // LazyStaggeredGridItemInfo does not expose the span; a full-line row (search bar,
++            // section header) is recognised by being wider than a lane cell.
++            val laneWidth = visibleItems.minOfOrNull { it.size.width } ?: 0
++            visibleItems.fastForEach { item ->
++                val lanes = item.lane + 1
++                if (lanes > measurements.laneCount) measurements.laneCount = lanes
++                if (laneWidth > 0 && item.size.width > laneWidth * 3 / 2) {
++                    measurements.heights.remove(item.index)?.let { measurements.heightSum -= it }
++                    return@fastForEach
++                }
++                val height = item.size.height
++                val previous = measurements.heights.put(item.index, height)
++                if (previous == null) {
++                    measurements.heightSum += height
++                } else if (previous != height) {
++                    measurements.heightSum += height - previous
++                }
++            }
++
++            val averageHeight = if (measurements.heights.isNotEmpty()) {
++                measurements.heightSum.toFloat() / measurements.heights.size
++            } else {
++                visibleItems.firstOrNull()?.size?.height?.toFloat() ?: 0f
++            }
++            val laneCount = measurements.laneCount.coerceAtLeast(1)
++            val rowSpacing = layoutInfo.mainAxisItemSpacing
++            val totalItemsCount = layoutInfo.totalItemsCount
++            val first = visibleItems.firstOrNull()
++            var beforeFirst = 0f
++            var beforeAll = 0f
++            for (index in 0 until totalItemsCount) {
++                if (first != null && index == first.index) beforeFirst = beforeAll
++                beforeAll += measurements.heights[index]?.toFloat() ?: averageHeight
++            }
++
++            // offset.y is relative to the content start (negative once the item has scrolled off
++            // the top); beforeContentPadding is applied only at placement, so a grid at rest
++            // reports scroll offset 0 and the padding belongs to the range only.
++            val scrollOffset = if (first == null) {
++                0f
++            } else {
++                beforeFirst / laneCount + rowSpacing * (first.index / laneCount) - first.offset.y
++            }
++            val scrollRange = beforeAll / laneCount +
++                rowSpacing * ceil(totalItemsCount.toFloat() / laneCount) +
++                layoutInfo.beforeContentPadding +
++                layoutInfo.afterContentPadding
++            StaggeredGridEstimate(
++                laneCount = laneCount,
++                rowHeight = averageHeight + rowSpacing,
++                scrollOffset = scrollOffset,
++                scrollRange = scrollRange,
++            )
++        }
++    }
+ }
+ // Harmony <--
+ 

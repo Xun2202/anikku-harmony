@@ -28,6 +28,9 @@ Anikku 先在用户选择的 SAF 目录里创建 `Video.tmp`，再把这个 `con
 本构建的做法：ffmpeg 改写到 App 私有缓存里的普通文件，写完后再复制进下载目录；目录/文件改名失败时自动改为「复制后删除」。
 另外提供「使用应用私有目录」一键选项，完全绕开 SAF。
 
+- **「检查更新」可能一直停在旧版本**（preview.12 及之前）：更新器取 Release 列表里的第一项，GitHub 的列表顺序不保证按版本（Mihon 在上游 0.21.0 → 0.21.1 时实际中招）。preview.13（补丁 0024）起按版本号取最大。
+- 书架 / 浏览页显示模式新增「**全景紧凑网格**」（preview.13，补丁 0022）；瀑布流里右侧快速滚动条不再抽搐（补丁 0023）。
+
 **鸿蒙图库会收录下载的视频。** 卓易通把应用选的 SAF 文件夹映射到鸿蒙文件管理的「我的手机 → 兼容应用数据 → …」下，
 鸿蒙的媒体扫描会把整棵树扫一遍，并且**不认 `.nomedia`**（华为官方文档也只说图库按文件类型收录）。它判断“是不是视频”只看扩展名，
 所以本构建从 preview.2 起把下载完成的视频存成 `<集>.mkv.anikku`：对系统来说是“未知类型文件”，图库不收；Anikku 自己是通过文件描述符交给 mpv 播放的，
@@ -104,6 +107,9 @@ Anikku 先在用户选择的 SAF 目录里创建 `Video.tmp`，再把这个 `con
 | [`0019-crash-log-filter-harmony-noise-and-keep-app-log.patch`](./patches/0019-crash-log-filter-harmony-noise-and-keep-app-log.patch) | 与 mihon-harmony 0012 同源：崩溃日志去噪。卓易通会往应用自己的 logcat 里每分钟写几百条图形层错误（`BLASTBufferQueue`、`SurfaceDelegator client is nullptr`、`HwViewRootImpl`、`HwAssetManagerEx`、`Display : result is null`），几分钟就把缓冲区挤满。`CrashLogUtil` 改为读 logcat 管道、按已知特征过滤并写明过滤数量；新增 `HarmonyLogBuffer`（内存里保留应用自己最近 600 行 `logcat {}` 输出，与 Mihon 的文件逐字节相同），导出时作为「App log」小节附在末尾。 |
 | [`0020-library-panorama-grid-staggered-and-wider-auto-columns.patch`](./patches/0020-library-panorama-grid-staggered-and-wider-auto-columns.patch) | 书架「全景松散网格」的两处排版问题（0015 的后续）。① 每行数量「自动」时，横版封面偏窄：自动列宽沿用书形网格的 128 dp 下限，3:2 的封面只有竖版封面那么宽、三分之二高；全景模式改用 168 dp 下限（手机两列、约 530 dp 起三列），横版封面大致拿到竖版封面在 128 dp 下的面积；手动固定列数不受影响。② 竖版封面和横版封面同一行时横版下面留一大块空白：`LazyVerticalGrid` 每行按最高的格子算高度。全景模式改用 `LazyVerticalStaggeredGrid`，每一列各自往下排，不同高度的格子紧挨着不留空；给瀑布流网格补了一个快速滚动条（`presentation-core` 新增 `VerticalStaggeredGridFastScroller`，按可见项平均高度估算，与 Irregular 版同一思路）。另把每部作品的封面横竖比缓存到进程生命周期，格子滚回视野时不再先按书形再跳成横版；全景模式下未知封面默认按 16:9。Harmony 独有：Mihon 没有全景封面功能，Animeko 没有这种网格。 |
 | [`0021-browse-panorama-grids-staggered-and-wider-auto-columns.patch`](./patches/0021-browse-panorama-grids-staggered-and-wider-auto-columns.patch) | 0020 的后续：插件浏览页和「相关作品」页的全景网格也改成瀑布流 + 自动列宽 168 dp（手动固定列数不变；横版和竖版封面混排时不留空；分区标题、分页占位整行）。列数偏好用一个仍按 `Adaptive(128.dp)` / `Fixed(n)` 布局的 `CountedGridCells` 带出来（上游 `GridCells.Fixed` 的列数读不到），非全景模式的网格布局不变。封面横竖比缓存与书架共用。没改的：作品详情页的季度网格（从不走全景）。行为差异：浏览页全景模式多了一个快速滚动条。Harmony 独有，同 0020。 |
+| [`0022-library-panorama-compact-grid-display-mode.patch`](./patches/0022-library-panorama-compact-grid-display-mode.patch) | 新增显示模式「全景紧凑网格」：标题压在封面上的紧凑网格，套用全景松散网格同一套规则（横版封面 3:2、瀑布流、自动列宽 168 dp、封面横竖比按作品缓存）。序列化 `COMPACT_GRID_PANORAMA`，排在紧凑网格之后；书架显示设置、浏览页 / 相关作品页的显示模式菜单各多一项。与 mihon-harmony 0015 同源。 |
+| [`0023-presentation-staggered-fast-scroller-steady-thumb.patch`](./patches/0023-presentation-staggered-fast-scroller-steady-thumb.patch) | 修复全景网格上下滑动时右侧快速滚动条「抽搐」：0020 的瀑布流滚动条用当前屏上条目的平均高度估算位置，3:2 与 2:3 格子换进换出时平均值跟着变、拇指来回跳。现在按条目索引记住量过的高度（没见过的用累计平均），满行条目（搜索栏等，按比单格宽判断）不计入，列数取见过的最大值；`offset.y` 相对内容起点，顶部 padding 只算进总长度。与 mihon-harmony 0016 的估算段逐字相同。 |
+| [`0024-updater-pick-highest-harmony-version.patch`](./patches/0024-updater-pick-highest-harmony-version.patch) | 修复「检查更新」可能拉不到最新版：`getLatest()` 原来取列表**第一项**，GitHub 的列表顺序并不保证按版本（Mihon 已实际中招：上游出 0.21.1 后镜像里 `v0.21.0-harmony-preview.2` 排在 `v0.21.1-harmony-preview.1` 前面）。现在候选按 `(主, 次, 补丁, harmony 号)` 四元组排序取最大，合并显示的更新日志也按这个顺序；解析不了的 tag 排最后。附单元测试。与 mihon-harmony 0017 同源；animeko-harmony 0002 本来就是排序取最大，不适用。 |
 
 补丁按 [`patches/series`](./patches/series) 的顺序套用；已被官方合入的补丁会被 `prepare-source.sh` 自动跳过。
 

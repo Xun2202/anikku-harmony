@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 17:19:17 +0000
+Subject: [PATCH] updater: pick the highest harmony version instead of the
+ first listed
+
+getLatest() took the first release of the list GetApplicationRelease had
+already narrowed to the channel (and, for the update check, to releases newer
+than the running build). GitHub does not promise an order and the mirror that
+CI writes to the repo branch is the API answer at the time it ran, so a preview
+of the last upstream version could sit in front of a newer one and the app kept
+offering the older build.
+
+The candidates are now ordered by their (major, minor, patch, harmony) tuple,
+newest first; the joined release notes follow that order. Tags that do not
+parse sort last. The regex and the comparison move to file level so the
+extension function can share them with the class. Adds a unit test with the
+newest release listed second.
+
+Harmony-only: same bug and fix as mihon-harmony 0017; Animeko 0002 already
+sorts and takes the max.
+---
+ .../interactor/GetApplicationRelease.kt       | 62 +++++++++++--------
+ .../interactor/GetApplicationReleaseTest.kt   | 48 ++++++++++++++
+ 2 files changed, 84 insertions(+), 26 deletions(-)
+
+diff --git a/domain/src/main/java/tachiyomi/domain/release/interactor/GetApplicationRelease.kt b/domain/src/main/java/tachiyomi/domain/release/interactor/GetApplicationRelease.kt
+index 706ddcb..10402b9 100644
+--- a/domain/src/main/java/tachiyomi/domain/release/interactor/GetApplicationRelease.kt
++++ b/domain/src/main/java/tachiyomi/domain/release/interactor/GetApplicationRelease.kt
+@@ -46,7 +46,6 @@ class GetApplicationRelease(
+         val latest = releases.getLatest() ?: return Result.NoNewUpdate
+         // KMK <--
+ 
+-
+         // Check if latest version is different from current version
+         val isNewVersion = isNewVersion(
+             isPreview = arguments.isPreview,
+@@ -114,25 +113,6 @@ class GetApplicationRelease(
+         }
+     }
+ 
+-    /**
+-     * Returns `[major, minor, patch, harmonyPatch]` or null when [value] is not an Anikku Harmony
+-     * version string or release tag.
+-     */
+-    private fun parseHarmonyVersion(value: String): List<Int>? {
+-        val match = HARMONY_VERSION_REGEX.find(value) ?: return null
+-        return match.groupValues.drop(1).map { it.toInt() }
+-    }
+-
+-    private fun compareVersions(a: List<Int>, b: List<Int>): Int {
+-        val size = maxOf(a.size, b.size)
+-        for (index in 0 until size) {
+-            val x = a.getOrElse(index) { 0 }
+-            val y = b.getOrElse(index) { 0 }
+-            if (x != y) return x.compareTo(y)
+-        }
+-        return 0
+-    }
+-
+     data class Arguments(
+         val isFoss: Boolean,
+         /** If current version is Preview (beta) build */
+@@ -152,20 +132,50 @@ class GetApplicationRelease(
+         data object NoNewUpdate : Result
+         data object OsTooOld : Result
+     }
+-
+-    private companion object {
+-        val HARMONY_VERSION_REGEX = Regex("""(\d+)\.(\d+)\.(\d+)-harmony(?:-preview)?\.(\d+)""")
+-    }
+ }
+ 
+ // KMK --.
+ internal fun List<Release>.getLatest(): Release? {
+-    return firstOrNull()
++    // Harmony -->
++    // GitHub does not guarantee the list order (a patch release of an older upstream version can
++    // be listed before a newer one), so order the candidates by their harmony version instead of
++    // taking the first entry. Tags that do not parse sort last.
++    val ordered = sortedWith(
++        compareByDescending<Release> { parseHarmonyVersion(it.version) != null }
++            .thenComparator { a, b ->
++                compareVersions(parseHarmonyVersion(b.version).orEmpty(), parseHarmonyVersion(a.version).orEmpty())
++            },
++    )
++    return ordered.firstOrNull()
++        // Harmony <--
+         ?.copy(
+-            info = joinToString("\r-----\r") {
++            info = ordered.joinToString("\r-----\r") {
+                 "## ${it.version}\r\r" +
+                     it.info
+             },
+         )
+ }
+ // KMK <--
++
++// Harmony -->
++private val HARMONY_VERSION_REGEX = Regex("""(\d+)\.(\d+)\.(\d+)-harmony(?:-preview)?\.(\d+)""")
++
++/**
++ * Returns `[major, minor, patch, harmonyPatch]` or null when [value] is not an Anikku Harmony
++ * version string or release tag.
++ */
++private fun parseHarmonyVersion(value: String): List<Int>? {
++    val match = HARMONY_VERSION_REGEX.find(value) ?: return null
++    return match.groupValues.drop(1).map { it.toInt() }
++}
++
++private fun compareVersions(a: List<Int>, b: List<Int>): Int {
++    val size = maxOf(a.size, b.size)
++    for (index in 0 until size) {
++        val x = a.getOrElse(index) { 0 }
++        val y = b.getOrElse(index) { 0 }
++        if (x != y) return x.compareTo(y)
++    }
++    return 0
++}
++// Harmony <--
+diff --git a/domain/src/test/java/tachiyomi/domain/release/interactor/GetApplicationReleaseTest.kt b/domain/src/test/java/tachiyomi/domain/release/interactor/GetApplicationReleaseTest.kt
+index bddb163..6180a37 100644
+--- a/domain/src/test/java/tachiyomi/domain/release/interactor/GetApplicationReleaseTest.kt
++++ b/domain/src/test/java/tachiyomi/domain/release/interactor/GetApplicationReleaseTest.kt
+@@ -150,4 +150,52 @@ class GetApplicationReleaseTest {
+         coVerify(exactly = 0) { releaseService.releaseNotes(any()) }
+         result shouldBe GetApplicationRelease.Result.NoNewUpdate
+     }
++
++    // Harmony -->
++    @Test
++    fun `When an older harmony release is listed first expect the highest version`() = runTest {
++        every { preference.get() } returns 0
++        every { preference.set(any()) }.answers { }
++
++        val releases = listOf(
++            Release(
++                "v0.2.0-harmony-preview.12",
++                "older",
++                "http://example.com/release_link",
++                "http://example.com/release_link.apk",
++            ),
++            Release(
++                "v0.2.1-harmony-preview.1",
++                "newest",
++                "http://example.com/release_link",
++                "http://example.com/release_link.apk",
++            ),
++            Release(
++                "v0.2.0-harmony-preview.13",
++                "middle",
++                "http://example.com/release_link",
++                "http://example.com/release_link.apk",
++            ),
++        )
++
++        coEvery { releaseService.releaseNotes(any()) } returns releases
++
++        val result = getApplicationRelease.await(
++            GetApplicationRelease.Arguments(
++                isFoss = false,
++                isPreview = true,
++                commitCount = 0,
++                versionName = "0.2.0-harmony.11",
++                repository = "test",
++            ),
++        )
++
++        val update = result as GetApplicationRelease.Result.NewUpdate
++        update.release.version shouldBe "v0.2.1-harmony-preview.1"
++        update.release.info shouldBe
++            "## v0.2.1-harmony-preview.1\r\rnewest\r-----\r" +
++            "## v0.2.0-harmony-preview.13\r\rmiddle\r-----\r" +
++            "## v0.2.0-harmony-preview.12\r\rolder"
++    }
++    // Harmony <--
+ }

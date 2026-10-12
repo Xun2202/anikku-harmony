@@ -19,3 +19,6 @@
 0019-crash-log-filter-harmony-noise-and-keep-app-log.patch
 0020-library-panorama-grid-staggered-and-wider-auto-columns.patch
 0021-browse-panorama-grids-staggered-and-wider-auto-columns.patch
+0022-library-panorama-compact-grid-display-mode.patch
+0023-presentation-staggered-fast-scroller-steady-thumb.patch
+0024-updater-pick-highest-harmony-version.patch
