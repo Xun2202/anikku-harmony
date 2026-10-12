@@ -48,6 +48,8 @@ patches/
   0015-library-panorama-grid-fit-wide-covers.patch              书架「全景松散网格」按 3:2 横版排格子 (fitToPanoramaCover = true, 与浏览页一致)
   0016-downloads-finalize-with-fewer-saf-copies-and-error-reasons.patch  下载收尾少抄两遍视频 (直接写最终名 + 标记, 目录用 moveDocument/合并), 队列显示失败原因
   0017-updater-stable-release-notes-while-downloading.patch   更新页 remember { GFMFlavourDescriptor() } (说明文字下载时不再闪烁); ffmpeg 原因去掉 [tcp @ 0x…] 前缀
+  0018-downloads-never-skip-silently-reuse-or-replace-leftover-folders.patch  点「下载」不再被静默跳过: 按缓存判断已下载, 残留目录完整则登记/不完整则删, Snackbar 说明原因
+  0019-crash-log-filter-harmony-noise-and-keep-app-log.patch  崩溃日志过滤卓易通图形层噪音 + 附应用自己的最近 600 行日志 (HarmonyLogBuffer)
 scripts/prepare-source.sh                  套补丁 + 改版本号 (CI 与本地通用)
 scripts/write-release-index.sh             把 Releases 接口返回写到 repo 分支 (releases.json / latest.json)
 .github/workflows/harmony_preview.yml      编译、重签、发布, 然后写 Release 索引
@@ -185,6 +187,17 @@ git format-patch -o /tmp/new-patches --no-signature --zero-commit v0.3.0..HEAD
   而更新页按钮文字读 `downloadProgress()`，下载期间每个 tick 都重组，于是说明文字闪。Mihon v0.20.4 上游（`NewUpdateScreen.kt`）本来就是 `remember`，
   KMK 的那份漏了；上游若合入同样的 `remember`，脚本会自动跳过。`Downloader` 的 ffmpeg `LogCallback`：`FFMPEG_CONTEXT_PREFIX` 正则去掉
   `[tcp @ 0x…] ` 之类前缀后再进 `recentLogs`，与上一条相同则丢弃。
+- 0018 改 `Downloader.kt`（`queueEpisodes()` 返回新增的 `data class QueueResult(queued, alreadyDownloaded, alreadyQueued, sourceUnavailable, fillermarked)`，
+  「已下载」改用 `cache.isChapterDownloaded(name, scanlator, anime.ogTitle, anime.source, skipCache = false)`；`downloadEpisode()` 把 `createDirectory(_tmp)` 挪进 `try`，
+  之前先调新函数 `reuseOrRemoveExistingEpisode(download, animeDir, episodeDirname)`：`getValidChapterDirNames` 逐个 `animeDir.findFile`，目录里除 `.nomedia` / `*.tmp` 外恰一个文件且 `length() > 0`、
+  并且 `_tmp` 里没有视频或有同大小的视频 → `createNoMediaFile` + `cache.addChapter(name, …)` + 删 `_tmp` + 返回 true；否则 `existing.delete()`（删不掉抛 `harmony_download_leftover_delete_failed`）），
+  `DownloadManager.downloadChapters()/downloadEpisodes()`（返回 `QueueResult`，`fillermarked = episodes.size - filteredEpisodes.size`），
+  `MangaScreenModel.downloadChapters()`（改 `suspend`，MergedSource 分支用私有 `plus` 累加，`result.skipped > 0` 时拼 Snackbar），
+  六条字符串 `harmony_download_skipped*` / `harmony_download_leftover_delete_failed`（i18n-ank base + zh-rCN）。`PlayerViewModel` / `LibraryUpdateJob` 等调用方忽略返回值。
+  与 mihon-harmony 0011 的差异只在完整性规则（一个视频 vs 页数）和 `fillermarked` 一项。
+- 0019 改 `CrashLogUtil.kt`（`Runtime.exec(arrayOf("logcat", "*:E", "-d", "-v", "year", "-v", "zone"))` 读 stdout，`filterNoise()` 按 `HARMONY_NOISE_MARKERS` 六个子串过滤并计数，
+  `logcatHeader()` 写「--- Logcat (N 卓易通 graphics-layer lines filtered: …) ---」，末尾追加「--- App log (last N lines …) ---」+ `HarmonyLogBuffer.snapshot()`）、
+  新文件 `util/system/HarmonyLogBuffer.kt`（与 mihon-harmony 0012 的同名文件**逐字节相同**，改一处同步另一处）、`App.kt`（`LogcatLogger.loggers += HarmonyLogBuffer`，排在 XLog / Android logger 之后）。
 
 ### 5.2 加新补丁
 
@@ -250,6 +263,8 @@ gh release list --repo Xun2202/anikku-harmony
 | 点「下载」后停在「正在下载… (0%)」、按钮灰掉，一直不动（preview.5 / preview.6 也会） | 更新下载是 WorkManager expedited 任务，卓易通从不派发，worker 没跑过（见 0013；这才是 0011 之后还卡住的原因）。升级到 preview.7 起的版本。升级后若 20 秒变「重试」，说明普通任务也没被派发：设置 → 高级 → 转储崩溃日志，看 logcat 里有没有 `WM-WorkerWrapper` 启动 `AppUpdateDownloadJob` 的记录 |
 | 「检查更新」toast「HTTP error 403」 | 匿名 `api.github.com` 的配额（每个出口 IP 每小时 60 次）被用完，NAT / 代理后面所有人共用；仓库本身公开可访问。等一小时或换网络；preview.7 起先读 `repo` 分支的镜像（`raw.githubusercontent.com`），一般不会再撞上。仍 403 说明镜像也读不到（被墙 / 超时 10 秒），看 logcat 里的 `Release mirror unavailable` |
 | 下载进度到 100% 后变成「!」，重试还是一样；日志里成对出现 `DocumentsContractApi21: Failed to renameTo …/<集>_tmp/<集>.mkv.anikku` 与 `…/<集>` | preview.7 及之前：卓易通 SAF 不支持 `renameDocument`，0001 的回退把整段视频在 SAF 里再复制两遍，失败又没有提示（见 0016）。升级到 preview.8 起的版本；之后再出错，下载队列的那一行会直接写出原因（「出错：…」），把这句话连同崩溃日志一起发来。残留的 `<集>_tmp` 目录不用手动删，重新下载会合并 / 覆盖 |
+| 点「下载」按钮没反应、队列为空也没提示 | preview.9 及之前：磁盘上已有同名剧集目录（收尾被打断的残留）但下载缓存不知道，`queueEpisodes` 静默丢弃（见 0018）。preview.10 起会弹「未加入下载队列：…」，残留目录完整则直接登记为已下载，不完整则删掉重下；「不要下载标记剧集」排除的也会说明。若仍无提示，看 crash log 末尾「App log」小节有没有 `Removing incomplete leftover` / `already on disk` |
+| 导出的崩溃日志几乎全是 `BLASTBufferQueue` / `SurfaceDelegator` | 卓易通图形层噪音。preview.10 起会被过滤并在「--- Logcat (N … filtered) ---」里计数；应用自己的日志看末尾「App log」小节。出现新的刷屏 tag 就往 `CrashLogUtil.HARMONY_NOISE_MARKERS` 加子串（与 Mihon 同步） |
 | 更新页点「下载」后，上面的版本说明文字随进度一直闪烁 / 短暂变空 | preview.8 及之前：每个进度 tick 都新建 `GFMFlavourDescriptor()`，Markdown 渲染库当成内容变了重新解析（见 0017）。升级到 preview.9 起的版本；按钮上的百分比照常跳动即可，说明文字不应再变 |
 | 刚发版几分钟内「检查更新」说「没有新版本」 | `raw.githubusercontent.com` 对 `releases.json` 有最多约 5 分钟缓存，加上 OkHttp 本地缓存；等几分钟再点。确认 `repo` 分支的 `releases.json` 已包含新 tag（发版 workflow 最后一步「Update the release index」） |
 | `repo` 分支的 `releases.json` 没更新 / 不存在 | 发版 workflow 的最后一步失败，或 Release 是手动改的而 `release_index.yml` 没跑。到 Actions 手动运行「Release index」；本地也可 `GH_TOKEN=... scripts/write-release-index.sh Xun2202/anikku-harmony` |
@@ -305,3 +320,5 @@ gh release list --repo Xun2202/anikku-harmony
   加入补丁 0017（`remember` + ffmpeg 原因去 `[tcp @ 0x…]` 前缀）；本地 `assemblePreview -Penable-updater` 编译通过，干净 v0.2.0 上 `prepare-source.sh … 9`
   套用 17 张补丁后与本地树 `cmp` 一致。同时把 Mihon 的同病（矩阵 #25）移植为 mihon-harmony 0010 并发布 `v0.20.4-harmony-preview.9`。
   正式发版 → `v0.2.0-harmony-preview.9`（versionCode 809）。闪烁本身在无 GPU 的 TCG 模拟器上截不到稳定画面，按代码分析 + 与 Mihon 相同写法确认。
+- 2026-10-12 Mihon 用户上报「点了下载按钮卡一下但没开始」+ crash log 全是卓易通图形层噪音。根因在 Tachiyomi 共享的 `queueChapters/queueEpisodes` 静默过滤（B 层），
+  Anikku 同病：移植为 0018 / 0019（Mihon 为 0011 / 0012），本地 `:app:compilePreviewKotlin` 通过，干净 v0.2.0 上 19 张补丁套用后与开发树一致，`check_patches` run 38206407935 绿。
