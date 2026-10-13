@@ -1,0 +1,2579 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 17:51:00 +0000
+Subject: [PATCH] presentation: lay panorama cells left to right unless a lane
+ is recessed by half
+
+The staggered grid always dropped the next cell into the shortest lane, so a
+right lane only a few pixels shorter left a hole on the left. Changing the
+column count (a foldable going from 2 to 4) also reflowed only the visible
+items until the next scroll.
+
+Panorama mode now measures a LazyLayout masonry. Every rectangle is computed
+in one pass: a cell goes to the leftmost lane whose bottom is within half of
+that cell's height of the shortest lane. Full-line rows (search bar, section
+title, loading row) sit on the deepest lane and realign the others. Cover
+heights come from the committed wide/tall band (3/2 or 2/3, plus the 4 dp
+cell padding and, for comfortable grids, 4 dp plus two 18 sp title lines).
+A column or width change records the viewport-top item and its offset and
+restores that scroll in the same measure.
+
+The fast scroller uses the known content height instead of the staggered
+estimate. Library, browse, and related panorama grids call the new layout.
+Regular grids are unchanged.
+
+Homologous with mihon-harmony 0021. This patch is anikku-harmony 0030.
+---
+ .../components/BrowseSourceComfortableGrid.kt |  51 +-
+ .../components/BrowseSourceCompactGrid.kt     |  51 +-
+ .../RelatedMangasComfortableGrid.kt           |  94 +--
+ .../components/RelatedMangasCompactGrid.kt    |  94 +--
+ .../library/components/LazyLibraryGrid.kt     |  31 +-
+ .../components/LibraryComfortableGrid.kt      |  17 +-
+ .../library/components/LibraryCompactGrid.kt  |  17 +-
+ .../library/components/PanoramaCoverShapes.kt |  44 ++
+ .../library/components/PanoramaGrid.kt        |  28 +-
+ presentation-core/build.gradle.kts            |  10 +
+ .../presentation/core/components/LazyGrid.kt  |  44 --
+ .../core/components/PanoramaMasonry.kt        | 566 ++++++++++++++++++
+ .../core/components/PanoramaMasonryLayout.kt  | 430 +++++++++++++
+ .../core/components/VerticalFastScroller.kt   | 199 +-----
+ .../components/PanoramaMasonryLayoutTest.kt   | 244 ++++++++
+ 15 files changed, 1578 insertions(+), 342 deletions(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
+index a00eb37..b8d84a7 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
+@@ -5,8 +5,6 @@ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.foundation.lazy.grid.GridCells
+ import androidx.compose.foundation.lazy.grid.GridItemSpan
+ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+-import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridItemSpan
+-import androidx.compose.foundation.lazy.staggeredgrid.rememberLazyStaggeredGridState
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.CompositionLocalProvider
+@@ -20,7 +18,9 @@ import eu.kanade.presentation.library.components.CommonMangaItemDefaults
+ import eu.kanade.presentation.library.components.LocalPanoramaGridSettled
+ import eu.kanade.presentation.library.components.MangaComfortableGridItem
+ import eu.kanade.presentation.library.components.PrefetchPanoramaCoverShapes
+-import eu.kanade.presentation.library.components.panoramaStaggeredColumns
++import eu.kanade.presentation.library.components.TrackPanoramaCoverShapes
++import eu.kanade.presentation.library.components.committedCoverIsWide
++import eu.kanade.presentation.library.components.panoramaColumns
+ import eu.kanade.presentation.library.components.rememberCoverRatio
+ import eu.kanade.presentation.library.components.rememberPanoramaGridSettled
+ import exh.metadata.metadata.RaisedSearchMetadata
+@@ -29,9 +29,15 @@ import kotlinx.coroutines.flow.StateFlow
+ import tachiyomi.domain.manga.model.Manga
+ import tachiyomi.domain.manga.model.MangaCover
+ import tachiyomi.presentation.core.components.Badge
+-import tachiyomi.presentation.core.components.FastScrollLazyVerticalStaggeredGrid
++import tachiyomi.presentation.core.components.FastScrollPanoramaMasonry
++import tachiyomi.presentation.core.components.PanoramaCellHeight
++import tachiyomi.presentation.core.components.PanoramaSpan
++import tachiyomi.presentation.core.components.rememberPanoramaMasonryState
+ import tachiyomi.presentation.core.util.plus
+ 
++// 16.dp padding above and below the 40.dp material circular indicator.
++private val BrowseSourceLoadingRowHeight = 72.dp
++
+ @Composable
+ fun BrowseSourceComfortableGrid(
+     mangaList: LazyPagingItems<StateFlow</* SY --> */Pair<Manga, RaisedSearchMetadata?>/* SY <-- */>>,
+@@ -49,27 +55,42 @@ fun BrowseSourceComfortableGrid(
+     // cell, which leaves a hole under each wide cover; a staggered grid lets each lane flow on its
+     // own. Auto columns use a wider minimum than the 128 dp meant for book covers.
+     if (usePanoramaCover) {
+-        // The grid has to own the scroll state: a shape learnt mid-fling remeasures every lane.
+-        val state = rememberLazyStaggeredGridState()
++        // The grid owns the scroll state: a cross-band shape commit remeasures every lane.
++        val state = rememberPanoramaMasonryState()
+         val settled = rememberPanoramaGridSettled { state.isScrollInProgress }
+         PrefetchPanoramaCoverShapes(mangaList.itemCount) { mangaList.peek(it)?.value?.first }
+         CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
+-            FastScrollLazyVerticalStaggeredGrid(
+-                columns = columns.panoramaStaggeredColumns(),
++            TrackPanoramaCoverShapes(mangaList.itemCount) { mangaList.peek(it)?.value?.first?.id }
++            FastScrollPanoramaMasonry(
++                columns = columns.panoramaColumns(),
+                 state = state,
+                 contentPadding = contentPadding + PaddingValues(8.dp),
+                 topContentPadding = contentPadding.calculateTopPadding(),
+                 bottomContentPadding = contentPadding.calculateBottomPadding(),
+-                verticalItemSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
+-                horizontalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridHorizontalSpacer),
++                verticalSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
++                horizontalSpacing = CommonMangaItemDefaults.GridHorizontalSpacer,
+             ) {
+                 if (mangaList.loadState.prepend is LoadState.Loading) {
+-                    item(span = StaggeredGridItemSpan.FullLine) {
++                    item(
++                        key = "browse_source_loading_prepend",
++                        span = PanoramaSpan.FullLine,
++                        height = PanoramaCellHeight.Fixed(BrowseSourceLoadingRowHeight),
++                    ) {
+                         BrowseSourceLoadingItem()
+                     }
+                 }
+ 
+-                items(count = mangaList.itemCount) { index ->
++                items(
++                    count = mangaList.itemCount,
++                    key = { index -> mangaList.peek(index)?.value?.first?.id ?: index },
++                    height = { index ->
++                        val id = mangaList.peek(index)?.value?.first?.id
++                        PanoramaCellHeight.Cover(
++                            wide = id == null || committedCoverIsWide(id),
++                            titleBelow = true,
++                        )
++                    },
++                ) { index ->
+                     val pair by mangaList[index]?.collectAsState() ?: return@items
+                     val manga = pair.first
+                     val metadata = pair.second
+@@ -87,7 +108,11 @@ fun BrowseSourceComfortableGrid(
+                 if (mangaList.loadState.refresh is LoadState.Loading ||
+                     mangaList.loadState.append is LoadState.Loading
+                 ) {
+-                    item(span = StaggeredGridItemSpan.FullLine) {
++                    item(
++                        key = "browse_source_loading_append",
++                        span = PanoramaSpan.FullLine,
++                        height = PanoramaCellHeight.Fixed(BrowseSourceLoadingRowHeight),
++                    ) {
+                         BrowseSourceLoadingItem()
+                     }
+                 }
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt
+index 98df8eb..82131cf 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt
+@@ -5,8 +5,6 @@ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.foundation.lazy.grid.GridCells
+ import androidx.compose.foundation.lazy.grid.GridItemSpan
+ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+-import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridItemSpan
+-import androidx.compose.foundation.lazy.staggeredgrid.rememberLazyStaggeredGridState
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.CompositionLocalProvider
+@@ -20,7 +18,9 @@ import eu.kanade.presentation.library.components.CommonMangaItemDefaults
+ import eu.kanade.presentation.library.components.LocalPanoramaGridSettled
+ import eu.kanade.presentation.library.components.MangaCompactGridItem
+ import eu.kanade.presentation.library.components.PrefetchPanoramaCoverShapes
+-import eu.kanade.presentation.library.components.panoramaStaggeredColumns
++import eu.kanade.presentation.library.components.TrackPanoramaCoverShapes
++import eu.kanade.presentation.library.components.committedCoverIsWide
++import eu.kanade.presentation.library.components.panoramaColumns
+ import eu.kanade.presentation.library.components.rememberCoverRatio
+ import eu.kanade.presentation.library.components.rememberPanoramaGridSettled
+ import exh.metadata.metadata.RaisedSearchMetadata
+@@ -29,9 +29,15 @@ import kotlinx.coroutines.flow.StateFlow
+ import tachiyomi.domain.manga.model.Manga
+ import tachiyomi.domain.manga.model.MangaCover
+ import tachiyomi.presentation.core.components.Badge
+-import tachiyomi.presentation.core.components.FastScrollLazyVerticalStaggeredGrid
++import tachiyomi.presentation.core.components.FastScrollPanoramaMasonry
++import tachiyomi.presentation.core.components.PanoramaCellHeight
++import tachiyomi.presentation.core.components.PanoramaSpan
++import tachiyomi.presentation.core.components.rememberPanoramaMasonryState
+ import tachiyomi.presentation.core.util.plus
+ 
++// 16.dp padding above and below the 40.dp material circular indicator.
++private val BrowseSourceLoadingRowHeight = 72.dp
++
+ @Composable
+ fun BrowseSourceCompactGrid(
+     mangaList: LazyPagingItems<StateFlow</* SY --> */Pair<Manga, RaisedSearchMetadata?>/* SY <-- */>>,
+@@ -50,27 +56,42 @@ fun BrowseSourceCompactGrid(
+     // Same two panorama problems as the comfortable browse grid: a shared row height leaves a hole
+     // under a wide cover, and auto columns at 128 dp make that cover cramped.
+     if (usePanoramaCover) {
+-        // The grid has to own the scroll state: a shape learnt mid-fling remeasures every lane.
+-        val state = rememberLazyStaggeredGridState()
++        // The grid owns the scroll state: a cross-band shape commit remeasures every lane.
++        val state = rememberPanoramaMasonryState()
+         val settled = rememberPanoramaGridSettled { state.isScrollInProgress }
+         PrefetchPanoramaCoverShapes(mangaList.itemCount) { mangaList.peek(it)?.value?.first }
+         CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
+-            FastScrollLazyVerticalStaggeredGrid(
+-                columns = columns.panoramaStaggeredColumns(),
++            TrackPanoramaCoverShapes(mangaList.itemCount) { mangaList.peek(it)?.value?.first?.id }
++            FastScrollPanoramaMasonry(
++                columns = columns.panoramaColumns(),
+                 state = state,
+                 contentPadding = contentPadding + PaddingValues(8.dp),
+                 topContentPadding = contentPadding.calculateTopPadding(),
+                 bottomContentPadding = contentPadding.calculateBottomPadding(),
+-                verticalItemSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
+-                horizontalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridHorizontalSpacer),
++                verticalSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
++                horizontalSpacing = CommonMangaItemDefaults.GridHorizontalSpacer,
+             ) {
+                 if (mangaList.loadState.prepend is LoadState.Loading) {
+-                    item(span = StaggeredGridItemSpan.FullLine) {
++                    item(
++                        key = "browse_source_loading_prepend",
++                        span = PanoramaSpan.FullLine,
++                        height = PanoramaCellHeight.Fixed(BrowseSourceLoadingRowHeight),
++                    ) {
+                         BrowseSourceLoadingItem()
+                     }
+                 }
+ 
+-                items(count = mangaList.itemCount) { index ->
++                items(
++                    count = mangaList.itemCount,
++                    key = { index -> mangaList.peek(index)?.value?.first?.id ?: index },
++                    height = { index ->
++                        val id = mangaList.peek(index)?.value?.first?.id
++                        PanoramaCellHeight.Cover(
++                            wide = id == null || committedCoverIsWide(id),
++                            titleBelow = false,
++                        )
++                    },
++                ) { index ->
+                     val pair by mangaList[index]?.collectAsState() ?: return@items
+                     val manga = pair.first
+                     val metadata = pair.second
+@@ -88,7 +109,11 @@ fun BrowseSourceCompactGrid(
+                 if (mangaList.loadState.refresh is LoadState.Loading ||
+                     mangaList.loadState.append is LoadState.Loading
+                 ) {
+-                    item(span = StaggeredGridItemSpan.FullLine) {
++                    item(
++                        key = "browse_source_loading_append",
++                        span = PanoramaSpan.FullLine,
++                        height = PanoramaCellHeight.Fixed(BrowseSourceLoadingRowHeight),
++                    ) {
+                         BrowseSourceLoadingItem()
+                     }
+                 }
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt
+index 9e69b52..f07ee5a 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt
+@@ -7,10 +7,6 @@ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.lazy.grid.GridCells
+-import androidx.compose.foundation.lazy.staggeredgrid.LazyStaggeredGridItemScope
+-import androidx.compose.foundation.lazy.staggeredgrid.LazyStaggeredGridScope
+-import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridItemSpan
+-import androidx.compose.foundation.lazy.staggeredgrid.rememberLazyStaggeredGridState
+ import androidx.compose.material3.HorizontalDivider
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
+@@ -18,24 +14,33 @@ import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.runtime.State
+ import androidx.compose.runtime.getValue
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.util.fastAny
+ import eu.kanade.presentation.browse.RelatedMangaTitle
+ import eu.kanade.presentation.browse.RelatedMangasLoadingItem
+ import eu.kanade.presentation.browse.header
+ import eu.kanade.presentation.library.components.CommonMangaItemDefaults
+ import eu.kanade.presentation.library.components.LocalPanoramaGridSettled
+-import eu.kanade.presentation.library.components.panoramaStaggeredColumns
++import eu.kanade.presentation.library.components.TrackPanoramaCoverShapes
++import eu.kanade.presentation.library.components.committedCoverIsWide
++import eu.kanade.presentation.library.components.panoramaColumns
+ import eu.kanade.presentation.library.components.rememberPanoramaGridSettled
+ import eu.kanade.tachiyomi.ui.manga.RelatedManga
+ import tachiyomi.domain.manga.model.Manga
+ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.kmk.KMR
+ import tachiyomi.presentation.core.components.FastScrollLazyVerticalGrid
+-import tachiyomi.presentation.core.components.FastScrollLazyVerticalStaggeredGrid
++import tachiyomi.presentation.core.components.FastScrollPanoramaMasonry
++import tachiyomi.presentation.core.components.PanoramaCellHeight
++import tachiyomi.presentation.core.components.PanoramaSpan
+ import tachiyomi.presentation.core.components.material.padding
++import tachiyomi.presentation.core.components.rememberPanoramaMasonryState
+ import tachiyomi.presentation.core.i18n.stringResource
+ import tachiyomi.presentation.core.util.plus
+ 
++// padding.medium (16.dp) above and below a 24.dp indicator.
++private val RelatedMangasLoadingRowHeight = 56.dp
++
+ @Composable
+ fun RelatedMangasComfortableGrid(
+     relatedMangas: List<RelatedManga>,
+@@ -54,17 +59,24 @@ fun RelatedMangasComfortableGrid(
+     // Same two panorama problems as the library and the source browse grid: a shared row height
+     // leaves a hole under a wide cover, and auto columns at 128 dp make that cover cramped.
+     if (usePanoramaCover) {
+-        // The grid has to own the scroll state: a shape learnt mid-fling remeasures every lane.
+-        val state = rememberLazyStaggeredGridState()
++        // The grid owns the scroll state: a cross-band shape commit remeasures every lane.
++        val state = rememberPanoramaMasonryState()
+         val settled = rememberPanoramaGridSettled { state.isScrollInProgress }
++        val trackIds = ArrayList<Long>()
++        for (related in relatedMangas) {
++            if (related is RelatedManga.Success) {
++                for (manga in related.mangaList) trackIds.add(manga.id)
++            }
++        }
+         CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
+-            FastScrollLazyVerticalStaggeredGrid(
+-                columns = columns.panoramaStaggeredColumns(),
++            TrackPanoramaCoverShapes(trackIds.size) { trackIds[it] }
++            FastScrollPanoramaMasonry(
++                columns = columns.panoramaColumns(),
+                 state = state,
+                 contentPadding = gridPadding,
+                 topContentPadding = contentPadding.calculateTopPadding(),
+-                verticalItemSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
+-                horizontalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridHorizontalSpacer),
++                verticalSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
++                horizontalSpacing = CommonMangaItemDefaults.GridHorizontalSpacer,
+             ) {
+                 addRelatedSections(
+                     relatedMangas = relatedMangas,
+@@ -75,9 +87,28 @@ fun RelatedMangasComfortableGrid(
+                     onKeywordLongClick = onKeywordLongClick,
+                     selection = selection,
+                     usePanoramaCover = true,
+-                    fullWidth = { key, content -> fullWidthItem(key) { content() } },
+-                    cells = { count, key, item ->
+-                        items(count = count, key = key) { index -> item(index) }
++                    fullWidth = { key, measured, content ->
++                        item(
++                            key = key,
++                            span = PanoramaSpan.FullLine,
++                            height = if (measured) {
++                                PanoramaCellHeight.Measure
++                            } else {
++                                PanoramaCellHeight.Fixed(RelatedMangasLoadingRowHeight)
++                            },
++                        ) { content() }
++                    },
++                    cells = { count, key, mangaId, item ->
++                        items(
++                            count = count,
++                            key = key,
++                            height = { index ->
++                                PanoramaCellHeight.Cover(
++                                    wide = committedCoverIsWide(mangaId(index)),
++                                    titleBelow = true,
++                                )
++                            },
++                        ) { index -> item(index) }
+                     },
+                 )
+             }
+@@ -101,10 +132,10 @@ fun RelatedMangasComfortableGrid(
+             onKeywordLongClick = onKeywordLongClick,
+             selection = selection,
+             usePanoramaCover = false,
+-            fullWidth = { key, content ->
++            fullWidth = { key, _, content ->
+                 header(key) { content() }
+             },
+-            cells = { count, key, item ->
++            cells = { count, key, _, item ->
+                 items(count = count, key = key) { index -> item(index) }
+             },
+         )
+@@ -120,24 +151,29 @@ private fun addRelatedSections(
+     onKeywordLongClick: (String) -> Unit,
+     selection: List<Manga>,
+     usePanoramaCover: Boolean,
+-    fullWidth: (key: String, content: @Composable () -> Unit) -> Unit,
+-    cells: (count: Int, key: (Int) -> Any, item: @Composable (Int) -> Unit) -> Unit,
++    fullWidth: (key: String, measured: Boolean, content: @Composable () -> Unit) -> Unit,
++    cells: (
++        count: Int,
++        key: (Int) -> Any,
++        mangaId: (Int) -> Long,
++        item: @Composable (Int) -> Unit,
++    ) -> Unit,
+ ) {
+     relatedMangas.forEach { relatedManga ->
+         when (relatedManga) {
+             is RelatedManga.Loading -> {
+-                fullWidth("${relatedManga.hashCode()}#header") {
++                fullWidth("${relatedManga.hashCode()}#header", true) {
+                     RelatedMangaSectionHeader(
+                         title = stringResource(MR.strings.loading),
+                         onClick = {},
+                         onLongClick = null,
+                     )
+                 }
+-                fullWidth("${relatedManga.hashCode()}#loading") { RelatedMangasLoadingItem() }
++                fullWidth("${relatedManga.hashCode()}#loading", false) { RelatedMangasLoadingItem() }
+             }
+             is RelatedManga.Success -> {
+                 val hasKeyword = relatedManga.keyword.isNotBlank()
+-                fullWidth("${relatedManga.hashCode()}#header") {
++                fullWidth("${relatedManga.hashCode()}#header", true) {
+                     RelatedMangaSectionHeader(
+                         title = if (hasKeyword) {
+                             stringResource(KMR.strings.related_mangas_more)
+@@ -156,6 +192,7 @@ private fun addRelatedSections(
+                 cells(
+                     relatedManga.mangaList.size,
+                     { "related-comfort-${relatedManga.mangaList[it].id}" },
++                    { relatedManga.mangaList[it].id },
+                 ) { index ->
+                     val manga by getManga(relatedManga.mangaList[index])
+                     BrowseSourceComfortableGridItem(
+@@ -199,16 +236,3 @@ private fun RelatedMangaSectionHeader(
+         )
+     }
+ }
+-
+-// Harmony -->
+-private fun LazyStaggeredGridScope.fullWidthItem(
+-    key: Any?,
+-    content: @Composable LazyStaggeredGridItemScope.() -> Unit,
+-) {
+-    item(
+-        key = key,
+-        span = StaggeredGridItemSpan.FullLine,
+-        content = content,
+-    )
+-}
+-// Harmony <--
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt
+index ba25876..5d4c31c 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt
+@@ -7,10 +7,6 @@ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.lazy.grid.GridCells
+-import androidx.compose.foundation.lazy.staggeredgrid.LazyStaggeredGridItemScope
+-import androidx.compose.foundation.lazy.staggeredgrid.LazyStaggeredGridScope
+-import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridItemSpan
+-import androidx.compose.foundation.lazy.staggeredgrid.rememberLazyStaggeredGridState
+ import androidx.compose.material3.HorizontalDivider
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
+@@ -18,24 +14,33 @@ import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.runtime.State
+ import androidx.compose.runtime.getValue
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.util.fastAny
+ import eu.kanade.presentation.browse.RelatedMangaTitle
+ import eu.kanade.presentation.browse.RelatedMangasLoadingItem
+ import eu.kanade.presentation.browse.header
+ import eu.kanade.presentation.library.components.CommonMangaItemDefaults
+ import eu.kanade.presentation.library.components.LocalPanoramaGridSettled
+-import eu.kanade.presentation.library.components.panoramaStaggeredColumns
++import eu.kanade.presentation.library.components.TrackPanoramaCoverShapes
++import eu.kanade.presentation.library.components.committedCoverIsWide
++import eu.kanade.presentation.library.components.panoramaColumns
+ import eu.kanade.presentation.library.components.rememberPanoramaGridSettled
+ import eu.kanade.tachiyomi.ui.manga.RelatedManga
+ import tachiyomi.domain.manga.model.Manga
+ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.kmk.KMR
+ import tachiyomi.presentation.core.components.FastScrollLazyVerticalGrid
+-import tachiyomi.presentation.core.components.FastScrollLazyVerticalStaggeredGrid
++import tachiyomi.presentation.core.components.FastScrollPanoramaMasonry
++import tachiyomi.presentation.core.components.PanoramaCellHeight
++import tachiyomi.presentation.core.components.PanoramaSpan
+ import tachiyomi.presentation.core.components.material.padding
++import tachiyomi.presentation.core.components.rememberPanoramaMasonryState
+ import tachiyomi.presentation.core.i18n.stringResource
+ import tachiyomi.presentation.core.util.plus
+ 
++// padding.medium (16.dp) above and below a 24.dp indicator.
++private val RelatedMangasLoadingRowHeight = 56.dp
++
+ @Composable
+ fun RelatedMangasCompactGrid(
+     relatedMangas: List<RelatedManga>,
+@@ -56,17 +61,24 @@ fun RelatedMangasCompactGrid(
+     // Same two panorama problems as the comfortable related grid: a shared row height leaves a
+     // hole under a wide cover, and auto columns at 128 dp make that cover cramped.
+     if (usePanoramaCover) {
+-        // The grid has to own the scroll state: a shape learnt mid-fling remeasures every lane.
+-        val state = rememberLazyStaggeredGridState()
++        // The grid owns the scroll state: a cross-band shape commit remeasures every lane.
++        val state = rememberPanoramaMasonryState()
+         val settled = rememberPanoramaGridSettled { state.isScrollInProgress }
++        val trackIds = ArrayList<Long>()
++        for (related in relatedMangas) {
++            if (related is RelatedManga.Success) {
++                for (manga in related.mangaList) trackIds.add(manga.id)
++            }
++        }
+         CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
+-            FastScrollLazyVerticalStaggeredGrid(
+-                columns = columns.panoramaStaggeredColumns(),
++            TrackPanoramaCoverShapes(trackIds.size) { trackIds[it] }
++            FastScrollPanoramaMasonry(
++                columns = columns.panoramaColumns(),
+                 state = state,
+                 contentPadding = gridPadding,
+                 topContentPadding = contentPadding.calculateTopPadding(),
+-                verticalItemSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
+-                horizontalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridHorizontalSpacer),
++                verticalSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
++                horizontalSpacing = CommonMangaItemDefaults.GridHorizontalSpacer,
+             ) {
+                 addRelatedSections(
+                     relatedMangas = relatedMangas,
+@@ -77,9 +89,28 @@ fun RelatedMangasCompactGrid(
+                     onKeywordLongClick = onKeywordLongClick,
+                     selection = selection,
+                     usePanoramaCover = true,
+-                    fullWidth = { key, content -> fullWidthItem(key) { content() } },
+-                    cells = { count, key, item ->
+-                        items(count = count, key = key) { index -> item(index) }
++                    fullWidth = { key, measured, content ->
++                        item(
++                            key = key,
++                            span = PanoramaSpan.FullLine,
++                            height = if (measured) {
++                                PanoramaCellHeight.Measure
++                            } else {
++                                PanoramaCellHeight.Fixed(RelatedMangasLoadingRowHeight)
++                            },
++                        ) { content() }
++                    },
++                    cells = { count, key, mangaId, item ->
++                        items(
++                            count = count,
++                            key = key,
++                            height = { index ->
++                                PanoramaCellHeight.Cover(
++                                    wide = committedCoverIsWide(mangaId(index)),
++                                    titleBelow = false,
++                                )
++                            },
++                        ) { index -> item(index) }
+                     },
+                 )
+             }
+@@ -103,10 +134,10 @@ fun RelatedMangasCompactGrid(
+             onKeywordLongClick = onKeywordLongClick,
+             selection = selection,
+             usePanoramaCover = false,
+-            fullWidth = { key, content ->
++            fullWidth = { key, _, content ->
+                 header(key) { content() }
+             },
+-            cells = { count, key, item ->
++            cells = { count, key, _, item ->
+                 items(count = count, key = key) { index -> item(index) }
+             },
+         )
+@@ -122,24 +153,29 @@ private fun addRelatedSections(
+     onKeywordLongClick: (String) -> Unit,
+     selection: List<Manga>,
+     usePanoramaCover: Boolean,
+-    fullWidth: (key: String, content: @Composable () -> Unit) -> Unit,
+-    cells: (count: Int, key: (Int) -> Any, item: @Composable (Int) -> Unit) -> Unit,
++    fullWidth: (key: String, measured: Boolean, content: @Composable () -> Unit) -> Unit,
++    cells: (
++        count: Int,
++        key: (Int) -> Any,
++        mangaId: (Int) -> Long,
++        item: @Composable (Int) -> Unit,
++    ) -> Unit,
+ ) {
+     relatedMangas.forEach { relatedManga ->
+         when (relatedManga) {
+             is RelatedManga.Loading -> {
+-                fullWidth("${relatedManga.hashCode()}#header") {
++                fullWidth("${relatedManga.hashCode()}#header", true) {
+                     RelatedMangaSectionHeader(
+                         title = stringResource(MR.strings.loading),
+                         onClick = {},
+                         onLongClick = null,
+                     )
+                 }
+-                fullWidth("${relatedManga.hashCode()}#loading") { RelatedMangasLoadingItem() }
++                fullWidth("${relatedManga.hashCode()}#loading", false) { RelatedMangasLoadingItem() }
+             }
+             is RelatedManga.Success -> {
+                 val hasKeyword = relatedManga.keyword.isNotBlank()
+-                fullWidth("${relatedManga.hashCode()}#header") {
++                fullWidth("${relatedManga.hashCode()}#header", true) {
+                     RelatedMangaSectionHeader(
+                         title = if (hasKeyword) {
+                             stringResource(KMR.strings.related_mangas_more)
+@@ -158,6 +194,7 @@ private fun addRelatedSections(
+                 cells(
+                     relatedManga.mangaList.size,
+                     { "related-compact-${relatedManga.mangaList[it].id}" },
++                    { relatedManga.mangaList[it].id },
+                 ) { index ->
+                     val manga by getManga(relatedManga.mangaList[index])
+                     BrowseSourceCompactGridItem(
+@@ -201,16 +238,3 @@ private fun RelatedMangaSectionHeader(
+         )
+     }
+ }
+-
+-// Harmony -->
+-private fun LazyStaggeredGridScope.fullWidthItem(
+-    key: Any?,
+-    content: @Composable LazyStaggeredGridItemScope.() -> Unit,
+-) {
+-    item(
+-        key = key,
+-        span = StaggeredGridItemSpan.FullLine,
+-        content = content,
+-    )
+-}
+-// Harmony <--
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt
+index 20ffef7..b69d573 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt
+@@ -5,15 +5,16 @@ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.foundation.lazy.grid.GridCells
+ import androidx.compose.foundation.lazy.grid.GridItemSpan
+ import androidx.compose.foundation.lazy.grid.LazyGridScope
+-import androidx.compose.foundation.lazy.staggeredgrid.LazyStaggeredGridScope
+-import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridItemSpan
+-import androidx.compose.foundation.lazy.staggeredgrid.rememberLazyStaggeredGridState
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.unit.dp
+ import tachiyomi.presentation.core.components.FastScrollLazyVerticalGrid
+-import tachiyomi.presentation.core.components.FastScrollLazyVerticalStaggeredGrid
++import tachiyomi.presentation.core.components.FastScrollPanoramaMasonry
++import tachiyomi.presentation.core.components.PanoramaCellHeight
++import tachiyomi.presentation.core.components.PanoramaMasonryScope
++import tachiyomi.presentation.core.components.PanoramaSpan
++import tachiyomi.presentation.core.components.rememberPanoramaMasonryState
+ import tachiyomi.presentation.core.util.plus
+ 
+ @Composable
+@@ -43,32 +44,36 @@ internal fun LazyLibraryStaggeredGrid(
+     modifier: Modifier = Modifier,
+     columns: Int,
+     contentPadding: PaddingValues,
+-    content: LazyStaggeredGridScope.() -> Unit,
++    beforeContent: @Composable () -> Unit = {},
++    content: PanoramaMasonryScope.() -> Unit,
+ ) {
+-    // The grid has to own the scroll state: a shape learnt mid-fling remeasures every lane.
+-    val state = rememberLazyStaggeredGridState()
++    // The grid owns the scroll state: a cross-band shape commit remeasures every lane.
++    val state = rememberPanoramaMasonryState()
+     val settled = rememberPanoramaGridSettled { state.isScrollInProgress }
+     CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
+-        FastScrollLazyVerticalStaggeredGrid(
+-            columns = panoramaStaggeredColumns(columns),
++        beforeContent()
++        FastScrollPanoramaMasonry(
++            columns = panoramaColumns(columns),
+             modifier = modifier,
+             state = state,
+             contentPadding = contentPadding + PaddingValues(8.dp),
+-            verticalItemSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
+-            horizontalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridHorizontalSpacer),
++            verticalSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
++            horizontalSpacing = CommonMangaItemDefaults.GridHorizontalSpacer,
+             content = content,
+         )
+     }
+ }
+ 
+-fun LazyStaggeredGridScope.globalSearchItem(
++fun PanoramaMasonryScope.globalSearchItem(
+     searchQuery: String?,
+     onGlobalSearchClicked: () -> Unit,
+ ) {
+     if (!searchQuery.isNullOrEmpty()) {
+         item(
+-            span = StaggeredGridItemSpan.FullLine,
++            key = "library_global_search_item",
++            span = PanoramaSpan.FullLine,
+             contentType = "library_global_search_item",
++            height = PanoramaCellHeight.Measure,
+         ) {
+             GlobalSearchItem(
+                 searchQuery = searchQuery,
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt
+index 626eb03..005afec 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt
+@@ -3,12 +3,12 @@ package eu.kanade.presentation.library.components
+ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.lazy.grid.items
+-import androidx.compose.foundation.lazy.staggeredgrid.items
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Modifier
+ import eu.kanade.tachiyomi.ui.library.LibraryItem
+ import tachiyomi.domain.library.model.LibraryManga
+ import tachiyomi.domain.manga.model.MangaCover
++import tachiyomi.presentation.core.components.PanoramaCellHeight
+ 
+ @Composable
+ internal fun LibraryComfortableGrid(
+@@ -35,13 +35,24 @@ internal fun LibraryComfortableGrid(
+             modifier = Modifier.fillMaxSize(),
+             columns = columns,
+             contentPadding = contentPadding,
++            beforeContent = {
++                TrackPanoramaCoverShapes(items.size) { items[it].libraryManga.manga.id }
++            },
+         ) {
+             globalSearchItem(searchQuery, onGlobalSearchClicked)
+ 
+             items(
+-                items = items,
++                count = items.size,
++                key = { items[it].libraryManga.manga.id },
+                 contentType = { "library_comfortable_grid_item" },
+-            ) { libraryItem ->
++                height = {
++                    PanoramaCellHeight.Cover(
++                        wide = committedCoverIsWide(items[it].libraryManga.manga.id),
++                        titleBelow = true,
++                    )
++                },
++            ) { index ->
++                val libraryItem = items[index]
+                 LibraryComfortableGridItem(
+                     libraryItem = libraryItem,
+                     isSelected = libraryItem.libraryManga.manga.id in selection,
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LibraryCompactGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/LibraryCompactGrid.kt
+index a667465..055dca6 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LibraryCompactGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LibraryCompactGrid.kt
+@@ -3,12 +3,12 @@ package eu.kanade.presentation.library.components
+ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.lazy.grid.items
+-import androidx.compose.foundation.lazy.staggeredgrid.items
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Modifier
+ import eu.kanade.tachiyomi.ui.library.LibraryItem
+ import tachiyomi.domain.library.model.LibraryManga
+ import tachiyomi.domain.manga.model.MangaCover
++import tachiyomi.presentation.core.components.PanoramaCellHeight
+ 
+ @Composable
+ fun LibraryCompactGrid(
+@@ -34,13 +34,24 @@ fun LibraryCompactGrid(
+             modifier = Modifier.fillMaxSize(),
+             columns = columns,
+             contentPadding = contentPadding,
++            beforeContent = {
++                TrackPanoramaCoverShapes(items.size) { items[it].libraryManga.manga.id }
++            },
+         ) {
+             globalSearchItem(searchQuery, onGlobalSearchClicked)
+ 
+             items(
+-                items = items,
++                count = items.size,
++                key = { items[it].libraryManga.manga.id },
+                 contentType = { "library_compact_grid_item" },
+-            ) { libraryItem ->
++                height = {
++                    PanoramaCellHeight.Cover(
++                        wide = committedCoverIsWide(items[it].libraryManga.manga.id),
++                        titleBelow = false,
++                    )
++                },
++            ) { index ->
++                val libraryItem = items[index]
+                 LibraryCompactGridItem(
+                     libraryItem = libraryItem,
+                     showTitle = showTitle,
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt
+index c751a83..33ff521 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt
+@@ -17,6 +17,7 @@ import coil3.request.CachePolicy
+ import coil3.request.Disposable
+ import coil3.request.ImageRequest
+ import coil3.size.Precision
++import eu.kanade.presentation.manga.components.RatioSwitchToPanorama
+ import kotlinx.coroutines.CompletableDeferred
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+@@ -57,6 +58,49 @@ private val AlwaysSettled: () -> Boolean = { true }
+  */
+ val LocalPanoramaGridSettled = compositionLocalOf<() -> Boolean> { AlwaysSettled }
+ 
++/**
++ * Ratios the panorama grid has committed to drawing. The masonry and the cells both read this,
++ * so a shape that is still waiting for the grid to settle does not change a lane height.
++ * Unknown covers commit as 9/16, which is on the wide side of 0.75.
++ */
++private const val WIDE_COVER_RATIO = 9f / 16f
++
++private val committedRatios = mutableStateMapOf<Long, Float>()
++
++internal fun committedCoverIsWide(mangaId: Long): Boolean {
++    val ratio = committedRatios[mangaId] ?: WIDE_COVER_RATIO
++    return ratio <= RatioSwitchToPanorama
++}
++
++internal fun panoramaCommittedRatio(mangaId: Long, known: Float?, settled: Boolean): Float {
++    val fallback = known ?: WIDE_COVER_RATIO
++    val current = committedRatios[mangaId]
++    if (current == null) {
++        committedRatios[mangaId] = fallback
++        return fallback
++    }
++    if (known == null || known == current) return current
++    val sameBand = (known <= RatioSwitchToPanorama) == (current <= RatioSwitchToPanorama)
++    if (sameBand || settled) {
++        committedRatios[mangaId] = known
++        return known
++    }
++    return current
++}
++
++/**
++ * Commits a shape for every id the layout will size. Uses the caller's peek, not the paging
++ * accessor, so computing heights does not fetch pages.
++ */
++@Composable
++fun TrackPanoramaCoverShapes(count: Int, mangaIdAt: (Int) -> Long?) {
++    val settled = LocalPanoramaGridSettled.current()
++    for (index in 0 until count) {
++        val mangaId = mangaIdAt(index) ?: continue
++        panoramaCommittedRatio(mangaId, PanoramaCoverShapes.get(mangaId), settled)
++    }
++}
++
+ object PanoramaCoverShapes {
+     private val ratios = mutableStateMapOf<Long, Float>()
+     private val stored = LinkedHashMap<Long, Float>()
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
+index 528e0af..22daf2c 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
+@@ -2,7 +2,6 @@ package eu.kanade.presentation.library.components
+ 
+ import android.content.res.Configuration
+ import androidx.compose.foundation.lazy.grid.GridCells
+-import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridCells
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.Immutable
+ import androidx.compose.runtime.LaunchedEffect
+@@ -16,6 +15,7 @@ import androidx.compose.ui.unit.dp
+ import eu.kanade.presentation.manga.components.RatioSwitchToPanorama
+ import kotlinx.coroutines.flow.first
+ import tachiyomi.domain.library.service.LibraryPreferences
++import tachiyomi.presentation.core.components.PanoramaColumns
+ import uy.kohesive.injekt.Injekt
+ import uy.kohesive.injekt.api.get
+ 
+@@ -49,11 +49,11 @@ internal data class CountedGridCells(
+ 
+ internal fun libraryGridCells(columnCount: Int): GridCells = CountedGridCells(columnCount)
+ 
+-internal fun panoramaStaggeredColumns(columnCount: Int): StaggeredGridCells {
++internal fun panoramaColumns(columnCount: Int): PanoramaColumns {
+     return if (columnCount == 0) {
+-        StaggeredGridCells.Adaptive(PanoramaGridMinColumnWidth)
++        PanoramaColumns.Adaptive(PanoramaGridMinColumnWidth)
+     } else {
+-        StaggeredGridCells.Fixed(columnCount)
++        PanoramaColumns.Fixed(columnCount)
+     }
+ }
+ 
+@@ -63,10 +63,10 @@ internal fun panoramaStaggeredColumns(columnCount: Int): StaggeredGridCells {
+  * preference those cells were built from.
+  */
+ @Composable
+-internal fun GridCells.panoramaStaggeredColumns(): StaggeredGridCells {
++internal fun GridCells.panoramaColumns(): PanoramaColumns {
+     val orientation = LocalConfiguration.current.orientation
+     val columnCount = (this as? CountedGridCells)?.columnCount ?: libraryColumnCount(orientation)
+-    return panoramaStaggeredColumns(columnCount)
++    return panoramaColumns(columnCount)
+ }
+ 
+ private fun libraryColumnCount(orientation: Int): Int {
+@@ -79,22 +79,24 @@ private fun libraryColumnCount(orientation: Int): Int {
+     }
+ }
+ 
+-/** height / width of a 16:9 thumbnail, the common shape of video covers. Unknown panorama covers start here. */
+-private const val WIDE_COVER_RATIO = 9f / 16f
+-
+ @Composable
+ internal fun rememberCoverRatio(mangaId: Long, usePanoramaCover: Boolean): MutableFloatState {
+     val settled = LocalPanoramaGridSettled.current
+     val known = PanoramaCoverShapes.get(mangaId)
++    if (usePanoramaCover) {
++        // Same committed value the masonry used to size the slot. Cross-band changes wait until
++        // the grid has been still; same-band changes do not move the lane.
++        val committed = panoramaCommittedRatio(mangaId, known, settled())
++        val ratio = remember(mangaId) { mutableFloatStateOf(committed) }
++        if (ratio.floatValue != committed) ratio.floatValue = committed
++        return ratio
++    }
+     val ratio = remember(mangaId) {
+-        mutableFloatStateOf(known ?: if (usePanoramaCover) WIDE_COVER_RATIO else 1f)
++        mutableFloatStateOf(known ?: 1f)
+     }
+-    // A newly learnt shape is applied only once the grid stops moving; every cell shape change
+-    // re-measures the whole staggered grid, which is what the user sees as jitter and dropped frames.
+     LaunchedEffect(mangaId, known) {
+         if (known == null || known == ratio.floatValue) return@LaunchedEffect
+         val sameShape = (known <= RatioSwitchToPanorama) == (ratio.floatValue <= RatioSwitchToPanorama)
+-        // Same side of the wide/tall cut keeps the cell's aspect ratio, so the lane does not move.
+         if (!sameShape) {
+             snapshotFlow { settled() }.first { it }
+         }
+diff --git a/presentation-core/build.gradle.kts b/presentation-core/build.gradle.kts
+index e3c5030..be112de 100644
+--- a/presentation-core/build.gradle.kts
++++ b/presentation-core/build.gradle.kts
+@@ -11,6 +11,12 @@ android {
+         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+         consumerProguardFiles("consumer-rules.pro")
+     }
++
++    testOptions {
++        unitTests.all {
++            it.useJUnitPlatform()
++        }
++    }
+ }
+ 
+ kotlin {
+@@ -50,4 +56,8 @@ dependencies {
+     implementation(androidx.paging.runtime)
+     implementation(androidx.paging.compose)
+     implementation(kotlinx.immutables)
++
++    // JVM tests for the panorama masonry lane math. The layout file has no Android API.
++    testImplementation(libs.junit.jupiter)
++    testRuntimeOnly(libs.junit.platform.launcher)
+ }
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/LazyGrid.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/LazyGrid.kt
+index 40d405d..514d449 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/LazyGrid.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/LazyGrid.kt
+@@ -7,11 +7,6 @@ import androidx.compose.foundation.lazy.grid.LazyGridScope
+ import androidx.compose.foundation.lazy.grid.LazyGridState
+ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+ import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+-import androidx.compose.foundation.lazy.staggeredgrid.LazyStaggeredGridScope
+-import androidx.compose.foundation.lazy.staggeredgrid.LazyStaggeredGridState
+-import androidx.compose.foundation.lazy.staggeredgrid.LazyVerticalStaggeredGrid
+-import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridCells
+-import androidx.compose.foundation.lazy.staggeredgrid.rememberLazyStaggeredGridState
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Modifier
+@@ -62,45 +57,6 @@ fun FastScrollLazyVerticalGrid(
+     }
+ }
+ 
+-// Harmony -->
+-@Composable
+-fun FastScrollLazyVerticalStaggeredGrid(
+-    columns: StaggeredGridCells,
+-    modifier: Modifier = Modifier,
+-    state: LazyStaggeredGridState = rememberLazyStaggeredGridState(),
+-    thumbAllowed: () -> Boolean = { true },
+-    thumbColor: Color = MaterialTheme.colorScheme.primary,
+-    contentPadding: PaddingValues = PaddingValues(0.dp),
+-    topContentPadding: Dp = Dp.Hairline,
+-    bottomContentPadding: Dp = Dp.Hairline,
+-    endContentPadding: Dp = Dp.Hairline,
+-    verticalItemSpacing: Dp = 0.dp,
+-    horizontalArrangement: Arrangement.Horizontal = Arrangement.Start,
+-    userScrollEnabled: Boolean = true,
+-    content: LazyStaggeredGridScope.() -> Unit,
+-) {
+-    VerticalStaggeredGridFastScroller(
+-        state = state,
+-        modifier = modifier,
+-        thumbAllowed = thumbAllowed,
+-        thumbColor = thumbColor,
+-        topContentPadding = topContentPadding,
+-        bottomContentPadding = bottomContentPadding,
+-        endContentPadding = endContentPadding,
+-    ) {
+-        LazyVerticalStaggeredGrid(
+-            columns = columns,
+-            state = state,
+-            contentPadding = contentPadding,
+-            verticalItemSpacing = verticalItemSpacing,
+-            horizontalArrangement = horizontalArrangement,
+-            userScrollEnabled = userScrollEnabled,
+-            content = content,
+-        )
+-    }
+-}
+-// Harmony <--
+-
+ // AM -->
+ @Composable
+ fun FastScrollIrregularLazyVerticalGrid(
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+new file mode 100644
+index 0000000..9478e1d
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+@@ -0,0 +1,566 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.MutatePriority
++import androidx.compose.foundation.gestures.Orientation
++import androidx.compose.foundation.gestures.ScrollableDefaults
++import androidx.compose.foundation.gestures.ScrollableState
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.lazy.layout.LazyLayout
++import androidx.compose.foundation.lazy.layout.LazyLayoutIntervalContent
++import androidx.compose.foundation.lazy.layout.LazyLayoutItemProvider
++import androidx.compose.foundation.lazy.layout.LazyLayoutMeasureScope
++import androidx.compose.foundation.lazy.layout.MutableIntervalList
++import androidx.compose.foundation.scrollableArea
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.SideEffect
++import androidx.compose.runtime.Stable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableFloatStateOf
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberUpdatedState
++import androidx.compose.runtime.saveable.rememberSaveable
++import androidx.compose.runtime.setValue
++import androidx.compose.runtime.withFrameNanos
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clipToBounds
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.layout.MeasureResult
++import androidx.compose.ui.layout.Placeable
++import androidx.compose.ui.semantics.ScrollAxisRange
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.semantics.verticalScrollAxisRange
++import androidx.compose.ui.unit.Constraints
++import androidx.compose.ui.unit.Dp
++import androidx.compose.ui.unit.LayoutDirection
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import kotlin.math.roundToInt
++
++/**
++ * Columns for [PanoramaMasonry]. The counts match [androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridCells].
++ */
++@Stable
++sealed interface PanoramaColumns {
++    /** Exactly [count] columns. Remainder pixels go to the first columns. */
++    data class Fixed(val count: Int) : PanoramaColumns
++
++    /** As many columns as fit at [minSize], same formula as StaggeredGridCells.Adaptive. */
++    data class Adaptive(val minSize: Dp) : PanoramaColumns
++}
++
++/**
++ * Height the masonry can resolve without measuring the cell, except [Measure].
++ * Cells are constrained to the resolved height and clipped, so the slot matches what is drawn.
++ */
++@Stable
++sealed interface PanoramaCellHeight {
++    /** Panorama cover. [wide] is the committed shape (height/width <= 0.75). */
++    data class Cover(val wide: Boolean, val titleBelow: Boolean) : PanoramaCellHeight
++
++    data class Fixed(val height: Dp) : PanoramaCellHeight
++
++    /** Full-line rows whose height is not known up front (search bar, section title). */
++    data object Measure : PanoramaCellHeight
++}
++
++@Stable
++class PanoramaMasonryState {
++    internal val scrollableState: ScrollableState = ScrollableState { delta ->
++        val max = maxScroll
++        val next = (scrollOffset + delta).coerceIn(0f, max)
++        val consumed = next - scrollOffset
++        if (consumed != 0f) scrollOffset = next
++        consumed
++    }
++
++    internal val layoutCache = PanoramaMasonryLayoutCache()
++
++    var scrollOffset by mutableFloatStateOf(0f)
++        internal set
++
++    var maxScroll by mutableFloatStateOf(0f)
++        internal set
++
++    var viewportHeight by mutableIntStateOf(0)
++        internal set
++
++    var contentHeight by mutableIntStateOf(0)
++        internal set
++
++    var afterContentPadding by mutableIntStateOf(0)
++        internal set
++
++    var firstVisibleItemIndex by mutableIntStateOf(0)
++        internal set
++
++    var firstVisibleItemScrollOffset by mutableIntStateOf(0)
++        internal set
++
++    var canScrollForward by mutableStateOf(false)
++        internal set
++
++    var canScrollBackward by mutableStateOf(false)
++        internal set
++
++    /**
++     * Bumped by [requestScrollToItem] so the next measure observes the request.
++     * Read during measure.
++     */
++    internal var scrollRequest by mutableIntStateOf(0)
++
++    internal var pendingIndex: Int = -1
++    internal var pendingOffset: Int = 0
++    internal var pendingRestoreIndex: Int = Int.MIN_VALUE
++    internal var pendingRestoreOffset: Int = 0
++    internal var lastAnchor: PanoramaAnchor? = null
++    internal var lastKeys: List<Any>? = null
++
++    val isScrollInProgress: Boolean
++        get() = scrollableState.isScrollInProgress
++
++    fun requestScrollToItem(index: Int, scrollOffset: Int = 0) {
++        pendingIndex = index
++        pendingOffset = scrollOffset
++        scrollRequest++
++    }
++
++    suspend fun scrollToItem(index: Int, scrollOffset: Int = 0) {
++        scrollableState.scroll(MutatePriority.UserInput) {
++            requestScrollToItem(index, scrollOffset)
++            withFrameNanos { }
++        }
++    }
++
++    /**
++     * Jumps to an absolute content offset. Used by the fast scroller, which already knows the
++     * content height. The frame wait keeps [isScrollInProgress] true long enough for the
++     * panorama shape settle timer to treat the drag as scrolling.
++     */
++    suspend fun scrollToOffset(offsetPx: Float) {
++        scrollableState.scroll(MutatePriority.UserInput) {
++            scrollOffset = offsetPx.coerceIn(0f, maxScroll)
++            withFrameNanos { }
++        }
++    }
++}
++
++@Composable
++fun rememberPanoramaMasonryState(): PanoramaMasonryState {
++    val savedIndex = rememberSaveable { mutableIntStateOf(Int.MIN_VALUE) }
++    val savedOffset = rememberSaveable { mutableIntStateOf(0) }
++    val state = remember {
++        PanoramaMasonryState().also {
++            if (savedIndex.intValue != Int.MIN_VALUE) {
++                it.pendingRestoreIndex = savedIndex.intValue
++                it.pendingRestoreOffset = savedOffset.intValue
++            }
++        }
++    }
++    SideEffect {
++        val anchor = state.lastAnchor
++        if (anchor != null && state.pendingRestoreIndex == Int.MIN_VALUE) {
++            if (savedIndex.intValue != anchor.index) savedIndex.intValue = anchor.index
++            if (savedOffset.intValue != anchor.offsetFromViewportTop) {
++                savedOffset.intValue = anchor.offsetFromViewportTop
++            }
++        }
++    }
++    return state
++}
++
++interface PanoramaMasonryScope {
++    fun item(
++        key: Any? = null,
++        contentType: Any? = null,
++        span: PanoramaSpan = PanoramaSpan.SingleLane,
++        height: PanoramaCellHeight,
++        content: @Composable () -> Unit,
++    )
++
++    fun items(
++        count: Int,
++        key: ((index: Int) -> Any)? = null,
++        contentType: (index: Int) -> Any? = { null },
++        span: (index: Int) -> PanoramaSpan = { PanoramaSpan.SingleLane },
++        height: (index: Int) -> PanoramaCellHeight,
++        itemContent: @Composable (index: Int) -> Unit,
++    )
++}
++
++@Composable
++fun PanoramaMasonry(
++    columns: PanoramaColumns,
++    modifier: Modifier = Modifier,
++    state: PanoramaMasonryState = rememberPanoramaMasonryState(),
++    contentPadding: PaddingValues = PaddingValues(0.dp),
++    verticalSpacing: Dp = 0.dp,
++    horizontalSpacing: Dp = 0.dp,
++    userScrollEnabled: Boolean = true,
++    content: PanoramaMasonryScope.() -> Unit,
++) {
++    val latestContent = rememberUpdatedState(content)
++    val flingBehavior = ScrollableDefaults.flingBehavior()
++    val args = rememberUpdatedState(
++        MasonryMeasureArgs(
++            columns = columns,
++            contentPadding = contentPadding,
++            verticalSpacing = verticalSpacing,
++            horizontalSpacing = horizontalSpacing,
++        ),
++    )
++    LazyLayout(
++        modifier = modifier
++            .semantics {
++                if (userScrollEnabled) {
++                    // scrollBy is provided by scrollableArea. The axis range is the real offset:
++                    // every rectangle is known, so this is not the lazy list's estimate.
++                    verticalScrollAxisRange = ScrollAxisRange(
++                        value = { state.scrollOffset },
++                        maxValue = { state.maxScroll },
++                    )
++                }
++            }
++            .scrollableArea(
++                state = state.scrollableState,
++                orientation = Orientation.Vertical,
++                enabled = userScrollEnabled,
++                flingBehavior = flingBehavior,
++            ),
++        itemProvider = {
++            PanoramaItemProvider(PanoramaIntervalContent(latestContent.value))
++        },
++    ) { constraints ->
++        measureMasonry(
++            constraints = constraints,
++            state = state,
++            args = args.value,
++            content = latestContent.value,
++        )
++    }
++}
++
++@Composable
++fun FastScrollPanoramaMasonry(
++    columns: PanoramaColumns,
++    modifier: Modifier = Modifier,
++    state: PanoramaMasonryState = rememberPanoramaMasonryState(),
++    thumbAllowed: () -> Boolean = { true },
++    thumbColor: Color = MaterialTheme.colorScheme.primary,
++    contentPadding: PaddingValues = PaddingValues(0.dp),
++    topContentPadding: Dp = Dp.Hairline,
++    bottomContentPadding: Dp = Dp.Hairline,
++    endContentPadding: Dp = Dp.Hairline,
++    verticalSpacing: Dp = 0.dp,
++    horizontalSpacing: Dp = 0.dp,
++    userScrollEnabled: Boolean = true,
++    content: PanoramaMasonryScope.() -> Unit,
++) {
++    VerticalMasonryFastScroller(
++        state = state,
++        modifier = modifier,
++        thumbAllowed = thumbAllowed,
++        thumbColor = thumbColor,
++        topContentPadding = topContentPadding,
++        bottomContentPadding = bottomContentPadding,
++        endContentPadding = endContentPadding,
++    ) {
++        PanoramaMasonry(
++            columns = columns,
++            state = state,
++            contentPadding = contentPadding,
++            verticalSpacing = verticalSpacing,
++            horizontalSpacing = horizontalSpacing,
++            userScrollEnabled = userScrollEnabled,
++            content = content,
++        )
++    }
++}
++
++private class MasonryMeasureArgs(
++    val columns: PanoramaColumns,
++    val contentPadding: PaddingValues,
++    val verticalSpacing: Dp,
++    val horizontalSpacing: Dp,
++)
++
++private fun LazyLayoutMeasureScope.measureMasonry(
++    constraints: Constraints,
++    state: PanoramaMasonryState,
++    args: MasonryMeasureArgs,
++    content: PanoramaMasonryScope.() -> Unit,
++): MeasureResult {
++    // Subscribes this measure to scroll-to-item requests.
++    state.scrollRequest
++
++    val intervals = PanoramaIntervalContent(content)
++    val count = intervals.itemCount
++    val direction = layoutDirection
++    val padding = args.contentPadding
++    val left = padding.calculateLeftPadding(direction).roundToPx()
++    val right = padding.calculateRightPadding(direction).roundToPx()
++    val topPad = padding.calculateTopPadding().roundToPx()
++    val bottomPad = padding.calculateBottomPadding().roundToPx()
++    val available = if (constraints.hasBoundedWidth) {
++        (constraints.maxWidth - left - right).coerceAtLeast(0)
++    } else {
++        0
++    }
++    val horizontalPx = args.horizontalSpacing.roundToPx()
++    val verticalPx = args.verticalSpacing.roundToPx()
++    val laneCount = when (val columns = args.columns) {
++        is PanoramaColumns.Fixed -> columns.count.coerceAtLeast(1)
++        is PanoramaColumns.Adaptive -> staggeredLaneCountAdaptive(
++            availableSize = available,
++            spacing = horizontalPx,
++            minSize = columns.minSize.roundToPx(),
++        )
++    }
++    val laneWidths = staggeredLaneWidths(available, laneCount, horizontalPx)
++    val cellPadding = PANORAMA_CELL_PADDING_DP.dp.roundToPx()
++    val titlePadding = PANORAMA_TITLE_PADDING_DP.dp.roundToPx()
++    val titleLine = PANORAMA_TITLE_LINE_SP.sp.roundToPx()
++    val measuredPlaceables = HashMap<Int, List<Placeable>>(4)
++
++    fun heightOf(index: Int, widthPx: Int): Int {
++        return when (val spec = intervals.heightAt(index)) {
++            is PanoramaCellHeight.Cover -> panoramaCoverCellHeightPx(
++                laneWidthPx = widthPx,
++                wide = spec.wide,
++                titleBelow = spec.titleBelow,
++                cellPaddingPx = cellPadding,
++                titlePaddingPx = titlePadding,
++                titleLineHeightPx = titleLine,
++            )
++            is PanoramaCellHeight.Fixed -> spec.height.roundToPx()
++            PanoramaCellHeight.Measure -> {
++                measuredPlaceables[index]?.let { places ->
++                    return places.maxOfOrNull { it.height } ?: 0
++                }
++                val places = compose(index).map { measurable ->
++                    measurable.measure(Constraints(minWidth = widthPx, maxWidth = widthPx))
++                }
++                measuredPlaceables[index] = places
++                places.maxOfOrNull { it.height } ?: 0
++            }
++        }
++    }
++
++    val masonry = if (laneCount == 0 || count == 0) {
++        state.layoutCache.layout(
++            count = 0,
++            isFullLine = { false },
++            heightOf = { _, _ -> 0 },
++            laneWidths = if (laneWidths.isEmpty()) intArrayOf(0) else laneWidths,
++            verticalSpacing = verticalPx,
++            horizontalSpacing = horizontalPx,
++            rtl = direction == LayoutDirection.Rtl,
++        )
++    } else {
++        state.layoutCache.layout(
++            count = count,
++            isFullLine = { index -> intervals.spanAt(index) == PanoramaSpan.FullLine },
++            heightOf = { index, widthPx -> heightOf(index, widthPx) },
++            laneWidths = laneWidths,
++            verticalSpacing = verticalPx,
++            horizontalSpacing = horizontalPx,
++            rtl = direction == LayoutDirection.Rtl,
++        )
++    }
++
++    val keys = ArrayList<Any>(masonry.rects.size)
++    for (rect in masonry.rects) {
++        keys.add(intervals.getKey(rect.index))
++    }
++    val viewport = if (constraints.hasBoundedHeight) constraints.maxHeight else 0
++    val total = topPad + masonry.contentHeight + bottomPad
++    val maxScroll = (total - viewport).coerceAtLeast(0).toFloat()
++    var scroll = state.scrollOffset
++    val structural = state.layoutCache.structuralChange || keysChanged(state.lastKeys, keys)
++    if (state.pendingIndex >= 0 && masonry.rects.isNotEmpty()) {
++        val index = state.pendingIndex.coerceIn(0, masonry.rects.lastIndex)
++        val top = topPad + masonry.rects[index].y
++        scroll = (top + state.pendingOffset).toFloat()
++        state.pendingIndex = -1
++    } else if (state.pendingRestoreIndex != Int.MIN_VALUE && masonry.rects.isNotEmpty()) {
++        scroll = scrollOffsetForAnchor(
++            anchor = PanoramaAnchor(
++                index = state.pendingRestoreIndex,
++                key = state.pendingRestoreIndex,
++                offsetFromViewportTop = state.pendingRestoreOffset,
++            ),
++            rects = masonry.rects,
++            keys = keys,
++            topPadding = topPad,
++            maxScroll = maxScroll.toInt(),
++        ).toFloat()
++        state.pendingRestoreIndex = Int.MIN_VALUE
++    } else if (structural) {
++        val anchor = state.lastAnchor
++        if (anchor != null) {
++            scroll = scrollOffsetForAnchor(
++                anchor = anchor,
++                rects = masonry.rects,
++                keys = keys,
++                topPadding = topPad,
++                maxScroll = maxScroll.toInt(),
++            ).toFloat()
++        }
++    }
++    scroll = scroll.coerceIn(0f, maxScroll)
++    if (state.scrollOffset != scroll) state.scrollOffset = scroll
++    state.maxScroll = maxScroll
++    state.viewportHeight = viewport
++    state.contentHeight = total
++    state.afterContentPadding = bottomPad
++
++    val scrollPx = scroll.roundToInt()
++    val anchor = captureViewportAnchor(masonry.rects, keys, scrollPx, topPad)
++    state.lastAnchor = anchor
++    state.lastKeys = keys
++    if (anchor != null && anchor.index in masonry.rects.indices) {
++        val top = topPad + masonry.rects[anchor.index].y
++        state.firstVisibleItemIndex = anchor.index
++        state.firstVisibleItemScrollOffset = (scrollPx - top).coerceAtLeast(0)
++    } else {
++        state.firstVisibleItemIndex = 0
++        state.firstVisibleItemScrollOffset = 0
++    }
++    state.canScrollBackward = scroll > 0.5f
++    state.canScrollForward = scroll < maxScroll - 0.5f
++
++    val prefetch = viewport / 2
++    val windowStart = scrollPx - prefetch
++    val windowEnd = scrollPx + viewport + prefetch
++    val placed = ArrayList<Pair<PanoramaMasonryRect, List<Placeable>>>(16)
++    for (rect in masonry.rects) {
++        val top = topPad + rect.y
++        val bottom = top + rect.height
++        if (bottom <= windowStart || top >= windowEnd) continue
++        val placeables = measuredPlaceables[rect.index] ?: compose(rect.index).map { measurable ->
++            measurable.measure(
++                Constraints(
++                    minWidth = rect.width,
++                    maxWidth = rect.width,
++                    minHeight = rect.height,
++                    maxHeight = rect.height,
++                ),
++            )
++        }
++        placed.add(rect to placeables)
++    }
++
++    val layoutWidth = if (constraints.hasBoundedWidth) constraints.maxWidth else available + left + right
++    val layoutHeight = if (constraints.hasBoundedHeight) constraints.maxHeight else total.coerceAtLeast(0)
++    return layout(layoutWidth, layoutHeight) {
++        for ((rect, placeables) in placed) {
++            val x = left + rect.x
++            val y = topPad + rect.y - scrollPx
++            for (placeable in placeables) {
++                placeable.place(x, y)
++            }
++        }
++    }
++}
++
++private fun keysChanged(previous: List<Any>?, keys: List<Any>): Boolean {
++    if (previous == null) return false
++    val shared = minOf(previous.size, keys.size)
++    for (index in 0 until shared) {
++        if (previous[index] != keys[index]) return true
++    }
++    return false
++}
++
++private class PanoramaIntervalContent(
++    content: PanoramaMasonryScope.() -> Unit,
++) : PanoramaMasonryScope, LazyLayoutIntervalContent<PanoramaInterval>() {
++    override val intervals = MutableIntervalList<PanoramaInterval>()
++
++    init {
++        apply(content)
++    }
++
++    override fun item(
++        key: Any?,
++        contentType: Any?,
++        span: PanoramaSpan,
++        height: PanoramaCellHeight,
++        content: @Composable () -> Unit,
++    ) {
++        items(
++            count = 1,
++            key = key?.let { itemKey -> { itemKey } },
++            contentType = { contentType },
++            span = { span },
++            height = { height },
++            itemContent = { content() },
++        )
++    }
++
++    override fun items(
++        count: Int,
++        key: ((index: Int) -> Any)?,
++        contentType: (index: Int) -> Any?,
++        span: (index: Int) -> PanoramaSpan,
++        height: (index: Int) -> PanoramaCellHeight,
++        itemContent: @Composable (index: Int) -> Unit,
++    ) {
++        intervals.addInterval(
++            count,
++            PanoramaInterval(
++                key = key,
++                type = contentType,
++                span = span,
++                height = height,
++                item = itemContent,
++            ),
++        )
++    }
++
++    fun spanAt(index: Int): PanoramaSpan {
++        return withInterval(index) { local, interval -> interval.span(local) }
++    }
++
++    fun heightAt(index: Int): PanoramaCellHeight {
++        return withInterval(index) { local, interval -> interval.height(local) }
++    }
++}
++
++private class PanoramaInterval(
++    override val key: ((index: Int) -> Any)?,
++    override val type: (index: Int) -> Any?,
++    val span: (index: Int) -> PanoramaSpan,
++    val height: (index: Int) -> PanoramaCellHeight,
++    val item: @Composable (index: Int) -> Unit,
++) : LazyLayoutIntervalContent.Interval
++
++private class PanoramaItemProvider(
++    private val intervals: PanoramaIntervalContent,
++) : LazyLayoutItemProvider {
++    override val itemCount: Int
++        get() = intervals.itemCount
++
++    @Composable
++    override fun Item(index: Int, key: Any) {
++        Box(Modifier.clipToBounds()) {
++            intervals.withInterval(index) { local, interval ->
++                interval.item(local)
++            }
++        }
++    }
++
++    override fun getContentType(index: Int): Any? = intervals.getContentType(index)
++
++    override fun getKey(index: Int): Any = intervals.getKey(index)
++
++    override fun getIndex(key: Any): Int {
++        for (index in 0 until itemCount) {
++            if (getKey(index) == key) return index
++        }
++        return -1
++    }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt
+new file mode 100644
+index 0000000..74da312
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt
+@@ -0,0 +1,430 @@
++package tachiyomi.presentation.core.components
++
++import kotlin.math.roundToInt
++
++/**
++ * A lane stays eligible when its bottom is within half the incoming item of the shortest lane.
++ * The item is placed in the leftmost eligible lane, so a column that is only slightly shorter
++ * does not steal the next cell and leave a hole on the left.
++ *
++ * Exactly half is still eligible: the item moves only when the recess is more than half.
++ */
++const val PANORAMA_RECESS_FRACTION = 0.5
++
++/**
++ * Cover cell chrome from [eu.kanade.presentation.library.components.MangaCompactGridItem] and
++ * [eu.kanade.presentation.library.components.MangaComfortableGridItem].
++ *
++ * The selectable box pads 4 dp on every edge. The cover is [fillMaxWidth] + [aspectRatio]:
++ * wide (height/width <= 0.75, unknown starts at 9/16) uses 3/2, tall uses 2/3.
++ * Compact draws the title over the cover, so the cell is the padding plus the cover.
++ * Comfortable adds the title block: padding 4 dp and two lines at 18 sp (`minLines` = 2).
++ */
++const val PANORAMA_CELL_PADDING_DP = 4
++const val PANORAMA_TITLE_PADDING_DP = 4
++const val PANORAMA_TITLE_LINE_SP = 18
++const val PANORAMA_TITLE_LINES = 2
++
++enum class PanoramaSpan {
++    SingleLane,
++    FullLine,
++}
++
++class PanoramaMasonryRect(
++    val index: Int,
++    val lane: Int,
++    val x: Int,
++    val y: Int,
++    val width: Int,
++    val height: Int,
++    val fullLine: Boolean,
++)
++
++class PanoramaMasonryLayout(
++    val laneWidths: IntArray,
++    val laneOffsets: IntArray,
++    val verticalSpacing: Int,
++    val horizontalSpacing: Int,
++    val rtl: Boolean,
++    val rects: List<PanoramaMasonryRect>,
++    /** Bottom of each lane after its last item, including the spacing that follows that item. */
++    val laneBottoms: IntArray,
++    /** Max item bottom. Spacing after the last item of a lane is not included. */
++    val contentHeight: Int,
++) {
++    val laneCount: Int
++        get() = laneWidths.size
++
++    val contentWidth: Int
++        get() = contentWidthOf(laneWidths, horizontalSpacing)
++}
++
++class PanoramaAnchor(
++    val index: Int,
++    val key: Any,
++    /** Item top minus the viewport top. Negative when the item is scrolled partly off the top. */
++    val offsetFromViewportTop: Int,
++)
++
++/**
++ * Lane count of [androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridCells.Adaptive].
++ */
++fun staggeredLaneCountAdaptive(availableSize: Int, spacing: Int, minSize: Int): Int {
++    if (minSize <= 0) return 1
++    return maxOf((availableSize + spacing) / (minSize + spacing), 1)
++}
++
++/**
++ * Column widths of [androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridCells.Fixed]
++ * and Adaptive. Remainder pixels go to the first lanes.
++ */
++fun staggeredLaneWidths(availableSize: Int, laneCount: Int, spacing: Int): IntArray {
++    require(laneCount > 0) { "grid with no columns" }
++    val gridSizeWithoutSpacing = availableSize - spacing * (laneCount - 1)
++    val slotSize = gridSizeWithoutSpacing / laneCount
++    val remainingPixels = gridSizeWithoutSpacing % laneCount
++    return IntArray(laneCount) { index ->
++        if (slotSize < 0) {
++            0
++        } else {
++            slotSize + if (index < remainingPixels) 1 else 0
++        }
++    }
++}
++
++fun panoramaReadingLane(bottoms: IntArray, itemHeight: Int): Int {
++    var shortest = bottoms[0]
++    for (index in 1 until bottoms.size) {
++        val bottom = bottoms[index]
++        if (bottom < shortest) shortest = bottom
++    }
++    val limit = shortest.toDouble() + itemHeight * PANORAMA_RECESS_FRACTION
++    for (index in bottoms.indices) {
++        if (bottoms[index].toDouble() <= limit) return index
++    }
++    return 0
++}
++
++/**
++ * @param heightOf item height for the width it would occupy in that lane, or the full content
++ * width when the item is a full line. Cover height depends on the lane width; a one pixel
++ * remainder can change it by a pixel, so the lane is chosen with that lane's own height.
++ */
++fun layoutPanoramaMasonry(
++    count: Int,
++    isFullLine: (Int) -> Boolean,
++    heightOf: (index: Int, widthPx: Int) -> Int,
++    laneWidths: IntArray,
++    verticalSpacing: Int,
++    horizontalSpacing: Int,
++    rtl: Boolean = false,
++): PanoramaMasonryLayout {
++    val laneCount = laneWidths.size
++    require(laneCount > 0)
++    val offsets = laneOffsets(laneWidths, horizontalSpacing, rtl)
++    val contentWidth = contentWidthOf(laneWidths, horizontalSpacing)
++    val bottoms = IntArray(laneCount)
++    val rects = ArrayList<PanoramaMasonryRect>(count)
++    var contentHeight = 0
++    for (index in 0 until count) {
++        val rect = placeItem(
++            index = index,
++            fullLine = isFullLine(index),
++            heightOf = heightOf,
++            laneWidths = laneWidths,
++            offsets = offsets,
++            bottoms = bottoms,
++            contentWidth = contentWidth,
++            verticalSpacing = verticalSpacing,
++        )
++        rects.add(rect)
++        val bottom = rect.y + rect.height
++        if (bottom > contentHeight) contentHeight = bottom
++    }
++    return PanoramaMasonryLayout(
++        laneWidths = laneWidths.copyOf(),
++        laneOffsets = offsets,
++        verticalSpacing = verticalSpacing,
++        horizontalSpacing = horizontalSpacing,
++        rtl = rtl,
++        rects = rects,
++        laneBottoms = bottoms,
++        contentHeight = contentHeight,
++    )
++}
++
++/**
++ * Continues [previous] with items appended after it. Existing rectangles are reused.
++ */
++fun appendPanoramaMasonry(
++    previous: PanoramaMasonryLayout,
++    count: Int,
++    isFullLine: (Int) -> Boolean,
++    heightOf: (index: Int, widthPx: Int) -> Int,
++): PanoramaMasonryLayout {
++    val rects = ArrayList<PanoramaMasonryRect>(count)
++    rects.addAll(previous.rects)
++    val bottoms = previous.laneBottoms.copyOf()
++    var contentHeight = previous.contentHeight
++    val contentWidth = previous.contentWidth
++    for (index in previous.rects.size until count) {
++        val rect = placeItem(
++            index = index,
++            fullLine = isFullLine(index),
++            heightOf = heightOf,
++            laneWidths = previous.laneWidths,
++            offsets = previous.laneOffsets,
++            bottoms = bottoms,
++            contentWidth = contentWidth,
++            verticalSpacing = previous.verticalSpacing,
++        )
++        rects.add(rect)
++        val bottom = rect.y + rect.height
++        if (bottom > contentHeight) contentHeight = bottom
++    }
++    return PanoramaMasonryLayout(
++        laneWidths = previous.laneWidths,
++        laneOffsets = previous.laneOffsets,
++        verticalSpacing = previous.verticalSpacing,
++        horizontalSpacing = previous.horizontalSpacing,
++        rtl = previous.rtl,
++        rects = rects,
++        laneBottoms = bottoms,
++        contentHeight = contentHeight,
++    )
++}
++
++/**
++ * Remembers a layout and appends when only the tail grew. A lane-width change, a height change,
++ * or a shorter list replaces the whole layout and reports [structuralChange].
++ */
++class PanoramaMasonryLayoutCache {
++    private var layout: PanoramaMasonryLayout? = null
++    private var laneWidths: IntArray = IntArray(0)
++    private var verticalSpacing: Int = Int.MIN_VALUE
++    private var horizontalSpacing: Int = Int.MIN_VALUE
++    private var rtl: Boolean = false
++
++    var structuralChange: Boolean = false
++        private set
++
++    fun layout(
++        count: Int,
++        isFullLine: (Int) -> Boolean,
++        heightOf: (index: Int, widthPx: Int) -> Int,
++        laneWidths: IntArray,
++        verticalSpacing: Int,
++        horizontalSpacing: Int,
++        rtl: Boolean,
++    ): PanoramaMasonryLayout {
++        val previous = layout
++        val sameGeometry = previous != null &&
++            verticalSpacing == this.verticalSpacing &&
++            horizontalSpacing == this.horizontalSpacing &&
++            rtl == this.rtl &&
++            this.laneWidths.contentEquals(laneWidths)
++        val reusable = sameGeometry &&
++            count >= previous.rects.size &&
++            prefixUnchanged(previous, isFullLine, heightOf)
++        val result = when {
++            reusable && count == previous.rects.size -> {
++                structuralChange = false
++                previous
++            }
++            reusable -> {
++                structuralChange = false
++                appendPanoramaMasonry(previous, count, isFullLine, heightOf)
++            }
++            else -> {
++                structuralChange = previous != null
++                layoutPanoramaMasonry(
++                    count = count,
++                    isFullLine = isFullLine,
++                    heightOf = heightOf,
++                    laneWidths = laneWidths,
++                    verticalSpacing = verticalSpacing,
++                    horizontalSpacing = horizontalSpacing,
++                    rtl = rtl,
++                )
++            }
++        }
++        this.layout = result
++        this.laneWidths = result.laneWidths
++        this.verticalSpacing = verticalSpacing
++        this.horizontalSpacing = horizontalSpacing
++        this.rtl = rtl
++        return result
++    }
++
++    private fun prefixUnchanged(
++        previous: PanoramaMasonryLayout,
++        isFullLine: (Int) -> Boolean,
++        heightOf: (index: Int, widthPx: Int) -> Int,
++    ): Boolean {
++        for (rect in previous.rects) {
++            if (isFullLine(rect.index) != rect.fullLine) return false
++            if (heightOf(rect.index, rect.width) != rect.height) return false
++        }
++        return true
++    }
++}
++
++/**
++ * First item, in index order, whose bottom is past the viewport top.
++ */
++fun captureViewportAnchor(
++    rects: List<PanoramaMasonryRect>,
++    keys: List<Any>,
++    scroll: Int,
++    topPadding: Int,
++): PanoramaAnchor? {
++    for (rect in rects) {
++        val top = topPadding + rect.y
++        val bottom = top + rect.height
++        if (bottom > scroll) {
++            val key = keys.getOrElse(rect.index) { rect.index }
++            return PanoramaAnchor(
++                index = rect.index,
++                key = key,
++                offsetFromViewportTop = top - scroll,
++            )
++        }
++    }
++    return null
++}
++
++/**
++ * Scroll that puts [anchor] at the same offset from the viewport top after a relayout.
++ * The anchor is found by key, then by index.
++ */
++fun scrollOffsetForAnchor(
++    anchor: PanoramaAnchor,
++    rects: List<PanoramaMasonryRect>,
++    keys: List<Any>,
++    topPadding: Int,
++    maxScroll: Int,
++): Int {
++    if (rects.isEmpty()) return 0
++    var index = -1
++    for (candidate in keys.indices) {
++        if (keys[candidate] == anchor.key) {
++            index = candidate
++            break
++        }
++    }
++    if (index !in rects.indices) {
++        index = anchor.index.coerceIn(0, rects.lastIndex)
++    }
++    val top = topPadding + rects[index].y
++    return (top - anchor.offsetFromViewportTop).coerceIn(0, maxScroll)
++}
++
++/**
++ * Height of a panorama cover cell. [laneWidthPx] is the column width, including the 4 dp
++ * padding on each side of the cover. Wide covers use aspect 3/2, tall covers 2/3.
++ */
++fun panoramaCoverCellHeightPx(
++    laneWidthPx: Int,
++    wide: Boolean,
++    titleBelow: Boolean,
++    cellPaddingPx: Int,
++    titlePaddingPx: Int,
++    titleLineHeightPx: Int,
++    titleLines: Int = PANORAMA_TITLE_LINES,
++): Int {
++    val innerWidth = (laneWidthPx - cellPaddingPx * 2).coerceAtLeast(0)
++    val cover = if (wide) {
++        (innerWidth * 2.0 / 3.0).roundToInt()
++    } else {
++        (innerWidth * 3.0 / 2.0).roundToInt()
++    }
++    var height = cellPaddingPx * 2 + cover
++    if (titleBelow) {
++        height += titlePaddingPx * 2 + titleLineHeightPx * titleLines
++    }
++    return height
++}
++
++private fun placeItem(
++    index: Int,
++    fullLine: Boolean,
++    heightOf: (index: Int, widthPx: Int) -> Int,
++    laneWidths: IntArray,
++    offsets: IntArray,
++    bottoms: IntArray,
++    contentWidth: Int,
++    verticalSpacing: Int,
++): PanoramaMasonryRect {
++    if (fullLine) {
++        var y = bottoms[0]
++        for (lane in 1 until bottoms.size) {
++            if (bottoms[lane] > y) y = bottoms[lane]
++        }
++        val height = heightOf(index, contentWidth).coerceAtLeast(0)
++        val next = y + height + verticalSpacing
++        for (lane in bottoms.indices) {
++            bottoms[lane] = next
++        }
++        return PanoramaMasonryRect(
++            index = index,
++            lane = 0,
++            x = 0,
++            y = y,
++            width = contentWidth,
++            height = height,
++            fullLine = true,
++        )
++    }
++    val (lane, height) = chooseLane(bottoms) { laneIndex ->
++        heightOf(index, laneWidths[laneIndex])
++    }
++    val y = bottoms[lane]
++    bottoms[lane] = y + height + verticalSpacing
++    return PanoramaMasonryRect(
++        index = index,
++        lane = lane,
++        x = offsets[lane],
++        y = y,
++        width = laneWidths[lane],
++        height = height,
++        fullLine = false,
++    )
++}
++
++private fun chooseLane(bottoms: IntArray, heightForLane: (Int) -> Int): Pair<Int, Int> {
++    val probe = heightForLane(0).coerceAtLeast(0)
++    var lane = panoramaReadingLane(bottoms, probe)
++    val atLane = heightForLane(lane).coerceAtLeast(0)
++    if (atLane != probe) {
++        lane = panoramaReadingLane(bottoms, atLane)
++    }
++    return lane to heightForLane(lane).coerceAtLeast(0)
++}
++
++private fun laneOffsets(laneWidths: IntArray, spacing: Int, rtl: Boolean): IntArray {
++    val offsets = IntArray(laneWidths.size)
++    if (!rtl) {
++        var x = 0
++        for (index in laneWidths.indices) {
++            offsets[index] = x
++            x += laneWidths[index]
++            if (index < laneWidths.lastIndex) x += spacing
++        }
++        return offsets
++    }
++    var x = contentWidthOf(laneWidths, spacing)
++    for (index in laneWidths.indices) {
++        x -= laneWidths[index]
++        offsets[index] = x
++        x -= spacing
++    }
++    return offsets
++}
++
++private fun contentWidthOf(laneWidths: IntArray, spacing: Int): Int {
++    if (laneWidths.isEmpty()) return 0
++    var width = 0
++    for (lane in laneWidths) width += lane
++    width += spacing * (laneWidths.size - 1)
++    return width.coerceAtLeast(0)
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+index b5c7993..d9bda76 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+@@ -2,7 +2,6 @@ package tachiyomi.presentation.core.components
+ 
+ import android.view.ViewConfiguration
+ import androidx.compose.animation.core.Animatable
+-import androidx.compose.animation.core.animate
+ import androidx.compose.animation.core.tween
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.gestures.Orientation
+@@ -23,14 +22,12 @@ import androidx.compose.foundation.lazy.LazyListItemInfo
+ import androidx.compose.foundation.lazy.LazyListState
+ import androidx.compose.foundation.lazy.grid.GridCells
+ import androidx.compose.foundation.lazy.grid.LazyGridState
+-import androidx.compose.foundation.lazy.staggeredgrid.LazyStaggeredGridState
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.foundation.systemGestureExclusion
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.State
+-import androidx.compose.runtime.derivedStateOf
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableFloatStateOf
+ import androidx.compose.runtime.mutableStateMapOf
+@@ -59,7 +56,6 @@ import kotlinx.coroutines.flow.sample
+ import tachiyomi.presentation.core.components.Scroller.EXACT_HEIGHT_KEY_PREFIX
+ import tachiyomi.presentation.core.components.Scroller.STICKY_HEADER_KEY_PREFIX
+ import kotlin.math.abs
+-import kotlin.math.ceil
+ import kotlin.math.max
+ import kotlin.math.min
+ import kotlin.math.roundToInt
+@@ -728,16 +724,17 @@ private fun computeScrollRange(
+ // <-- AM
+ 
+ // Harmony -->
++
+ /**
+- * Draws a vertical fast scroller next to a [androidx.compose.foundation.lazy.staggeredgrid.LazyVerticalStaggeredGrid].
++ * Fast scroller for [PanoramaMasonry].
+  *
+- * Lanes have independent heights. The scroll range is estimated from item heights seen so far,
+- * not from the items currently on screen: a window average jumps whenever a 3:2 cell replaces a
+- * 2:3 cell, and the thumb jitters with it.
++ * The grid already knows the content height and the scroll offset, so the thumb position is that
++ * ratio and dragging the thumb scrolls to the matching y. Lanes of different heights do not move
++ * the thumb on their own.
+  */
+ @Composable
+-fun VerticalStaggeredGridFastScroller(
+-    state: LazyStaggeredGridState,
++fun VerticalMasonryFastScroller(
++    state: PanoramaMasonryState,
+     modifier: Modifier = Modifier,
+     thumbAllowed: () -> Boolean = { true },
+     thumbColor: Color = MaterialTheme.colorScheme.primary,
+@@ -753,11 +750,7 @@ fun VerticalStaggeredGridFastScroller(
+ 
+         val scrollerConstraints = constraints.copy(minWidth = 0, minHeight = 0)
+         val scrollerPlaceable = subcompose("scroller") {
+-            val layoutInfo = state.layoutInfo
+-            val showScroller = remember(layoutInfo.totalItemsCount) {
+-                layoutInfo.visibleItemsInfo.size < layoutInfo.totalItemsCount
+-            }
+-            if (!showScroller) return@subcompose
++            if (state.maxScroll <= 1f) return@subcompose
+             val thumbTopPadding = with(LocalDensity.current) { topContentPadding.toPx() }
+             var thumbOffsetY by remember(thumbTopPadding) { mutableFloatStateOf(thumbTopPadding) }
+ 
+@@ -774,55 +767,34 @@ fun VerticalStaggeredGridFastScroller(
+             val heightPx = contentHeight.toFloat() -
+                 thumbTopPadding -
+                 thumbBottomPadding -
+-                state.layoutInfo.afterContentPadding
++                state.afterContentPadding
+             val thumbHeightPx = with(LocalDensity.current) { ThumbLength.toPx() }
+             val trackHeightPx = heightPx - thumbHeightPx
+-            val estimate by rememberStaggeredGridEstimate(state)
++            if (trackHeightPx <= 0f) return@subcompose
+ 
+-            // When thumb dragged
+             LaunchedEffect(thumbOffsetY) {
+-                if (layoutInfo.totalItemsCount == 0 || !isThumbDragged) return@LaunchedEffect
+-                if (estimate.rowHeight <= 0f) return@LaunchedEffect
+-
+-                val scrollRatio = (thumbOffsetY - thumbTopPadding) / trackHeightPx
+-                val scrollAmt = scrollRatio * (estimate.scrollRange - heightPx).coerceAtLeast(1f)
+-                val rowNumber = (scrollAmt / estimate.rowHeight).toInt()
+-                val rowOffset = scrollAmt - rowNumber * estimate.rowHeight
+-
+-                state.scrollToItem(
+-                    index = (estimate.laneCount * rowNumber).coerceIn(0, layoutInfo.totalItemsCount - 1),
+-                    scrollOffset = rowOffset.roundToInt(),
+-                )
++                if (!isThumbDragged) return@LaunchedEffect
++                val ratio = ((thumbOffsetY - thumbTopPadding) / trackHeightPx).coerceIn(0f, 1f)
++                state.scrollToOffset(ratio * state.maxScroll)
+                 scrolled.tryEmit(Unit)
+             }
+ 
+-            // When list scrolled
+             val lastScrollOffset = remember { MutableData(Float.NaN) }
+-            LaunchedEffect(estimate.scrollOffset, estimate.scrollRange) {
+-                if (state.layoutInfo.totalItemsCount == 0 || isThumbDragged) return@LaunchedEffect
+-                if (estimate.rowHeight <= 0f) return@LaunchedEffect
+-                val extraScrollRange = (estimate.scrollRange - heightPx).coerceAtLeast(1f)
++            LaunchedEffect(state.scrollOffset, state.maxScroll, state.canScrollForward) {
++                if (isThumbDragged) return@LaunchedEffect
+                 val proportion = if (!state.canScrollForward) {
+                     1f
+                 } else {
+-                    (estimate.scrollOffset / extraScrollRange).coerceIn(0f, 1f)
++                    (state.scrollOffset / state.maxScroll).coerceIn(0f, 1f)
+                 }
+                 val target = trackHeightPx * proportion + thumbTopPadding
+-                if (estimate.scrollOffset != lastScrollOffset.value) {
+-                    lastScrollOffset.value = estimate.scrollOffset
++                if (state.scrollOffset != lastScrollOffset.value) {
++                    lastScrollOffset.value = state.scrollOffset
+                     scrolled.tryEmit(Unit)
+                 }
+-                if (state.isScrollInProgress) {
+-                    thumbOffsetY = target
+-                } else {
+-                    // The range is only refreshed once the list stops; glide to it instead of jumping.
+-                    animate(thumbOffsetY, target, animationSpec = tween(RANGE_SETTLE_MILLIS)) { value, _ ->
+-                        thumbOffsetY = value
+-                    }
+-                }
++                thumbOffsetY = target
+             }
+ 
+-            // Thumb alpha
+             val alpha = remember { Animatable(0f) }
+             val isThumbVisible = alpha.value > 0f
+             LaunchedEffect(scrolled, alpha) {
+@@ -831,7 +803,13 @@ fun VerticalStaggeredGridFastScroller(
+                     .collectLatest {
+                         if (thumbAllowed()) {
+                             alpha.snapTo(1f)
+-                            alpha.animateTo(0f, animationSpec = FadeOutAnimationSpec)
++                            alpha.animateTo(
++                                0f,
++                                animationSpec = tween(
++                                    durationMillis = ViewConfiguration.getScrollBarFadeDuration(),
++                                    delayMillis = ViewConfiguration.getScrollDefaultDelay(),
++                                ),
++                            )
+                         } else {
+                             alpha.animateTo(0f, animationSpec = ImmediateFadeOutAnimationSpec)
+                         }
+@@ -842,7 +820,9 @@ fun VerticalStaggeredGridFastScroller(
+                 modifier = Modifier
+                     .offset { IntOffset(0, thumbOffsetY.roundToInt()) }
+                     .then(
+-                        if (isThumbVisible && !state.isScrollInProgress) {
++                        // Stay draggable while scrollToOffset reports a scroll, or the drag
++                        // gesture is cancelled on the frame that applies it.
++                        if (isThumbVisible) {
+                             Modifier.draggable(
+                                 interactionSource = dragInteractionSource,
+                                 orientation = Orientation.Vertical,
+@@ -884,123 +864,6 @@ fun VerticalStaggeredGridFastScroller(
+         }
+     }
+ }
+-
+-private class StaggeredGridEstimate(
+-    val laneCount: Int,
+-    /** Average item height including spacing; a row is one item per lane. */
+-    val rowHeight: Float,
+-    val scrollOffset: Float,
+-    val scrollRange: Float,
+-)
+-
+-/**
+- * Heights seen so far, kept on the grid state so the average does not follow whichever mix of
+- * 3:2 and 2:3 cells happens to be on screen.
+- */
+-private class StaggeredGridMeasurements {
+-    val heights = HashMap<Int, Int>()
+-    var heightSum = 0L
+-    var laneCount = 1
+-
+-    /** An item that was on screen last frame, and the scroll position measured against it. */
+-    var anchorIndex = -1
+-    var anchorOffsetY = 0
+-    var position = 0f
+-
+-    /** Range used while a scroll is in progress; every newly measured cell would otherwise nudge it. */
+-    var frozenRange = 0f
+-    var frozenItemsCount = -1
+-}
+-
+-@Composable
+-private fun rememberStaggeredGridEstimate(state: LazyStaggeredGridState): State<StaggeredGridEstimate> {
+-    val measurements = remember(state) { StaggeredGridMeasurements() }
+-    return remember(state) {
+-        derivedStateOf {
+-            val layoutInfo = state.layoutInfo
+-            val visibleItems = layoutInfo.visibleItemsInfo
+-            // LazyStaggeredGridItemInfo does not expose the span; a full-line row (search bar,
+-            // section header) is recognised by being wider than a lane cell.
+-            val laneWidth = visibleItems.minOfOrNull { it.size.width } ?: 0
+-            visibleItems.fastForEach { item ->
+-                val lanes = item.lane + 1
+-                if (lanes > measurements.laneCount) measurements.laneCount = lanes
+-                if (laneWidth > 0 && item.size.width > laneWidth * 3 / 2) {
+-                    measurements.heights.remove(item.index)?.let { measurements.heightSum -= it }
+-                    return@fastForEach
+-                }
+-                val height = item.size.height
+-                val previous = measurements.heights.put(item.index, height)
+-                if (previous == null) {
+-                    measurements.heightSum += height
+-                } else if (previous != height) {
+-                    measurements.heightSum += height - previous
+-                }
+-            }
+-
+-            val averageHeight = if (measurements.heights.isNotEmpty()) {
+-                measurements.heightSum.toFloat() / measurements.heights.size
+-            } else {
+-                visibleItems.firstOrNull()?.size?.height?.toFloat() ?: 0f
+-            }
+-            val laneCount = measurements.laneCount.coerceAtLeast(1)
+-            val rowSpacing = layoutInfo.mainAxisItemSpacing
+-            val totalItemsCount = layoutInfo.totalItemsCount
+-            val first = visibleItems.firstOrNull()
+-            var beforeFirst = 0f
+-            var beforeAll = 0f
+-            for (index in 0 until totalItemsCount) {
+-                if (first != null && index == first.index) beforeFirst = beforeAll
+-                beforeAll += measurements.heights[index]?.toFloat() ?: averageHeight
+-            }
+-
+-            // offset.y is relative to the content start (negative once the item has scrolled off
+-            // the top); beforeContentPadding is applied only at placement, so a grid at rest
+-            // reports scroll offset 0 and the padding belongs to the range only.
+-            //
+-            // The row formula assumes every lane is equally tall. Lanes of 3:2 and 2:3 cells are
+-            // not, so its error differs from item to item and the thumb jumped back each time the
+-            // first visible item changed (about once a row). Follow an item that stays on screen
+-            // instead, and fall back to the formula only after a jump.
+-            val itemZero = visibleItems.fastFirstOrNull { it.index == 0 }
+-            val scrollOffset = when {
+-                first == null -> 0f
+-                itemZero != null -> -itemZero.offset.y.toFloat()
+-                else -> {
+-                    val anchor = visibleItems.fastFirstOrNull { it.index == measurements.anchorIndex }
+-                    if (anchor != null) {
+-                        measurements.position + (measurements.anchorOffsetY - anchor.offset.y)
+-                    } else {
+-                        beforeFirst / laneCount + rowSpacing * (first.index / laneCount) - first.offset.y
+-                    }
+-                }
+-            }
+-            val nextAnchor = visibleItems.getOrNull(visibleItems.size / 2)
+-            measurements.anchorIndex = nextAnchor?.index ?: -1
+-            measurements.anchorOffsetY = nextAnchor?.offset?.y ?: 0
+-            measurements.position = scrollOffset
+-
+-            val measuredRange = beforeAll / laneCount +
+-                rowSpacing * ceil(totalItemsCount.toFloat() / laneCount) +
+-                layoutInfo.beforeContentPadding +
+-                layoutInfo.afterContentPadding
+-            val keepFrozen = state.isScrollInProgress &&
+-                measurements.frozenItemsCount == totalItemsCount &&
+-                measurements.frozenRange > 0f
+-            if (!keepFrozen) {
+-                measurements.frozenRange = measuredRange
+-                measurements.frozenItemsCount = totalItemsCount
+-            }
+-            val scrollRange = measurements.frozenRange
+-            StaggeredGridEstimate(
+-                laneCount = laneCount,
+-                rowHeight = averageHeight + rowSpacing,
+-                scrollOffset = scrollOffset,
+-                scrollRange = scrollRange,
+-            )
+-        }
+-    }
+-}
+ // Harmony <--
+ 
+ private class MutableData<T>(var value: T)
+@@ -1013,10 +876,6 @@ object Scroller {
+     // <-- AM
+ }
+ 
+-// Harmony -->
+-private const val RANGE_SETTLE_MILLIS = 150
+-// Harmony <--
+-
+ private val ThumbLength = 48.dp
+ private val ThumbThickness = 12.dp
+ private val ThumbShape = RoundedCornerShape(ThumbThickness / 2)
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt
+new file mode 100644
+index 0000000..89dda26
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt
+@@ -0,0 +1,244 @@
++package tachiyomi.presentation.core.components
++
++import org.junit.jupiter.api.Assertions.assertArrayEquals
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++
++class PanoramaMasonryLayoutTest {
++    @Test
++    fun `slight recess stays in the left lane`() {
++        // Left 252, right 244. Next wide cell is 112; half is 56, and 8 is not enough to move.
++        assertEquals(0, panoramaReadingLane(intArrayOf(252, 244), 112))
++    }
++
++    @Test
++    fun `a recess past half the item moves to that lane`() {
++        // Right lane is 80 shorter than the left. 80 > 56, so the wide cell goes right.
++        assertEquals(1, panoramaReadingLane(intArrayOf(252, 172), 112))
++    }
++
++    @Test
++    fun `four lanes pick the leftmost lane inside the limit`() {
++        // shortest 70, limit 126. Lane 2 (80) is inside it and is left of the shortest lane.
++        assertEquals(2, panoramaReadingLane(intArrayOf(300, 290, 80, 70), 112))
++    }
++
++    @Test
++    fun `a deep recess in the last lane is the only eligible one`() {
++        assertEquals(3, panoramaReadingLane(intArrayOf(300, 290, 280, 40), 112))
++    }
++
++    @Test
++    fun `reading order trace for a tall and wide mix`() {
++        val heights = intArrayOf(252, 112, 112, 252, 112, 252, 112, 112)
++        val two = layoutFixed(heights, lanes = 2, spacing = 4)
++        assertEquals(listOf(0, 1, 1, 0, 1, 1, 0, 0), two.rects.map { it.lane })
++        assertEquals(740, two.contentHeight)
++
++        val four = layoutFixed(heights, lanes = 4, spacing = 4)
++        assertEquals(listOf(0, 1, 2, 1, 3, 2, 3, 0), four.rects.map { it.lane })
++        assertEquals(368, four.contentHeight)
++    }
++
++    @Test
++    fun `full line sits on the deepest lane and aligns every lane under it`() {
++        val heights = intArrayOf(10, 20, 5)
++        val fullLine = booleanArrayOf(false, false, true)
++        val layout = layoutPanoramaMasonry(
++            count = 3,
++            isFullLine = { fullLine[it] },
++            heightOf = { index, _ -> heights[index] },
++            laneWidths = intArrayOf(100, 100),
++            verticalSpacing = 4,
++            horizontalSpacing = 4,
++        )
++        assertEquals(0, layout.rects[0].y)
++        assertEquals(0, layout.rects[0].lane)
++        assertEquals(0, layout.rects[1].y)
++        assertEquals(1, layout.rects[1].lane)
++        // Deepest lane bottom includes the spacing after the 20px item: 24.
++        assertEquals(24, layout.rects[2].y)
++        assertTrue(layout.rects[2].fullLine)
++        assertEquals(204, layout.rects[2].width)
++        assertEquals(29, layout.contentHeight)
++        assertArrayEquals(intArrayOf(33, 33), layout.laneBottoms)
++    }
++
++    @Test
++    fun `content height does not keep the spacing after the last item`() {
++        val layout = layoutFixed(intArrayOf(10, 10), lanes = 1, spacing = 4)
++        assertEquals(0, layout.rects[0].y)
++        assertEquals(14, layout.rects[1].y)
++        assertEquals(24, layout.contentHeight)
++        assertEquals(28, layout.laneBottoms[0])
++    }
++
++    @Test
++    fun `column change keeps the anchor item at the same viewport offset`() {
++        val heights = intArrayOf(252, 112, 112, 252, 112, 252, 112, 112)
++        val before = layoutFixed(heights, lanes = 2, spacing = 4)
++        val keys = List(heights.size) { it }
++        val topPadding = 20
++        // Item 3 (y = 256) sits 15 px above the viewport top.
++        val scroll = topPadding + 256 + 15
++        val anchor = captureViewportAnchor(before.rects, keys, scroll, topPadding)
++        assertEquals(3, anchor!!.index)
++        assertEquals(-15, anchor.offsetFromViewportTop)
++
++        val after = layoutFixed(heights, lanes = 4, spacing = 4)
++        val maxScroll = 10_000
++        val restored = scrollOffsetForAnchor(anchor, after.rects, keys, topPadding, maxScroll)
++        val newTop = topPadding + after.rects[3].y
++        assertEquals(newTop - anchor.offsetFromViewportTop, restored)
++        assertEquals(-15, newTop - restored)
++    }
++
++    @Test
++    fun `anchor follows a key when the item moves to another index`() {
++        val rects = listOf(
++            rect(index = 0, y = 0, height = 100),
++            rect(index = 1, y = 40, height = 100),
++        )
++        val anchor = PanoramaAnchor(index = 5, key = "manga", offsetFromViewportTop = -8)
++        val scroll = scrollOffsetForAnchor(
++            anchor = anchor,
++            rects = rects,
++            keys = listOf("other", "manga"),
++            topPadding = 0,
++            maxScroll = 500,
++        )
++        assertEquals(40 - (-8), scroll)
++    }
++
++    @Test
++    fun `anchor scroll is clamped`() {
++        val rects = listOf(rect(index = 0, y = 0, height = 100))
++        val anchor = PanoramaAnchor(index = 0, key = 0, offsetFromViewportTop = -40)
++        val scroll = scrollOffsetForAnchor(anchor, rects, listOf("missing"), 0, maxScroll = 10)
++        assertEquals(10, scroll)
++    }
++
++    @Test
++    fun `append matches a full layout and does not count as a structural change`() {
++        val head = intArrayOf(252, 112, 112, 252)
++        val tail = intArrayOf(112, 252, 112, 112)
++        val all = head + tail
++        val cache = PanoramaMasonryLayoutCache()
++        val first = cache.layout(
++            count = head.size,
++            isFullLine = { false },
++            heightOf = { index, _ -> head[index] },
++            laneWidths = intArrayOf(100, 100),
++            verticalSpacing = 4,
++            horizontalSpacing = 4,
++            rtl = false,
++        )
++        assertFalse(cache.structuralChange)
++        val appended = cache.layout(
++            count = all.size,
++            isFullLine = { false },
++            heightOf = { index, _ -> all[index] },
++            laneWidths = intArrayOf(100, 100),
++            verticalSpacing = 4,
++            horizontalSpacing = 4,
++            rtl = false,
++        )
++        assertFalse(cache.structuralChange)
++        val full = layoutFixed(all, lanes = 2, spacing = 4)
++        assertEquals(full.contentHeight, appended.contentHeight)
++        assertEquals(full.rects.map { it.lane }, appended.rects.map { it.lane })
++        assertEquals(full.rects.map { it.y }, appended.rects.map { it.y })
++        assertEquals(first.rects.map { it.y }, appended.rects.take(head.size).map { it.y })
++    }
++
++    @Test
++    fun `a height change replaces the layout`() {
++        val cache = PanoramaMasonryLayoutCache()
++        cache.layout(
++            count = 2,
++            isFullLine = { false },
++            heightOf = { _, _ -> 100 },
++            laneWidths = intArrayOf(50, 50),
++            verticalSpacing = 0,
++            horizontalSpacing = 0,
++            rtl = false,
++        )
++        cache.layout(
++            count = 2,
++            isFullLine = { false },
++            heightOf = { index, _ -> if (index == 0) 180 else 100 },
++            laneWidths = intArrayOf(50, 50),
++            verticalSpacing = 0,
++            horizontalSpacing = 0,
++            rtl = false,
++        )
++        assertTrue(cache.structuralChange)
++    }
++
++    @Test
++    fun `lane width remainder matches staggered fixed cells`() {
++        assertArrayEquals(intArrayOf(4, 3, 3), staggeredLaneWidths(10, 3, 0))
++        assertArrayEquals(intArrayOf(31, 31, 30), staggeredLaneWidths(100, 3, 4))
++    }
++
++    @Test
++    fun `adaptive lane count matches staggered adaptive cells`() {
++        // 88 px, 20 px minimum, no spacing: 4 columns.
++        assertEquals(4, staggeredLaneCountAdaptive(88, 0, 20))
++        assertArrayEquals(intArrayOf(22, 22, 22, 22), staggeredLaneWidths(88, 4, 0))
++        // Spacing counts on both sides of the division, same as StaggeredGridCells.Adaptive.
++        assertEquals(3, staggeredLaneCountAdaptive(88, 4, 20))
++    }
++
++    @Test
++    fun `rtl puts the first lane on the right and keeps the extra pixel there`() {
++        val layout = layoutPanoramaMasonry(
++            count = 1,
++            isFullLine = { false },
++            heightOf = { _, _ -> 10 },
++            laneWidths = staggeredLaneWidths(10, 3, 0),
++            verticalSpacing = 0,
++            horizontalSpacing = 0,
++            rtl = true,
++        )
++        // Widths are 4, 3, 3. Lane 0 is the rightmost and keeps the remainder pixel.
++        assertEquals(6, layout.rects[0].x)
++        assertEquals(4, layout.rects[0].width)
++    }
++
++    @Test
++    fun `cover cell height follows the grid padding and the two aspect ratios`() {
++        // Lane 100, padding 4: inner 92. Wide 3/2 -> round(92 * 2 / 3) = 61. Compact = 8 + 61.
++        assertEquals(69, panoramaCoverCellHeightPx(100, wide = true, titleBelow = false, 4, 4, 18))
++        // Tall 2/3 -> round(92 * 3 / 2) = 138. Compact = 8 + 138.
++        assertEquals(146, panoramaCoverCellHeightPx(100, wide = false, titleBelow = false, 4, 4, 18))
++        // Comfortable adds title padding 8 and two 18 px lines.
++        assertEquals(113, panoramaCoverCellHeightPx(100, wide = true, titleBelow = true, 4, 4, 18))
++        assertEquals(190, panoramaCoverCellHeightPx(100, wide = false, titleBelow = true, 4, 4, 18))
++    }
++
++    private fun layoutFixed(heights: IntArray, lanes: Int, spacing: Int): PanoramaMasonryLayout {
++        return layoutPanoramaMasonry(
++            count = heights.size,
++            isFullLine = { false },
++            heightOf = { index, _ -> heights[index] },
++            laneWidths = IntArray(lanes) { 100 },
++            verticalSpacing = spacing,
++            horizontalSpacing = spacing,
++        )
++    }
++
++    private fun rect(index: Int, y: Int, height: Int): PanoramaMasonryRect {
++        return PanoramaMasonryRect(
++            index = index,
++            lane = 0,
++            x = 0,
++            y = y,
++            width = 10,
++            height = height,
++            fullLine = false,
++        )
++    }
++}
