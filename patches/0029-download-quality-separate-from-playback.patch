@@ -1,0 +1,309 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 15:20:47 +0000
+Subject: [PATCH] download: pick the download quality separately from playback
+
+Episodes queued without a chosen video used to take the source's
+playback preference (preferred / sortVideos), so downloads were as
+small as what was streamed. Add Settings -> Downloads -> "Download
+quality" (harmony_download_quality): Highest available (default),
+Up to 2160p/1440p/1080p/720p/480p/360p, or Same as playback.
+
+DownloadQualitySelector loads every non-lazy hoster, ranks videos by
+height (Video.resolution or "1080p" / "1920x1080" / "4K" in the title;
+tallest not above the cap, then shortest above it, then videos without
+a height by label: High > auto > plain > Low, reversed for caps <= 480p)
+and resolves them in that order. If nothing resolves, or "Same as
+playback" is chosen, the old HosterLoader.getBestVideo path is used.
+A quality picked in the per-episode dialog still wins.
+
+Anikku only: Mihon has no video quality; Animeko's single resource
+preference already ranks 2160p > 1440p > 1080p > 720p for playback and
+caching, and manual caching lets the user pick the exact resource.
+---
+ .../settings/screen/SettingsDownloadScreen.kt |  15 +++
+ .../data/download/DownloadQualitySelector.kt  | 108 ++++++++++++++++++
+ .../tachiyomi/data/download/Downloader.kt     |   5 +-
+ .../download/DownloadQualitySelectorTest.kt   |  57 +++++++++
+ .../download/service/DownloadPreferences.kt   |   6 +
+ .../moko-resources/base/strings.xml           |   7 ++
+ .../moko-resources/zh-rCN/strings.xml         |   7 ++
+ 7 files changed, 204 insertions(+), 1 deletion(-)
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQualitySelector.kt
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/DownloadQualitySelectorTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDownloadScreen.kt b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDownloadScreen.kt
+index 27d9d12..47ba16f 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDownloadScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDownloadScreen.kt
+@@ -16,6 +16,7 @@ import eu.kanade.presentation.category.visualName
+ import eu.kanade.presentation.more.settings.Preference
+ import eu.kanade.presentation.more.settings.widget.TriStateListDialog
+ import eu.kanade.tachiyomi.data.download.DownloadManager
++import eu.kanade.tachiyomi.data.download.DownloadQualitySelector
+ import eu.kanade.tachiyomi.util.system.toast
+ import kotlinx.collections.immutable.persistentListOf
+ import kotlinx.collections.immutable.persistentMapOf
+@@ -69,6 +70,20 @@ object SettingsDownloadScreen : SearchableSettings {
+                 onValueChanged = { downloadPreferences.parallelSourceLimit().set(it) },
+             ),
+             // Harmony -->
++            Preference.PreferenceItem.ListPreference(
++                preference = downloadPreferences.downloadQuality(),
++                entries = buildMap {
++                    put(DownloadQualitySelector.HIGHEST, stringResource(AMR.strings.harmony_download_quality_highest))
++                    DownloadQualitySelector.HEIGHTS.forEach {
++                        put(it.toString(), stringResource(AMR.strings.harmony_download_quality_up_to, it))
++                    }
++                    put(DownloadQualitySelector.FOLLOW_SOURCE, stringResource(AMR.strings.harmony_download_quality_follow))
++                }.toImmutableMap(),
++                title = stringResource(AMR.strings.pref_harmony_download_quality),
++                subtitleProvider = { value, entries ->
++                    "${entries[value]}\n${stringResource(AMR.strings.pref_harmony_download_quality_summary)}"
++                },
++            ),
+             Preference.PreferenceItem.SwitchPreference(
+                 preference = downloadPreferences.hideDownloadedVideosFromGallery(),
+                 title = stringResource(AMR.strings.pref_hide_downloaded_videos_from_gallery),
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQualitySelector.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQualitySelector.kt
+new file mode 100644
+index 0000000..dbc7621
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQualitySelector.kt
+@@ -0,0 +1,108 @@
++package eu.kanade.tachiyomi.data.download
++
++import eu.kanade.tachiyomi.animesource.AnimeSource
++import eu.kanade.tachiyomi.animesource.model.Hoster
++import eu.kanade.tachiyomi.animesource.model.Video
++import eu.kanade.tachiyomi.ui.player.controls.components.sheets.HosterState
++import eu.kanade.tachiyomi.ui.player.loader.EpisodeLoader
++import eu.kanade.tachiyomi.ui.player.loader.HosterLoader
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.withContext
++import logcat.LogPriority
++import tachiyomi.core.common.util.system.logcat
++
++/**
++ * Chooses the video for a queued episode that has none yet, by the download quality setting
++ * instead of the source's playback preference (`preferred` / `sortVideos`), so downloads can be
++ * sharper than what is streamed.
++ *
++ * The height comes from [Video.resolution] or from the title ("1080p", "1920x1080", "4K").
++ * Videos without a height (e.g. "MP4 High", "HLS (auto)") are only used when no video has one.
++ */
++object DownloadQualitySelector {
++    const val FOLLOW_SOURCE = "follow"
++    const val HIGHEST = "highest"
++    val HEIGHTS = listOf(2160, 1440, 1080, 720, 480, 360)
++
++    /** @return the resolved video, or null to fall back to [HosterLoader.getBestVideo]. */
++    suspend fun pick(source: AnimeSource, hosters: List<Hoster>, quality: String): Video? {
++        val limit = when (quality) {
++            FOLLOW_SOURCE -> return null
++            HIGHEST -> Int.MAX_VALUE
++            else -> quality.toIntOrNull() ?: return null
++        }
++        val candidates = withContext(Dispatchers.IO) {
++            hosters.map { async { EpisodeLoader.loadHosterVideos(source, it) } }.awaitAll()
++        }
++            .filterIsInstance<HosterState.Ready>()
++            .flatMap { it.videoList }
++            .filter { it.videoUrl.isNotEmpty() || !it.initialized }
++
++        for (video in rank(candidates, limit)) {
++            val resolved = HosterLoader.getResolvedVideo(source, video)
++            if (resolved?.videoUrl?.isNotEmpty() == true) {
++                logcat(LogPriority.INFO) { "Download quality $quality: picked '${video.videoTitle}'" }
++                return resolved
++            }
++        }
++        return null
++    }
++
++    /**
++     * Best first: the tallest video not above [limit], then the shortest above it, then videos
++     * without a height. Ties keep the source's order, preferred videos first.
++     */
++    fun rank(videos: List<Video>, limit: Int): List<Video> {
++        return videos.withIndex()
++            .sortedWith(
++                compareBy<IndexedValue<Video>> { sortKey(it.value, limit).first }
++                    .thenBy { sortKey(it.value, limit).second }
++                    .thenByDescending { it.value.bitrate ?: 0 }
++                    .thenByDescending { it.value.preferred }
++                    .thenBy { it.index },
++            )
++            .map { it.value }
++    }
++
++    private fun sortKey(video: Video, limit: Int): Pair<Int, Int> {
++        val height = heightOf(video)
++        return when {
++            height != null && height <= limit -> 0 to -height
++            height != null -> 1 to height
++            else -> 2 to -labelScore(video.videoTitle, preferSmall = limit <= SMALL_LIMIT)
++        }
++    }
++
++    fun heightOf(video: Video): Int? {
++        video.resolution?.takeIf { it > 0 }?.let { return it }
++        val title = video.videoTitle
++        DIMENSIONS.find(title)?.let { return it.groupValues[1].toInt() }
++        HEIGHT.find(title)?.let { return it.groupValues[1].toInt() }
++        return when {
++            K4.containsMatchIn(title) -> 2160
++            K2.containsMatchIn(title) -> 1440
++            else -> null
++        }
++    }
++
++    private fun labelScore(title: String, preferSmall: Boolean): Int {
++        val score = when {
++            HIGH.containsMatchIn(title) -> 2
++            AUTO.containsMatchIn(title) -> 1
++            LOW.containsMatchIn(title) -> -1
++            else -> 0
++        }
++        return if (preferSmall && score != 1) -score else score
++    }
++
++    private const val SMALL_LIMIT = 480
++    private val DIMENSIONS = Regex("""\b\d{3,4}\s*[x×]\s*(\d{3,4})\b""")
++    private val HEIGHT = Regex("""(?<!\d)(\d{3,4})\s*[pPiI](?![a-zA-Z])""")
++    private val K4 = Regex("""(?i)(?<![a-z0-9])(4k|uhd)(?![a-z0-9])""")
++    private val K2 = Regex("""(?i)(?<![a-z0-9])2k(?![a-z0-9])""")
++    private val HIGH = Regex("""(?i)\b(high|best|source|original)\b|高清|超清|原画|蓝光""")
++    private val AUTO = Regex("""(?i)\b(auto|default)\b|自动""")
++    private val LOW = Regex("""(?i)\b(low|sd)\b|流畅|标清""")
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 1d92b78..c96ed63 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -446,7 +446,10 @@ class Downloader(
+                 if (hosters.isEmpty()) {
+                     throw Exception(context.stringResource(AYMR.strings.video_list_empty_error))
+                 }
+-                val bestVideo = HosterLoader.getBestVideo(download.source, hosters)
++                // Harmony: downloads follow their own quality setting, not the playback preference.
++                val quality = downloadPreferences.downloadQuality().get()
++                val bestVideo = DownloadQualitySelector.pick(download.source, hosters, quality)
++                    ?: HosterLoader.getBestVideo(download.source, hosters)
+                     ?: throw Exception(context.stringResource(AYMR.strings.video_list_empty_error))
+                 download.video = bestVideo
+             }
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/DownloadQualitySelectorTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/DownloadQualitySelectorTest.kt
+new file mode 100644
+index 0000000..95a8d40
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/DownloadQualitySelectorTest.kt
+@@ -0,0 +1,57 @@
++package eu.kanade.tachiyomi.data.download
++
++import eu.kanade.tachiyomi.animesource.model.Video
++import io.kotest.matchers.shouldBe
++import org.junit.jupiter.api.Test
++
++class DownloadQualitySelectorTest {
++
++    private fun video(title: String, preferred: Boolean = false, resolution: Int? = null) =
++        Video(videoUrl = "https://example.org/$title", videoTitle = title, preferred = preferred, resolution = resolution)
++
++    private val hls = listOf(
++        video("HLS 480p - 1.20 MB/s", preferred = true),
++        video("HLS 1080p - 4.10 MB/s"),
++        video("HLS 720p - 2.50 MB/s"),
++        video("MP4 High"),
++        video("MP4 Low"),
++    )
++
++    private fun titles(videos: List<Video>) = videos.map { it.videoTitle.substringBefore(" -") }
++
++    @Test
++    fun highestIgnoresThePlaybackPreference() {
++        titles(DownloadQualitySelector.rank(hls, Int.MAX_VALUE)) shouldBe
++            listOf("HLS 1080p", "HLS 720p", "HLS 480p", "MP4 High", "MP4 Low")
++    }
++
++    @Test
++    fun capTakesTheTallestNotAboveThenTheShortestAbove() {
++        titles(DownloadQualitySelector.rank(hls, 720)) shouldBe
++            listOf("HLS 720p", "HLS 480p", "HLS 1080p", "MP4 High", "MP4 Low")
++        titles(DownloadQualitySelector.rank(hls, 360)).first() shouldBe "HLS 480p"
++    }
++
++    @Test
++    fun videosWithoutHeightRankByLabel() {
++        val mp4 = listOf(video("MP4 Low"), video("HLS (auto)"), video("MP4 High"))
++        titles(DownloadQualitySelector.rank(mp4, Int.MAX_VALUE)) shouldBe listOf("MP4 High", "HLS (auto)", "MP4 Low")
++        titles(DownloadQualitySelector.rank(mp4, 480)) shouldBe listOf("MP4 Low", "HLS (auto)", "MP4 High")
++    }
++
++    @Test
++    fun heightComesFromResolutionOrTitle() {
++        DownloadQualitySelector.heightOf(video("whatever", resolution = 1440)) shouldBe 1440
++        DownloadQualitySelector.heightOf(video("1920x1080 · 3 MB")) shouldBe 1080
++        DownloadQualitySelector.heightOf(video("Source 4K")) shouldBe 2160
++        DownloadQualitySelector.heightOf(video("720P60")) shouldBe 720
++        DownloadQualitySelector.heightOf(video("1500 kbps")) shouldBe null
++        DownloadQualitySelector.heightOf(video("MP4 High")) shouldBe null
++    }
++
++    @Test
++    fun equalHeightsKeepPreferredFirst() {
++        val same = listOf(video("Mirror A 1080p"), video("Mirror B 1080p", preferred = true))
++        titles(DownloadQualitySelector.rank(same, Int.MAX_VALUE)) shouldBe listOf("Mirror B 1080p", "Mirror A 1080p")
++    }
++}
+diff --git a/domain/src/main/java/tachiyomi/domain/download/service/DownloadPreferences.kt b/domain/src/main/java/tachiyomi/domain/download/service/DownloadPreferences.kt
+index 336b1e2..c61ad99 100644
+--- a/domain/src/main/java/tachiyomi/domain/download/service/DownloadPreferences.kt
++++ b/domain/src/main/java/tachiyomi/domain/download/service/DownloadPreferences.kt
+@@ -74,6 +74,12 @@ class DownloadPreferences(
+         "harmony_keep_alive_in_background",
+         true,
+     )
++
++    /**
++     * Quality picked for downloads that were queued without a specific video: "follow" (same as
++     * playback, the source's preference), "highest", or a maximum height such as "1080".
++     */
++    fun downloadQuality() = preferenceStore.getString("harmony_download_quality", "highest")
+     // Harmony <--
+ 
+     companion object {
+diff --git a/i18n-ank/src/commonMain/moko-resources/base/strings.xml b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+index 4486c83..de8f006 100644
+--- a/i18n-ank/src/commonMain/moko-resources/base/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+@@ -277,4 +277,11 @@
+     <string name="harmony_download_skipped_no_source">%1$d from a source that is not installed</string>
+     <string name="harmony_download_skipped_fillermarked">%1$d fillermarked (download denied in settings)</string>
+     <string name="harmony_download_leftover_delete_failed">Could not remove the leftover \'%1$s\' from an earlier download</string>
++
++    <!-- Harmony fork: download quality separate from playback -->
++    <string name="pref_harmony_download_quality">Download quality</string>
++    <string name="pref_harmony_download_quality_summary">Used when an episode is queued without picking a quality; playback keeps the source\'s preferred quality.</string>
++    <string name="harmony_download_quality_highest">Highest available</string>
++    <string name="harmony_download_quality_up_to">Up to %1$dp</string>
++    <string name="harmony_download_quality_follow">Same as playback (source preference)</string>
+ </resources>
+diff --git a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+index c6e902a..3abcb73 100644
+--- a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+@@ -272,4 +272,11 @@
+     <string name="harmony_download_skipped_no_source">%1$d 集的来源未安装</string>
+     <string name="harmony_download_skipped_fillermarked">%1$d 集为「标记剧集」（下载设置中已选择不下载）</string>
+     <string name="harmony_download_leftover_delete_failed">无法删除上次下载残留的「%1$s」</string>
++
++    <!-- Harmony fork: download quality separate from playback -->
++    <string name="pref_harmony_download_quality">下载画质</string>
++    <string name="pref_harmony_download_quality_summary">下载时未单独选择画质的剧集按此下载；在线播放仍用插件里的首选画质。</string>
++    <string name="harmony_download_quality_highest">最高可用</string>
++    <string name="harmony_download_quality_up_to">不超过 %1$dp</string>
++    <string name="harmony_download_quality_follow">与播放相同（插件首选）</string>
+ </resources>

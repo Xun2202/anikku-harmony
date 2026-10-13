@@ -25,3 +25,5 @@
 0025-library-panorama-stable-cell-shapes.patch
 0026-presentation-cover-asyncimage-smooth-grids.patch
 0027-library-panorama-settle-debounce-browse-prefetch.patch
+0028-presentation-staggered-scroller-stable-thumb.patch
+0029-download-quality-separate-from-playback.patch

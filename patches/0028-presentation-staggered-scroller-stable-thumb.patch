@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 15:07:30 +0000
+Subject: [PATCH] presentation: keep the staggered fast-scroll thumb from
+ stepping back once a row
+
+The thumb position came from a row formula anchored on the first
+visible item: (heights of earlier items) / lanes + spacing - offset.
+That assumes every lane is equally tall. Lanes of 3:2 and 2:3 cells are
+not, so the formula is off by a different amount for each item, and
+every time the first visible item changed (about once a row) the thumb
+stepped back a few pixels and caught up again. A simulation of 200
+mixed cells in two lanes gives 141 backward steps over 100 rows, 3 px
+median, 9 px max.
+
+* Position: follow an item that stays on screen from frame to frame
+  and add the pixels it moved; item 0 visible gives the exact offset.
+  The row formula is only used after a jump (thumb drag, scrollToItem).
+* Range: the average of measured heights moves with every new cell,
+  and the range with it. Keep the range fixed while a scroll is in
+  progress (refresh when the item count changes, i.e. a page loaded)
+  and glide the thumb to the refreshed value over 150 ms once the list
+  stops. At the end of the list the thumb sits at the bottom.
+
+The estimate section is still byte-identical between mihon-harmony and
+anikku-harmony.
+
+Same change as mihon-harmony 0020.
+---
+ .../core/components/VerticalFastScroller.kt   | 74 ++++++++++++++++---
+ 1 file changed, 65 insertions(+), 9 deletions(-)
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+index 5204200..b5c7993 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+@@ -2,6 +2,7 @@ package tachiyomi.presentation.core.components
+ 
+ import android.view.ViewConfiguration
+ import androidx.compose.animation.core.Animatable
++import androidx.compose.animation.core.animate
+ import androidx.compose.animation.core.tween
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.gestures.Orientation
+@@ -796,13 +797,29 @@ fun VerticalStaggeredGridFastScroller(
+             }
+ 
+             // When list scrolled
+-            LaunchedEffect(state.firstVisibleItemIndex, state.firstVisibleItemScrollOffset) {
++            val lastScrollOffset = remember { MutableData(Float.NaN) }
++            LaunchedEffect(estimate.scrollOffset, estimate.scrollRange) {
+                 if (state.layoutInfo.totalItemsCount == 0 || isThumbDragged) return@LaunchedEffect
+                 if (estimate.rowHeight <= 0f) return@LaunchedEffect
+                 val extraScrollRange = (estimate.scrollRange - heightPx).coerceAtLeast(1f)
+-                val proportion = (estimate.scrollOffset / extraScrollRange).coerceIn(0f, 1f)
+-                thumbOffsetY = trackHeightPx * proportion + thumbTopPadding
+-                scrolled.tryEmit(Unit)
++                val proportion = if (!state.canScrollForward) {
++                    1f
++                } else {
++                    (estimate.scrollOffset / extraScrollRange).coerceIn(0f, 1f)
++                }
++                val target = trackHeightPx * proportion + thumbTopPadding
++                if (estimate.scrollOffset != lastScrollOffset.value) {
++                    lastScrollOffset.value = estimate.scrollOffset
++                    scrolled.tryEmit(Unit)
++                }
++                if (state.isScrollInProgress) {
++                    thumbOffsetY = target
++                } else {
++                    // The range is only refreshed once the list stops; glide to it instead of jumping.
++                    animate(thumbOffsetY, target, animationSpec = tween(RANGE_SETTLE_MILLIS)) { value, _ ->
++                        thumbOffsetY = value
++                    }
++                }
+             }
+ 
+             // Thumb alpha
+@@ -884,6 +901,15 @@ private class StaggeredGridMeasurements {
+     val heights = HashMap<Int, Int>()
+     var heightSum = 0L
+     var laneCount = 1
++
++    /** An item that was on screen last frame, and the scroll position measured against it. */
++    var anchorIndex = -1
++    var anchorOffsetY = 0
++    var position = 0f
++
++    /** Range used while a scroll is in progress; every newly measured cell would otherwise nudge it. */
++    var frozenRange = 0f
++    var frozenItemsCount = -1
+ }
+ 
+ @Composable
+@@ -931,15 +957,41 @@ private fun rememberStaggeredGridEstimate(state: LazyStaggeredGridState): State<
+             // offset.y is relative to the content start (negative once the item has scrolled off
+             // the top); beforeContentPadding is applied only at placement, so a grid at rest
+             // reports scroll offset 0 and the padding belongs to the range only.
+-            val scrollOffset = if (first == null) {
+-                0f
+-            } else {
+-                beforeFirst / laneCount + rowSpacing * (first.index / laneCount) - first.offset.y
++            //
++            // The row formula assumes every lane is equally tall. Lanes of 3:2 and 2:3 cells are
++            // not, so its error differs from item to item and the thumb jumped back each time the
++            // first visible item changed (about once a row). Follow an item that stays on screen
++            // instead, and fall back to the formula only after a jump.
++            val itemZero = visibleItems.fastFirstOrNull { it.index == 0 }
++            val scrollOffset = when {
++                first == null -> 0f
++                itemZero != null -> -itemZero.offset.y.toFloat()
++                else -> {
++                    val anchor = visibleItems.fastFirstOrNull { it.index == measurements.anchorIndex }
++                    if (anchor != null) {
++                        measurements.position + (measurements.anchorOffsetY - anchor.offset.y)
++                    } else {
++                        beforeFirst / laneCount + rowSpacing * (first.index / laneCount) - first.offset.y
++                    }
++                }
+             }
+-            val scrollRange = beforeAll / laneCount +
++            val nextAnchor = visibleItems.getOrNull(visibleItems.size / 2)
++            measurements.anchorIndex = nextAnchor?.index ?: -1
++            measurements.anchorOffsetY = nextAnchor?.offset?.y ?: 0
++            measurements.position = scrollOffset
++
++            val measuredRange = beforeAll / laneCount +
+                 rowSpacing * ceil(totalItemsCount.toFloat() / laneCount) +
+                 layoutInfo.beforeContentPadding +
+                 layoutInfo.afterContentPadding
++            val keepFrozen = state.isScrollInProgress &&
++                measurements.frozenItemsCount == totalItemsCount &&
++                measurements.frozenRange > 0f
++            if (!keepFrozen) {
++                measurements.frozenRange = measuredRange
++                measurements.frozenItemsCount = totalItemsCount
++            }
++            val scrollRange = measurements.frozenRange
+             StaggeredGridEstimate(
+                 laneCount = laneCount,
+                 rowHeight = averageHeight + rowSpacing,
+@@ -961,6 +1013,10 @@ object Scroller {
+     // <-- AM
+ }
+ 
++// Harmony -->
++private const val RANGE_SETTLE_MILLIS = 150
++// Harmony <--
++
+ private val ThumbLength = 48.dp
+ private val ThumbThickness = 12.dp
+ private val ThumbShape = RoundedCornerShape(ThumbThickness / 2)
