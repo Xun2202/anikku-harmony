@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 09:21:01 +0000
+Subject: [PATCH] presentation: draw covers with AsyncImage so grids scroll
+ without subcomposition
+
+MangaCover used SubcomposeAsyncImage, which subcomposes every cell of a
+lazy grid and gave each loading cell an indeterminate spinner that
+animates on every frame. On the panorama staggered grid this showed up
+as dropped frames and a jerky fast-scroll thumb, while mihon-harmony
+(plain AsyncImage + colour placeholder) scrolled smoothly.
+
+Draw the cover with AsyncImage inside the same coloured box. Loading
+and error states keep the KMK look: the error icon is drawn over the
+box, and the spinner only appears when a cover is still loading after
+400 ms, so memory and disk cache hits never flash one.
+
+SourceIconBadge read Source.icon on every composition; the getter scans
+installed extensions and may draw the drawable into a new bitmap. Keep
+it per source id.
+
+mihon-harmony does not have this: its MangaCover is already AsyncImage
+and it has no source icon badge.
+---
+ .../library/components/LibraryBadges.kt       |   6 +-
+ .../manga/components/MangaCover.kt            | 151 ++++++++++--------
+ 2 files changed, 91 insertions(+), 66 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LibraryBadges.kt b/app/src/main/java/eu/kanade/presentation/library/components/LibraryBadges.kt
+index 76e2963..11cb79b 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LibraryBadges.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LibraryBadges.kt
+@@ -8,6 +8,7 @@ import androidx.compose.material.icons.outlined.Folder
+ import androidx.compose.material.icons.outlined.LocalLibrary
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.scale
+ import androidx.compose.ui.graphics.Color
+@@ -77,7 +78,10 @@ fun SourceIconBadge(
+     source: Source?,
+ ) {
+     if (source == null) return
+-    val icon = source.icon
++    // Harmony -->
++    // The getter scans installed extensions and may redraw the icon into a new bitmap on every call.
++    val icon = remember(source.id) { source.icon }
++    // Harmony <--
+ 
+     when {
+         source.isStub && icon == null -> {
+diff --git a/app/src/main/java/eu/kanade/presentation/manga/components/MangaCover.kt b/app/src/main/java/eu/kanade/presentation/manga/components/MangaCover.kt
+index 2484e1b..9565cf6 100644
+--- a/app/src/main/java/eu/kanade/presentation/manga/components/MangaCover.kt
++++ b/app/src/main/java/eu/kanade/presentation/manga/components/MangaCover.kt
+@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.size
+ import androidx.compose.material3.CircularProgressIndicator
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+@@ -27,16 +28,19 @@ import androidx.compose.ui.graphics.vector.ImageVector
+ import androidx.compose.ui.layout.ContentScale
+ import androidx.compose.ui.res.vectorResource
+ import androidx.compose.ui.semantics.Role
++import androidx.compose.ui.unit.Dp
+ import androidx.compose.ui.unit.dp
++import coil3.compose.AsyncImage
+ import coil3.compose.AsyncImagePainter
+-import coil3.compose.SubcomposeAsyncImage
+ import eu.kanade.presentation.manga.components.MangaCover.Companion.COVER_TEMPLATE_SIZE_BIG
+ import eu.kanade.presentation.manga.components.MangaCover.Companion.COVER_TEMPLATE_SIZE_MEDIUM
+ import eu.kanade.presentation.manga.components.MangaCover.Companion.COVER_TEMPLATE_SIZE_NORMAL
+ import eu.kanade.presentation.manga.components.MangaCover.Size
+ import eu.kanade.tachiyomi.R
++import kotlinx.coroutines.delay
+ import tachiyomi.domain.manga.model.Manga
+ import tachiyomi.domain.manga.model.asMangaCover
++import kotlin.time.Duration.Companion.milliseconds
+ import tachiyomi.domain.manga.model.MangaCover as DomainMangaCover
+ 
+ enum class MangaCover(val ratio: Float) {
+@@ -75,15 +79,16 @@ enum class MangaCover(val ratio: Float) {
+         scale: ContentScale = ContentScale.Crop,
+         // KMK <--
+     ) {
+-        // KMK -->
+-        var succeed by remember { mutableStateOf(false) }
+-        // KMK <--
++        // Harmony -->
++        // SubcomposeAsyncImage subcomposes every cell of a lazy grid; AsyncImage keeps scrolling cheap.
++        var status by remember { mutableStateOf(CoverStatus.Loading) }
++        // Harmony <--
+ 
+         val modifierColored = modifier
+             .aspectRatio(ratio)
+             .clip(shape)
+             // KMK -->
+-            .alpha(if (succeed) alpha else 1f)
++            .alpha(if (status == CoverStatus.Success) alpha else 1f)
+             .background(bgColor ?: CoverPlaceholderColor)
+             // KMK <--
+             .then(
+@@ -97,67 +102,53 @@ enum class MangaCover(val ratio: Float) {
+                 },
+             )
+ 
+-        SubcomposeAsyncImage(
+-            model = data,
+-            // KMK -->
+-            loading = {
+-                Box(
+-                    modifier = modifierColored,
+-                ) {
+-                    CircularProgressIndicator(
+-                        color = tint?.let { Color(it) } ?: CoverPlaceholderOnBgColor,
+-                        modifier = Modifier
+-                            .size(
+-                                when (size) {
+-                                    Size.Big -> COVER_TEMPLATE_SIZE_BIG
+-                                    Size.Medium -> COVER_TEMPLATE_SIZE_MEDIUM
+-                                    else -> COVER_TEMPLATE_SIZE_NORMAL
+-                                },
+-                            )
+-                            .align(Alignment.Center),
+-                        strokeWidth = when (size) {
+-                            Size.Normal -> 3.dp
+-                            else -> 2.dp
+-                        },
+-                    )
+-                }
+-            },
+-            error = {
+-                Box(
+-                    modifier = modifierColored,
+-                ) {
+-                    Image(
+-                        imageVector = ImageVector.vectorResource(R.drawable.cover_error_vector),
+-                        contentDescription = contentDescription,
+-                        modifier = Modifier
+-                            .size(
+-                                when (size) {
+-                                    Size.Big -> COVER_TEMPLATE_SIZE_BIG
+-                                    Size.Medium -> COVER_TEMPLATE_SIZE_MEDIUM
+-                                    else -> COVER_TEMPLATE_SIZE_NORMAL
+-                                },
+-                            )
+-                            .align(Alignment.Center),
+-                        colorFilter = ColorFilter.tint(
+-                            tint?.let { Color(it) } ?: CoverPlaceholderOnBgColor,
+-                        ),
+-                    )
+-                }
+-            },
+-            onSuccess = { result ->
+-                succeed = true
+-                if (onCoverLoaded != null) {
+-                    when (data) {
+-                        is Manga -> onCoverLoaded(data.asMangaCover(), result)
+-                        is DomainMangaCover -> onCoverLoaded(data, result)
++        // Harmony -->
++        Box(modifier = modifierColored) {
++            AsyncImage(
++                model = data,
++                contentDescription = contentDescription,
++                modifier = Modifier.matchParentSize(),
++                contentScale = scale,
++                onLoading = { status = CoverStatus.Loading },
++                onSuccess = { result ->
++                    status = CoverStatus.Success
++                    // KMK -->
++                    if (onCoverLoaded != null) {
++                        when (data) {
++                            is Manga -> onCoverLoaded(data.asMangaCover(), result)
++                            is DomainMangaCover -> onCoverLoaded(data, result)
++                        }
+                     }
+-                }
+-            },
+-            // KMK <--
+-            contentDescription = contentDescription,
+-            modifier = modifierColored,
+-            contentScale = scale,
+-        )
++                    // KMK <--
++                },
++                onError = { status = CoverStatus.Error },
++            )
++            val templateSize = when (size) {
++                Size.Big -> COVER_TEMPLATE_SIZE_BIG
++                Size.Medium -> COVER_TEMPLATE_SIZE_MEDIUM
++                else -> COVER_TEMPLATE_SIZE_NORMAL
++            }
++            val onBgColor = tint?.let { Color(it) } ?: CoverPlaceholderOnBgColor
++            when (status) {
++                CoverStatus.Loading -> DelayedLoadingIndicator(
++                    color = onBgColor,
++                    strokeWidth = if (size == Size.Normal) 3.dp else 2.dp,
++                    modifier = Modifier
++                        .size(templateSize)
++                        .align(Alignment.Center),
++                )
++                CoverStatus.Error -> Image(
++                    imageVector = ImageVector.vectorResource(R.drawable.cover_error_vector),
++                    contentDescription = contentDescription,
++                    modifier = Modifier
++                        .size(templateSize)
++                        .align(Alignment.Center),
++                    colorFilter = ColorFilter.tint(onBgColor),
++                )
++                CoverStatus.Success -> Unit
++            }
++        }
++        // Harmony <--
+     }
+ 
+     companion object {
+@@ -227,3 +218,33 @@ internal const val RatioSwitchToPanorama = 0.75f
+ 
+ internal val CoverPlaceholderColor = Color(0x1F888888)
+ internal val CoverPlaceholderOnBgColor = Color(0x8F888888)
++
++// Harmony -->
++private enum class CoverStatus { Loading, Success, Error }
++
++/**
++ * Memory and disk cache hits land within a few frames. A spinner shown at once would flash in
++ * every cell of a fling and animate each frame while it is up.
++ */
++@Composable
++private fun DelayedLoadingIndicator(
++    color: Color,
++    strokeWidth: Dp,
++    modifier: Modifier = Modifier,
++) {
++    var visible by remember { mutableStateOf(false) }
++    LaunchedEffect(Unit) {
++        delay(LoadingIndicatorDelay)
++        visible = true
++    }
++    if (visible) {
++        CircularProgressIndicator(
++            color = color,
++            strokeWidth = strokeWidth,
++            modifier = modifier,
++        )
++    }
++}
++
++private val LoadingIndicatorDelay = 400.milliseconds
++// Harmony <--

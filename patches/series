@@ -23,3 +23,5 @@
 0023-presentation-staggered-fast-scroller-steady-thumb.patch
 0024-updater-pick-highest-harmony-version.patch
 0025-library-panorama-stable-cell-shapes.patch
+0026-presentation-cover-asyncimage-smooth-grids.patch
+0027-library-panorama-settle-debounce-browse-prefetch.patch

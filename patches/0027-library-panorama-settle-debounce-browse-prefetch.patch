@@ -1,0 +1,291 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 09:42:02 +0000
+Subject: [PATCH] library: wait for the panorama grid to really stop and learn
+ browse shapes ahead
+
+Two gaps let a learnt shape flip a cell in front of the user, and the
+browse page learnt every shape only once the cell was already on screen.
+
+* Settling: the grid counted as settled whenever isScrollInProgress was
+  false. Dragging the fast-scroll thumb is a run of short scrollToItem
+  calls with false in between, so shapes landed mid-drag; the same
+  happened in the pause between two flings. rememberPanoramaGridSettled
+  now reports settled only after 300 ms without scrolling.
+* Browse prefetch: PrefetchPanoramaCoverShapes requests the covers of
+  entries that are loaded but not on screen yet (paging loads the next
+  page ahead of the user) at 128 px, inexact, without the memory cache,
+  and records their shapes. The download lands in the disk cache the
+  cell reads afterwards. Requests are disposed when the grid leaves.
+
+PanoramaCoverShapes.kt stays byte-identical between mihon-harmony and
+anikku-harmony.
+
+Same change as mihon-harmony 0019. Anikku also uses the debounced
+settle in the related-entries grids; they get no prefetch (short lists).
+---
+ .../components/BrowseSourceComfortableGrid.kt |  6 +-
+ .../components/BrowseSourceCompactGrid.kt     |  6 +-
+ .../RelatedMangasComfortableGrid.kt           |  4 +-
+ .../components/RelatedMangasCompactGrid.kt    |  4 +-
+ .../library/components/LazyLibraryGrid.kt     |  3 +-
+ .../library/components/PanoramaCoverShapes.kt | 85 +++++++++++++++++++
+ 6 files changed, 98 insertions(+), 10 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
+index 9f1c1d5..a00eb37 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
+@@ -12,7 +12,6 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
+-import androidx.compose.runtime.remember
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.util.fastAny
+ import androidx.paging.LoadState
+@@ -20,8 +19,10 @@ import androidx.paging.compose.LazyPagingItems
+ import eu.kanade.presentation.library.components.CommonMangaItemDefaults
+ import eu.kanade.presentation.library.components.LocalPanoramaGridSettled
+ import eu.kanade.presentation.library.components.MangaComfortableGridItem
++import eu.kanade.presentation.library.components.PrefetchPanoramaCoverShapes
+ import eu.kanade.presentation.library.components.panoramaStaggeredColumns
+ import eu.kanade.presentation.library.components.rememberCoverRatio
++import eu.kanade.presentation.library.components.rememberPanoramaGridSettled
+ import exh.metadata.metadata.RaisedSearchMetadata
+ import exh.metadata.metadata.RankedSearchMetadata
+ import kotlinx.coroutines.flow.StateFlow
+@@ -50,7 +51,8 @@ fun BrowseSourceComfortableGrid(
+     if (usePanoramaCover) {
+         // The grid has to own the scroll state: a shape learnt mid-fling remeasures every lane.
+         val state = rememberLazyStaggeredGridState()
+-        val settled = remember(state) { { !state.isScrollInProgress } }
++        val settled = rememberPanoramaGridSettled { state.isScrollInProgress }
++        PrefetchPanoramaCoverShapes(mangaList.itemCount) { mangaList.peek(it)?.value?.first }
+         CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
+             FastScrollLazyVerticalStaggeredGrid(
+                 columns = columns.panoramaStaggeredColumns(),
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt
+index d65c407..98df8eb 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt
+@@ -12,7 +12,6 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
+-import androidx.compose.runtime.remember
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.util.fastAny
+ import androidx.paging.LoadState
+@@ -20,8 +19,10 @@ import androidx.paging.compose.LazyPagingItems
+ import eu.kanade.presentation.library.components.CommonMangaItemDefaults
+ import eu.kanade.presentation.library.components.LocalPanoramaGridSettled
+ import eu.kanade.presentation.library.components.MangaCompactGridItem
++import eu.kanade.presentation.library.components.PrefetchPanoramaCoverShapes
+ import eu.kanade.presentation.library.components.panoramaStaggeredColumns
+ import eu.kanade.presentation.library.components.rememberCoverRatio
++import eu.kanade.presentation.library.components.rememberPanoramaGridSettled
+ import exh.metadata.metadata.RaisedSearchMetadata
+ import exh.metadata.metadata.RankedSearchMetadata
+ import kotlinx.coroutines.flow.StateFlow
+@@ -51,7 +52,8 @@ fun BrowseSourceCompactGrid(
+     if (usePanoramaCover) {
+         // The grid has to own the scroll state: a shape learnt mid-fling remeasures every lane.
+         val state = rememberLazyStaggeredGridState()
+-        val settled = remember(state) { { !state.isScrollInProgress } }
++        val settled = rememberPanoramaGridSettled { state.isScrollInProgress }
++        PrefetchPanoramaCoverShapes(mangaList.itemCount) { mangaList.peek(it)?.value?.first }
+         CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
+             FastScrollLazyVerticalStaggeredGrid(
+                 columns = columns.panoramaStaggeredColumns(),
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt
+index 640aec5..9e69b52 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt
+@@ -17,7 +17,6 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.runtime.State
+ import androidx.compose.runtime.getValue
+-import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.util.fastAny
+ import eu.kanade.presentation.browse.RelatedMangaTitle
+@@ -26,6 +25,7 @@ import eu.kanade.presentation.browse.header
+ import eu.kanade.presentation.library.components.CommonMangaItemDefaults
+ import eu.kanade.presentation.library.components.LocalPanoramaGridSettled
+ import eu.kanade.presentation.library.components.panoramaStaggeredColumns
++import eu.kanade.presentation.library.components.rememberPanoramaGridSettled
+ import eu.kanade.tachiyomi.ui.manga.RelatedManga
+ import tachiyomi.domain.manga.model.Manga
+ import tachiyomi.i18n.MR
+@@ -56,7 +56,7 @@ fun RelatedMangasComfortableGrid(
+     if (usePanoramaCover) {
+         // The grid has to own the scroll state: a shape learnt mid-fling remeasures every lane.
+         val state = rememberLazyStaggeredGridState()
+-        val settled = remember(state) { { !state.isScrollInProgress } }
++        val settled = rememberPanoramaGridSettled { state.isScrollInProgress }
+         CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
+             FastScrollLazyVerticalStaggeredGrid(
+                 columns = columns.panoramaStaggeredColumns(),
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt
+index 08b4ad2..ba25876 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt
+@@ -17,7 +17,6 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.runtime.State
+ import androidx.compose.runtime.getValue
+-import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.util.fastAny
+ import eu.kanade.presentation.browse.RelatedMangaTitle
+@@ -26,6 +25,7 @@ import eu.kanade.presentation.browse.header
+ import eu.kanade.presentation.library.components.CommonMangaItemDefaults
+ import eu.kanade.presentation.library.components.LocalPanoramaGridSettled
+ import eu.kanade.presentation.library.components.panoramaStaggeredColumns
++import eu.kanade.presentation.library.components.rememberPanoramaGridSettled
+ import eu.kanade.tachiyomi.ui.manga.RelatedManga
+ import tachiyomi.domain.manga.model.Manga
+ import tachiyomi.i18n.MR
+@@ -58,7 +58,7 @@ fun RelatedMangasCompactGrid(
+     if (usePanoramaCover) {
+         // The grid has to own the scroll state: a shape learnt mid-fling remeasures every lane.
+         val state = rememberLazyStaggeredGridState()
+-        val settled = remember(state) { { !state.isScrollInProgress } }
++        val settled = rememberPanoramaGridSettled { state.isScrollInProgress }
+         CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
+             FastScrollLazyVerticalStaggeredGrid(
+                 columns = columns.panoramaStaggeredColumns(),
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt
+index 22f7387..20ffef7 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt
+@@ -10,7 +10,6 @@ import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridItemSpan
+ import androidx.compose.foundation.lazy.staggeredgrid.rememberLazyStaggeredGridState
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.CompositionLocalProvider
+-import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.unit.dp
+ import tachiyomi.presentation.core.components.FastScrollLazyVerticalGrid
+@@ -48,7 +47,7 @@ internal fun LazyLibraryStaggeredGrid(
+ ) {
+     // The grid has to own the scroll state: a shape learnt mid-fling remeasures every lane.
+     val state = rememberLazyStaggeredGridState()
+-    val settled = remember(state) { { !state.isScrollInProgress } }
++    val settled = rememberPanoramaGridSettled { state.isScrollInProgress }
+     CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
+         FastScrollLazyVerticalStaggeredGrid(
+             columns = panoramaStaggeredColumns(columns),
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt
+index cf199d4..c751a83 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt
+@@ -1,17 +1,34 @@
+ package eu.kanade.presentation.library.components
+ 
+ import android.graphics.BitmapFactory
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.compositionLocalOf
++import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateMapOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberUpdatedState
++import androidx.compose.runtime.snapshotFlow
++import androidx.compose.ui.platform.LocalContext
++import coil3.imageLoader
++import coil3.request.CachePolicy
++import coil3.request.Disposable
++import coil3.request.ImageRequest
++import coil3.size.Precision
+ import kotlinx.coroutines.CompletableDeferred
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.collectLatest
+ import kotlinx.coroutines.isActive
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
++import tachiyomi.domain.manga.model.Manga
++import tachiyomi.domain.manga.model.asMangaCover
+ import java.io.BufferedReader
+ import java.io.BufferedWriter
+ import java.io.File
+@@ -258,4 +275,72 @@ object PanoramaCoverShapes {
+         return "$whole.${frac.toString().padStart(3, '0')}"
+     }
+ }
++
++/**
++ * Settled once the grid has not scrolled for [SETTLE_DELAY_MILLIS]. Dragging the fast-scroll thumb
++ * is a run of short scrollToItem calls with isScrollInProgress false in between, and a fling that
++ * has just stopped is often followed by another; a shape applied in those gaps reads as jitter.
++ */
++@Composable
++fun rememberPanoramaGridSettled(isScrollInProgress: () -> Boolean): () -> Boolean {
++    val settled = remember { mutableStateOf(true) }
++    val scrolling by rememberUpdatedState(isScrollInProgress)
++    LaunchedEffect(Unit) {
++        snapshotFlow { scrolling() }.collectLatest { inProgress ->
++            if (inProgress) {
++                settled.value = false
++            } else {
++                delay(SETTLE_DELAY_MILLIS)
++                settled.value = true
++            }
++        }
++    }
++    return remember { { settled.value } }
++}
++
++/**
++ * Learns the shape of covers that are loaded into the list but not on screen yet, so their cells
++ * are laid out with the final shape when they scroll in. Only a small subsampled image is decoded
++ * and nothing goes to the memory cache; the download lands in the disk cache the cell reads.
++ */
++@Composable
++fun PrefetchPanoramaCoverShapes(itemCount: Int, mangaAt: (Int) -> Manga?) {
++    val context = LocalContext.current
++    val requests = remember { HashMap<Long, Disposable>() }
++    val currentMangaAt by rememberUpdatedState(mangaAt)
++    LaunchedEffect(itemCount) {
++        val loader = context.imageLoader
++        for (index in 0 until itemCount) {
++            val manga = currentMangaAt(index) ?: continue
++            if (manga.thumbnailUrl.isNullOrEmpty()) continue
++            if (manga.id in requests || PanoramaCoverShapes.get(manga.id) != null) continue
++            val mangaId = manga.id
++            requests[mangaId] = loader.enqueue(
++                ImageRequest.Builder(context)
++                    .data(manga.asMangaCover())
++                    .size(PREFETCH_SIZE_PX)
++                    .precision(Precision.INEXACT)
++                    .memoryCachePolicy(CachePolicy.DISABLED)
++                    .listener(
++                        onSuccess = { _, result ->
++                            val image = result.image
++                            if (image.width > 0) {
++                                PanoramaCoverShapes.put(mangaId, image.height.toFloat() / image.width)
++                            }
++                        },
++                    )
++                    .build(),
++            )
++        }
++    }
++    DisposableEffect(Unit) {
++        onDispose {
++            requests.values.forEach { it.dispose() }
++            requests.clear()
++        }
++    }
++}
++
++private const val SETTLE_DELAY_MILLIS = 300L
++private const val PREFETCH_SIZE_PX = 128
+ // Harmony <--
