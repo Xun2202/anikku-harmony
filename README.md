@@ -30,6 +30,7 @@ Anikku 先在用户选择的 SAF 目录里创建 `Video.tmp`，再把这个 `con
 
 - **「检查更新」可能一直停在旧版本**（preview.12 及之前）：更新器取 Release 列表里的第一项，GitHub 的列表顺序不保证按版本（Mihon 在上游 0.21.0 → 0.21.1 时实际中招）。preview.13（补丁 0024）起按版本号取最大。
 - 书架 / 浏览页显示模式新增「**全景紧凑网格**」（preview.13，补丁 0022）；瀑布流里右侧快速滚动条不再抽搐（补丁 0023）。
+- **全景网格滑动时格子抽搐、有掉帧、滚动条还在跳一下**（preview.13 及之前）：格子第一次出现时还不知道封面是横是竖，先按默认横版（3:2）排，图片解码完才改成竖版（2:3）。瀑布流里一个格子变高，会把这一列下面的全部推下去；快速滑动时每秒几十张图加载完，各触发一次整个瀑布流重新测量。横竖比例只记在内存里，重启 App 就忘了。横版和竖版封面还是两段不同的界面代码，一切换就把图片拆掉重新请求。滚动条用的是屏幕上看得见的格子高度，高度在滑的时候变，估算就跟着跳（补丁 0023 的滚动条算法本身没改）。preview.14（补丁 0025）起：学到的高/宽写进 App 自己的文件，下次启动直接用；正在滑动时不把新学到的形状写进排版（已经能确定是横还是竖的，马上用）；横版和竖版走同一个封面组件。从没见过的封面仍会在你手指停下的那一下改一次形状，改完就记住了。和 Mihon preview.3 是同一份代码。滑动还掉不掉帧，要在真机上滑一下确认。
 
 **鸿蒙图库会收录下载的视频。** 卓易通把应用选的 SAF 文件夹映射到鸿蒙文件管理的「我的手机 → 兼容应用数据 → …」下，
 鸿蒙的媒体扫描会把整棵树扫一遍，并且**不认 `.nomedia`**（华为官方文档也只说图库按文件类型收录）。它判断“是不是视频”只看扩展名，
@@ -110,6 +111,7 @@ Anikku 先在用户选择的 SAF 目录里创建 `Video.tmp`，再把这个 `con
 | [`0022-library-panorama-compact-grid-display-mode.patch`](./patches/0022-library-panorama-compact-grid-display-mode.patch) | 新增显示模式「全景紧凑网格」：标题压在封面上的紧凑网格，套用全景松散网格同一套规则（横版封面 3:2、瀑布流、自动列宽 168 dp、封面横竖比按作品缓存）。序列化 `COMPACT_GRID_PANORAMA`，排在紧凑网格之后；书架显示设置、浏览页 / 相关作品页的显示模式菜单各多一项。与 mihon-harmony 0015 同源。 |
 | [`0023-presentation-staggered-fast-scroller-steady-thumb.patch`](./patches/0023-presentation-staggered-fast-scroller-steady-thumb.patch) | 修复全景网格上下滑动时右侧快速滚动条「抽搐」：0020 的瀑布流滚动条用当前屏上条目的平均高度估算位置，3:2 与 2:3 格子换进换出时平均值跟着变、拇指来回跳。现在按条目索引记住量过的高度（没见过的用累计平均），满行条目（搜索栏等，按比单格宽判断）不计入，列数取见过的最大值；`offset.y` 相对内容起点，顶部 padding 只算进总长度。与 mihon-harmony 0016 的估算段逐字相同。 |
 | [`0024-updater-pick-highest-harmony-version.patch`](./patches/0024-updater-pick-highest-harmony-version.patch) | 修复「检查更新」可能拉不到最新版：`getLatest()` 原来取列表**第一项**，GitHub 的列表顺序并不保证按版本（Mihon 已实际中招：上游出 0.21.1 后镜像里 `v0.21.0-harmony-preview.2` 排在 `v0.21.1-harmony-preview.1` 前面）。现在候选按 `(主, 次, 补丁, harmony 号)` 四元组排序取最大，合并显示的更新日志也按这个顺序；解析不了的 tag 排最后。附单元测试。与 mihon-harmony 0017 同源；animeko-harmony 0002 本来就是排序取最大，不适用。 |
+| [`0025-library-panorama-stable-cell-shapes.patch`](./patches/0025-library-panorama-stable-cell-shapes.patch) | 修复全景网格滑动时资源块排版抽搐、掉帧，以及滚动条的残余抽搐（0023 的滚动条代码没动，跳的是格子高度）。新文件 `PanoramaCoverShapes.kt` 与 mihon-harmony 0018 **逐字节相同**：学到的封面高/宽记在 `filesDir/harmony_panorama_cover_shapes.txt`，正在滑动时不把新形状写进瀑布流布局（横竖已经同侧则立即写），封面横竖改成同一个 Compose 调用点。书架两种全景模式后台读封面缓存的宽高（挂在 `LibraryScreenModel`；Mihon 挂在 `LibraryViewModel`）。浏览页、相关作品页、全局搜索横条同样注入「网格是否静止」，但没有文件预取。不改数据库、不加设置项。从没见过的封面仍会在滑动停下时改一次形状。Animeko 没有这套网格，不适用。 |
 
 补丁按 [`patches/series`](./patches/series) 的顺序套用；已被官方合入的补丁会被 `prepare-source.sh` 自动跳过。
 
