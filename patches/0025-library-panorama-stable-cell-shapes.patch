@@ -1,0 +1,1147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 07:32:30 +0000
+Subject: [PATCH] library: keep panorama cell shapes stable while scrolling
+
+Panorama cells were laid out with a default wide shape and resized when each
+cover decoded, so a staggered grid remeasured every lane on every image. The
+shape switch also called MangaCover.Panorama and MangaCover.Book at two sites,
+which disposed AsyncImage and decoded the cover again. Those height changes
+while scrolling are what twitched the fast scroller.
+
+Shapes are now remembered across process restarts and prefetched from cached
+cover files, applied to a cell only once the grid is still (unless the new
+ratio keeps the same wide/tall cell), and drawn through a single AsyncImage
+call.
+
+Harmony-only: same change as mihon-harmony 0018; Animeko has no such grid.
+---
+ .../components/BrowseSourceComfortableGrid.kt |  68 +++--
+ .../components/BrowseSourceCompactGrid.kt     |  68 +++--
+ .../browse/components/GlobalSearchCardRow.kt  |   6 +-
+ .../RelatedMangasComfortableGrid.kt           |  52 ++--
+ .../components/RelatedMangasCompactGrid.kt    |  52 ++--
+ .../library/components/CommonMangaItem.kt     | 156 +++++------
+ .../library/components/LazyLibraryGrid.kt     |  25 +-
+ .../library/components/PanoramaCoverShapes.kt | 261 ++++++++++++++++++
+ .../library/components/PanoramaGrid.kt        |  32 +--
+ app/src/main/java/eu/kanade/tachiyomi/App.kt  |   5 +
+ .../ui/library/LibraryScreenModel.kt          |  70 +++++
+ 11 files changed, 585 insertions(+), 210 deletions(-)
+ create mode 100644 app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
+index 13858bb..9f1c1d5 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
+@@ -6,15 +6,19 @@ import androidx.compose.foundation.lazy.grid.GridCells
+ import androidx.compose.foundation.lazy.grid.GridItemSpan
+ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+ import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridItemSpan
++import androidx.compose.foundation.lazy.staggeredgrid.rememberLazyStaggeredGridState
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.remember
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.util.fastAny
+ import androidx.paging.LoadState
+ import androidx.paging.compose.LazyPagingItems
+ import eu.kanade.presentation.library.components.CommonMangaItemDefaults
++import eu.kanade.presentation.library.components.LocalPanoramaGridSettled
+ import eu.kanade.presentation.library.components.MangaComfortableGridItem
+ import eu.kanade.presentation.library.components.panoramaStaggeredColumns
+ import eu.kanade.presentation.library.components.rememberCoverRatio
+@@ -44,38 +48,46 @@ fun BrowseSourceComfortableGrid(
+     // cell, which leaves a hole under each wide cover; a staggered grid lets each lane flow on its
+     // own. Auto columns use a wider minimum than the 128 dp meant for book covers.
+     if (usePanoramaCover) {
+-        FastScrollLazyVerticalStaggeredGrid(
+-            columns = columns.panoramaStaggeredColumns(),
+-            contentPadding = contentPadding + PaddingValues(8.dp),
+-            topContentPadding = contentPadding.calculateTopPadding(),
+-            bottomContentPadding = contentPadding.calculateBottomPadding(),
+-            verticalItemSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
+-            horizontalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridHorizontalSpacer),
+-        ) {
+-            if (mangaList.loadState.prepend is LoadState.Loading) {
+-                item(span = StaggeredGridItemSpan.FullLine) {
+-                    BrowseSourceLoadingItem()
++        // The grid has to own the scroll state: a shape learnt mid-fling remeasures every lane.
++        val state = rememberLazyStaggeredGridState()
++        val settled = remember(state) { { !state.isScrollInProgress } }
++        CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
++            FastScrollLazyVerticalStaggeredGrid(
++                columns = columns.panoramaStaggeredColumns(),
++                state = state,
++                contentPadding = contentPadding + PaddingValues(8.dp),
++                topContentPadding = contentPadding.calculateTopPadding(),
++                bottomContentPadding = contentPadding.calculateBottomPadding(),
++                verticalItemSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
++                horizontalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridHorizontalSpacer),
++            ) {
++                if (mangaList.loadState.prepend is LoadState.Loading) {
++                    item(span = StaggeredGridItemSpan.FullLine) {
++                        BrowseSourceLoadingItem()
++                    }
+                 }
+-            }
+ 
+-            items(count = mangaList.itemCount) { index ->
+-                val pair by mangaList[index]?.collectAsState() ?: return@items
+-                val manga = pair.first
+-                val metadata = pair.second
++                items(count = mangaList.itemCount) { index ->
++                    val pair by mangaList[index]?.collectAsState() ?: return@items
++                    val manga = pair.first
++                    val metadata = pair.second
+ 
+-                BrowseSourceComfortableGridItem(
+-                    manga = manga,
+-                    metadata = metadata,
+-                    onClick = { onMangaClick(manga) },
+-                    onLongClick = { onMangaLongClick(manga) },
+-                    isSelected = selection.fastAny { selected -> selected.id == manga.id },
+-                    usePanoramaCover = true,
+-                )
+-            }
++                    BrowseSourceComfortableGridItem(
++                        manga = manga,
++                        metadata = metadata,
++                        onClick = { onMangaClick(manga) },
++                        onLongClick = { onMangaLongClick(manga) },
++                        isSelected = selection.fastAny { selected -> selected.id == manga.id },
++                        usePanoramaCover = true,
++                    )
++                }
+ 
+-            if (mangaList.loadState.refresh is LoadState.Loading || mangaList.loadState.append is LoadState.Loading) {
+-                item(span = StaggeredGridItemSpan.FullLine) {
+-                    BrowseSourceLoadingItem()
++                if (mangaList.loadState.refresh is LoadState.Loading ||
++                    mangaList.loadState.append is LoadState.Loading
++                ) {
++                    item(span = StaggeredGridItemSpan.FullLine) {
++                        BrowseSourceLoadingItem()
++                    }
+                 }
+             }
+         }
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt
+index b37929a..d65c407 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt
+@@ -6,15 +6,19 @@ import androidx.compose.foundation.lazy.grid.GridCells
+ import androidx.compose.foundation.lazy.grid.GridItemSpan
+ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+ import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridItemSpan
++import androidx.compose.foundation.lazy.staggeredgrid.rememberLazyStaggeredGridState
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.remember
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.util.fastAny
+ import androidx.paging.LoadState
+ import androidx.paging.compose.LazyPagingItems
+ import eu.kanade.presentation.library.components.CommonMangaItemDefaults
++import eu.kanade.presentation.library.components.LocalPanoramaGridSettled
+ import eu.kanade.presentation.library.components.MangaCompactGridItem
+ import eu.kanade.presentation.library.components.panoramaStaggeredColumns
+ import eu.kanade.presentation.library.components.rememberCoverRatio
+@@ -45,38 +49,46 @@ fun BrowseSourceCompactGrid(
+     // Same two panorama problems as the comfortable browse grid: a shared row height leaves a hole
+     // under a wide cover, and auto columns at 128 dp make that cover cramped.
+     if (usePanoramaCover) {
+-        FastScrollLazyVerticalStaggeredGrid(
+-            columns = columns.panoramaStaggeredColumns(),
+-            contentPadding = contentPadding + PaddingValues(8.dp),
+-            topContentPadding = contentPadding.calculateTopPadding(),
+-            bottomContentPadding = contentPadding.calculateBottomPadding(),
+-            verticalItemSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
+-            horizontalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridHorizontalSpacer),
+-        ) {
+-            if (mangaList.loadState.prepend is LoadState.Loading) {
+-                item(span = StaggeredGridItemSpan.FullLine) {
+-                    BrowseSourceLoadingItem()
++        // The grid has to own the scroll state: a shape learnt mid-fling remeasures every lane.
++        val state = rememberLazyStaggeredGridState()
++        val settled = remember(state) { { !state.isScrollInProgress } }
++        CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
++            FastScrollLazyVerticalStaggeredGrid(
++                columns = columns.panoramaStaggeredColumns(),
++                state = state,
++                contentPadding = contentPadding + PaddingValues(8.dp),
++                topContentPadding = contentPadding.calculateTopPadding(),
++                bottomContentPadding = contentPadding.calculateBottomPadding(),
++                verticalItemSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
++                horizontalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridHorizontalSpacer),
++            ) {
++                if (mangaList.loadState.prepend is LoadState.Loading) {
++                    item(span = StaggeredGridItemSpan.FullLine) {
++                        BrowseSourceLoadingItem()
++                    }
+                 }
+-            }
+ 
+-            items(count = mangaList.itemCount) { index ->
+-                val pair by mangaList[index]?.collectAsState() ?: return@items
+-                val manga = pair.first
+-                val metadata = pair.second
++                items(count = mangaList.itemCount) { index ->
++                    val pair by mangaList[index]?.collectAsState() ?: return@items
++                    val manga = pair.first
++                    val metadata = pair.second
+ 
+-                BrowseSourceCompactGridItem(
+-                    manga = manga,
+-                    metadata = metadata,
+-                    onClick = { onMangaClick(manga) },
+-                    onLongClick = { onMangaLongClick(manga) },
+-                    isSelected = selection.fastAny { selected -> selected.id == manga.id },
+-                    usePanoramaCover = true,
+-                )
+-            }
++                    BrowseSourceCompactGridItem(
++                        manga = manga,
++                        metadata = metadata,
++                        onClick = { onMangaClick(manga) },
++                        onLongClick = { onMangaLongClick(manga) },
++                        isSelected = selection.fastAny { selected -> selected.id == manga.id },
++                        usePanoramaCover = true,
++                    )
++                }
+ 
+-            if (mangaList.loadState.refresh is LoadState.Loading || mangaList.loadState.append is LoadState.Loading) {
+-                item(span = StaggeredGridItemSpan.FullLine) {
+-                    BrowseSourceLoadingItem()
++                if (mangaList.loadState.refresh is LoadState.Loading ||
++                    mangaList.loadState.append is LoadState.Loading
++                ) {
++                    item(span = StaggeredGridItemSpan.FullLine) {
++                        BrowseSourceLoadingItem()
++                    }
+                 }
+             }
+         }
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/GlobalSearchCardRow.kt b/app/src/main/java/eu/kanade/presentation/browse/components/GlobalSearchCardRow.kt
+index d11d5f9..4e80682 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/GlobalSearchCardRow.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/GlobalSearchCardRow.kt
+@@ -12,14 +12,13 @@ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.State
+ import androidx.compose.runtime.getValue
+-import androidx.compose.runtime.mutableFloatStateOf
+-import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.util.fastAny
+ import eu.kanade.domain.ui.UiPreferences
+ import eu.kanade.presentation.library.components.CommonMangaItemDefaults
+ import eu.kanade.presentation.library.components.MangaComfortableGridItem
++import eu.kanade.presentation.library.components.rememberCoverRatio
+ import eu.kanade.presentation.manga.components.RatioSwitchToPanorama
+ import tachiyomi.domain.manga.model.Manga
+ import tachiyomi.domain.manga.model.MangaCover
+@@ -80,7 +79,8 @@ internal fun MangaItem(
+ ) {
+     // KMK -->
+     val panoramaCover = usePanoramaCover ?: Injekt.get<UiPreferences>().usePanoramaCoverFlow().collectAsState().value
+-    val coverRatio = remember { mutableFloatStateOf(1f) }
++    // The grid item no longer writes this state. Shapes come from the shared store, applied once known.
++    val coverRatio = rememberCoverRatio(cover.mangaId, panoramaCover)
+     // KMK <--
+     Box(
+         modifier = Modifier.width(
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt
+index 06da953..640aec5 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt
+@@ -10,17 +10,21 @@ import androidx.compose.foundation.lazy.grid.GridCells
+ import androidx.compose.foundation.lazy.staggeredgrid.LazyStaggeredGridItemScope
+ import androidx.compose.foundation.lazy.staggeredgrid.LazyStaggeredGridScope
+ import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridItemSpan
++import androidx.compose.foundation.lazy.staggeredgrid.rememberLazyStaggeredGridState
+ import androidx.compose.material3.HorizontalDivider
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.runtime.State
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.util.fastAny
+ import eu.kanade.presentation.browse.RelatedMangaTitle
+ import eu.kanade.presentation.browse.RelatedMangasLoadingItem
+ import eu.kanade.presentation.browse.header
+ import eu.kanade.presentation.library.components.CommonMangaItemDefaults
++import eu.kanade.presentation.library.components.LocalPanoramaGridSettled
+ import eu.kanade.presentation.library.components.panoramaStaggeredColumns
+ import eu.kanade.tachiyomi.ui.manga.RelatedManga
+ import tachiyomi.domain.manga.model.Manga
+@@ -50,27 +54,33 @@ fun RelatedMangasComfortableGrid(
+     // Same two panorama problems as the library and the source browse grid: a shared row height
+     // leaves a hole under a wide cover, and auto columns at 128 dp make that cover cramped.
+     if (usePanoramaCover) {
+-        FastScrollLazyVerticalStaggeredGrid(
+-            columns = columns.panoramaStaggeredColumns(),
+-            contentPadding = gridPadding,
+-            topContentPadding = contentPadding.calculateTopPadding(),
+-            verticalItemSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
+-            horizontalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridHorizontalSpacer),
+-        ) {
+-            addRelatedSections(
+-                relatedMangas = relatedMangas,
+-                getManga = getManga,
+-                onMangaClick = onMangaClick,
+-                onMangaLongClick = onMangaLongClick,
+-                onKeywordClick = onKeywordClick,
+-                onKeywordLongClick = onKeywordLongClick,
+-                selection = selection,
+-                usePanoramaCover = true,
+-                fullWidth = { key, content -> fullWidthItem(key) { content() } },
+-                cells = { count, key, item ->
+-                    items(count = count, key = key) { index -> item(index) }
+-                },
+-            )
++        // The grid has to own the scroll state: a shape learnt mid-fling remeasures every lane.
++        val state = rememberLazyStaggeredGridState()
++        val settled = remember(state) { { !state.isScrollInProgress } }
++        CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
++            FastScrollLazyVerticalStaggeredGrid(
++                columns = columns.panoramaStaggeredColumns(),
++                state = state,
++                contentPadding = gridPadding,
++                topContentPadding = contentPadding.calculateTopPadding(),
++                verticalItemSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
++                horizontalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridHorizontalSpacer),
++            ) {
++                addRelatedSections(
++                    relatedMangas = relatedMangas,
++                    getManga = getManga,
++                    onMangaClick = onMangaClick,
++                    onMangaLongClick = onMangaLongClick,
++                    onKeywordClick = onKeywordClick,
++                    onKeywordLongClick = onKeywordLongClick,
++                    selection = selection,
++                    usePanoramaCover = true,
++                    fullWidth = { key, content -> fullWidthItem(key) { content() } },
++                    cells = { count, key, item ->
++                        items(count = count, key = key) { index -> item(index) }
++                    },
++                )
++            }
+         }
+         return
+     }
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt
+index 9ff9982..08b4ad2 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt
+@@ -10,17 +10,21 @@ import androidx.compose.foundation.lazy.grid.GridCells
+ import androidx.compose.foundation.lazy.staggeredgrid.LazyStaggeredGridItemScope
+ import androidx.compose.foundation.lazy.staggeredgrid.LazyStaggeredGridScope
+ import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridItemSpan
++import androidx.compose.foundation.lazy.staggeredgrid.rememberLazyStaggeredGridState
+ import androidx.compose.material3.HorizontalDivider
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.runtime.State
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.util.fastAny
+ import eu.kanade.presentation.browse.RelatedMangaTitle
+ import eu.kanade.presentation.browse.RelatedMangasLoadingItem
+ import eu.kanade.presentation.browse.header
+ import eu.kanade.presentation.library.components.CommonMangaItemDefaults
++import eu.kanade.presentation.library.components.LocalPanoramaGridSettled
+ import eu.kanade.presentation.library.components.panoramaStaggeredColumns
+ import eu.kanade.tachiyomi.ui.manga.RelatedManga
+ import tachiyomi.domain.manga.model.Manga
+@@ -52,27 +56,33 @@ fun RelatedMangasCompactGrid(
+     // Same two panorama problems as the comfortable related grid: a shared row height leaves a
+     // hole under a wide cover, and auto columns at 128 dp make that cover cramped.
+     if (usePanoramaCover) {
+-        FastScrollLazyVerticalStaggeredGrid(
+-            columns = columns.panoramaStaggeredColumns(),
+-            contentPadding = gridPadding,
+-            topContentPadding = contentPadding.calculateTopPadding(),
+-            verticalItemSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
+-            horizontalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridHorizontalSpacer),
+-        ) {
+-            addRelatedSections(
+-                relatedMangas = relatedMangas,
+-                getManga = getManga,
+-                onMangaClick = onMangaClick,
+-                onMangaLongClick = onMangaLongClick,
+-                onKeywordClick = onKeywordClick,
+-                onKeywordLongClick = onKeywordLongClick,
+-                selection = selection,
+-                usePanoramaCover = true,
+-                fullWidth = { key, content -> fullWidthItem(key) { content() } },
+-                cells = { count, key, item ->
+-                    items(count = count, key = key) { index -> item(index) }
+-                },
+-            )
++        // The grid has to own the scroll state: a shape learnt mid-fling remeasures every lane.
++        val state = rememberLazyStaggeredGridState()
++        val settled = remember(state) { { !state.isScrollInProgress } }
++        CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
++            FastScrollLazyVerticalStaggeredGrid(
++                columns = columns.panoramaStaggeredColumns(),
++                state = state,
++                contentPadding = gridPadding,
++                topContentPadding = contentPadding.calculateTopPadding(),
++                verticalItemSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
++                horizontalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridHorizontalSpacer),
++            ) {
++                addRelatedSections(
++                    relatedMangas = relatedMangas,
++                    getManga = getManga,
++                    onMangaClick = onMangaClick,
++                    onMangaLongClick = onMangaLongClick,
++                    onKeywordClick = onKeywordClick,
++                    onKeywordLongClick = onKeywordLongClick,
++                    selection = selection,
++                    usePanoramaCover = true,
++                    fullWidth = { key, content -> fullWidthItem(key) { content() } },
++                    cells = { count, key, item ->
++                        items(count = count, key = key) { index -> item(index) }
++                    },
++                )
++            }
+         }
+         return
+     }
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/CommonMangaItem.kt b/app/src/main/java/eu/kanade/presentation/library/components/CommonMangaItem.kt
+index d1fcbbd..437d5e1 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/CommonMangaItem.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/CommonMangaItem.kt
+@@ -42,6 +42,7 @@ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.unit.Dp
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
++import coil3.compose.AsyncImagePainter
+ import eu.kanade.presentation.manga.components.MangaCover
+ import eu.kanade.presentation.manga.components.MangaCoverHide
+ import eu.kanade.presentation.manga.components.RatioSwitchToPanorama
+@@ -97,6 +98,16 @@ fun MangaCompactGridItem(
+ ) {
+     // Harmony -->
+     val coverIsWide = coverRatio.floatValue <= RatioSwitchToPanorama
++    val onCoverLoaded: ((MangaCoverModel, AsyncImagePainter.State.Success) -> Unit)? = if (usePanoramaCover) {
++        { _, result ->
++            val image = result.result.image
++            val width = image.width
++            // A direct write remeasures every lane mid-fling. The grid applies a new shape once it is still.
++            if (width > 0) PanoramaCoverShapes.put(coverData.mangaId, image.height.toFloat() / width)
++        }
++    } else {
++        null
++    }
+     // Harmony <--
+     // KMK -->
+     val bgColor = coverData.dominantCoverColors?.first?.let { Color(it) }.takeIf { libraryColored }
+@@ -119,51 +130,30 @@ fun MangaCompactGridItem(
+                     )
+                 } else {
+                     // Harmony -->
+-                    if (fitToPanoramaCover && usePanoramaCover && coverIsWide) {
+-                        MangaCover.Panorama(
+-                            modifier = Modifier
+-                                .fillMaxWidth(),
+-                            data = coverData,
+-                            alpha = if (isSelected) GRID_SELECTED_COVER_ALPHA else coverAlpha,
+-                            bgColor = bgColor ?: (MaterialTheme.colorScheme.surface.takeIf { isSelected }),
+-                            tint = onBgColor,
+-                            onCoverLoaded = { _, result ->
+-                                val image = result.result.image
+-                                coverRatio.floatValue = image.height.toFloat() / image.width
+-                            },
+-                        )
++                    // Two call sites would dispose AsyncImage when the shape flips and decode the cover again.
++                    val cover = if (fitToPanoramaCover && usePanoramaCover && coverIsWide) {
++                        MangaCover.Panorama
+                     } else {
+-                        // Harmony <--
+-                        // KMK <--
+-                        MangaCover.Book(
+-                            modifier = Modifier
+-                                // KMK -->
+-                                // .alpha(if (isSelected) GridSelectedCoverAlpha else coverAlpha)
+-                                // KMK <--
+-                                .fillMaxWidth(),
+-                            data = coverData,
+-                            // KMK -->
+-                            alpha = if (isSelected) GRID_SELECTED_COVER_ALPHA else coverAlpha,
+-                            bgColor = bgColor ?: (MaterialTheme.colorScheme.surface.takeIf { isSelected }),
+-                            tint = onBgColor,
+-                            // KMK <--
+-                            // Harmony -->
+-                            onCoverLoaded = if (usePanoramaCover) {
+-                                { _, result ->
+-                                    val image = result.result.image
+-                                    coverRatio.floatValue = image.height.toFloat() / image.width
+-                                }
+-                            } else {
+-                                null
+-                            },
+-                            scale = if (usePanoramaCover && coverIsWide) {
+-                                ContentScale.Fit
+-                            } else {
+-                                ContentScale.Crop
+-                            },
+-                            // Harmony <--
+-                        )
++                        MangaCover.Book
+                     }
++                    cover(
++                        modifier = Modifier
++                            .fillMaxWidth(),
++                        data = coverData,
++                        // KMK -->
++                        alpha = if (isSelected) GRID_SELECTED_COVER_ALPHA else coverAlpha,
++                        bgColor = bgColor ?: (MaterialTheme.colorScheme.surface.takeIf { isSelected }),
++                        tint = onBgColor,
++                        // KMK <--
++                        onCoverLoaded = onCoverLoaded,
++                        // Fit letterboxes a wide cover inside a book cell. A panorama cell keeps Crop.
++                        scale = if (usePanoramaCover && coverIsWide && !fitToPanoramaCover) {
++                            ContentScale.Fit
++                        } else {
++                            ContentScale.Crop
++                        },
++                    )
++                    // Harmony <--
+                 }
+             },
+             // Harmony -->
+@@ -277,6 +267,18 @@ fun MangaComfortableGridItem(
+     val bgColor = coverData.dominantCoverColors?.first?.let { Color(it) }.takeIf { libraryColored }
+     val onBgColor = coverData.dominantCoverColors?.second.takeIf { libraryColored }
+     // KMK <--
++    // Harmony -->
++    val onCoverLoaded: ((MangaCoverModel, AsyncImagePainter.State.Success) -> Unit)? = if (usePanoramaCover) {
++        { _, result ->
++            val image = result.result.image
++            val width = image.width
++            // A direct write remeasures every lane mid-fling. The grid applies a new shape once it is still.
++            if (width > 0) PanoramaCoverShapes.put(coverData.mangaId, image.height.toFloat() / width)
++        }
++    } else {
++        null
++    }
++    // Harmony <--
+     GridItemSelectable(
+         isSelected = isSelected,
+         onClick = onClick,
+@@ -294,49 +296,31 @@ fun MangaComfortableGridItem(
+                             tint = onBgColor,
+                         )
+                     } else {
+-                        if (fitToPanoramaCover && usePanoramaCover && coverIsWide) {
+-                            MangaCover.Panorama(
+-                                modifier = Modifier
+-                                    // KMK -->
+-                                    // .alpha(if (isSelected) GridSelectedCoverAlpha else coverAlpha)
+-                                    // KMK <--
+-                                    .fillMaxWidth(),
+-                                data = coverData,
+-                                // KMK -->
+-                                alpha = if (isSelected) GRID_SELECTED_COVER_ALPHA else coverAlpha,
+-                                bgColor = bgColor ?: (MaterialTheme.colorScheme.surface.takeIf { isSelected }),
+-                                tint = onBgColor,
+-                                onCoverLoaded = { _, result ->
+-                                    val image = result.result.image
+-                                    coverRatio.floatValue = image.height.toFloat() / image.width
+-                                },
+-                                // KMK <--
+-                            )
++                        // Harmony -->
++                        // Two call sites would dispose AsyncImage when the shape flips and decode the cover again.
++                        val cover = if (fitToPanoramaCover && usePanoramaCover && coverIsWide) {
++                            MangaCover.Panorama
+                         } else {
+-                            // KMK <--
+-                            MangaCover.Book(
+-                                modifier = Modifier
+-                                    // KMK -->
+-                                    // .alpha(if (isSelected) GridSelectedCoverAlpha else coverAlpha)
+-                                    // KMK <--
+-                                    .fillMaxWidth(),
+-                                data = coverData,
+-                                // KMK -->
+-                                alpha = if (isSelected) GRID_SELECTED_COVER_ALPHA else coverAlpha,
+-                                bgColor = bgColor ?: (MaterialTheme.colorScheme.surface.takeIf { isSelected }),
+-                                tint = onBgColor,
+-                                onCoverLoaded = { _, result ->
+-                                    val image = result.result.image
+-                                    coverRatio.floatValue = image.height.toFloat() / image.width
+-                                },
+-                                scale = if (usePanoramaCover && coverIsWide) {
+-                                    ContentScale.Fit
+-                                } else {
+-                                    ContentScale.Crop
+-                                },
+-                                // KMK <--
+-                            )
++                            MangaCover.Book
+                         }
++                        cover(
++                            modifier = Modifier
++                                .fillMaxWidth(),
++                            data = coverData,
++                            // KMK -->
++                            alpha = if (isSelected) GRID_SELECTED_COVER_ALPHA else coverAlpha,
++                            bgColor = bgColor ?: (MaterialTheme.colorScheme.surface.takeIf { isSelected }),
++                            tint = onBgColor,
++                            // KMK <--
++                            onCoverLoaded = onCoverLoaded,
++                            // Fit letterboxes a wide cover inside a book cell. A panorama cell keeps Crop.
++                            scale = if (usePanoramaCover && coverIsWide && !fitToPanoramaCover) {
++                                ContentScale.Fit
++                            } else {
++                                ContentScale.Crop
++                            },
++                        )
++                        // Harmony <--
+                     }
+                 },
+                 // KMK -->
+@@ -532,7 +516,9 @@ fun MangaListItem(
+             )
+         } else {
+             // KMK <--
+-            MangaCover.Book(
++            // List rows are always book-shaped, so this is one call and AsyncImage is not recreated.
++            val cover = MangaCover.Book
++            cover(
+                 modifier = Modifier
+                     // KMK -->
+                     // .alpha(coverAlpha)
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt
+index 469f621..22f7387 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt
+@@ -7,7 +7,10 @@ import androidx.compose.foundation.lazy.grid.GridItemSpan
+ import androidx.compose.foundation.lazy.grid.LazyGridScope
+ import androidx.compose.foundation.lazy.staggeredgrid.LazyStaggeredGridScope
+ import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridItemSpan
++import androidx.compose.foundation.lazy.staggeredgrid.rememberLazyStaggeredGridState
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.unit.dp
+ import tachiyomi.presentation.core.components.FastScrollLazyVerticalGrid
+@@ -43,14 +46,20 @@ internal fun LazyLibraryStaggeredGrid(
+     contentPadding: PaddingValues,
+     content: LazyStaggeredGridScope.() -> Unit,
+ ) {
+-    FastScrollLazyVerticalStaggeredGrid(
+-        columns = panoramaStaggeredColumns(columns),
+-        modifier = modifier,
+-        contentPadding = contentPadding + PaddingValues(8.dp),
+-        verticalItemSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
+-        horizontalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridHorizontalSpacer),
+-        content = content,
+-    )
++    // The grid has to own the scroll state: a shape learnt mid-fling remeasures every lane.
++    val state = rememberLazyStaggeredGridState()
++    val settled = remember(state) { { !state.isScrollInProgress } }
++    CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
++        FastScrollLazyVerticalStaggeredGrid(
++            columns = panoramaStaggeredColumns(columns),
++            modifier = modifier,
++            state = state,
++            contentPadding = contentPadding + PaddingValues(8.dp),
++            verticalItemSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
++            horizontalArrangement = Arrangement.spacedBy(CommonMangaItemDefaults.GridHorizontalSpacer),
++            content = content,
++        )
++    }
+ }
+ 
+ fun LazyStaggeredGridScope.globalSearchItem(
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt
+new file mode 100644
+index 0000000..cf199d4
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt
+@@ -0,0 +1,261 @@
++package eu.kanade.presentation.library.components
++
++import android.graphics.BitmapFactory
++import androidx.compose.runtime.compositionLocalOf
++import androidx.compose.runtime.mutableStateMapOf
++import kotlinx.coroutines.CompletableDeferred
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.isActive
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import java.io.BufferedReader
++import java.io.BufferedWriter
++import java.io.File
++import java.io.FileReader
++import java.io.FileWriter
++import kotlin.coroutines.cancellation.CancellationException
++import kotlin.math.abs
++import kotlin.math.roundToInt
++
++// Harmony -->
++// Cover shapes (height / width) learnt so far, kept across process restarts so a panorama grid can
++// lay every cell out with its final shape on first composition instead of re-measuring when the
++// image arrives. A shape learnt mid-scroll is what shoves the rest of a staggered lane downward.
++
++private const val MAX_ENTRIES = 20_000
++private const val RATIO_EPSILON = 0.01f
++private const val PERSIST_DELAY_MILLIS = 2_000L
++private const val PREFETCH_PARALLELISM = 4
++
++private val AlwaysSettled: () -> Boolean = { true }
++
++/**
++ * True once the surrounding panorama grid is not scrolling.
++ * Defaults to settled so a grid that never provides it still applies shapes.
++ * The default instance is shared: a fresh lambda on every read would fail equality and recompose forever.
++ */
++val LocalPanoramaGridSettled = compositionLocalOf<() -> Boolean> { AlwaysSettled }
++
++object PanoramaCoverShapes {
++    private val ratios = mutableStateMapOf<Long, Float>()
++    private val stored = LinkedHashMap<Long, Float>()
++    private val gate = Any()
++    private val ready = CompletableDeferred<Unit>()
++
++    private var storeFile: File? = null
++    private var persistScope: CoroutineScope? = null
++    private var persistJob: Job? = null
++
++    @Volatile
++    private var dirty = false
++
++    @Volatile
++    private var initialized = false
++
++    @Volatile
++    private var loaded = false
++
++    fun init(file: File, scope: CoroutineScope) {
++        synchronized(gate) {
++            if (initialized) return
++            initialized = true
++            storeFile = file
++            persistScope = scope
++        }
++        scope.launch(Dispatchers.IO) {
++            try {
++                read(file)
++            } catch (cancelled: CancellationException) {
++                throw cancelled
++            } catch (_: Exception) {
++                // A missing or corrupt file only means covers stay unknown until they are measured.
++            } finally {
++                // Puts that arrived while the file was still loading must not overwrite it early.
++                synchronized(gate) { loaded = true }
++                ready.complete(Unit)
++                if (dirty) schedulePersist()
++            }
++        }
++    }
++
++    fun get(mangaId: Long): Float? = ratios[mangaId]
++
++    fun put(mangaId: Long, ratio: Float) {
++        if (ratio <= 0f || ratio.isNaN() || ratio.isInfinite()) return
++        val changed = synchronized(gate) {
++            val current = stored[mangaId]
++            if (current != null && abs(current - ratio) <= RATIO_EPSILON) {
++                false
++            } else {
++                // Re-insert so the cap drops the oldest entry, not the one just learnt.
++                stored.remove(mangaId)
++                while (stored.size >= MAX_ENTRIES) {
++                    val eldest = stored.entries.iterator().next().key
++                    stored.remove(eldest)
++                    ratios.remove(eldest)
++                }
++                stored[mangaId] = ratio
++                ratios[mangaId] = ratio
++                true
++            }
++        }
++        if (changed) schedulePersist()
++    }
++
++    suspend fun prefetch(entries: List<Pair<Long, () -> File?>>) {
++        if (!initialized) return
++        ready.await()
++        val missing = ArrayList<Pair<Long, () -> File?>>()
++        for (entry in entries) {
++            if (storedRatio(entry.first) == null) missing.add(entry)
++        }
++        if (missing.isEmpty()) return
++        coroutineScope {
++            var next = 0
++            val workers = minOf(PREFETCH_PARALLELISM, missing.size)
++            repeat(workers) {
++                launch(Dispatchers.IO) {
++                    while (isActive) {
++                        val index = synchronized(missing) {
++                            if (next >= missing.size) -1 else next++
++                        }
++                        if (index < 0) return@launch
++                        val (id, fileOf) = missing[index]
++                        if (storedRatio(id) != null) continue
++                        val ratio = readRatio(fileOf) ?: continue
++                        put(id, ratio)
++                    }
++                }
++            }
++        }
++    }
++
++    private fun storedRatio(mangaId: Long): Float? = synchronized(gate) { stored[mangaId] }
++
++    private fun readRatio(fileOf: () -> File?): Float? {
++        val file = try {
++            fileOf()
++        } catch (cancelled: CancellationException) {
++            throw cancelled
++        } catch (_: Exception) {
++            null
++        } ?: return null
++        return decodeRatio(file)
++    }
++
++    private fun decodeRatio(file: File): Float? {
++        return try {
++            if (!file.isFile || file.length() <= 0L) return null
++            val options = BitmapFactory.Options()
++            options.inJustDecodeBounds = true
++            BitmapFactory.decodeFile(file.path, options)
++            val width = options.outWidth
++            val height = options.outHeight
++            if (width <= 0 || height <= 0) return null
++            height.toFloat() / width.toFloat()
++        } catch (_: Exception) {
++            null
++        }
++    }
++
++    private fun schedulePersist() {
++        val scope: CoroutineScope
++        val file: File
++        synchronized(gate) {
++            val currentScope = persistScope
++            val currentFile = storeFile
++            if (!loaded || currentScope == null || currentFile == null) {
++                dirty = true
++                return
++            }
++            dirty = false
++            persistJob?.cancel()
++            scope = currentScope
++            file = currentFile
++            persistJob = scope.launch {
++                delay(PERSIST_DELAY_MILLIS)
++                withContext(Dispatchers.IO) { write(file) }
++            }
++        }
++    }
++
++    private fun read(file: File) {
++        if (!file.isFile) return
++        val parsed = ArrayList<Pair<Long, Float>>()
++        BufferedReader(FileReader(file)).use { reader ->
++            while (true) {
++                val line = reader.readLine() ?: break
++                val space = line.indexOf(' ')
++                if (space <= 0) continue
++                val id = line.substring(0, space).toLongOrNull() ?: continue
++                val ratio = line.substring(space + 1).trim().toFloatOrNull() ?: continue
++                if (ratio <= 0f || ratio.isNaN() || ratio.isInfinite()) continue
++                parsed.add(id to ratio)
++            }
++        }
++        val kept = if (parsed.size > MAX_ENTRIES) {
++            parsed.subList(parsed.size - MAX_ENTRIES, parsed.size)
++        } else {
++            parsed
++        }
++        synchronized(gate) {
++            val newer = LinkedHashMap(stored)
++            stored.clear()
++            for ((id, ratio) in kept) {
++                if (id in newer) continue
++                stored.remove(id)
++                stored[id] = ratio
++                ratios[id] = ratio
++            }
++            for ((id, ratio) in newer) {
++                stored.remove(id)
++                stored[id] = ratio
++                ratios[id] = ratio
++            }
++            while (stored.size > MAX_ENTRIES) {
++                val eldest = stored.entries.iterator().next().key
++                stored.remove(eldest)
++                ratios.remove(eldest)
++            }
++        }
++    }
++
++    private fun write(destination: File) {
++        val parent = destination.parentFile ?: return
++        val snapshot = synchronized(gate) {
++            stored.entries.map { it.key to it.value }
++        }
++        val tmp = File(parent, "${destination.name}.tmp")
++        try {
++            BufferedWriter(FileWriter(tmp)).use { writer ->
++                for ((id, ratio) in snapshot) {
++                    writer.write(id.toString())
++                    writer.write(" ")
++                    writer.write(formatRatio(ratio))
++                    writer.newLine()
++                }
++            }
++            if (!tmp.renameTo(destination)) {
++                tmp.copyTo(destination, overwrite = true)
++                tmp.delete()
++            }
++        } catch (cancelled: CancellationException) {
++            tmp.delete()
++            throw cancelled
++        } catch (_: Exception) {
++            tmp.delete()
++        }
++    }
++
++    private fun formatRatio(ratio: Float): String {
++        val milli = (ratio * 1000f).roundToInt()
++        val whole = milli / 1000
++        val frac = milli % 1000
++        return "$whole.${frac.toString().padStart(3, '0')}"
++    }
++}
++// Harmony <--
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
+index e5191cd..528e0af 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
+@@ -13,11 +13,11 @@ import androidx.compose.runtime.snapshotFlow
+ import androidx.compose.ui.platform.LocalConfiguration
+ import androidx.compose.ui.unit.Density
+ import androidx.compose.ui.unit.dp
+-import kotlinx.coroutines.flow.drop
++import eu.kanade.presentation.manga.components.RatioSwitchToPanorama
++import kotlinx.coroutines.flow.first
+ import tachiyomi.domain.library.service.LibraryPreferences
+ import uy.kohesive.injekt.Injekt
+ import uy.kohesive.injekt.api.get
+-import java.util.concurrent.ConcurrentHashMap
+ 
+ // Harmony -->
+ /** Auto column width for a panorama grid; a 3:2 cover at this width is as tall as a 2:3 cover at 128 dp is wide. */
+@@ -79,26 +79,26 @@ private fun libraryColumnCount(orientation: Int): Int {
+     }
+ }
+ 
+-/**
+- * Cover orientation (height / width) by manga id, kept for the process lifetime so a cell keeps
+- * its shape when it scrolls back into view instead of jumping from book to panorama once the
+- * image is decoded again. In panorama mode an unknown cover is assumed wide, since that is what
+- * the mode is for.
+- */
+-private val coverRatios = ConcurrentHashMap<Long, Float>()
+-
+-/** height / width of a 16:9 thumbnail, the common shape of video covers. */
++/** height / width of a 16:9 thumbnail, the common shape of video covers. Unknown panorama covers start here. */
+ private const val WIDE_COVER_RATIO = 9f / 16f
+ 
+ @Composable
+ internal fun rememberCoverRatio(mangaId: Long, usePanoramaCover: Boolean): MutableFloatState {
++    val settled = LocalPanoramaGridSettled.current
++    val known = PanoramaCoverShapes.get(mangaId)
+     val ratio = remember(mangaId) {
+-        mutableFloatStateOf(coverRatios[mangaId] ?: if (usePanoramaCover) WIDE_COVER_RATIO else 1f)
++        mutableFloatStateOf(known ?: if (usePanoramaCover) WIDE_COVER_RATIO else 1f)
+     }
+-    LaunchedEffect(mangaId) {
+-        snapshotFlow { ratio.floatValue }
+-            .drop(1)
+-            .collect { coverRatios[mangaId] = it }
++    // A newly learnt shape is applied only once the grid stops moving; every cell shape change
++    // re-measures the whole staggered grid, which is what the user sees as jitter and dropped frames.
++    LaunchedEffect(mangaId, known) {
++        if (known == null || known == ratio.floatValue) return@LaunchedEffect
++        val sameShape = (known <= RatioSwitchToPanorama) == (ratio.floatValue <= RatioSwitchToPanorama)
++        // Same side of the wide/tall cut keeps the cell's aspect ratio, so the lane does not move.
++        if (!sameShape) {
++            snapshotFlow { settled() }.first { it }
++        }
++        ratio.floatValue = known
+     }
+     return ratio
+ }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/App.kt b/app/src/main/java/eu/kanade/tachiyomi/App.kt
+index eea9651..ae2b32a 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/App.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/App.kt
+@@ -42,6 +42,7 @@ import eu.kanade.domain.base.BasePreferences
+ import eu.kanade.domain.sync.SyncPreferences
+ import eu.kanade.domain.ui.UiPreferences
+ import eu.kanade.domain.ui.model.setAppCompatDelegateThemeMode
++import eu.kanade.presentation.library.components.PanoramaCoverShapes
+ import eu.kanade.tachiyomi.core.security.PrivacyPreferences
+ import eu.kanade.tachiyomi.crash.CrashActivity
+ import eu.kanade.tachiyomi.crash.GlobalExceptionHandler
+@@ -98,6 +99,7 @@ import timber.log.Timber
+ import uy.kohesive.injekt.Injekt
+ import uy.kohesive.injekt.api.get
+ import uy.kohesive.injekt.injectLazy
++import java.io.File
+ import java.security.Security
+ import java.text.SimpleDateFormat
+ import java.util.Locale
+@@ -227,6 +229,9 @@ class App : Application(), DefaultLifecycleObserver, SingletonImageLoader.Factor
+         scope.launch(Dispatchers.IO) {
+             AppUpdateDownloadJob.deleteInstalledApk(this@App)
+         }
++        // Shapes have to be known before the first panorama layout; loading them at process start
++        // avoids measuring every cell twice after a restart.
++        PanoramaCoverShapes.init(File(filesDir, "harmony_panorama_cover_shapes.txt"), scope)
+         // Harmony <--
+ 
+         initializeMigrator()
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryScreenModel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryScreenModel.kt
+index 5d2bed5..a9232ef 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryScreenModel.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryScreenModel.kt
+@@ -21,6 +21,7 @@ import eu.kanade.domain.manga.interactor.UpdateManga
+ import eu.kanade.domain.sync.SyncPreferences
+ import eu.kanade.presentation.components.SEARCH_DEBOUNCE_MILLIS
+ import eu.kanade.presentation.library.components.LibraryToolbarTitle
++import eu.kanade.presentation.library.components.PanoramaCoverShapes
+ import eu.kanade.presentation.manga.DownloadAction
+ import eu.kanade.tachiyomi.data.cache.BackgroundCache
+ import eu.kanade.tachiyomi.data.cache.CoverCache
+@@ -50,8 +51,10 @@ import kotlinx.collections.immutable.PersistentList
+ import kotlinx.collections.immutable.persistentSetOf
+ import kotlinx.collections.immutable.toImmutableList
+ import kotlinx.collections.immutable.toImmutableSet
++import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.asFlow
+ import kotlinx.coroutines.flow.collectLatest
+ import kotlinx.coroutines.flow.combine
+@@ -67,6 +70,7 @@ import kotlinx.coroutines.flow.onEach
+ import kotlinx.coroutines.flow.toList
+ import kotlinx.coroutines.flow.update
+ import kotlinx.coroutines.flow.updateAndGet
++import kotlinx.coroutines.launch
+ import kotlinx.coroutines.runBlocking
+ import mihon.core.common.utils.mutate
+ import tachiyomi.core.common.i18n.stringResource
+@@ -107,6 +111,7 @@ import tachiyomi.source.local.LocalSource
+ import tachiyomi.source.local.isLocal
+ import uy.kohesive.injekt.Injekt
+ import uy.kohesive.injekt.api.get
++import java.io.File
+ import kotlin.random.Random
+ import tachiyomi.domain.source.model.Source as DomainSource
+ 
+@@ -148,6 +153,38 @@ class LibraryScreenModel(
+     private var recommendationSearchJob: Job? = null
+     // SY <--
+ 
++    // Harmony -->
++    // The screen already collects favorites. A second collector would run the library query twice.
++    private val panoramaPrefetchItems = MutableStateFlow<List<LibraryItem>>(emptyList())
++
++    private var panoramaPrefetchJob: Job? = null
++
++    init {
++        // Bounds decoding stays off the list path. A newer snapshot cancels the previous pass.
++        combine(
++            panoramaPrefetchItems,
++            libraryPreferences.displayMode().changes(),
++        ) { items, mode -> items to mode }
++            .distinctUntilChanged { old, new ->
++                val oldPanorama = old.second.isPanoramaGrid()
++                val newPanorama = new.second.isPanoramaGrid()
++                if (oldPanorama != newPanorama) return@distinctUntilChanged false
++                // Badge-only updates must not cancel a bounds scan that is already running.
++                if (!newPanorama) return@distinctUntilChanged true
++                old.first.samePanoramaCovers(new.first)
++            }
++            .onEach { (items, mode) ->
++                panoramaPrefetchJob?.cancel()
++                panoramaPrefetchJob = null
++                if (!mode.isPanoramaGrid() || items.isEmpty()) return@onEach
++                panoramaPrefetchJob = screenModelScope.launch(Dispatchers.IO) {
++                    PanoramaCoverShapes.prefetch(items.map { it.panoramaCoverFile() })
++                }
++            }
++            .launchIn(screenModelScope)
++    }
++    // Harmony <--
++
+     init {
+         mutableState.update { state ->
+             state.copy(activeCategoryIndex = libraryPreferences.lastUsedCategory().get())
+@@ -815,7 +852,40 @@ class LibraryScreenModel(
+                 )
+             }
+         }
++            .onEach { items ->
++                // Harmony: the screen collector is the only one; this publishes the list for cover prefetch.
++                panoramaPrefetchItems.value = items
++            }
++    }
++
++    // Harmony -->
++    private fun LibraryDisplayMode.isPanoramaGrid(): Boolean {
++        return this == LibraryDisplayMode.ComfortableGridPanorama ||
++            this == LibraryDisplayMode.CompactGridPanorama
++    }
++
++    private fun List<LibraryItem>.samePanoramaCovers(other: List<LibraryItem>): Boolean {
++        if (size != other.size) return false
++        for (index in indices) {
++            val left = this[index]
++            val right = other[index]
++            if (left.id != right.id ||
++                left.libraryManga.manga.thumbnailUrl != right.libraryManga.manga.thumbnailUrl
++            ) {
++                return false
++            }
++        }
++        return true
++    }
++
++    private fun LibraryItem.panoramaCoverFile(): Pair<Long, () -> File?> {
++        val manga = libraryManga.manga
++        return id to {
++            coverCache.getCustomCoverFile(manga.id).takeIf { it.exists() }
++                ?: coverCache.getCoverFile(manga.thumbnailUrl)?.takeIf { it.exists() }
++        }
+     }
++    // Harmony <--
+ 
+     /**
+      * Flow of tracking filter preferences
