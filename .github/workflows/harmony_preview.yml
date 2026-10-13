@@ -50,6 +50,7 @@ jobs:
         env:
           INPUT_UPSTREAM_TAG: ${{ inputs.upstream_tag }}
           INPUT_PATCH_NUMBER: ${{ inputs.patch_number }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
 
@@ -70,6 +71,17 @@ jobs:
           fi
 
           upstream_version="${upstream_tag#v}"
+
+          # 新版本号 = 上游版本 + 补丁序号. 比已发布的旧, 手机会当成降级拒装 (2026-10-13 发过一次 Mihon v0.21.1 在 v0.21.2 之后).
+          if [[ "$DRY_RUN" != "true" ]] && ! gh release view "${upstream_tag}-harmony-preview.${patch_number}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            newest="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq '.[].tagName' \
+              | sed -n 's/^v\([0-9]*\.[0-9]*\.[0-9]*\)-harmony-preview\.\([0-9]*\)$/\1.\2/p' | sort -V | tail -n 1)"
+            if [[ -n "$newest" ]] && [[ "$(printf '%s\n%s\n' "$newest" "${upstream_version}.${patch_number}" | sort -V | tail -n 1)" != "${upstream_version}.${patch_number}" ]]; then
+              echo "Refusing to release ${upstream_tag}-harmony-preview.${patch_number}: newest release is ${newest%.*}-harmony-preview.${newest##*.}; installs would be a downgrade." >&2
+              exit 1
+            fi
+          fi
+
           {
             echo "upstream_tag=$upstream_tag"
             echo "upstream_version=$upstream_version"
