@@ -1,9 +1,9 @@
 {
-  "url": "https://api.github.com/repos/Xun2202/anikku-harmony/releases/412595718",
-  "assets_url": "https://api.github.com/repos/Xun2202/anikku-harmony/releases/412595718/assets",
-  "upload_url": "https://uploads.github.com/repos/Xun2202/anikku-harmony/releases/412595718/assets{?name,label}",
-  "html_url": "https://github.com/Xun2202/anikku-harmony/releases/tag/v0.2.0-harmony-preview.19",
-  "id": 412595718,
+  "url": "https://api.github.com/repos/Xun2202/anikku-harmony/releases/412632320",
+  "assets_url": "https://api.github.com/repos/Xun2202/anikku-harmony/releases/412632320/assets",
+  "upload_url": "https://uploads.github.com/repos/Xun2202/anikku-harmony/releases/412632320/assets{?name,label}",
+  "html_url": "https://github.com/Xun2202/anikku-harmony/releases/tag/v0.2.0-harmony-preview.20",
+  "id": 412632320,
   "author": {
     "login": "github-actions[bot]",
     "id": 41898282,
@@ -25,22 +25,22 @@
     "user_view_type": "public",
     "site_admin": false
   },
-  "node_id": "RE_kwDOU9D-tM4Yl7YG",
-  "tag_name": "v0.2.0-harmony-preview.19",
-  "target_commitish": "570066fab9092cbce9377d52d417522649037a89",
-  "name": "Anikku Harmony Preview v0.2.0-harmony-preview.19",
+  "node_id": "RE_kwDOU9D-tM4YmEUA",
+  "tag_name": "v0.2.0-harmony-preview.20",
+  "target_commitish": "101835af3b37dd9dd459e1ab486e107f96ea66d3",
+  "name": "Anikku Harmony Preview v0.2.0-harmony-preview.20",
   "draft": false,
   "immutable": false,
   "prerelease": false,
-  "created_at": "2026-10-14T10:16:15Z",
-  "updated_at": "2026-10-14T10:34:45Z",
-  "published_at": "2026-10-14T10:34:45Z",
+  "created_at": "2026-10-14T11:02:33Z",
+  "updated_at": "2026-10-14T11:19:14Z",
+  "published_at": "2026-10-14T11:19:14Z",
   "assets": [
     {
-      "url": "https://api.github.com/repos/Xun2202/anikku-harmony/releases/assets/640046988",
-      "id": 640046988,
-      "node_id": "RA_kwDOU9D-tM4mJleM",
-      "name": "Anikku-v0.2.0-harmony-preview.19-arm64-v8a.apk",
+      "url": "https://api.github.com/repos/Xun2202/anikku-harmony/releases/assets/640151135",
+      "id": 640151135,
+      "node_id": "RA_kwDOU9D-tM4mJ-5f",
+      "name": "Anikku-v0.2.0-harmony-preview.20-arm64-v8a.apk",
       "label": "",
       "uploader": {
         "login": "github-actions[bot]",
@@ -66,17 +66,17 @@
       "content_type": "application/vnd.android.package-archive",
       "state": "uploaded",
       "size": 90185845,
-      "digest": "sha256:772e6e5232a98f36cb7ca150c11f59e3efccbae67c8f41be4870116752cea791",
+      "digest": "sha256:402f5ec45a18d2d421c1b38546dbabb871c073b016235670e2081efe44cd66a6",
       "download_count": 0,
-      "created_at": "2026-10-14T10:34:35Z",
-      "updated_at": "2026-10-14T10:34:38Z",
-      "browser_download_url": "https://github.com/Xun2202/anikku-harmony/releases/download/v0.2.0-harmony-preview.19/Anikku-v0.2.0-harmony-preview.19-arm64-v8a.apk"
+      "created_at": "2026-10-14T11:19:00Z",
+      "updated_at": "2026-10-14T11:19:06Z",
+      "browser_download_url": "https://github.com/Xun2202/anikku-harmony/releases/download/v0.2.0-harmony-preview.20/Anikku-v0.2.0-harmony-preview.20-arm64-v8a.apk"
     },
     {
-      "url": "https://api.github.com/repos/Xun2202/anikku-harmony/releases/assets/640046989",
-      "id": 640046989,
-      "node_id": "RA_kwDOU9D-tM4mJleN",
-      "name": "Anikku-v0.2.0-harmony-preview.19.apk",
+      "url": "https://api.github.com/repos/Xun2202/anikku-harmony/releases/assets/640151138",
+      "id": 640151138,
+      "node_id": "RA_kwDOU9D-tM4mJ-5i",
+      "name": "Anikku-v0.2.0-harmony-preview.20.apk",
       "label": "",
       "uploader": {
         "login": "github-actions[bot]",
@@ -102,14 +102,14 @@
       "content_type": "application/vnd.android.package-archive",
       "state": "uploaded",
       "size": 282182455,
-      "digest": "sha256:147f8307eb00095e95ed7c1239ff7ca3cc4695abbdc60832fc679785c1aa245e",
+      "digest": "sha256:42b60586032fe88ccdaae999a48eb751b90804c7492d541bf1638d79759fb738",
       "download_count": 0,
-      "created_at": "2026-10-14T10:34:35Z",
-      "updated_at": "2026-10-14T10:34:44Z",
-      "browser_download_url": "https://github.com/Xun2202/anikku-harmony/releases/download/v0.2.0-harmony-preview.19/Anikku-v0.2.0-harmony-preview.19.apk"
+      "created_at": "2026-10-14T11:19:00Z",
+      "updated_at": "2026-10-14T11:19:13Z",
+      "browser_download_url": "https://github.com/Xun2202/anikku-harmony/releases/download/v0.2.0-harmony-preview.20/Anikku-v0.2.0-harmony-preview.20.apk"
     }
   ],
-  "tarball_url": "https://api.github.com/repos/Xun2202/anikku-harmony/tarball/v0.2.0-harmony-preview.19",
-  "zipball_url": "https://api.github.com/repos/Xun2202/anikku-harmony/zipball/v0.2.0-harmony-preview.19",
-  "body": "基于 [Anikku v0.2.0](https://github.com/komikku-app/anikku/releases/tag/v0.2.0) 的非官方 HarmonyOS / 卓易通 兼容构建 (preview 构建类型)。\n\n## 本构建包含的补丁\n\n- `0001-downloads-rename-fallback-for-saf-without-renamedocument.patch`: downloads: fall back to copy+delete when SAF renameDocument is unsupported\n- `0002-downloads-mux-video-in-private-cache.patch`: downloads: mux videos into the private cache instead of a SAF document\n- `0003-updater-use-harmony-fork-releases.patch`: updater: check this fork's GitHub releases for -harmony-preview builds\n- `0004-storage-app-private-location-option.patch`: storage: offer the app-private directory as a one-tap storage location\n- `0005-build-flexible-adapter-from-maven-central.patch`: build: resolve FlexibleAdapter from Maven Central instead of JitPack\n- `0006-downloads-hide-videos-from-gallery-with-unknown-extension.patch`: downloads: hide videos from gallery apps with an unknown file extension\n- `0007-downloads-share-downloads-across-entries-by-url.patch`: downloads: reuse a download held by another entry with the same url\n- `0008-updater-in-screen-download-progress-and-install.patch`: updater: keep the update screen open with progress and an Install button\n- `0009-downloads-background-keep-alive-silent-audio.patch`: downloads: keep the process alive in the background on HarmonyOS (silent audio + wake lock)\n- `0010-downloads-notification-speed-and-progress.patch`: downloads: Animeko-style progress notification with speed and progress\n- `0011-updater-no-background-auto-download-and-apk-cleanup.patch`: updater: keep the background auto-download from blocking the update screen\n- `0012-about-match-mihon-update-ui.patch`: about: match Mihon's update UI (no post-update dialog, release page for What's new)\n- `0013-updater-regular-work-request.patch`: updater: download updates as a regular work request\n- `0014-updater-release-mirror.patch`: updater: read the release list from the repo-branch mirror first\n- `0015-library-panorama-grid-fit-wide-covers.patch`: library: panorama comfortable grid sizes cells to wide covers\n- `0016-downloads-finalize-with-fewer-saf-copies-and-error-reasons.patch`: downloads: finish videos with fewer SAF copies and show why a download failed\n- `0017-updater-stable-release-notes-while-downloading.patch`: updater: keep the release notes stable while downloading; tidy ffmpeg failure text\n- `0018-downloads-never-skip-silently-reuse-or-replace-leftover-folders.patch`: downloads: never drop an episode silently; reuse or replace folders left on disk\n- `0019-crash-log-filter-harmony-noise-and-keep-app-log.patch`: =?UTF-8?q?crash=20log:=20filter=20=E5=8D=93=E6=98=93?= =?UTF-8?q?=E9=80=9A=20graphics=20noise=20and=20keep=20the=20app's=20own?= =?UTF-8?q?=20log=20lines?=\n- `0020-library-panorama-grid-staggered-and-wider-auto-columns.patch`: library: panorama comfortable grid flows as a staggered grid with wider auto columns\n- `0021-browse-panorama-grids-staggered-and-wider-auto-columns.patch`: browse: panorama comfortable grids flow as staggered grids with wider auto columns\n- `0022-library-panorama-compact-grid-display-mode.patch`: library: add a panorama compact grid display mode\n- `0023-presentation-staggered-fast-scroller-steady-thumb.patch`: presentation: keep the staggered fast scroller thumb steady\n- `0024-updater-pick-highest-harmony-version.patch`: updater: pick the highest harmony version instead of the first listed\n- `0025-library-panorama-stable-cell-shapes.patch`: library: keep panorama cell shapes stable while scrolling\n- `0026-presentation-cover-asyncimage-smooth-grids.patch`: presentation: draw covers with AsyncImage so grids scroll without subcomposition\n- `0027-library-panorama-settle-debounce-browse-prefetch.patch`: library: wait for the panorama grid to really stop and learn browse shapes ahead\n- `0028-presentation-staggered-scroller-stable-thumb.patch`: presentation: keep the staggered fast-scroll thumb from stepping back once a row\n- `0029-download-quality-separate-from-playback.patch`: download: pick the download quality separately from playback\n- `0030-presentation-panorama-masonry-reading-order.patch`: presentation: lay panorama cells left to right unless a lane is recessed by half\n- `0031-presentation-panorama-auto-columns-span.patch`: presentation: panorama auto columns fit book covers and wide covers span two lanes\n- `0032-presentation-panorama-scroll-anchor-by-key.patch`: presentation: panorama grid saves its scroll anchor by key\n- `0033-presentation-panorama-layout-epoch.patch`: presentation: panorama layout skips per-item work while content is unchanged\n- `0034-library-panorama-cover-shapes-versioned.patch`: library: panorama cover shapes notify per version, not per map read\n- `0035-presentation-fast-scroller-hold-grab.patch`: presentation: fast scroller thumb stays grabbed while pressed\n- `0036-presentation-panorama-tiered-auto-columns.patch`: presentation: panorama auto columns widen on large windows\n- `0037-presentation-fast-scroller-snapshotflow.patch`: presentation: fast scroller follows scroll without restarting per frame\n- `0038-presentation-panorama-shaped-columns.patch`: presentation: panorama auto columns follow the shelf's dominant cover shape\n- `0039-library-panorama-shape-mode.patch`: library: panorama grids pick tall or wide columns from committed cover shapes\n- `0040-presentation-fast-scroller-thumb-hitbox.patch`: presentation: fast scroller hit box stays on the drawn thumb\n\n## 安装说明\n\n- 下载 `Anikku-v0.2.0-harmony-preview.19-arm64-v8a.apk`（华为设备均为 arm64）。\n- 包名为 `app.anikku.beta`，与官方 Anikku Preview 相同，但签名不同：**第一次安装前必须先卸载官方 Preview**。卸载前先在 设置 → 数据与存储 → 创建备份 导出备份，装好后再恢复；下载目录里已下载的视频不会丢，重新选择同一个存储位置即可。\n- harmony-preview 版本之间可直接覆盖安装；应用内更新会检查本仓库的 Release，而不是官方更新服务器。\n- 继续使用 Documents/Anikku 这类自选文件夹即可：本构建已把 ffmpeg 输出改到应用私有缓存再复制过去，并在目录重命名失败时自动改为复制。\n- 鸿蒙图库：设置 → 下载 → 「下载的视频对系统图库隐藏」默认开启，新下载存成 `<集>.mkv.anikku`（鸿蒙不认 .nomedia、只看扩展名）。升级前已下载的视频点同一页的「按上述设置重命名已下载的视频」补上后缀（下载进行中时先暂停）。\n- 同一视频收藏进多个文件夹（如 XvXun）：设置 → 下载 → 「不同条目间共用已下载的视频」默认开启，任一条目下载过的视频在其他条目里也显示为已下载并直接播放；删除请到实际下载它的条目里操作。\n- 不想在文件管理里看到任何下载内容，可改用 设置 → 数据与存储 → 「使用应用私有目录（鸿蒙推荐）」；代价是卸载应用时会一并删除。\n\n## 校验 (SHA-256)\n\n```\n772e6e5232a98f36cb7ca150c11f59e3efccbae67c8f41be4870116752cea791  Anikku-v0.2.0-harmony-preview.19-arm64-v8a.apk\n147f8307eb00095e95ed7c1239ff7ca3cc4695abbdc60832fc679785c1aa245e  Anikku-v0.2.0-harmony-preview.19.apk\n```\n"
+  "tarball_url": "https://api.github.com/repos/Xun2202/anikku-harmony/tarball/v0.2.0-harmony-preview.20",
+  "zipball_url": "https://api.github.com/repos/Xun2202/anikku-harmony/zipball/v0.2.0-harmony-preview.20",
+  "body": "基于 [Anikku v0.2.0](https://github.com/komikku-app/anikku/releases/tag/v0.2.0) 的非官方 HarmonyOS / 卓易通 兼容构建 (preview 构建类型)。\n\n## 本构建包含的补丁\n\n- `0001-downloads-rename-fallback-for-saf-without-renamedocument.patch`: downloads: fall back to copy+delete when SAF renameDocument is unsupported\n- `0002-downloads-mux-video-in-private-cache.patch`: downloads: mux videos into the private cache instead of a SAF document\n- `0003-updater-use-harmony-fork-releases.patch`: updater: check this fork's GitHub releases for -harmony-preview builds\n- `0004-storage-app-private-location-option.patch`: storage: offer the app-private directory as a one-tap storage location\n- `0005-build-flexible-adapter-from-maven-central.patch`: build: resolve FlexibleAdapter from Maven Central instead of JitPack\n- `0006-downloads-hide-videos-from-gallery-with-unknown-extension.patch`: downloads: hide videos from gallery apps with an unknown file extension\n- `0007-downloads-share-downloads-across-entries-by-url.patch`: downloads: reuse a download held by another entry with the same url\n- `0008-updater-in-screen-download-progress-and-install.patch`: updater: keep the update screen open with progress and an Install button\n- `0009-downloads-background-keep-alive-silent-audio.patch`: downloads: keep the process alive in the background on HarmonyOS (silent audio + wake lock)\n- `0010-downloads-notification-speed-and-progress.patch`: downloads: Animeko-style progress notification with speed and progress\n- `0011-updater-no-background-auto-download-and-apk-cleanup.patch`: updater: keep the background auto-download from blocking the update screen\n- `0012-about-match-mihon-update-ui.patch`: about: match Mihon's update UI (no post-update dialog, release page for What's new)\n- `0013-updater-regular-work-request.patch`: updater: download updates as a regular work request\n- `0014-updater-release-mirror.patch`: updater: read the release list from the repo-branch mirror first\n- `0015-library-panorama-grid-fit-wide-covers.patch`: library: panorama comfortable grid sizes cells to wide covers\n- `0016-downloads-finalize-with-fewer-saf-copies-and-error-reasons.patch`: downloads: finish videos with fewer SAF copies and show why a download failed\n- `0017-updater-stable-release-notes-while-downloading.patch`: updater: keep the release notes stable while downloading; tidy ffmpeg failure text\n- `0018-downloads-never-skip-silently-reuse-or-replace-leftover-folders.patch`: downloads: never drop an episode silently; reuse or replace folders left on disk\n- `0019-crash-log-filter-harmony-noise-and-keep-app-log.patch`: =?UTF-8?q?crash=20log:=20filter=20=E5=8D=93=E6=98=93?= =?UTF-8?q?=E9=80=9A=20graphics=20noise=20and=20keep=20the=20app's=20own?= =?UTF-8?q?=20log=20lines?=\n- `0020-library-panorama-grid-staggered-and-wider-auto-columns.patch`: library: panorama comfortable grid flows as a staggered grid with wider auto columns\n- `0021-browse-panorama-grids-staggered-and-wider-auto-columns.patch`: browse: panorama comfortable grids flow as staggered grids with wider auto columns\n- `0022-library-panorama-compact-grid-display-mode.patch`: library: add a panorama compact grid display mode\n- `0023-presentation-staggered-fast-scroller-steady-thumb.patch`: presentation: keep the staggered fast scroller thumb steady\n- `0024-updater-pick-highest-harmony-version.patch`: updater: pick the highest harmony version instead of the first listed\n- `0025-library-panorama-stable-cell-shapes.patch`: library: keep panorama cell shapes stable while scrolling\n- `0026-presentation-cover-asyncimage-smooth-grids.patch`: presentation: draw covers with AsyncImage so grids scroll without subcomposition\n- `0027-library-panorama-settle-debounce-browse-prefetch.patch`: library: wait for the panorama grid to really stop and learn browse shapes ahead\n- `0028-presentation-staggered-scroller-stable-thumb.patch`: presentation: keep the staggered fast-scroll thumb from stepping back once a row\n- `0029-download-quality-separate-from-playback.patch`: download: pick the download quality separately from playback\n- `0030-presentation-panorama-masonry-reading-order.patch`: presentation: lay panorama cells left to right unless a lane is recessed by half\n- `0031-presentation-panorama-auto-columns-span.patch`: presentation: panorama auto columns fit book covers and wide covers span two lanes\n- `0032-presentation-panorama-scroll-anchor-by-key.patch`: presentation: panorama grid saves its scroll anchor by key\n- `0033-presentation-panorama-layout-epoch.patch`: presentation: panorama layout skips per-item work while content is unchanged\n- `0034-library-panorama-cover-shapes-versioned.patch`: library: panorama cover shapes notify per version, not per map read\n- `0035-presentation-fast-scroller-hold-grab.patch`: presentation: fast scroller thumb stays grabbed while pressed\n- `0036-presentation-panorama-tiered-auto-columns.patch`: presentation: panorama auto columns widen on large windows\n- `0037-presentation-fast-scroller-snapshotflow.patch`: presentation: fast scroller follows scroll without restarting per frame\n- `0038-presentation-panorama-shaped-columns.patch`: presentation: panorama auto columns follow the shelf's dominant cover shape\n- `0039-library-panorama-shape-mode.patch`: library: panorama grids pick tall or wide columns from committed cover shapes\n- `0040-presentation-fast-scroller-thumb-hitbox.patch`: presentation: fast scroller hit box stays on the drawn thumb\n- `0041-presentation-panorama-scroll-trace.patch`: presentation: panorama scroll trace in the crash log dump\n\n## 安装说明\n\n- 下载 `Anikku-v0.2.0-harmony-preview.20-arm64-v8a.apk`（华为设备均为 arm64）。\n- 包名为 `app.anikku.beta`，与官方 Anikku Preview 相同，但签名不同：**第一次安装前必须先卸载官方 Preview**。卸载前先在 设置 → 数据与存储 → 创建备份 导出备份，装好后再恢复；下载目录里已下载的视频不会丢，重新选择同一个存储位置即可。\n- harmony-preview 版本之间可直接覆盖安装；应用内更新会检查本仓库的 Release，而不是官方更新服务器。\n- 继续使用 Documents/Anikku 这类自选文件夹即可：本构建已把 ffmpeg 输出改到应用私有缓存再复制过去，并在目录重命名失败时自动改为复制。\n- 鸿蒙图库：设置 → 下载 → 「下载的视频对系统图库隐藏」默认开启，新下载存成 `<集>.mkv.anikku`（鸿蒙不认 .nomedia、只看扩展名）。升级前已下载的视频点同一页的「按上述设置重命名已下载的视频」补上后缀（下载进行中时先暂停）。\n- 同一视频收藏进多个文件夹（如 XvXun）：设置 → 下载 → 「不同条目间共用已下载的视频」默认开启，任一条目下载过的视频在其他条目里也显示为已下载并直接播放；删除请到实际下载它的条目里操作。\n- 不想在文件管理里看到任何下载内容，可改用 设置 → 数据与存储 → 「使用应用私有目录（鸿蒙推荐）」；代价是卸载应用时会一并删除。\n\n## 校验 (SHA-256)\n\n```\n402f5ec45a18d2d421c1b38546dbabb871c073b016235670e2081efe44cd66a6  Anikku-v0.2.0-harmony-preview.20-arm64-v8a.apk\n42b60586032fe88ccdaae999a48eb751b90804c7492d541bf1638d79759fb738  Anikku-v0.2.0-harmony-preview.20.apk\n```\n"
 }
