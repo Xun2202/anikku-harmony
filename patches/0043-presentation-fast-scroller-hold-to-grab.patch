@@ -39,7 +39,7 @@ for 500 ms can still fire it.
 The same applies to all four scrollers here, including the fourth one,
 IrregularVerticalGridFastScroller.
 
-与 mihon-harmony 0036 同源。
+与 mihon-harmony 0035 同源。
 ---
  .../core/components/VerticalFastScroller.kt   | 162 ++++++++++++++++--
  .../components/PanoramaMasonryFlingTest.kt    | 139 +++++++++++++++
