@@ -25,12 +25,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# 和 App 请求的接口一致 (三个 App 都只看最近 30 个 Release), 原样保存, 不裁剪字段.
+# 字段和 App 请求的接口一致, 原样保存, 不裁剪. 但列表接口的顺序不是按创建时间 (实测 preview.10 排在
+# preview.9 等 6 个旧版之后), 只取第一页的 30 个时新版可能被挤出去; 所以翻完所有页, 按 created_at
+# 倒序后取前 30 个. App 端都按版本号挑最新, 不依赖顺序; 这里排序只是保证新版一定在文件里.
 # EXPECT_TAG: 刚创建的 Release. 列表接口有几秒延迟, 发版后立刻读可能还看不到它, 写进去的就是上一版.
 # 设置了就等到它出现在列表里 (最多约 2 分钟), 一直看不到则失败, 不写旧索引.
 expect_tag="${EXPECT_TAG:-}"
 for poll in $(seq 1 24); do
-  gh api -H "Accept: application/vnd.github+json" "repos/$repo/releases?per_page=30" > "$work/releases.json"
+  gh api --paginate -H "Accept: application/vnd.github+json" "repos/$repo/releases?per_page=100" \
+    | jq -s 'add // [] | sort_by(.created_at) | reverse | .[:30]' > "$work/releases.json"
   jq -e 'type == "array"' "$work/releases.json" > /dev/null
   if [[ -z "$expect_tag" ]] || jq -e --arg t "$expect_tag" 'any(.[]; .tag_name == $t)' "$work/releases.json" > /dev/null; then
     break
@@ -51,7 +54,7 @@ cat > "$work/README.md" <<EOF
 
 由 GitHub Actions 自动生成 (scripts/write-release-index.sh), 不要手改.
 
-- \`releases.json\`: \`GET /repos/$repo/releases?per_page=30\` 的原样返回.
+- \`releases.json\`: \`GET /repos/$repo/releases\` 全部分页的原样条目, 按 created_at 倒序取前 30 个.
 - \`latest.json\`: 其中最新的正式 Release (等价于 \`/releases/latest\`).
 
 应用内更新器优先读 \`https://raw.githubusercontent.com/$repo/$branch/releases.json\`,
