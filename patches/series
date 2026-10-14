@@ -39,3 +39,4 @@
 0039-library-panorama-shape-mode.patch
 0040-presentation-fast-scroller-thumb-hitbox.patch
 0041-presentation-panorama-scroll-trace.patch
+0042-presentation-panorama-exact-scroll-delta.patch

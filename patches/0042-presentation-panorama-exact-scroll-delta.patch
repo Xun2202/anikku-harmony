@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 11:44:02 +0000
+Subject: [PATCH] presentation: panorama scroll reports the exact delta it
+ applied
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Far down a panorama shelf, a flick back toward the top had no coast.
+Once it happened it kept happening: every following return flick died,
+while forward flicks were fine. The 0033 trace showed it on device:
+release velocity 6000-13500 px/s, a normal 7-12 ms gap before the lift,
+and "fling start v=0" each time.
+
+The masonry ScrollableState returned next - current as the consumed
+amount. Past 65536 px a float step is 1/128 px, so that difference is
+not exactly delta. A few thousandths of a pixel were left over on each
+drag frame. Material 3 pullToRefresh, which wraps the library shelf,
+takes any leftover in onPostScroll as a pull, so distancePulled became
+non-zero. Its onPreFling then consumes the whole velocity of a downward
+finger (a return flick) whenever distancePulled != 0. Upward leftovers
+are clamped to 0, which is why only one direction broke.
+
+Report exactly delta unless the scroll was clamped at an end. Compose's
+lazy lists do the same. The new test wraps the grid in pullToRefresh at
+offset 70000 and makes three forward then four return flicks. Before the
+fix the fling starts are [5120, 5120, 5120, 0, 0, 0, 0]; after it the
+return flicks start at -5120. The 0033 trace stays in place.
+
+与 mihon-harmony 0034 同源。
+---
+ .../core/components/PanoramaMasonry.kt        | 12 +++--
+ .../components/PanoramaMasonryFlingTest.kt    | 49 +++++++++++++++++++
+ 2 files changed, 57 insertions(+), 4 deletions(-)
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+index 0c69aa0..f4d7f95 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+@@ -117,10 +117,14 @@ sealed interface PanoramaCellHeight {
+ class PanoramaMasonryState {
+     internal val scrollableState: ScrollableState = ScrollableState { delta ->
+         val max = maxScroll
+-        val next = (scrollOffset + delta).coerceIn(0f, max)
+-        val consumed = next - scrollOffset
+-        if (consumed != 0f) scrollOffset = next
+-        consumed
++        val current = scrollOffset
++        val raw = current + delta
++        val next = raw.coerceIn(0f, max)
++        if (next != current) scrollOffset = next
++        // Harmony: away from the ends report exactly [delta]. next - current is off by float rounding
++        // at large offsets, and a parent pull-to-refresh takes that sliver as a pull, then eats the
++        // whole upward fling in onPreFling.
++        if (next == raw) delta else next - current
+     }
+ 
+     internal val layoutCache = PanoramaMasonryLayoutCache()
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt
+index 4b4d2a6..9408cdc 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt
+@@ -3,6 +3,8 @@ package tachiyomi.presentation.core.components
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.requiredSize
++import androidx.compose.material3.pulltorefresh.pullToRefresh
++import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
+ import androidx.compose.runtime.MutableIntState
+ import androidx.compose.runtime.mutableIntStateOf
+ import androidx.compose.runtime.rememberCoroutineScope
+@@ -200,6 +202,53 @@ class PanoramaMasonryFlingTest {
+         assertTrue(abs(inertia) < 1f, "inertia $inertia")
+     }
+ 
++    @Test
++    fun `return flicks under pull to refresh keep their velocity far down the list`() {
++        PanoramaScrollTrace.clearForTest()
++        runComposeUiTest {
++            val state = PanoramaMasonryState()
++            setContent {
++                Box(
++                    Modifier
++                        .pullToRefresh(isRefreshing = false, state = rememberPullToRefreshState(), onRefresh = {})
++                        .requiredSize(360.dp, 640.dp),
++                ) {
++                    PanoramaMasonry(
++                        columns = PanoramaColumns.Fixed(2),
++                        modifier = Modifier.fillMaxSize().testTag("grid"),
++                        state = state,
++                    ) {
++                        items(count = ITEM_COUNT, key = { it }, height = { PanoramaCellHeight.Fixed(150.dp) }) {
++                            Box(Modifier.fillMaxSize())
++                        }
++                    }
++                }
++            }
++            mainClock.autoAdvance = false
++            repeat(4) { mainClock.advanceTimeByFrame() }
++            // Harmony: past 65536 px a float step is 1/128 px, so offset + delta - offset != delta.
++            state.scrollOffset = 70_000f
++            repeat(4) { mainClock.advanceTimeByFrame() }
++            fun flick(forward: Boolean) {
++                onNodeWithTag("grid").performTouchInput {
++                    val low = Offset(centerX, height * 0.7f)
++                    val high = Offset(centerX, height * 0.3f)
++                    if (forward) swipe(low, high, 50) else swipe(high, low, 50)
++                }
++                repeat(30) { mainClock.advanceTimeByFrame() }
++            }
++            repeat(3) { flick(forward = true) }
++            repeat(4) { flick(forward = false) }
++        }
++        val starts = PanoramaScrollTrace.snapshot()
++            .filter { " fling start v=" in it }
++            .map { it.substringAfter("v=").substringBefore(' ').toInt() }
++        println("FLING_TRACE pullReturn $starts")
++        assertTrue(starts.size == 7, "$starts")
++        assertTrue(starts.take(3).all { it > 1_000 }, "$starts")
++        assertTrue(starts.drop(3).all { it < -1_000 }, "$starts")
++    }
++
+     private fun ComposeUiTest.setPlainGrid(state: PanoramaMasonryState): CoroutineScope {
+         lateinit var scope: CoroutineScope
+         setContent {
