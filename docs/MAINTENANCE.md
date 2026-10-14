@@ -68,6 +68,9 @@ patches/
   0035-presentation-fast-scroller-hold-grab.patch                    滚动条按下即抓, 按住不淡出 (另含剧集网格 IrregularVerticalGridFastScroller; 与 Mihon 0027 同源)
   0036-presentation-panorama-tiered-auto-columns.patch                自动列宽按网格宽分档 Tiered (常量在 PanoramaGrid.kt; 与 Mihon 0028 同源)
   0037-presentation-fast-scroller-snapshotflow.patch                  瀑布流与剧集网格滚动条改为单个 LaunchedEffect + snapshotFlow (与 Mihon 0029 同源)
+  0038-presentation-panorama-shaped-columns.patch                    全景自动列 Shaped: 面积大致恒定 (三个共享文件与 Mihon 0030 逐字节相同)
+  0039-library-panorama-shape-mode.patch                              形状模式 Tall/Wide/Unknown (PanoramaShapeMode.kt 在 app 层; 阈值名 RatioSwitchToPanorama; 相关作品两套; 与 Mihon 0031 同源)
+  0040-presentation-fast-scroller-thumb-hitbox.patch                   滚动条热区收回为绘制宽度 (另含剧集网格 IrregularVerticalGridFastScroller; 与 Mihon 0032 同源)
 scripts/prepare-source.sh                  套补丁 + 改版本号 (CI 与本地通用)
 scripts/write-release-index.sh             把 Releases 接口返回写到 repo 分支 (releases.json / latest.json)
 .github/workflows/harmony_preview.yml      编译、重签、发布, 然后写 Release 索引
@@ -276,6 +279,23 @@ git format-patch -o /tmp/new-patches --no-signature --zero-commit v0.3.0..HEAD
 
   同病：Mihon 0023–0029 同轮已修。Animeko：滚动条按住不适用（Android 端是不可拖动的 `LazyListVerticalScrollIndicator`）；惯性卡顿 / 自动列宽不适用（没有全景瀑布流，也不学习封面比例）；返回丢位置待确认（另一套导航）。
 
+- 0038–0040 与 mihon-harmony 0030–0032 一一对应、同源（用户 2026-10-14：折叠屏全景紧凑右列空；惯性有时消失，稳定复现是滑到书架最底再往回甩；「我没动滑块」）。根因与 Mihon §5.1 相同，这里只写本仓差异。不是卓易通平台限制。
+
+  做法与 Mihon 相同，补丁号加 8：0038 `PanoramaColumns.Shaped`（`A0 = 23064 dp²`，`refArea = 459 × 552`，`area = A0 × max(1, √(网格面积 / refArea))`，`ideal = clamp(√(area / 高宽比) + 8, 104, 240)`）；0039 形状模式（已知数够了才判定，宽比例 ≥ 0.60 切 Wide、≤ 0.40 才切回 Tall；只在 settle 时采样；`committedShapeVersion` 与条目签名变化时重采样；列数变化不 bump epoch；Tall → `Shaped(1.5)` 且横封面 ≥3 列跨两列，Wide → `Shaped(2/3)` 不跨列，Unknown → 原 `Tiered(112, 140, 600)`；手动固定列数时列数不变，跨列仍按模式）；0040 热区改为 `ThumbThickness + endInset`，按在拇指上仍按下即拖。
+
+  **重做要点**（相对 Mihon，rebase 时不要抹平）：
+  - `PanoramaMasonry.kt`、`PanoramaMasonryLayout.kt`、`PanoramaMasonryLayoutTest.kt` 与 Mihon 0030–0032 里对应的三份 **逐字节相同**，改一处要同步另一处。
+  - `PanoramaShapeMode.kt` 在 app 层。不要为了 `cmp` 把它挪进上面三个共享文件。
+  - `committedShapeVersion` 只在主线程写，measure 不读。
+  - 形状阈值名是 `RatioSwitchToPanorama`（Mihon `RATIO_SWITCH_TO_PANORAMA`）。列宽常量在 `PanoramaGrid.kt`（Mihon 在 `LibraryComfortableGrid.kt`）。
+  - 相关作品两套全景和书架、浏览一起按自己的条目统计形状。Mihon 没有相关作品页。
+  - 第四个滚动条 `IrregularVerticalGridFastScroller`（番剧详情页的剧集网格）在 0040 里一起改了。Mihon 只有列表、网格、瀑布流三根。
+  - 测试依赖：Robolectric 4.16.1、Compose ui-test、junit-vintage **6.0.3**（Mihon 是 6.1.3）、`isIncludeAndroidResources`、`debugImplementation(ui-test-manifest)`。UI 测试用 `runComposeUiTest`。发版的 preview 构建对库模块回退到 release 变体，所以不进包。manifest 已核对，无 ui-test 的 ComponentActivity。
+
+  子代理（grok-4.7-high-fast）实现。主代理复跑 `:presentation-core:spotlessCheck :presentation-core:testDebugUnitTest :app:testDebugUnitTest :app:compilePreviewKotlin` 通过（presentation-core 51 个用例，0 失败，2 跳过；app 21 个）。干净树 `/tmp/anikku-verify40`（`prepare-source.sh`，v0.2.0，N=19）套用成功，21 个改动文件与开发树 `cmp` 一致。没有真机手势测试。流水线提交 `570066f`。series 40 张（0001–0040）。
+
+  同病：Mihon 0030–0032 同轮已修。Animeko：列数按形状不适用（没有全景瀑布流）；滚动条热区不适用（Android 端是不可拖动的 `LazyListVerticalScrollIndicator`）；惯性不适用，同一原因。
+
 ### 5.2 加新补丁
 
 在套完现有补丁的源码树上直接改代码并 commit（message 写清楚为什么），`git format-patch -1 --no-signature --zero-commit` 导出，
@@ -366,7 +386,9 @@ gh release list --repo Xun2202/anikku-harmony
 | 全景点进条目再返回，回到最顶 | preview.17 及之前：`rememberPanoramaMasonryState` 用父组合 `SideEffect` 把锚点拷进 `rememberSaveable`，滑动不重组父组合，存下的永远是 0。0032（`v0.2.0-harmony-preview.18`）起按 key 存，列表加载完整后再恢复。书架、浏览、相关作品全景都改了。没有真机手势测试 |
 | 2000 项书架高速松开后惯性滑动一卡一卡 | 与 Mihon 0025 / 0026 / 0029 同一处。0033 加 `PanoramaMasonryContentEpoch`（2000 项、120 帧：每帧 0.323 ms → 0.0082 ms，分配 266,776 B → 56 B）。0034 形状表按版本通知，阈值名仍是 `RatioSwitchToPanorama`。0037 瀑布流滚动条改为单个 `LaunchedEffect` + `snapshotFlow`；剧集网格滚动条同样改了。可装的是 preview.18。上游列表 / 网格的 `LaunchedEffect(firstVisibleItemScrollOffset)` 故意没改 |
 | 按住滚动条快速下翻时拇指变透明，松手方向变成上翻 | 0035（preview.18）与 Mihon 0027 同源：`startDragImmediately`，按住期间不淡出、不摘手势，触摸区 32 dp。本仓多一根番剧详情页剧集网格的 `IrregularVerticalGridFastScroller`，一起修了 |
-| 全景「自动」在折叠屏只有两列，竖封面过大、横封面过小 | preview.17 及之前自动最小列宽 168 dp。0031 起横封面在 ≥3 列时跨两列。0036 起 `PanoramaColumns.Tiered`，常量在 `PanoramaGrid.kt`：网格宽 < 600 dp 最小 112 dp，≥ 600 dp 用 140 dp。360 / 420 / 459 dp → 3 列，939 dp → 6 列。比较的是网格自身宽度 |
+| 全景「自动」在折叠屏只有两列，竖封面过大、横封面过小 | preview.17 及之前自动最小列宽 168 dp。0031 起横封面在 ≥3 列时跨两列。0036 起 `PanoramaColumns.Tiered`，常量在 `PanoramaGrid.kt`：网格宽 < 600 dp 最小 112 dp，≥ 600 dp 用 140 dp。360 / 420 / 459 dp → 3 列，939 dp → 6 列。比较的是网格自身宽度。横封面多时右列空、以及按主导形状定列，见下两行 |
+| 横封面多时右列空 | 折叠 459 dp 按 `Tiered` 分 3 列，横封面 `TwoLanesWhenRoomy` 跨两列，等高时取最左，横封面占多数时第 3 列永远空。折叠竖全景紧凑看起来只有一列、右边空着。0038 / 0039（`v0.2.0-harmony-preview.19`）改为 `Shaped` + 形状模式：折叠竖 + 横书架为 2 列宽封面。相关作品两套也按自己的条目统计。形状未学够时先按 Tiered，判定后最多跳一次。40–60% 横的混合书架仍按 Tall（跨列），偶尔会有空位。阈值名 `RatioSwitchToPanorama`，常量在 `PanoramaGrid.kt` |
+| 到底往回滑没惯性 | 0035 的热区 32 dp，比画出的拇指（12 dp）向内容侧多约 20 dp 透明区，且按下即抓。到底时拇指停在右下角，往回滑被当成拖滚动条，松手没有惯性。用户说没动滑块，碰到的是透明的那一截。0040 起热区改为 `ThumbThickness + endInset`。第四根 `IrregularVerticalGridFastScroller`（番剧详情页剧集网格）一起改了。测试与 Mihon 0032 同一份数字：修前距右缘 20 dp 起滑 0 px，修后 4462 px / 134 帧；滚到底再向下甩，修前 0 px，修后 247.72 px（中央基线的 100%）。UI 测试用 `runComposeUiTest`。热区变窄后能否稳稳按住拖，要真机确认 |
 
 ## 8. 不要做的事
 
@@ -457,3 +479,6 @@ gh release list --repo Xun2202/anikku-harmony
 - 2026-10-14（07:42 UTC）与 mihon-harmony 0023–0029 同一轮四件事：返回丢位置、2000 项惯性卡顿、按住滚动条变透明后上翻、自动列过宽 / 横封面过小。根因见 §5.1 补丁 0031–0037。本仓差异：列宽常量在 `PanoramaGrid.kt`，形状阈值名 `RatioSwitchToPanorama`，相关作品全景一并改，第四个滚动条 `IrregularVerticalGridFastScroller`（番剧详情页剧集网格）在 0035 / 0037 里一起修。三个共享文件与 Mihon 逐字节相同。共享测试不再依赖 `java.awt` / `com.sun.management`，AGP 8 不用改 Gradle。`:app:spotlessCheck` 的 import 顺序告警仍是旧待办。
   子代理（grok-4.7-high-fast）实现。主代理复跑 `:presentation-core:spotlessCheck :presentation-core:testDebugUnitTest :app:testDebugUnitTest :app:compilePreviewKotlin` 通过（presentation-core 33 通过 / 2 跳过；app 14 个）。干净树 `/tmp/anikku-verify37`（v0.2.0，N=18）套用成功，14 个改动文件与开发树 `cmp` 一致。没有真机 / 模拟器手势测试。
   推 `main` `610c580` → `check_patches` run 38527764370 绿 → `dry_run` run 38527790664 绿 → 正式 run 38529023403 → **`v0.2.0-harmony-preview.18`**（07:42 UTC），`app.anikku.beta` versionCode 818、versionName `0.2.0-harmony.18-8928`，签名 `cf7a2adc…d829` 不变，arm64 90,185,845 B（SHA-256 前缀 `8a97b8189469`），universal 282,182,455 B，DEX 含 `PanoramaColumns$Tiered`、`holdOpaqueWhileThumbGrabbed`、`PanoramaMasonryContentEpoch`，另含 `harmonyThumbTouch`；`repo` 分支 `releases.json` 18 条，第一条即此版。series 37 张（0001–0037）。同轮 Mihon 0023–0029 → `v0.21.2-harmony-preview.5`。Animeko：滚动条按住、惯性卡顿、自动列宽不适用；返回丢位置待确认。
+- 2026-10-14（10:34 UTC）与 mihon-harmony 0030–0032 同一轮两件事：横封面多时全景右列空，滑到底再往回甩惯性消失。根因见 §5.1 补丁 0038–0040。本仓差异：阈值名 `RatioSwitchToPanorama`，列宽常量在 `PanoramaGrid.kt`，相关作品两套一并按自己的条目统计，第四个滚动条 `IrregularVerticalGridFastScroller` 在 0040 里一起修，junit-vintage 6.0.3，UI 测试用 `runComposeUiTest`。`PanoramaShapeMode.kt` 在 app 层。`committedShapeVersion` 只在主线程写，measure 不读。三个共享文件与 Mihon 逐字节相同。测试依赖不进包（preview 对库模块回退 release 变体）。
+  子代理（grok-4.7-high-fast）实现。主代理复跑 `:presentation-core:spotlessCheck :presentation-core:testDebugUnitTest :app:testDebugUnitTest :app:compilePreviewKotlin` 通过（presentation-core 51 个用例，0 失败，2 跳过；app 21 个）。干净树 `/tmp/anikku-verify40`（v0.2.0，N=19）套用成功，21 个改动文件与开发树 `cmp` 一致。没有真机手势测试。
+  推 `main` `570066f` → `check_patches` run 38548386536 绿 → `dry_run` run 38548398379 绿 → 正式 run 38549488071 → **`v0.2.0-harmony-preview.19`**（10:34 UTC），`app.anikku.beta` versionCode 819、versionName `0.2.0-harmony.19-8931`，签名 `cf7a2adc…d829` 不变，arm64 90,185,845 B（SHA-256 前缀 `772e6e5232a9`；体积与 preview.18 相同，是对齐填充，分辨看 SHA-256 / versionCode），universal 282,182,455 B，DEX 含 `PanoramaColumns$Shaped`、`PanoramaShapeMode`、`committedShapeVersion`；manifest 无 ui-test 的 ComponentActivity；DEX 里 `robolectric` 字符串 3 处，与上一版相同。`repo` 分支 `releases.json` 19 条，第一条即此版。series 40 张（0001–0040）。同轮 Mihon 0030–0032 → `v0.21.2-harmony-preview.6`。Animeko：列数按形状、滚动条热区、惯性都不适用。
