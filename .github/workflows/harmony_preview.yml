@@ -254,4 +254,6 @@ jobs:
         if: steps.existing.outputs.skip != 'true' && inputs.dry_run != true
         # 应用内更新器优先读 raw.githubusercontent.com/<repo>/repo/releases.json (见脚本注释).
         # GITHUB_TOKEN 创建的 Release 不会触发 release_index.yml, 所以这里自己写一遍.
+        env:
+          EXPECT_TAG: ${{ steps.version.outputs.release_tag }}
         run: scripts/write-release-index.sh

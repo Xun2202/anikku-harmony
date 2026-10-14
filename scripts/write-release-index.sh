@@ -26,8 +26,22 @@ cleanup() {
 trap cleanup EXIT
 
 # 和 App 请求的接口一致 (三个 App 都只看最近 30 个 Release), 原样保存, 不裁剪字段.
-gh api -H "Accept: application/vnd.github+json" "repos/$repo/releases?per_page=30" > "$work/releases.json"
-jq -e 'type == "array"' "$work/releases.json" > /dev/null
+# EXPECT_TAG: 刚创建的 Release. 列表接口有几秒延迟, 发版后立刻读可能还看不到它, 写进去的就是上一版.
+# 设置了就等到它出现在列表里 (最多约 2 分钟), 一直看不到则失败, 不写旧索引.
+expect_tag="${EXPECT_TAG:-}"
+for poll in $(seq 1 24); do
+  gh api -H "Accept: application/vnd.github+json" "repos/$repo/releases?per_page=30" > "$work/releases.json"
+  jq -e 'type == "array"' "$work/releases.json" > /dev/null
+  if [[ -z "$expect_tag" ]] || jq -e --arg t "$expect_tag" 'any(.[]; .tag_name == $t)' "$work/releases.json" > /dev/null; then
+    break
+  fi
+  if [[ "$poll" == 24 ]]; then
+    echo "Release $expect_tag is still missing from the releases list; not writing a stale index." >&2
+    exit 1
+  fi
+  echo "Release $expect_tag not in the releases list yet (poll $poll); waiting." >&2
+  sleep 5
+done
 # /releases/latest 的等价物: 最新的非 draft、非 prerelease 的 Release; 一个都没有时为 null.
 jq '[.[] | select((.draft or .prerelease) | not)] | first' "$work/releases.json" > "$work/latest.json"
 latest_tag="$(jq -r '.[0].tag_name // "no releases"' "$work/releases.json")"
