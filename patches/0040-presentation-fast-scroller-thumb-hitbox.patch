@@ -1,0 +1,683 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 10:07:38 +0000
+Subject: [PATCH] presentation: fast scroller hit box stays on the drawn thumb
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A fling leaves the thumb visible for the fade delay. The hit rectangle
+was 32 dp, grown toward the content, and startDragImmediately consumes
+the down. A swipe that started in that strip, including one that began
+during the coast, dragged the thumb. The list jumped by the scroll
+ratio and the release had no coast.
+
+The hit rectangle is now ThumbThickness plus endInset. A down on the
+drawn thumb still drags immediately. A down anywhere else scrolls the
+content, including while the thumb is visible after a fling.
+
+VerticalFastScroller, VerticalGridFastScroller, VerticalMasonryFastScroller,
+and IrregularVerticalGridFastScroller share HarmonyScrollerThumb.
+ThumbTouchWidth is gone.
+
+Tests: PanoramaMasonryFlingTest (Robolectric) and
+PanoramaMasonryFlingLogicTest. Robolectric 4.16.1 and ui-test stay.
+junit-vintage is 6.0.3, matching this tree's JUnit. The Compose test
+entry is androidx.compose.ui.test.runComposeUiTest; this BOM has no
+ui.test.v2. preview's matchingFallbacks is release, so
+debugImplementation(ui-test-manifest) is not in the preview APK.
+
+与 mihon-harmony 0032 同源。
+---
+ presentation-core/build.gradle.kts            |  11 +
+ .../core/components/VerticalFastScroller.kt   |  16 +-
+ .../PanoramaMasonryFlingLogicTest.kt          | 239 +++++++++++++
+ .../components/PanoramaMasonryFlingTest.kt    | 321 ++++++++++++++++++
+ .../src/test/resources/robolectric.properties |   2 +
+ 5 files changed, 582 insertions(+), 7 deletions(-)
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingLogicTest.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt
+ create mode 100644 presentation-core/src/test/resources/robolectric.properties
+
+diff --git a/presentation-core/build.gradle.kts b/presentation-core/build.gradle.kts
+index be112de..ee3c222 100644
+--- a/presentation-core/build.gradle.kts
++++ b/presentation-core/build.gradle.kts
+@@ -13,6 +13,7 @@ android {
+     }
+ 
+     testOptions {
++        unitTests.isIncludeAndroidResources = true
+         unitTests.all {
+             it.useJUnitPlatform()
+         }
+@@ -60,4 +61,14 @@ dependencies {
+     // JVM tests for the panorama masonry lane math. The layout file has no Android API.
+     testImplementation(libs.junit.jupiter)
+     testRuntimeOnly(libs.junit.platform.launcher)
++
++    // Gesture fling curves. Robolectric hosts the Compose test activity; there is no emulator.
++    // Harmony: vintage matches this tree's JUnit 6.0.3. Mihon uses vintage 6.1.3 with its own JUnit.
++    testImplementation(platform(compose.bom))
++    testImplementation("androidx.compose.ui:ui-test")
++    testImplementation("androidx.compose.ui:ui-test-junit4")
++    testImplementation("androidx.compose.ui:ui-test-manifest")
++    debugImplementation("androidx.compose.ui:ui-test-manifest")
++    testImplementation("org.robolectric:robolectric:4.16.1")
++    testRuntimeOnly("org.junit.vintage:junit-vintage-engine:6.0.3")
+ }
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+index b595610..83f81ab 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+@@ -868,13 +868,15 @@ fun VerticalMasonryFastScroller(
+     }
+ }
+ 
+-/** Hit width. The drawn thumb stays [ThumbThickness]; the remainder lies toward the content. */
+-private val ThumbTouchWidth = 32.dp
+-
+ /**
+- * Drawn thumb stays [ThumbThickness] by [ThumbLength]. The hit rectangle is at least
+- * [ThumbTouchWidth] wide and the extra space is on the start side, toward the content.
+- * [endInset] keeps whatever gap the caller already had between the thumb and the end edge.
++ * Drawn thumb stays [ThumbThickness] by [ThumbLength]. The hit rectangle is that same
++ * width, plus [endInset] on the end edge.
++ *
++ * Harmony: the hit rectangle used to be 32 dp, grown toward the content. The thumb stays
++ * visible for the fade delay after a fling, and [startDragImmediately] consumes the down.
++ * A swipe that started in that strip dragged the thumb, jumped the list by the scroll
++ * ratio, and had no coast. A down on the drawn thumb still drags immediately. A down
++ * anywhere else, including during that coast, scrolls the content.
+  *
+  * Pointer modifiers are omitted unless [touchEnabled]. An invisible thumb must not sit
+  * on top of the content and take its clicks or scrolls. [touchEnabled] stays true for the
+@@ -904,7 +906,7 @@ private fun HarmonyScrollerThumb(
+                 excludeSystemGestures = excludeSystemGestures,
+             )
+             .height(ThumbLength)
+-            .width(ThumbTouchWidth + endInset)
++            .width(ThumbThickness + endInset)
+             .padding(end = endInset),
+         contentAlignment = Alignment.CenterEnd,
+     ) {
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingLogicTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingLogicTest.kt
+new file mode 100644
+index 0000000..5b65cf8
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingLogicTest.kt
+@@ -0,0 +1,239 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.MutatePriority
++import androidx.compose.runtime.BroadcastFrameClock
++import androidx.compose.runtime.withFrameNanos
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.CoroutineStart
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.runBlocking
++import kotlinx.coroutines.withTimeout
++import kotlinx.coroutines.yield
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++import kotlin.math.abs
++
++/**
++ * Drives [PanoramaMasonryState] the way [androidx.compose.foundation.gestures.DefaultFlingBehavior]
++ * does: each frame scrolls by the decay delta and cancels when the consumed amount misses that
++ * delta by more than half a pixel. Layout passes run between frames, while the fling session is
++ * suspended, which is when measure rewrites [PanoramaMasonryState.scrollOffset].
++ */
++class PanoramaMasonryFlingLogicTest {
++    @Test
++    fun `baseline fling travels until the decay ends`() = runBlocking {
++        val trace = fling()
++        println("FLING_LOGIC baseline distance=${trace.distance} frames=${trace.frames} cancelled=${trace.cancelled}")
++        assertTrue(trace.distance > 2_000f, "distance ${trace.distance}")
++        assertTrue(trace.frames > 20, "frames ${trace.frames}")
++        assertTrue(!trace.cancelled)
++    }
++
++    @Test
++    fun `one epoch change during a fling keeps almost all of the distance`() = runBlocking {
++        val baseline = fling()
++        val trace = fling { frame, _, control ->
++            // Measure has been keeping the anchor on the viewport. One new epoch snaps to it.
++            if (frame == 8) control.epoch = 99L
++        }
++        println(
++            "FLING_LOGIC epochOnce distance=${trace.distance} frames=${trace.frames} " +
++                "cancelled=${trace.cancelled} baseline=${baseline.distance}",
++        )
++        assertTrue(!trace.cancelled)
++        assertTrue(trace.distance > baseline.distance * 0.85f, "${trace.distance} vs ${baseline.distance}")
++    }
++
++    @Test
++    fun `epoch change on every frame leaves no visual fling`() = runBlocking {
++        val baseline = fling()
++        val trace = fling { frame, _, control ->
++            control.epoch = frame.toLong() + 10L
++        }
++        println(
++            "FLING_LOGIC epochEveryFrame distance=${trace.distance} frames=${trace.frames} " +
++                "cancelled=${trace.cancelled} baseline=${baseline.distance}",
++        )
++        assertTrue(trace.distance < baseline.distance * 0.15f, "${trace.distance} vs ${baseline.distance}")
++    }
++
++    @Test
++    fun `same keys in a new list do not pull the offset back`() = runBlocking {
++        val baseline = fling()
++        // Every frame already rebuilds the key list. The epoch stays, so the snap stays off.
++        val trace = fling()
++        println(
++            "FLING_LOGIC sameKeys distance=${trace.distance} frames=${trace.frames} " +
++                "baseline=${baseline.distance}",
++        )
++        assertTrue(!trace.cancelled)
++        assertTrue(abs(trace.distance - baseline.distance) < 2f, "${trace.distance} vs ${baseline.distance}")
++    }
++
++    @Test
++    fun `one height change during a fling does not end it`() = runBlocking {
++        val baseline = fling()
++        val trace = fling { frame, _, control ->
++            if (frame == 8) {
++                control.epoch = 50L
++                control.height = 280
++            }
++        }
++        println(
++            "FLING_LOGIC heightOnce distance=${trace.distance} frames=${trace.frames} " +
++                "cancelled=${trace.cancelled} baseline=${baseline.distance}",
++        )
++        assertTrue(!trace.cancelled)
++        assertTrue(trace.frames > baseline.frames - 5, "frames ${trace.frames} vs ${baseline.frames}")
++        assertTrue(trace.distance > 1_000f, "distance ${trace.distance}")
++    }
++
++    @Test
++    fun `pending restore during a fling jumps once and the decay continues`() = runBlocking {
++        val baseline = fling()
++        val trace = fling { frame, state, _ ->
++            if (frame == 5) {
++                state.pendingRestore = PanoramaPendingRestore(
++                    index = 40,
++                    offsetFromViewportTop = 0,
++                    key = 40,
++                )
++            }
++        }
++        println(
++            "FLING_LOGIC pendingRestore distance=${trace.distance} frames=${trace.frames} " +
++                "cancelled=${trace.cancelled} baseline=${baseline.distance}",
++        )
++        assertTrue(!trace.cancelled, "restore must not look like an edge")
++        assertTrue(trace.frames > 20, "frames ${trace.frames}")
++        assertEquals(null, trace.state.pendingRestore)
++    }
++
++    @Test
++    fun `user input scroll cancels the fling session`() = runBlocking {
++        val baseline = fling()
++        val trace = fling { frame, state, _ ->
++            if (frame == 4) {
++                launch(start = CoroutineStart.UNDISPATCHED) {
++                    state.scrollableState.scroll(MutatePriority.UserInput) {
++                        scrollBy(1f)
++                    }
++                }
++            }
++        }
++        println(
++            "FLING_LOGIC userInput distance=${trace.distance} frames=${trace.frames} " +
++                "cancelled=${trace.cancelled} baseline=${baseline.distance}",
++        )
++        assertTrue(trace.distance < baseline.distance * 0.35f, "${trace.distance} vs ${baseline.distance}")
++        assertTrue(trace.frames < baseline.frames / 2, "frames ${trace.frames} vs ${baseline.frames}")
++    }
++
++    private suspend fun fling(
++        count: Int = ITEM_COUNT,
++        onFrame: suspend CoroutineScope.(
++            frame: Int,
++            state: PanoramaMasonryState,
++            control: FrameControl,
++        ) -> Unit = { _, _, _ -> },
++    ): FlingTrace = coroutineScope {
++        val state = PanoramaMasonryState()
++        val control = FrameControl()
++        applyShelf(state, epoch = control.epoch, height = control.height, count = count)
++        val clock = BroadcastFrameClock()
++        val samples = ArrayList<Float>()
++        var cancelled = false
++        val job = launch(clock, start = CoroutineStart.UNDISPATCHED) {
++            state.scrollableState.scroll(MutatePriority.Default) {
++                var velocity = INITIAL_VELOCITY
++                var last = 0f
++                var value = 0f
++                while (abs(velocity) > 40f) {
++                    value += velocity * FRAME_SECONDS
++                    val delta = value - last
++                    val consumed = scrollBy(delta)
++                    last = value
++                    if (abs(delta - consumed) > 0.5f) {
++                        cancelled = true
++                        break
++                    }
++                    velocity *= DECAY
++                    withFrameNanos { }
++                }
++            }
++        }
++        var frames = 0
++        withTimeout(5_000) {
++            while (job.isActive && frames < MAX_FRAMES) {
++                // The finger already moved this frame. Measure, as the real grid does, before
++                // the next decay step. The hook may change the epoch or the heights first.
++                onFrame(frames, state, control)
++                applyShelf(state, epoch = control.epoch, height = control.height, count = count)
++                clock.sendFrame(frames * FRAME_NANOS)
++                yield()
++                samples.add(state.scrollOffset)
++                frames++
++            }
++        }
++        job.cancel()
++        val distance = if (samples.isEmpty()) 0f else samples.last() - samples.first()
++        FlingTrace(state, distance, frames, cancelled)
++    }
++
++    private fun applyShelf(
++        state: PanoramaMasonryState,
++        epoch: Long,
++        height: Int,
++        count: Int = ITEM_COUNT,
++        forceStructural: Boolean? = null,
++    ) {
++        val heights = IntArray(count) { height }
++        val layout = state.layoutCache.layout(
++            count = count,
++            contentEpoch = epoch,
++            heightOf = { index, _ -> heights[index] },
++            laneWidths = intArrayOf(LANE, LANE),
++            verticalSpacing = SPACING,
++            horizontalSpacing = SPACING,
++            rtl = false,
++        )
++        val keys = List(layout.rects.size) { it }
++        val structural = forceStructural ?: state.layoutCache.structuralChange
++        val viewport = 1_800
++        val total = layout.contentHeight
++        state.applyMeasuredViewport(
++            rects = layout.rects,
++            keys = keys,
++            topPadding = 0,
++            viewport = viewport,
++            totalHeight = total,
++            bottomPadding = 0,
++            structural = structural,
++        )
++    }
++
++    private class FrameControl {
++        var epoch = 1L
++        var height = 400
++    }
++
++    private class FlingTrace(
++        val state: PanoramaMasonryState,
++        val distance: Float,
++        val frames: Int,
++        val cancelled: Boolean,
++    )
++
++    private companion object {
++        const val ITEM_COUNT = 2_000
++        const val LANE = 300
++        const val SPACING = 8
++        const val MAX_FRAMES = 240
++        const val FRAME_SECONDS = 0.016f
++        const val FRAME_NANOS = 16_000_000L
++        const val DECAY = 0.94f
++        const val INITIAL_VELOCITY = 12_000f
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt
+new file mode 100644
+index 0000000..2ee80cc
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt
+@@ -0,0 +1,321 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.requiredSize
++import androidx.compose.runtime.MutableIntState
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.test.ComposeUiTest
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.onNodeWithTag
++import androidx.compose.ui.test.performTouchInput
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.test.swipe
++import androidx.compose.ui.unit.Dp
++import androidx.compose.ui.unit.dp
++import org.junit.After
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.robolectric.annotation.GraphicsMode
++import kotlin.math.abs
++
++/**
++ * Finger-up coast of a 2000-cell panorama, stepped a frame at a time on the compose clock.
++ */
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@GraphicsMode(GraphicsMode.Mode.LEGACY)
++@Config(sdk = [34])
++class PanoramaMasonryFlingTest {
++    @After
++    fun resetEpoch() {
++        PanoramaMasonryContentEpoch.intValue = 0
++    }
++
++    @Test
++    fun `a coast from the content survives and a coast from the thumb does not`() {
++        val center = coast(xFromEnd = null)
++        val from40 = coast(xFromEnd = 40.dp)
++        val from20 = coast(xFromEnd = 20.dp)
++        val onThumb = coast(xFromEnd = 6.dp)
++        println(
++            "FLING_UI center=${center.inertia} drag=${center.drag} frames=${center.frames} " +
++                "dp40=${from40.inertia} drag=${from40.drag} frames=${from40.frames} " +
++                "dp20=${from20.inertia} drag=${from20.drag} frames=${from20.frames} " +
++                "thumb=${onThumb.inertia} drag=${onThumb.drag} frames=${onThumb.frames}",
++        )
++        assertTrue(center.inertia > 300f, "baseline ${center.inertia}")
++        assertTrue(from40.inertia > center.inertia * 0.6f, "40dp ${from40.inertia} vs ${center.inertia}")
++        assertTrue(from20.inertia > center.inertia * 0.6f, "20dp ${from20.inertia} vs ${center.inertia}")
++        assertTrue(onThumb.inertia < center.inertia * 0.25f, "thumb ${onThumb.inertia} vs ${center.inertia}")
++    }
++
++    @Test
++    fun `a downward flick beside the bottom thumb still coasts`() {
++        // Harmony: at the end of the list the thumb sits in the bottom corner. A return
++        // flick starts inside its height, 20 dp from the end, which the old 32 dp hit box covered.
++        val center = coast(xFromEnd = null, atEnd = true, swipeDown = true)
++        val beside = coast(xFromEnd = 20.dp, atEnd = true, swipeDown = true)
++        val centerBack = -center.inertia
++        val besideBack = -beside.inertia
++        println(
++            "FLING_UI bottomReturn center=$centerBack drag=${center.drag} frames=${center.frames} " +
++                "beside=$besideBack drag=${beside.drag} frames=${beside.frames}",
++        )
++        assertTrue(centerBack > 100f, "baseline $centerBack")
++        assertTrue(besideBack >= centerBack * 0.9f, "20dp $besideBack vs $centerBack")
++    }
++
++    @Test
++    fun `one epoch bump during the coast keeps most of it`() {
++        val baseline = coast(fastScroller = false)
++        val bumped = coast(fastScroller = false) { frame, _ ->
++            if (frame == 3) PanoramaMasonryContentEpoch.intValue++
++        }
++        println(
++            "FLING_UI epochOnce baseline=${baseline.inertia} frames=${baseline.frames} " +
++                "bumped=${bumped.inertia} frames=${bumped.frames}",
++        )
++        assertTrue(bumped.inertia > baseline.inertia * 0.6f, "${bumped.inertia} vs ${baseline.inertia}")
++        assertTrue(bumped.frames > 8, "frames ${bumped.frames}")
++    }
++
++    @Test
++    fun `a new items lambda once during the coast keeps most of it`() {
++        val baseline = coast(fastScroller = false)
++        val replaced = coast(
++            xFromEnd = null,
++            fastScroller = false,
++            observeGeneration = true,
++            restyle = false,
++        ) { frame, _, generation ->
++            if (frame == 3) generation.intValue++
++        }
++        println(
++            "FLING_UI newLambda baseline=${baseline.inertia} frames=${baseline.frames} " +
++                "replaced=${replaced.inertia} frames=${replaced.frames}",
++        )
++        assertTrue(replaced.inertia > baseline.inertia * 0.6f, "${replaced.inertia} vs ${baseline.inertia}")
++    }
++
++    @Test
++    fun `a height change once during the coast does not end it`() {
++        val baseline = coast(fastScroller = false)
++        val changed = coast(
++            xFromEnd = null,
++            fastScroller = false,
++            observeGeneration = true,
++            restyle = true,
++        ) { frame, _, generation ->
++            if (frame == 3) generation.intValue++
++        }
++        println(
++            "FLING_UI heightOnce baseline=${baseline.inertia} frames=${baseline.frames} " +
++                "changed=${changed.inertia} frames=${changed.frames}",
++        )
++        assertTrue(changed.frames > 8, "frames ${changed.frames}")
++    }
++
++    @Test
++    fun `a new items lambda on every coast frame eats the visual fling`() {
++        val baseline = coast(fastScroller = false)
++        val every = coast(
++            xFromEnd = null,
++            fastScroller = false,
++            observeGeneration = true,
++            restyle = false,
++        ) { _, _, generation ->
++            generation.intValue++
++        }
++        println(
++            "FLING_UI lambdaEveryFrame baseline=${baseline.inertia} frames=${baseline.frames} " +
++                "every=${every.inertia} frames=${every.frames}",
++        )
++        assertTrue(every.inertia < baseline.inertia * 0.35f, "${every.inertia} vs ${baseline.inertia}")
++    }
++
++    @Test
++    fun `pending restore during the coast does not end it`() {
++        val baseline = coast(fastScroller = false)
++        val restored = coast(fastScroller = false) { frame, masonry ->
++            if (frame == 2 && masonry.pendingRestore == null) {
++                masonry.pendingRestore = PanoramaPendingRestore(
++                    index = 30,
++                    offsetFromViewportTop = 0,
++                    key = 30,
++                )
++            }
++        }
++        println(
++            "FLING_UI pendingRestore baseline=${baseline.inertia} frames=${baseline.frames} " +
++                "restored=${restored.inertia} frames=${restored.frames}",
++        )
++        assertTrue(restored.frames > 8, "frames ${restored.frames}")
++    }
++
++    private fun coast(
++        xFromEnd: Dp? = null,
++        fastScroller: Boolean = true,
++        observeGeneration: Boolean = false,
++        restyle: Boolean = false,
++        atEnd: Boolean = false,
++        swipeDown: Boolean = false,
++        onFrame: (frame: Int, state: PanoramaMasonryState) -> Unit = { _, _ -> },
++    ): Coast = coast(
++        xFromEnd,
++        fastScroller,
++        observeGeneration,
++        restyle,
++        atEnd,
++        swipeDown,
++    ) { frame, state, _ ->
++        onFrame(frame, state)
++    }
++
++    private fun coast(
++        xFromEnd: Dp?,
++        fastScroller: Boolean,
++        observeGeneration: Boolean,
++        restyle: Boolean = false,
++        atEnd: Boolean = false,
++        swipeDown: Boolean = false,
++        onFrame: (frame: Int, state: PanoramaMasonryState, generation: MutableIntState) -> Unit,
++    ): Coast {
++        lateinit var coast: Coast
++        runComposeUiTest {
++            coast = runCoast(xFromEnd, fastScroller, observeGeneration, restyle, atEnd, swipeDown, onFrame)
++        }
++        return coast
++    }
++
++    private fun ComposeUiTest.runCoast(
++        xFromEnd: Dp?,
++        fastScroller: Boolean,
++        observeGeneration: Boolean,
++        restyle: Boolean,
++        atEnd: Boolean,
++        swipeDown: Boolean,
++        onFrame: (frame: Int, state: PanoramaMasonryState, generation: MutableIntState) -> Unit,
++    ): Coast {
++        val state = PanoramaMasonryState()
++        val generation = mutableIntStateOf(0)
++        setContent {
++            val tick = if (observeGeneration) generation.intValue else 0
++            Box(Modifier.requiredSize(360.dp, 640.dp)) {
++                val grid = Modifier
++                    .fillMaxSize()
++                    .testTag("grid")
++                val content: PanoramaMasonryScope.() -> Unit = {
++                    items(
++                        count = ITEM_COUNT,
++                        key = { it },
++                        height = {
++                            val tall = restyle && tick != 0 && it % 5 == 0
++                            PanoramaCellHeight.Fixed(if (tall) 90.dp else 150.dp)
++                        },
++                    ) {
++                        Box(Modifier.fillMaxSize())
++                    }
++                }
++                if (fastScroller) {
++                    FastScrollPanoramaMasonry(
++                        columns = PanoramaColumns.Fixed(2),
++                        modifier = grid,
++                        state = state,
++                        thumbColor = Color.Black,
++                        content = content,
++                    )
++                } else {
++                    PanoramaMasonry(
++                        columns = PanoramaColumns.Fixed(2),
++                        modifier = grid,
++                        state = state,
++                        content = content,
++                    )
++                }
++            }
++        }
++        mainClock.autoAdvance = false
++        repeat(4) { mainClock.advanceTimeByFrame() }
++        check(state.maxScroll > 1_000f) { "maxScroll=${state.maxScroll}" }
++        if (fastScroller || atEnd) {
++            state.scrollOffset = if (atEnd) state.maxScroll else state.maxScroll / 2f
++            // The thumb fades in off the scroll signal. Give that delay a few frames.
++            repeat(40) { mainClock.advanceTimeByFrame() }
++        }
++        if (atEnd) {
++            check(abs(state.scrollOffset - state.maxScroll) < 1f) {
++                "offset ${state.scrollOffset} max ${state.maxScroll}"
++            }
++            check(!state.canScrollForward) { "thumb is not parked at the end" }
++        }
++        val beforeDrag = state.scrollOffset
++        onNodeWithTag("grid").performTouchInput {
++            val x = if (xFromEnd == null) centerX else width - xFromEnd.toPx()
++            val startY: Float
++            val endY: Float
++            if (swipeDown) {
++                // Drawn thumb is 48 dp. The down is inside that span; only x differs from the center flick.
++                val thumbHeightPx = 48.dp.toPx()
++                val topPad = Dp.Hairline.toPx()
++                val bottomPad = Dp.Hairline.toPx()
++                val track = height - topPad - bottomPad - state.afterContentPadding - thumbHeightPx
++                check(track > 0f) { "track $track" }
++                val proportion = if (!state.canScrollForward) {
++                    1f
++                } else {
++                    (state.scrollOffset / state.maxScroll).coerceIn(0f, 1f)
++                }
++                val thumbTop = topPad + track * proportion
++                startY = thumbTop + 1f
++                endY = thumbTop + thumbHeightPx - 1f
++                check(startY > thumbTop && endY < thumbTop + thumbHeightPx) { "y $startY..$endY top $thumbTop" }
++            } else {
++                // Half-scroll puts the thumb on the vertical middle. The down has to land there
++                // for the right-edge cases; the same line is a normal content fling in the middle.
++                startY = height * 0.50f
++                endY = height * 0.12f
++            }
++            swipe(
++                start = Offset(x, startY),
++                end = Offset(x, endY),
++                durationMillis = 40,
++            )
++        }
++        val atRelease = state.scrollOffset
++        var frames = 0
++        var stable = 0
++        var previous = atRelease
++        while (frames < MAX_COAST_FRAMES && stable < 4) {
++            onFrame(frames, state, generation)
++            mainClock.advanceTimeByFrame()
++            val now = state.scrollOffset
++            if (abs(now - previous) < 0.5f) stable++ else stable = 0
++            previous = now
++            frames++
++        }
++        return Coast(
++            drag = atRelease - beforeDrag,
++            inertia = state.scrollOffset - atRelease,
++            frames = frames,
++        )
++    }
++
++    private class Coast(
++        val drag: Float,
++        val inertia: Float,
++        val frames: Int,
++    )
++
++    private companion object {
++        const val ITEM_COUNT = 2_000
++        const val MAX_COAST_FRAMES = 160
++    }
++}
+diff --git a/presentation-core/src/test/resources/robolectric.properties b/presentation-core/src/test/resources/robolectric.properties
+new file mode 100644
+index 0000000..36de98a
+--- /dev/null
++++ b/presentation-core/src/test/resources/robolectric.properties
+@@ -0,0 +1,2 @@
++sdk=34
++instrumentedPackages=androidx.loader.content

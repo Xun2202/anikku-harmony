@@ -1,0 +1,862 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 09:45:43 +0000
+Subject: [PATCH] library: panorama grids pick tall or wide columns from
+ committed cover shapes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Each panorama grid votes its own mode from covers that have already
+committed a shape. committedRatio returns 9/16 for an unknown id, so that
+value is not a vote; committedRatioOrNull skips it. Wide is the existing
+0.75 band (RatioSwitchToPanorama).
+
+A sample is trusted once the known count reaches min(total, max(8,
+total / 2)). Below that the previous mode stays, including Unknown. The
+first trusted sample is Wide at or above 0.60 and Tall below that. Wide
+returns to Tall only at or below 0.40. The sample runs when the grid
+settles, after the cross-band flush, and again if the listed count
+changes while settled. A put does not recompute the mode and does not
+bump PanoramaMasonryContentEpoch. The mode is read in composition, so the
+content lambda identity changes and the layout cache rebuilds the spans.
+
+Tall uses Shaped(1.5). Wide uses Shaped(2/3) and keeps every cover in one
+lane, which is what stops a landscape shelf from leaving the right column
+empty on the folded compact grid. Unknown stays on the width-only tier and
+still spans a landscape cover when there is room. A fixed column count
+stays fixed; the span still follows the mode.
+
+Library comfortable and compact, browse comfortable and compact, and the
+related comfortable and compact grids each keep the mode in their own
+rememberSaveable. A category page is its own composition, so a category
+change recounts.
+
+与 mihon-harmony 0031 同源。
+---
+ .../components/BrowseSourceComfortableGrid.kt |  13 +-
+ .../components/BrowseSourceCompactGrid.kt     |  13 +-
+ .../RelatedMangasComfortableGrid.kt           |  13 +-
+ .../components/RelatedMangasCompactGrid.kt    |  13 +-
+ .../library/components/LazyLibraryGrid.kt     |  16 +-
+ .../components/LibraryComfortableGrid.kt      |  13 +-
+ .../library/components/LibraryCompactGrid.kt  |  13 +-
+ .../library/components/PanoramaCoverShapes.kt |  47 ++++-
+ .../library/components/PanoramaGrid.kt        |  18 +-
+ .../library/components/PanoramaShapeMode.kt   | 170 +++++++++++++++++
+ .../components/PanoramaShapeModeTest.kt       | 174 ++++++++++++++++++
+ 11 files changed, 452 insertions(+), 51 deletions(-)
+ create mode 100644 app/src/main/java/eu/kanade/presentation/library/components/PanoramaShapeMode.kt
+ create mode 100644 app/src/test/java/eu/kanade/presentation/library/components/PanoramaShapeModeTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
+index f1d31f2..26315db 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
+@@ -24,6 +24,7 @@ import eu.kanade.presentation.library.components.panoramaColumns
+ import eu.kanade.presentation.library.components.panoramaCoverSpan
+ import eu.kanade.presentation.library.components.rememberCoverRatio
+ import eu.kanade.presentation.library.components.rememberPanoramaGridSettled
++import eu.kanade.presentation.library.components.rememberPanoramaShapeModeState
+ import exh.metadata.metadata.RaisedSearchMetadata
+ import exh.metadata.metadata.RankedSearchMetadata
+ import kotlinx.coroutines.flow.StateFlow
+@@ -53,17 +54,19 @@ fun BrowseSourceComfortableGrid(
+ ) {
+     // Harmony -->
+     // Panorama mode mixes 3:2 and 2:3 cells. Lanes flow on their own so a short cover does not
+-    // stretch the whole row. Auto columns are sized for the tall cover; a wide cover spans two
+-    // of them when the grid has at least three.
++    // stretch the whole row. Auto columns follow the shelf's committed shape; a wide shelf
++    // keeps each cover in one column.
+     if (usePanoramaCover) {
+         // The grid owns the scroll state: a cross-band shape commit remeasures every lane.
+         val state = rememberPanoramaMasonryState()
+         val settled = rememberPanoramaGridSettled { state.isScrollInProgress }
+         PrefetchPanoramaCoverShapes(mangaList.itemCount) { mangaList.peek(it)?.value?.first }
++        val shapeMode = rememberPanoramaShapeModeState()
+         CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
+-            TrackPanoramaCoverShapes(mangaList.itemCount) { mangaList.peek(it)?.value?.first?.id }
++            TrackPanoramaCoverShapes(mangaList.itemCount, shapeMode) { mangaList.peek(it)?.value?.first?.id }
++            val mode = shapeMode.mode
+             FastScrollPanoramaMasonry(
+-                columns = columns.panoramaColumns(),
++                columns = columns.panoramaColumns(mode),
+                 state = state,
+                 contentPadding = contentPadding + PaddingValues(8.dp),
+                 topContentPadding = contentPadding.calculateTopPadding(),
+@@ -86,7 +89,7 @@ fun BrowseSourceComfortableGrid(
+                     key = { index -> mangaList.peek(index)?.value?.first?.id ?: index },
+                     span = { index ->
+                         val id = mangaList.peek(index)?.value?.first?.id
+-                        panoramaCoverSpan(id == null || committedCoverIsWide(id))
++                        panoramaCoverSpan(id == null || committedCoverIsWide(id), mode)
+                     },
+                     height = { index ->
+                         val id = mangaList.peek(index)?.value?.first?.id
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt
+index a6374de..4177c1c 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt
+@@ -24,6 +24,7 @@ import eu.kanade.presentation.library.components.panoramaColumns
+ import eu.kanade.presentation.library.components.panoramaCoverSpan
+ import eu.kanade.presentation.library.components.rememberCoverRatio
+ import eu.kanade.presentation.library.components.rememberPanoramaGridSettled
++import eu.kanade.presentation.library.components.rememberPanoramaShapeModeState
+ import exh.metadata.metadata.RaisedSearchMetadata
+ import exh.metadata.metadata.RankedSearchMetadata
+ import kotlinx.coroutines.flow.StateFlow
+@@ -55,17 +56,19 @@ fun BrowseSourceCompactGrid(
+ ) {
+     // Harmony -->
+     // Panorama mode mixes 3:2 and 2:3 cells. Lanes flow on their own so a short cover does not
+-    // stretch the whole row. Auto columns are sized for the tall cover; a wide cover spans two
+-    // of them when the grid has at least three.
++    // stretch the whole row. Auto columns follow the shelf's committed shape; a wide shelf
++    // keeps each cover in one column.
+     if (usePanoramaCover) {
+         // The grid owns the scroll state: a cross-band shape commit remeasures every lane.
+         val state = rememberPanoramaMasonryState()
+         val settled = rememberPanoramaGridSettled { state.isScrollInProgress }
+         PrefetchPanoramaCoverShapes(mangaList.itemCount) { mangaList.peek(it)?.value?.first }
++        val shapeMode = rememberPanoramaShapeModeState()
+         CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
+-            TrackPanoramaCoverShapes(mangaList.itemCount) { mangaList.peek(it)?.value?.first?.id }
++            TrackPanoramaCoverShapes(mangaList.itemCount, shapeMode) { mangaList.peek(it)?.value?.first?.id }
++            val mode = shapeMode.mode
+             FastScrollPanoramaMasonry(
+-                columns = columns.panoramaColumns(),
++                columns = columns.panoramaColumns(mode),
+                 state = state,
+                 contentPadding = contentPadding + PaddingValues(8.dp),
+                 topContentPadding = contentPadding.calculateTopPadding(),
+@@ -88,7 +91,7 @@ fun BrowseSourceCompactGrid(
+                     key = { index -> mangaList.peek(index)?.value?.first?.id ?: index },
+                     span = { index ->
+                         val id = mangaList.peek(index)?.value?.first?.id
+-                        panoramaCoverSpan(id == null || committedCoverIsWide(id))
++                        panoramaCoverSpan(id == null || committedCoverIsWide(id), mode)
+                     },
+                     height = { index ->
+                         val id = mangaList.peek(index)?.value?.first?.id
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt
+index fd07eaa..1ddc1b7 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt
+@@ -26,6 +26,7 @@ import eu.kanade.presentation.library.components.committedCoverIsWide
+ import eu.kanade.presentation.library.components.panoramaColumns
+ import eu.kanade.presentation.library.components.panoramaCoverSpan
+ import eu.kanade.presentation.library.components.rememberPanoramaGridSettled
++import eu.kanade.presentation.library.components.rememberPanoramaShapeModeState
+ import eu.kanade.tachiyomi.ui.manga.RelatedManga
+ import tachiyomi.domain.manga.model.Manga
+ import tachiyomi.i18n.MR
+@@ -57,8 +58,8 @@ fun RelatedMangasComfortableGrid(
+ ) {
+     val gridPadding = contentPadding + PaddingValues(horizontal = MaterialTheme.padding.small) // padding for scrollbar
+     // Harmony -->
+-    // Same packing as the library panorama grid. Lanes flow on their own, and a wide cover spans
+-    // two book-sized columns when the grid has at least three.
++    // Same packing as the library panorama grid. Lanes flow on their own. Auto columns follow the
++    // committed shape; a wide shelf keeps each cover in one column.
+     if (usePanoramaCover) {
+         // The grid owns the scroll state: a cross-band shape commit remeasures every lane.
+         val state = rememberPanoramaMasonryState()
+@@ -69,10 +70,12 @@ fun RelatedMangasComfortableGrid(
+                 for (manga in related.mangaList) trackIds.add(manga.id)
+             }
+         }
++        val shapeMode = rememberPanoramaShapeModeState()
+         CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
+-            TrackPanoramaCoverShapes(trackIds.size) { trackIds[it] }
++            TrackPanoramaCoverShapes(trackIds.size, shapeMode) { trackIds[it] }
++            val mode = shapeMode.mode
+             FastScrollPanoramaMasonry(
+-                columns = columns.panoramaColumns(),
++                columns = columns.panoramaColumns(mode),
+                 state = state,
+                 contentPadding = gridPadding,
+                 topContentPadding = contentPadding.calculateTopPadding(),
+@@ -103,7 +106,7 @@ fun RelatedMangasComfortableGrid(
+                         items(
+                             count = count,
+                             key = key,
+-                            span = { index -> panoramaCoverSpan(committedCoverIsWide(mangaId(index))) },
++                            span = { index -> panoramaCoverSpan(committedCoverIsWide(mangaId(index)), mode) },
+                             height = { index ->
+                                 PanoramaCellHeight.Cover(
+                                     wide = committedCoverIsWide(mangaId(index)),
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt
+index 276a0f1..9d19af1 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt
+@@ -26,6 +26,7 @@ import eu.kanade.presentation.library.components.committedCoverIsWide
+ import eu.kanade.presentation.library.components.panoramaColumns
+ import eu.kanade.presentation.library.components.panoramaCoverSpan
+ import eu.kanade.presentation.library.components.rememberPanoramaGridSettled
++import eu.kanade.presentation.library.components.rememberPanoramaShapeModeState
+ import eu.kanade.tachiyomi.ui.manga.RelatedManga
+ import tachiyomi.domain.manga.model.Manga
+ import tachiyomi.i18n.MR
+@@ -59,8 +60,8 @@ fun RelatedMangasCompactGrid(
+ ) {
+     val gridPadding = contentPadding + PaddingValues(horizontal = MaterialTheme.padding.small) // padding for scrollbar
+     // Harmony -->
+-    // Same packing as the library panorama grid. Lanes flow on their own, and a wide cover spans
+-    // two book-sized columns when the grid has at least three.
++    // Same packing as the library panorama grid. Lanes flow on their own. Auto columns follow the
++    // committed shape; a wide shelf keeps each cover in one column.
+     if (usePanoramaCover) {
+         // The grid owns the scroll state: a cross-band shape commit remeasures every lane.
+         val state = rememberPanoramaMasonryState()
+@@ -71,10 +72,12 @@ fun RelatedMangasCompactGrid(
+                 for (manga in related.mangaList) trackIds.add(manga.id)
+             }
+         }
++        val shapeMode = rememberPanoramaShapeModeState()
+         CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
+-            TrackPanoramaCoverShapes(trackIds.size) { trackIds[it] }
++            TrackPanoramaCoverShapes(trackIds.size, shapeMode) { trackIds[it] }
++            val mode = shapeMode.mode
+             FastScrollPanoramaMasonry(
+-                columns = columns.panoramaColumns(),
++                columns = columns.panoramaColumns(mode),
+                 state = state,
+                 contentPadding = gridPadding,
+                 topContentPadding = contentPadding.calculateTopPadding(),
+@@ -105,7 +108,7 @@ fun RelatedMangasCompactGrid(
+                         items(
+                             count = count,
+                             key = key,
+-                            span = { index -> panoramaCoverSpan(committedCoverIsWide(mangaId(index))) },
++                            span = { index -> panoramaCoverSpan(committedCoverIsWide(mangaId(index)), mode) },
+                             height = { index ->
+                                 PanoramaCellHeight.Cover(
+                                     wide = committedCoverIsWide(mangaId(index)),
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt
+index b69d573..9649419 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LazyLibraryGrid.kt
+@@ -44,23 +44,27 @@ internal fun LazyLibraryStaggeredGrid(
+     modifier: Modifier = Modifier,
+     columns: Int,
+     contentPadding: PaddingValues,
+-    beforeContent: @Composable () -> Unit = {},
+-    content: PanoramaMasonryScope.() -> Unit,
++    shapeCount: Int,
++    shapeIdAt: (Int) -> Long?,
++    content: PanoramaMasonryScope.(PanoramaShapeMode) -> Unit,
+ ) {
+     // The grid owns the scroll state: a cross-band shape commit remeasures every lane.
++    val shapeMode = rememberPanoramaShapeModeState()
+     val state = rememberPanoramaMasonryState()
+     val settled = rememberPanoramaGridSettled { state.isScrollInProgress }
+     CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
+-        beforeContent()
++        TrackPanoramaCoverShapes(shapeCount, shapeMode, shapeIdAt)
++        val mode = shapeMode.mode
+         FastScrollPanoramaMasonry(
+-            columns = panoramaColumns(columns),
++            columns = panoramaColumns(columns, mode),
+             modifier = modifier,
+             state = state,
+             contentPadding = contentPadding + PaddingValues(8.dp),
+             verticalSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
+             horizontalSpacing = CommonMangaItemDefaults.GridHorizontalSpacer,
+-            content = content,
+-        )
++        ) {
++            content(mode)
++        }
+     }
+ }
+ 
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt
+index 2d83d5d..d99a7fe 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt
+@@ -27,24 +27,23 @@ internal fun LibraryComfortableGrid(
+ ) {
+     // Harmony -->
+     // Panorama mode mixes 3:2 and 2:3 cells. Lanes flow on their own so a short cover does not
+-    // stretch the whole row. Auto columns are sized for the tall cover; a wide cover spans two
+-    // of them when the grid has at least three.
++    // stretch the whole row. Auto columns follow the shelf's committed shape; a wide shelf
++    // keeps each cover in one column.
+     if (usePanoramaCover) {
+         LazyLibraryStaggeredGrid(
+             modifier = Modifier.fillMaxSize(),
+             columns = columns,
+             contentPadding = contentPadding,
+-            beforeContent = {
+-                TrackPanoramaCoverShapes(items.size) { items[it].libraryManga.manga.id }
+-            },
+-        ) {
++            shapeCount = items.size,
++            shapeIdAt = { items[it].libraryManga.manga.id },
++        ) { mode ->
+             globalSearchItem(searchQuery, onGlobalSearchClicked)
+ 
+             items(
+                 count = items.size,
+                 key = { items[it].libraryManga.manga.id },
+                 contentType = { "library_comfortable_grid_item" },
+-                span = { panoramaCoverSpan(committedCoverIsWide(items[it].libraryManga.manga.id)) },
++                span = { panoramaCoverSpan(committedCoverIsWide(items[it].libraryManga.manga.id), mode) },
+                 height = {
+                     PanoramaCellHeight.Cover(
+                         wide = committedCoverIsWide(items[it].libraryManga.manga.id),
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LibraryCompactGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/LibraryCompactGrid.kt
+index 64bf6b2..920cbea 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LibraryCompactGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LibraryCompactGrid.kt
+@@ -28,24 +28,23 @@ fun LibraryCompactGrid(
+ ) {
+     // Harmony -->
+     // Panorama mode mixes 3:2 and 2:3 cells. Lanes flow on their own so a short cover does not
+-    // stretch the whole row. Auto columns are sized for the tall cover; a wide cover spans two
+-    // of them when the grid has at least three.
++    // stretch the whole row. Auto columns follow the shelf's committed shape; a wide shelf
++    // keeps each cover in one column.
+     if (usePanoramaCover) {
+         LazyLibraryStaggeredGrid(
+             modifier = Modifier.fillMaxSize(),
+             columns = columns,
+             contentPadding = contentPadding,
+-            beforeContent = {
+-                TrackPanoramaCoverShapes(items.size) { items[it].libraryManga.manga.id }
+-            },
+-        ) {
++            shapeCount = items.size,
++            shapeIdAt = { items[it].libraryManga.manga.id },
++        ) { mode ->
+             globalSearchItem(searchQuery, onGlobalSearchClicked)
+ 
+             items(
+                 count = items.size,
+                 key = { items[it].libraryManga.manga.id },
+                 contentType = { "library_compact_grid_item" },
+-                span = { panoramaCoverSpan(committedCoverIsWide(items[it].libraryManga.manga.id)) },
++                span = { panoramaCoverSpan(committedCoverIsWide(items[it].libraryManga.manga.id), mode) },
+                 height = {
+                     PanoramaCellHeight.Cover(
+                         wide = committedCoverIsWide(items[it].libraryManga.manga.id),
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt
+index d5a2e19..76d8ccf 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt
+@@ -8,6 +8,7 @@ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.MutableFloatState
+ import androidx.compose.runtime.compositionLocalOf
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.rememberUpdatedState
+@@ -73,21 +74,38 @@ internal fun committedCoverIsWide(mangaId: Long): Boolean {
+ /**
+  * Applies cross-band shapes once the grid has settled.
+  *
+- * Harmony: the id list is not read during composition. [PanoramaCoverShapes.put] records the id,
+- * and a side effect commits it. Scrolling does not recompose the shelf for the ratio table.
+- * [count] and [mangaIdAt] stay so call sites do not depend on a walk that subscribed every id.
++ * Harmony: composition peeks a few ids for the sample key and does not walk the shelf.
++ * [PanoramaCoverShapes.committedShapeVersion] is read here, in the effect, and not in measure.
++ * A version bump while settled (the shape file landing, or a flush) samples again.
+  */
+ @Composable
+-fun TrackPanoramaCoverShapes(count: Int, mangaIdAt: (Int) -> Long?) {
++internal fun TrackPanoramaCoverShapes(
++    count: Int,
++    shapeMode: PanoramaShapeModeState,
++    mangaIdAt: (Int) -> Long?,
++) {
+     val token = remember { Any() }
+     val settledState = LocalPanoramaGridSettled.current
+     val listed by rememberUpdatedState(count to mangaIdAt)
++    val listSignature by rememberUpdatedState(panoramaShapeListSignature(count, mangaIdAt))
++    val currentMode by rememberUpdatedState(shapeMode)
+     DisposableEffect(token) {
+         onDispose { PanoramaCoverShapes.setGridScrolling(token, scrolling = false) }
+     }
+     LaunchedEffect(token) {
+-        snapshotFlow { settledState() to listed.first }.collect { (settled, _) ->
++        snapshotFlow {
++            // Harmony: version is a snapshot read so a flush while settled wakes this effect.
++            Triple(
++                settledState(),
++                listSignature,
++                PanoramaCoverShapes.committedShapeVersion.intValue,
++            )
++        }.collect { (settled, signature, _) ->
++            // Harmony: flush cross-band commits first. That flush may bump the version.
+             PanoramaCoverShapes.setGridScrolling(token, scrolling = !settled)
++            val version = PanoramaCoverShapes.committedShapeVersion.intValue
++            val (total, idAt) = listed
++            currentMode.onGridSignal(settled, total, idAt, signature, version)
+         }
+     }
+ }
+@@ -142,6 +160,13 @@ object PanoramaCoverShapes {
+     @Volatile
+     private var loaded = false
+ 
++    /**
++     * Harmony: owner-thread counter. Increments after the shape file is applied and after every
++     * flush commit. Read from composition or an effect only. Measure must not read it, and it
++     * does not bump [PanoramaMasonryContentEpoch].
++     */
++    internal val committedShapeVersion = mutableIntStateOf(0)
++
+     fun init(file: File, scope: CoroutineScope) {
+         val queued = synchronized(gate) {
+             if (initialized) return
+@@ -180,6 +205,14 @@ object PanoramaCoverShapes {
+         committed[mangaId] ?: WIDE_COVER_RATIO
+     }
+ 
++    /**
++     * Committed height/width, or null when this id has never been committed.
++     * Harmony: column voting must use this. [committedRatio] fills unknown ids with 9/16, which is wide.
++     */
++    fun committedRatioOrNull(mangaId: Long): Float? = synchronized(gate) {
++        committed[mangaId]
++    }
++
+     /**
+      * Updates the cell's ratio when the committed band did not change.
+      * A cross-band change waits for [PanoramaMasonryContentEpoch] and the cell reads it there.
+@@ -251,6 +284,7 @@ object PanoramaCoverShapes {
+         }
+         snapshotDispatcher = AndroidSnapshotDispatcher
+         PanoramaMasonryContentEpoch.intValue = 0
++        committedShapeVersion.intValue = 0
+     }
+ 
+     suspend fun prefetch(entries: List<Pair<Long, () -> File?>>) {
+@@ -373,6 +407,7 @@ object PanoramaCoverShapes {
+                 pendingCross.remove(eldest)
+             }
+         }
++        // Harmony: one flush applies the file. runFlush publishes committedShapeVersion on the owner thread.
+         scheduleFlush()
+     }
+ 
+@@ -405,6 +440,8 @@ object PanoramaCoverShapes {
+         }
+         // Harmony: one epoch for the whole batch. Same-band edits do not reach this write.
+         if (bump) PanoramaMasonryContentEpoch.intValue++
++        // Harmony: every commit, including a same-band flush and the shape-file load. Not the layout epoch.
++        committedShapeVersion.intValue++
+     }
+ 
+     /** Caller holds [gate]. Returns whether a wide/tall band changed. */
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
+index 639940c..5948d1a 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
+@@ -34,6 +34,8 @@ import uy.kohesive.injekt.api.get
+  * Pura X Max folded portrait is about 459 dp (3) and unfolded landscape about 939 dp (6).
+  * vivo X100 Pro portrait is 360 and 420 dp (3).
+  * (A single 104 dp minimum put that 939 dp window on 8 columns.)
++ *
++ * A shelf that has settled on a shape uses [panoramaAutoColumns] instead of this tier.
+  */
+ internal val PanoramaGridMinColumnWidth = PanoramaColumns.Tiered(
+     compactMin = 112.dp,
+@@ -41,8 +43,12 @@ internal val PanoramaGridMinColumnWidth = PanoramaColumns.Tiered(
+     breakpoint = 600.dp,
+ )
+ 
+-/** Wide covers span two lanes when there are at least three; tall covers stay in one. */
+-internal fun panoramaCoverSpan(wide: Boolean): PanoramaSpan {
++/**
++ * Wide covers span two lanes when the shelf is tall or still unknown and the grid has room.
++ * Harmony: a wide shelf already sizes the column as a landscape cover, so it stays in one lane.
++ */
++internal fun panoramaCoverSpan(wide: Boolean, mode: PanoramaShapeMode): PanoramaSpan {
++    if (mode == PanoramaShapeMode.Wide) return PanoramaSpan.SingleLane
+     return if (wide) PanoramaSpan.TwoLanesWhenRoomy else PanoramaSpan.SingleLane
+ }
+ 
+@@ -72,9 +78,9 @@ internal data class CountedGridCells(
+ 
+ internal fun libraryGridCells(columnCount: Int): GridCells = CountedGridCells(columnCount)
+ 
+-internal fun panoramaColumns(columnCount: Int): PanoramaColumns {
++internal fun panoramaColumns(columnCount: Int, mode: PanoramaShapeMode): PanoramaColumns {
+     return if (columnCount == 0) {
+-        PanoramaGridMinColumnWidth
++        panoramaAutoColumns(mode)
+     } else {
+         PanoramaColumns.Fixed(columnCount)
+     }
+@@ -86,10 +92,10 @@ internal fun panoramaColumns(columnCount: Int): PanoramaColumns {
+  * preference those cells were built from.
+  */
+ @Composable
+-internal fun GridCells.panoramaColumns(): PanoramaColumns {
++internal fun GridCells.panoramaColumns(mode: PanoramaShapeMode): PanoramaColumns {
+     val orientation = LocalConfiguration.current.orientation
+     val columnCount = (this as? CountedGridCells)?.columnCount ?: libraryColumnCount(orientation)
+-    return panoramaColumns(columnCount)
++    return panoramaColumns(columnCount, mode)
+ }
+ 
+ private fun libraryColumnCount(orientation: Int): Int {
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaShapeMode.kt b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaShapeMode.kt
+new file mode 100644
+index 0000000..5ba8798
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaShapeMode.kt
+@@ -0,0 +1,170 @@
++package eu.kanade.presentation.library.components
++
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.Stable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.saveable.Saver
++import androidx.compose.runtime.saveable.rememberSaveable
++import androidx.compose.runtime.setValue
++import eu.kanade.presentation.manga.components.RatioSwitchToPanorama
++import tachiyomi.presentation.core.components.PanoramaColumns
++
++// Harmony -->
++/**
++ * Dominant cover shape of one panorama grid.
++ *
++ * [Unknown] keeps the width-only tier. [Tall] and [Wide] size the auto columns for that shape.
++ * A wide grid does not span a landscape cover across two columns.
++ */
++internal enum class PanoramaShapeMode {
++    Unknown,
++    Tall,
++    Wide,
++}
++
++/** Enter wide columns only at this wide-cover fraction, unless already wide. */
++internal const val PANORAMA_WIDE_ENTER_FRACTION = 0.60
++
++/** Leave wide columns only once the wide-cover fraction falls to this. */
++internal const val PANORAMA_WIDE_EXIT_FRACTION = 0.40
++
++private const val PANORAMA_SHAPE_MIN_KNOWN = 8
++
++/**
++ * Next mode from a settled sample.
++ *
++ * Harmony: [known] counts only ids that already have a committed shape. The 9/16 default is not a
++ * vote. A sample is trusted once [known] reaches min(total, max(8, total / 2)); otherwise the
++ * previous mode stays, including [PanoramaShapeMode.Unknown]. The first trusted sample is wide at
++ * or above 0.60 and tall below that. After that, wide waits for 0.40 before it returns to tall.
++ */
++internal fun nextPanoramaShapeMode(
++    current: PanoramaShapeMode,
++    total: Int,
++    known: Int,
++    wide: Int,
++): PanoramaShapeMode {
++    if (total <= 0 || known <= 0) return current
++    val need = minOf(total, maxOf(PANORAMA_SHAPE_MIN_KNOWN, total / 2))
++    if (known < need) return current
++    val fraction = wide.toDouble() / known.toDouble()
++    return when (current) {
++        PanoramaShapeMode.Wide -> {
++            if (fraction <= PANORAMA_WIDE_EXIT_FRACTION) PanoramaShapeMode.Tall else PanoramaShapeMode.Wide
++        }
++        PanoramaShapeMode.Unknown -> {
++            if (fraction >= PANORAMA_WIDE_ENTER_FRACTION) PanoramaShapeMode.Wide else PanoramaShapeMode.Tall
++        }
++        PanoramaShapeMode.Tall -> {
++            if (fraction >= PANORAMA_WIDE_ENTER_FRACTION) PanoramaShapeMode.Wide else PanoramaShapeMode.Tall
++        }
++    }
++}
++
++/** Votes with [PanoramaCoverShapes.committedRatioOrNull]. An id that was never committed is skipped. */
++internal fun panoramaShapeMode(
++    current: PanoramaShapeMode,
++    total: Int,
++    mangaIdAt: (Int) -> Long?,
++): PanoramaShapeMode {
++    var known = 0
++    var wide = 0
++    for (index in 0 until total) {
++        val id = mangaIdAt(index) ?: continue
++        val ratio = PanoramaCoverShapes.committedRatioOrNull(id) ?: continue
++        known++
++        if (ratio <= RatioSwitchToPanorama) wide++
++    }
++    return nextPanoramaShapeMode(current, total, known, wide)
++}
++
++/**
++ * Sample key for one grid. [listSignature] is [panoramaShapeListSignature].
++ * [shapeVersion] is [PanoramaCoverShapes.committedShapeVersion].
++ */
++internal data class PanoramaShapeSampleKey(
++    val listSignature: Long,
++    val shapeVersion: Int,
++)
++
++/**
++ * Harmony: first, quarter, middle, three-quarter, and last id. A category, a search, or a
++ * browse page changes one of those. This does not walk the shelf.
++ */
++internal fun panoramaShapeListSignature(total: Int, mangaIdAt: (Int) -> Long?): Long {
++    if (total <= 0) return 0L
++    val indexes = intArrayOf(0, total / 4, total / 2, total * 3 / 4, total - 1)
++    var hash = total.toLong()
++    var seen = -1
++    for (index in indexes) {
++        if (index == seen) continue
++        seen = index
++        hash = hash * 31 + (mangaIdAt(index) ?: Long.MIN_VALUE)
++    }
++    return hash
++}
++
++/**
++ * One sample per settle key. The key changes when the listed ids change or the shape table
++ * publishes a new version. A repeated key does not sample again.
++ */
++internal class PanoramaShapeModeGate {
++    private var sampled = false
++    private var key = PanoramaShapeSampleKey(Long.MIN_VALUE, Int.MIN_VALUE)
++
++    fun allow(settled: Boolean, key: PanoramaShapeSampleKey): Boolean {
++        if (!settled) {
++            sampled = false
++            return false
++        }
++        if (sampled && this.key == key) return false
++        sampled = true
++        this.key = key
++        return true
++    }
++}
++
++@Stable
++internal class PanoramaShapeModeState(initial: PanoramaShapeMode) {
++    var mode by mutableStateOf(initial)
++        private set
++
++    private val gate = PanoramaShapeModeGate()
++
++    fun onGridSignal(
++        settled: Boolean,
++        total: Int,
++        mangaIdAt: (Int) -> Long?,
++        listSignature: Long,
++        shapeVersion: Int,
++    ) {
++        if (!gate.allow(settled, PanoramaShapeSampleKey(listSignature, shapeVersion))) return
++        val next = panoramaShapeMode(mode, total, mangaIdAt)
++        if (next != mode) mode = next
++    }
++
++    companion object {
++        val Saver: Saver<PanoramaShapeModeState, String> = Saver(
++            save = { it.mode.name },
++            restore = { PanoramaShapeModeState(PanoramaShapeMode.valueOf(it)) },
++        )
++    }
++}
++
++@Composable
++internal fun rememberPanoramaShapeModeState(): PanoramaShapeModeState {
++    return rememberSaveable(saver = PanoramaShapeModeState.Saver) {
++        PanoramaShapeModeState(PanoramaShapeMode.Unknown)
++    }
++}
++
++/** Auto columns for the mode. A fixed column count is the caller's [PanoramaColumns.Fixed]. */
++internal fun panoramaAutoColumns(mode: PanoramaShapeMode): PanoramaColumns {
++    return when (mode) {
++        PanoramaShapeMode.Tall -> PanoramaColumns.Shaped(1.5f)
++        PanoramaShapeMode.Wide -> PanoramaColumns.Shaped(2f / 3f)
++        PanoramaShapeMode.Unknown -> PanoramaGridMinColumnWidth
++    }
++}
++// Harmony <--
+diff --git a/app/src/test/java/eu/kanade/presentation/library/components/PanoramaShapeModeTest.kt b/app/src/test/java/eu/kanade/presentation/library/components/PanoramaShapeModeTest.kt
+new file mode 100644
+index 0000000..c5f049d
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/presentation/library/components/PanoramaShapeModeTest.kt
+@@ -0,0 +1,174 @@
++package eu.kanade.presentation.library.components
++
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertNotEquals
++import org.junit.jupiter.api.Assertions.assertNull
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.BeforeEach
++import org.junit.jupiter.api.Test
++
++class PanoramaShapeModeTest {
++    @BeforeEach
++    fun reset() {
++        PanoramaCoverShapes.resetForTest()
++        PanoramaCoverShapes.snapshotDispatcher = ImmediateShapeDispatcher
++    }
++
++    @Test
++    fun `an id that has not been committed does not vote`() {
++        assertNull(PanoramaCoverShapes.committedRatioOrNull(1L))
++        assertEquals(WIDE_COVER_RATIO, PanoramaCoverShapes.committedRatio(1L))
++        // Eight missing ids would be 100% wide if the 9/16 default counted.
++        val mode = panoramaShapeMode(PanoramaShapeMode.Unknown, total = 8) { it.toLong() }
++        assertEquals(PanoramaShapeMode.Unknown, mode)
++    }
++
++    @Test
++    fun `the wide band is the existing 0_75 switch`() {
++        repeat(8) { PanoramaCoverShapes.put(it.toLong(), 0.75f) }
++        assertEquals(
++            PanoramaShapeMode.Wide,
++            panoramaShapeMode(PanoramaShapeMode.Unknown, total = 8) { it.toLong() },
++        )
++        PanoramaCoverShapes.resetForTest()
++        PanoramaCoverShapes.snapshotDispatcher = ImmediateShapeDispatcher
++        repeat(8) { PanoramaCoverShapes.put(it.toLong(), 0.76f) }
++        assertEquals(
++            PanoramaShapeMode.Tall,
++            panoramaShapeMode(PanoramaShapeMode.Unknown, total = 8) { it.toLong() },
++        )
++    }
++
++    @Test
++    fun `a sample needs half the shelf and at least eight committed covers`() {
++        assertEquals(
++            PanoramaShapeMode.Unknown,
++            nextPanoramaShapeMode(PanoramaShapeMode.Unknown, total = 40, known = 19, wide = 19),
++        )
++        assertEquals(
++            PanoramaShapeMode.Wide,
++            nextPanoramaShapeMode(PanoramaShapeMode.Unknown, total = 40, known = 20, wide = 20),
++        )
++        // A short shelf has to know every cover. total / 2 is below 8, so the floor is the shelf.
++        assertEquals(
++            PanoramaShapeMode.Unknown,
++            nextPanoramaShapeMode(PanoramaShapeMode.Unknown, total = 5, known = 4, wide = 4),
++        )
++        assertEquals(
++            PanoramaShapeMode.Wide,
++            nextPanoramaShapeMode(PanoramaShapeMode.Unknown, total = 5, known = 5, wide = 5),
++        )
++        // Below the line, a mode that was already chosen stays.
++        assertEquals(
++            PanoramaShapeMode.Wide,
++            nextPanoramaShapeMode(PanoramaShapeMode.Wide, total = 40, known = 19, wide = 0),
++        )
++    }
++
++    @Test
++    fun `wide columns enter at 0_60 and leave at 0_40`() {
++        // 10 known, need max(8, 5) = 8.
++        assertEquals(PanoramaShapeMode.Wide, sample(PanoramaShapeMode.Unknown, wide = 6))
++        assertEquals(PanoramaShapeMode.Tall, sample(PanoramaShapeMode.Unknown, wide = 5))
++        assertEquals(PanoramaShapeMode.Wide, sample(PanoramaShapeMode.Wide, wide = 5))
++        assertEquals(PanoramaShapeMode.Tall, sample(PanoramaShapeMode.Wide, wide = 4))
++        assertEquals(PanoramaShapeMode.Tall, sample(PanoramaShapeMode.Tall, wide = 5))
++        assertEquals(PanoramaShapeMode.Wide, sample(PanoramaShapeMode.Tall, wide = 6))
++    }
++
++    @Test
++    fun `shape mode updates when the grid settles and not when a cover is stored`() {
++        val state = PanoramaShapeModeState(PanoramaShapeMode.Unknown)
++        val firstShelf = { index: Int -> index.toLong() }
++        val signature = panoramaShapeListSignature(10, firstShelf)
++        fun signal(settled: Boolean) {
++            state.onGridSignal(
++                settled = settled,
++                total = 10,
++                mangaIdAt = firstShelf,
++                listSignature = signature,
++                shapeVersion = 1,
++            )
++        }
++        repeat(10) { PanoramaCoverShapes.put(it.toLong(), 0.50f) }
++        signal(settled = false)
++        assertEquals(PanoramaShapeMode.Unknown, state.mode)
++
++        signal(settled = true)
++        assertEquals(PanoramaShapeMode.Wide, state.mode)
++
++        // A repeated key does not sample again, even after the stored ratios change.
++        repeat(10) { PanoramaCoverShapes.put(it.toLong(), 1.60f) }
++        assertEquals(PanoramaShapeMode.Wide, state.mode)
++        signal(settled = true)
++        assertEquals(PanoramaShapeMode.Wide, state.mode)
++
++        signal(settled = false)
++        signal(settled = true)
++        assertEquals(PanoramaShapeMode.Tall, state.mode)
++    }
++
++    @Test
++    fun `a shape version bump while settled resamples without scrolling`() {
++        val state = PanoramaShapeModeState(PanoramaShapeMode.Unknown)
++        val ids = { index: Int -> index.toLong() }
++        val signature = panoramaShapeListSignature(10, ids)
++        state.onGridSignal(
++            settled = true,
++            total = 10,
++            mangaIdAt = ids,
++            listSignature = signature,
++            shapeVersion = PanoramaCoverShapes.committedShapeVersion.intValue,
++        )
++        assertEquals(PanoramaShapeMode.Unknown, state.mode)
++
++        // The shape file and every flush publish this version on the owner thread.
++        repeat(10) { PanoramaCoverShapes.put(it.toLong(), 0.50f) }
++        val version = PanoramaCoverShapes.committedShapeVersion.intValue
++        assertTrue(version > 0)
++        state.onGridSignal(
++            settled = true,
++            total = 10,
++            mangaIdAt = ids,
++            listSignature = signature,
++            shapeVersion = version,
++        )
++        assertEquals(PanoramaShapeMode.Wide, state.mode)
++    }
++
++    @Test
++    fun `the same count with different ids resamples once settled`() {
++        val state = PanoramaShapeModeState(PanoramaShapeMode.Unknown)
++        repeat(10) { PanoramaCoverShapes.put(it.toLong(), 0.50f) }
++        repeat(10) { PanoramaCoverShapes.put(1_000L + it, 1.60f) }
++        val wideShelf = { index: Int -> index.toLong() }
++        val tallShelf = { index: Int -> 1_000L + index }
++        val wideSignature = panoramaShapeListSignature(10, wideShelf)
++        val tallSignature = panoramaShapeListSignature(10, tallShelf)
++        assertNotEquals(wideSignature, tallSignature)
++        val version = PanoramaCoverShapes.committedShapeVersion.intValue
++        state.onGridSignal(true, 10, wideShelf, wideSignature, version)
++        assertEquals(PanoramaShapeMode.Wide, state.mode)
++        state.onGridSignal(true, 10, tallShelf, tallSignature, version)
++        assertEquals(PanoramaShapeMode.Tall, state.mode)
++
++        var reads = 0
++        panoramaShapeListSignature(2_000) {
++            reads++
++            it.toLong()
++        }
++        assertTrue(reads <= 5, "reads $reads")
++    }
++
++    private fun sample(current: PanoramaShapeMode, wide: Int): PanoramaShapeMode {
++        return nextPanoramaShapeMode(current, total = 10, known = 10, wide = wide)
++    }
++}
++
++private object ImmediateShapeDispatcher : PanoramaSnapshotDispatcher {
++    override fun isOwnerThread(): Boolean = true
++
++    override fun post(block: () -> Unit) {
++        block()
++    }
++}
