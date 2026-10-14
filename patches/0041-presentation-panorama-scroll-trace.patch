@@ -1,0 +1,509 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 11:00:19 +0000
+Subject: [PATCH] presentation: panorama scroll trace in the crash log dump
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Users report that a panorama shelf sometimes stops dead after a swipe,
+away from the edges. Reading the code does not tell which path ends the
+fling, so the grid now logs what happened, and "Dump crash logs"
+appends the last 400 events.
+
+Per touch it logs down and up. Up carries the move count, the gap between
+the last move and the release, the velocity from Compose's tracker, and
+the velocity of the last 100 ms of samples. Compose reports 0 when that
+gap is over 40 ms, so a stalled touch stream shows trackerV=0 next to a
+non-zero recentV.
+
+Per fling it logs the start velocity, then how it ended: done, stopped
+(remaining velocity), or cancelled. It also logs any frame that consumed
+less than it asked for, and the longest frame gap. scrollToItem,
+requestScrollToItem and scrollToOffset log themselves, so a cancel is
+preceded by its cause. A measure that moves the offset logs its reason
+(request, restore, anchor, clamp), as do epoch changes and changes to the
+scroll range mid-scroll. Grid enter/leave and userScrollEnabled=false
+are logged too.
+
+Release builds are minified, so every entry point writes its own label
+instead of a stack trace. Scrolling is unchanged. The fling wrapper
+forwards every delta, and the touch observer reads the Initial pass
+without consuming anything.
+
+与 mihon-harmony 0033 同源。
+---
+ .../eu/kanade/tachiyomi/util/CrashLogUtil.kt  |   5 +
+ .../core/components/PanoramaMasonry.kt        |  45 ++++-
+ .../core/components/PanoramaScrollTrace.kt    | 182 ++++++++++++++++++
+ .../components/PanoramaMasonryFlingTest.kt    |  89 +++++++++
+ 4 files changed, 320 insertions(+), 1 deletion(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaScrollTrace.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/util/CrashLogUtil.kt b/app/src/main/java/eu/kanade/tachiyomi/util/CrashLogUtil.kt
+index 1d486ca..932a762 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/util/CrashLogUtil.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/util/CrashLogUtil.kt
+@@ -12,6 +12,7 @@ import eu.kanade.tachiyomi.util.system.toShareIntent
+ import eu.kanade.tachiyomi.util.system.toast
+ import tachiyomi.core.common.util.lang.withNonCancellableContext
+ import tachiyomi.core.common.util.lang.withUIContext
++import tachiyomi.presentation.core.components.PanoramaScrollTrace
+ import uy.kohesive.injekt.Injekt
+ import uy.kohesive.injekt.api.get
+ import java.time.OffsetDateTime
+@@ -43,6 +44,10 @@ class CrashLogUtil(
+             file.appendText("--- App log (last ${appLines.size} lines logged by Anikku itself) ---\n")
+             file.appendText(appLines.joinToString("\n", postfix = "\n"))
+ 
++            val scrollLines = PanoramaScrollTrace.snapshot()
++            file.appendText("\n--- Panorama scroll trace (last ${scrollLines.size} events) ---\n")
++            file.appendText(scrollLines.joinToString("\n", postfix = "\n"))
++
+             val uri = file.getUriCompat(context)
+             context.startActivity(uri.toShareIntent(context, "text/plain"))
+         } catch (e: Throwable) {
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+index 86ebf12..0c69aa0 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+@@ -14,15 +14,19 @@ import androidx.compose.foundation.lazy.layout.MutableIntervalList
+ import androidx.compose.foundation.scrollableArea
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.Stable
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableFloatStateOf
+ import androidx.compose.runtime.mutableIntStateOf
+ import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
+ import androidx.compose.runtime.rememberUpdatedState
+ import androidx.compose.runtime.saveable.Saver
+ import androidx.compose.runtime.saveable.rememberSaveable
+ import androidx.compose.runtime.setValue
++import androidx.compose.runtime.snapshots.Snapshot
+ import androidx.compose.runtime.withFrameNanos
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clipToBounds
+@@ -37,6 +41,7 @@ import androidx.compose.ui.unit.Dp
+ import androidx.compose.ui.unit.LayoutDirection
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
++import kotlin.math.abs
+ import kotlin.math.roundToInt
+ 
+ /**
+@@ -179,7 +184,11 @@ class PanoramaMasonryState {
+     val isScrollInProgress: Boolean
+         get() = scrollableState.isScrollInProgress
+ 
++    internal val traceId: Int = PanoramaScrollTrace.nextGridId()
++    private var traceEpoch: Long = Long.MIN_VALUE
++
+     fun requestScrollToItem(index: Int, scrollOffset: Int = 0) {
++        PanoramaScrollTrace.log(traceId, "requestScrollToItem index=$index offset=$scrollOffset")
+         pendingIndex = index
+         pendingOffset = scrollOffset
+         scrollRequest++
+@@ -198,6 +207,7 @@ class PanoramaMasonryState {
+      * panorama shape settle timer to treat the drag as scrolling.
+      */
+     suspend fun scrollToOffset(offsetPx: Float) {
++        PanoramaScrollTrace.log(traceId, "scrollToOffset ${offsetPx.roundToInt()}")
+         scrollableState.scroll(MutatePriority.UserInput) {
+             scrollOffset = offsetPx.coerceIn(0f, maxScroll)
+             withFrameNanos { }
+@@ -216,10 +226,13 @@ class PanoramaMasonryState {
+         totalHeight: Int,
+         bottomPadding: Int,
+         structural: Boolean,
++        contentEpoch: Long = 0L,
+     ) {
+         val max = (totalHeight - viewport).coerceAtLeast(0).toFloat()
+         var scroll = scrollOffset
++        var reason = "none"
+         if (pendingIndex >= 0 && rects.isNotEmpty()) {
++            reason = "request"
+             val index = pendingIndex.coerceIn(0, rects.lastIndex)
+             val top = topPadding + rects[index].y
+             scroll = (top + pendingOffset).toFloat()
+@@ -228,8 +241,10 @@ class PanoramaMasonryState {
+         } else if (pendingRestore != null) {
+             val restored = resolvePendingRestore(rects, keys, topPadding, max.toInt())
+             if (restored != null) scroll = restored
++            reason = "restore"
+         } else if (structural) {
+             val anchor = lastAnchor
++            reason = "anchor"
+             if (anchor != null && rects.isNotEmpty()) {
+                 scroll = scrollOffsetForAnchor(
+                     anchor = anchor,
+@@ -241,6 +256,8 @@ class PanoramaMasonryState {
+             }
+         }
+         scroll = scroll.coerceIn(0f, max)
++        if (reason == "none" && abs(scroll - scrollOffset) > 0.5f) reason = "clamp"
++        traceMeasure(scroll, max, reason, structural, contentEpoch, rects.size)
+         if (scrollOffset != scroll) scrollOffset = scroll
+         maxScroll = max
+         viewportHeight = viewport
+@@ -263,6 +280,22 @@ class PanoramaMasonryState {
+         canScrollForward = scroll < max - 0.5f
+     }
+ 
++    private fun traceMeasure(scroll: Float, max: Float, reason: String, structural: Boolean, epoch: Long, count: Int) {
++        val moved = abs(scroll - scrollOffset) > 0.5f
++        val epochChanged = epoch != traceEpoch
++        traceEpoch = epoch
++        // Harmony: called from measure. Reading isScrollInProgress there would remeasure on every gesture start and end.
++        val scrolling = Snapshot.withoutReadObservation { isScrollInProgress }
++        val maxChanged = abs(max - maxScroll) > 0.5f && scrolling
++        if (!moved && !structural && !epochChanged && !maxChanged) return
++        PanoramaScrollTrace.log(
++            traceId,
++            "measure reason=$reason structural=$structural epochChanged=$epochChanged items=$count " +
++                "offset=${scrollOffset.roundToInt()}->${scroll.roundToInt()} " +
++                "max=${maxScroll.roundToInt()}->${max.roundToInt()} scrolling=$scrolling",
++        )
++    }
++
+     /**
+      * Bundle snapshot of [lastAnchor]. Called from [Saver] at performSave, so a scroll that
+      * only remeasured is included. Scrolling does not recompose the owner.
+@@ -464,7 +497,15 @@ fun PanoramaMasonry(
+     content: PanoramaMasonryScope.() -> Unit,
+ ) {
+     val latestContent = rememberUpdatedState(content)
+-    val flingBehavior = ScrollableDefaults.flingBehavior()
++    val defaultFling = ScrollableDefaults.flingBehavior()
++    val flingBehavior = remember(defaultFling, state) { TracedFlingBehavior(defaultFling, state.traceId, state) }
++    DisposableEffect(state) {
++        PanoramaScrollTrace.log(state.traceId, "enter offset=${state.scrollOffset.roundToInt()}")
++        onDispose { PanoramaScrollTrace.log(state.traceId, "leave offset=${state.scrollOffset.roundToInt()}") }
++    }
++    LaunchedEffect(state, userScrollEnabled) {
++        if (!userScrollEnabled) PanoramaScrollTrace.log(state.traceId, "userScrollEnabled=false")
++    }
+     val args = rememberUpdatedState(
+         MasonryMeasureArgs(
+             columns = columns,
+@@ -475,6 +516,7 @@ fun PanoramaMasonry(
+     )
+     LazyLayout(
+         modifier = modifier
++            .panoramaTouchTrace(state.traceId)
+             .semantics {
+                 if (userScrollEnabled) {
+                     // scrollBy is provided by scrollableArea. The axis range is the real offset:
+@@ -679,6 +721,7 @@ private fun LazyLayoutMeasureScope.measureMasonry(
+         totalHeight = total,
+         bottomPadding = bottomPad,
+         structural = structural,
++        contentEpoch = contentEpoch,
+     )
+     val scrollPx = state.scrollOffset.roundToInt()
+ 
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaScrollTrace.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaScrollTrace.kt
+new file mode 100644
+index 0000000..698fd60
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaScrollTrace.kt
+@@ -0,0 +1,182 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.gestures.FlingBehavior
++import androidx.compose.foundation.gestures.ScrollScope
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.input.pointer.PointerEventPass
++import androidx.compose.ui.input.pointer.PointerEventType
++import androidx.compose.ui.input.pointer.pointerInput
++import androidx.compose.ui.input.pointer.util.VelocityTracker
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++import java.util.concurrent.atomic.AtomicInteger
++import kotlin.coroutines.cancellation.CancellationException
++import kotlin.math.abs
++import kotlin.math.roundToInt
++
++/**
++ * Harmony: event log for panorama grid scrolling, appended to the crash log dump.
++ *
++ * One line per touch release, fling start / end, scroll request, viewport correction and grid
++ * enter / leave. Nothing is written per frame unless a frame consumed less than it asked for.
++ * Velocities are px/s, distances px, times ms.
++ */
++object PanoramaScrollTrace {
++
++    private const val CAPACITY = 400
++
++    private val lines = ArrayDeque<String>(CAPACITY)
++    private val lock = Any()
++    private val timeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
++    private val gridIds = AtomicInteger(0)
++
++    internal fun nextGridId(): Int = gridIds.incrementAndGet()
++
++    fun log(gridId: Int, message: String) {
++        val timestamp = synchronized(timeFormat) { timeFormat.format(Date()) }
++        val entry = "$timestamp g$gridId $message"
++        synchronized(lock) {
++            if (lines.size >= CAPACITY) lines.removeFirst()
++            lines.addLast(entry)
++        }
++    }
++
++    fun snapshot(): List<String> = synchronized(lock) { lines.toList() }
++
++    internal fun clearForTest() = synchronized(lock) { lines.clear() }
++}
++
++/**
++ * Observes the touch stream without consuming it. Logs, per gesture: move count, the gap between
++ * the last move and the release (Compose's tracker reports 0 when it exceeds 40 ms), the tracker's
++ * velocity and the velocity of the last 100 ms of samples.
++ */
++internal fun Modifier.panoramaTouchTrace(gridId: Int): Modifier = pointerInput(gridId) {
++    awaitPointerEventScope {
++        val tracker = VelocityTracker()
++        val times = LongArray(TOUCH_SAMPLES)
++        val ys = FloatArray(TOUCH_SAMPLES)
++        var count = 0
++        var moves = 0
++        var downY = 0f
++        var active = false
++        while (true) {
++            val event = awaitPointerEvent(PointerEventPass.Initial)
++            val change = event.changes.firstOrNull() ?: continue
++            when {
++                event.type == PointerEventType.Press && !active -> {
++                    active = true
++                    tracker.resetTracking()
++                    tracker.addPosition(change.uptimeMillis, change.position)
++                    moves = 0
++                    downY = change.position.y
++                    times[0] = change.uptimeMillis
++                    ys[0] = change.position.y
++                    count = 1
++                    PanoramaScrollTrace.log(gridId, "down pointers=${event.changes.size}")
++                }
++                active && event.type == PointerEventType.Move -> {
++                    moves++
++                    change.historical.forEach { tracker.addPosition(it.uptimeMillis, it.position) }
++                    tracker.addPosition(change.uptimeMillis, change.position)
++                    val slot = count % TOUCH_SAMPLES
++                    times[slot] = change.uptimeMillis
++                    ys[slot] = change.position.y
++                    count++
++                }
++                active && event.type == PointerEventType.Release && event.changes.none { it.pressed } -> {
++                    active = false
++                    val lastMove = times[(count - 1) % TOUCH_SAMPLES]
++                    val gap = change.uptimeMillis - lastMove
++                    tracker.addPosition(change.uptimeMillis, change.position)
++                    val trackerVy = tracker.calculateVelocity().y
++                    var recentVy = 0f
++                    val newest = (count - 1) % TOUCH_SAMPLES
++                    val available = minOf(count, TOUCH_SAMPLES)
++                    for (back in 1 until available) {
++                        val slot = (count - 1 - back) % TOUCH_SAMPLES
++                        val dt = times[newest] - times[slot]
++                        if (dt >= RECENT_WINDOW_MS || back == available - 1) {
++                            if (dt > 0) recentVy = (ys[newest] - ys[slot]) * 1000f / dt
++                            break
++                        }
++                    }
++                    PanoramaScrollTrace.log(
++                        gridId,
++                        "up moves=$moves dy=${(change.position.y - downY).roundToInt()} " +
++                            "gapLastMove=${gap}ms trackerV=${trackerVy.roundToInt()} " +
++                            "recentV=${recentVy.roundToInt()} consumed=${change.isConsumed}",
++                    )
++                }
++            }
++        }
++    }
++}
++
++/**
++ * Wraps the grid's fling so the log shows how each fling ended. Scrolling itself is unchanged:
++ * every delta goes to [inner]'s scope as before.
++ */
++internal class TracedFlingBehavior(
++    private val inner: FlingBehavior,
++    private val gridId: Int,
++    private val state: PanoramaMasonryState,
++) : FlingBehavior {
++
++    override suspend fun ScrollScope.performFling(initialVelocity: Float): Float {
++        val outer = this
++        val start = System.nanoTime()
++        var last = start
++        var maxGapNs = 0L
++        var frames = 0
++        var travelled = 0f
++        val traced = object : ScrollScope {
++            override fun scrollBy(pixels: Float): Float {
++                val now = System.nanoTime()
++                if (frames > 0) maxGapNs = maxOf(maxGapNs, now - last)
++                last = now
++                frames++
++                val before = state.scrollOffset
++                val consumed = outer.scrollBy(pixels)
++                travelled += consumed
++                if (abs(pixels - consumed) > 0.5f) {
++                    PanoramaScrollTrace.log(
++                        gridId,
++                        "short frame asked=${pixels.roundToInt()} got=${consumed.roundToInt()} " +
++                            "offset=${before.roundToInt()} max=${state.maxScroll.roundToInt()}",
++                    )
++                }
++                return consumed
++            }
++        }
++        PanoramaScrollTrace.log(
++            gridId,
++            "fling start v=${initialVelocity.roundToInt()} offset=${state.scrollOffset.roundToInt()} " +
++                "max=${state.maxScroll.roundToInt()}",
++        )
++        val outcome: String
++        val left: Float
++        try {
++            left = with(inner) { traced.performFling(initialVelocity) }
++            outcome = if (abs(left) > 1f) "stopped" else "done"
++        } catch (e: CancellationException) {
++            logFlingEnd("cancelled", 0f, start, frames, travelled, maxGapNs)
++            throw e
++        }
++        logFlingEnd(outcome, left, start, frames, travelled, maxGapNs)
++        return left
++    }
++
++    private fun logFlingEnd(outcome: String, left: Float, start: Long, frames: Int, travelled: Float, maxGapNs: Long) {
++        PanoramaScrollTrace.log(
++            gridId,
++            "fling $outcome left=${left.roundToInt()} dist=${travelled.roundToInt()} frames=$frames " +
++                "ms=${(System.nanoTime() - start) / 1_000_000} maxGap=${maxGapNs / 1_000_000}ms " +
++                "offset=${state.scrollOffset.roundToInt()} max=${state.maxScroll.roundToInt()}",
++        )
++    }
++}
++
++private const val TOUCH_SAMPLES = 32
++private const val RECENT_WINDOW_MS = 100L
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt
+index 2ee80cc..4b4d2a6 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt
+@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.requiredSize
+ import androidx.compose.runtime.MutableIntState
+ import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.geometry.Offset
+ import androidx.compose.ui.graphics.Color
+@@ -17,6 +18,8 @@ import androidx.compose.ui.test.runComposeUiTest
+ import androidx.compose.ui.test.swipe
+ import androidx.compose.ui.unit.Dp
+ import androidx.compose.ui.unit.dp
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.launch
+ import org.junit.After
+ import org.junit.Test
+ import org.junit.jupiter.api.Assertions.assertTrue
+@@ -160,6 +163,92 @@ class PanoramaMasonryFlingTest {
+         assertTrue(restored.frames > 8, "frames ${restored.frames}")
+     }
+ 
++    @Test
++    fun `the scroll trace records the release and how the fling ended`() {
++        PanoramaScrollTrace.clearForTest()
++        coast(fastScroller = false)
++        val lines = PanoramaScrollTrace.snapshot()
++        println("FLING_TRACE normal\n" + lines.joinToString("\n"))
++        val up = lines.indexOfFirst { " up moves=" in it }
++        val start = lines.indexOfFirst { " fling start v=" in it }
++        val done = lines.indexOfFirst { " fling done " in it }
++        assertTrue(up >= 0 && start > up && done > start, lines.joinToString("\n"))
++    }
++
++    @Test
++    fun `the scroll trace names a jump that cancels the fling`() {
++        PanoramaScrollTrace.clearForTest()
++        runComposeUiTest { coastWithJump() }
++        val lines = PanoramaScrollTrace.snapshot()
++        println("FLING_TRACE jump\n" + lines.joinToString("\n"))
++        val jump = lines.indexOfFirst { " scrollToOffset " in it }
++        val cancelled = lines.indexOfFirst { " fling cancelled " in it }
++        assertTrue(jump >= 0 && cancelled > jump, lines.joinToString("\n"))
++    }
++
++    @Test
++    fun `a pause before lifting reads as zero release velocity`() {
++        PanoramaScrollTrace.clearForTest()
++        var inertia = 0f
++        runComposeUiTest {
++            inertia = coastWithPause()
++        }
++        val lines = PanoramaScrollTrace.snapshot()
++        println("FLING_TRACE pause inertia=$inertia\n" + lines.joinToString("\n"))
++        val up = lines.first { " up moves=" in it }
++        assertTrue("gapLastMove=60ms" in up, up)
++        assertTrue(abs(inertia) < 1f, "inertia $inertia")
++    }
++
++    private fun ComposeUiTest.setPlainGrid(state: PanoramaMasonryState): CoroutineScope {
++        lateinit var scope: CoroutineScope
++        setContent {
++            scope = rememberCoroutineScope()
++            Box(Modifier.requiredSize(360.dp, 640.dp)) {
++                PanoramaMasonry(
++                    columns = PanoramaColumns.Fixed(2),
++                    modifier = Modifier.fillMaxSize().testTag("grid"),
++                    state = state,
++                ) {
++                    items(count = ITEM_COUNT, key = { it }, height = { PanoramaCellHeight.Fixed(150.dp) }) {
++                        Box(Modifier.fillMaxSize())
++                    }
++                }
++            }
++        }
++        mainClock.autoAdvance = false
++        repeat(4) { mainClock.advanceTimeByFrame() }
++        return scope
++    }
++
++    private fun ComposeUiTest.coastWithJump() {
++        val state = PanoramaMasonryState()
++        val scope = setPlainGrid(state)
++        onNodeWithTag("grid").performTouchInput {
++            swipe(start = Offset(centerX, height * 0.5f), end = Offset(centerX, height * 0.12f), durationMillis = 40)
++        }
++        repeat(3) { mainClock.advanceTimeByFrame() }
++        scope.launch { state.scrollToOffset(1_000f) }
++        repeat(10) { mainClock.advanceTimeByFrame() }
++    }
++
++    private fun ComposeUiTest.coastWithPause(): Float {
++        val state = PanoramaMasonryState()
++        setPlainGrid(state)
++        onNodeWithTag("grid").performTouchInput {
++            down(Offset(centerX, height * 0.5f))
++            repeat(4) {
++                advanceEventTime(10)
++                moveBy(Offset(0f, -height * 0.09f))
++            }
++            advanceEventTime(60)
++            up()
++        }
++        val atRelease = state.scrollOffset
++        repeat(60) { mainClock.advanceTimeByFrame() }
++        return state.scrollOffset - atRelease
++    }
++
+     private fun coast(
+         xFromEnd: Dp? = null,
+         fastScroller: Boolean = true,
