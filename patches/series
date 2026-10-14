@@ -41,3 +41,4 @@
 0041-presentation-panorama-scroll-trace.patch
 0042-presentation-panorama-exact-scroll-delta.patch
 0043-presentation-fast-scroller-hold-to-grab.patch
+0044-app-scroll-performance-recorder.patch
