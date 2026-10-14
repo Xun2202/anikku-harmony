@@ -1,0 +1,470 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 12:27:59 +0000
+Subject: [PATCH] presentation: fast scroller grabs on the thumb or on a hold
+ beside it
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A 12 dp hit box on the drawn thumb is hard to hit, but the old 32 dp box
+grabbed on down, so every quick swipe that started near the end edge
+dragged the thumb: the list jumped by the scroll ratio and had no coast.
+That was worst for the return flick at the end of the list, which starts
+right on top of the bottom thumb.
+
+The hit area is 32 dp plus the end inset again, in two parts:
+
+- On the drawn thumb (plus the end inset) the thumb is grabbed on down,
+  as before. The content never sees that pointer.
+- Beside it, the other 20 dp toward the content shares pointer input with
+  the content and consumes nothing. The thumb is grabbed only if the
+  finger stays down and within touch slop for 120 ms while the content is
+  not already scrolling. A flick crosses slop sooner and scrolls the
+  content with its coast. A down during a coast stops the content and is
+  never a grab. After a grab every change is consumed in the initial pass,
+  the y movement drags the thumb, and DragInteraction start / stop marks
+  it as dragged.
+
+Overlapping siblings are not all hit-tested: hit testing stops at the
+first sibling that is hit unless that node shares pointer input. The
+part beside the thumb is a PointerInputModifierNode whose
+sharePointerInputWithSiblings() is true. Without that the content gets
+no events there. The KDoc that said otherwise is corrected.
+
+120 ms is well below the 500 ms long press timeout. A moving finger
+after the grab cancels an item long press. A finger held perfectly still
+for 500 ms can still fire it.
+
+The same applies to all four scrollers here, including the fourth one,
+IrregularVerticalGridFastScroller.
+
+与 mihon-harmony 0036 同源。
+---
+ .../core/components/VerticalFastScroller.kt   | 162 ++++++++++++++++--
+ .../components/PanoramaMasonryFlingTest.kt    | 139 +++++++++++++++
+ 2 files changed, 288 insertions(+), 13 deletions(-)
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+index 83f81ab..0236233 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+@@ -11,6 +11,7 @@ import androidx.compose.foundation.gestures.awaitEachGesture
+ import androidx.compose.foundation.gestures.awaitFirstDown
+ import androidx.compose.foundation.gestures.draggable
+ import androidx.compose.foundation.gestures.rememberDraggableState
++import androidx.compose.foundation.interaction.DragInteraction
+ import androidx.compose.foundation.interaction.MutableInteractionSource
+ import androidx.compose.foundation.interaction.collectIsDraggedAsState
+ import androidx.compose.foundation.layout.Arrangement
+@@ -43,14 +44,23 @@ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.alpha
+ import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.input.pointer.PointerEvent
+ import androidx.compose.ui.input.pointer.PointerEventPass
++import androidx.compose.ui.input.pointer.PointerInputScope
++import androidx.compose.ui.input.pointer.SuspendingPointerInputModifierNode
++import androidx.compose.ui.input.pointer.changedToDownIgnoreConsumed
+ import androidx.compose.ui.input.pointer.pointerInput
++import androidx.compose.ui.input.pointer.positionChangeIgnoreConsumed
+ import androidx.compose.ui.layout.SubcomposeLayout
++import androidx.compose.ui.node.DelegatingNode
++import androidx.compose.ui.node.ModifierNodeElement
++import androidx.compose.ui.node.PointerInputModifierNode
+ import androidx.compose.ui.platform.LocalDensity
+ import androidx.compose.ui.unit.Constraints
+ import androidx.compose.ui.unit.Density
+ import androidx.compose.ui.unit.Dp
+ import androidx.compose.ui.unit.IntOffset
++import androidx.compose.ui.unit.IntSize
+ import androidx.compose.ui.unit.LayoutDirection
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.util.fastAny
+@@ -223,6 +233,7 @@ fun VerticalFastScroller(
+                 touchEnabled = isThumbVisible || thumbPressed.pressed || isThumbDragged,
+                 pressState = thumbPressed,
+                 interactionSource = dragInteractionSource,
++                contentScrolling = { listState.isScrollInProgress },
+                 onDragDelta = { delta ->
+                     val newOffsetY = thumbOffsetY + delta
+                     thumbOffsetY = newOffsetY.coerceIn(
+@@ -407,6 +418,7 @@ fun VerticalGridFastScroller(
+                 touchEnabled = isThumbVisible || thumbPressed.pressed || isThumbDragged,
+                 pressState = thumbPressed,
+                 interactionSource = dragInteractionSource,
++                contentScrolling = { state.isScrollInProgress },
+                 onDragDelta = { delta ->
+                     val newOffsetY = thumbOffsetY + delta
+                     thumbOffsetY = newOffsetY.coerceIn(
+@@ -673,6 +685,7 @@ fun IrregularVerticalGridFastScroller(
+                 touchEnabled = isThumbVisible || thumbPressed.pressed || isThumbDragged,
+                 pressState = thumbPressed,
+                 interactionSource = dragInteractionSource,
++                contentScrolling = { state.isScrollInProgress },
+                 onDragDelta = { delta ->
+                     val newOffsetY = thumbOffsetY + delta
+                     thumbOffsetY = newOffsetY.coerceIn(
+@@ -843,6 +856,7 @@ fun VerticalMasonryFastScroller(
+                 touchEnabled = isThumbVisible || thumbPressed.pressed || isThumbDragged,
+                 pressState = thumbPressed,
+                 interactionSource = dragInteractionSource,
++                contentScrolling = { state.isScrollInProgress },
+                 onDragDelta = { delta ->
+                     val newOffsetY = thumbOffsetY + delta
+                     thumbOffsetY = newOffsetY.coerceIn(
+@@ -869,14 +883,23 @@ fun VerticalMasonryFastScroller(
+ }
+ 
+ /**
+- * Drawn thumb stays [ThumbThickness] by [ThumbLength]. The hit rectangle is that same
+- * width, plus [endInset] on the end edge.
++ * Drawn thumb stays [ThumbThickness] by [ThumbLength] on the end edge. The hit area is
++ * [ThumbTouchWidth] plus [endInset] wide and [ThumbLength] tall, in two parts:
+  *
+- * Harmony: the hit rectangle used to be 32 dp, grown toward the content. The thumb stays
+- * visible for the fade delay after a fling, and [startDragImmediately] consumes the down.
+- * A swipe that started in that strip dragged the thumb, jumped the list by the scroll
+- * ratio, and had no coast. A down on the drawn thumb still drags immediately. A down
+- * anywhere else, including during that coast, scrolls the content.
++ * - Thumb block: the drawn thumb plus [endInset]. A down here grabs the thumb at once
++ *   ([harmonyThumbTouch]); the content never sees the pointer.
++ * - Beside it: the remaining [ThumbTouchWidth] - [ThumbThickness] toward the content
++ *   ([harmonyHoldToGrab]). The content gets every event here. The thumb is grabbed only
++ *   when the finger stays down and within touch slop for [HoldToGrabMillis] while the
++ *   content is not already scrolling.
++ *
++ * A thumb-sized target is hard to hit, but a wide target that grabs on down turns every
++ * quick swipe near the edge into a thumb drag: the list jumps by the scroll ratio and has
++ * no coast. That is worst at the end of the list, where the thumb sits under the thumb
++ * of the hand that flicks back. A flick crosses touch slop well inside [HoldToGrabMillis],
++ * so beside the thumb a flick scrolls and a hold grabs. A down during a coast stops the
++ * content and is never a grab. [HoldToGrabMillis] is well below the 500 ms long press
++ * timeout, so a hold reaches the thumb before an item long press would fire.
+  *
+  * Pointer modifiers are omitted unless [touchEnabled]. An invisible thumb must not sit
+  * on top of the content and take its clicks or scrolls. [touchEnabled] stays true for the
+@@ -891,13 +914,28 @@ private fun HarmonyScrollerThumb(
+     touchEnabled: Boolean,
+     pressState: ThumbPressedState,
+     interactionSource: MutableInteractionSource,
++    contentScrolling: () -> Boolean,
+     onDragDelta: (Float) -> Unit,
+     excludeSystemGestures: Boolean,
+ ) {
+     val dragState = rememberDraggableState(onDragDelta)
++    // Emitted first so it sits under the thumb block: a down on the thumb block stops there.
+     Box(
+         modifier = Modifier
+             .offset { IntOffset(0, offsetY.roundToInt()) }
++            .harmonyHoldToGrab(
++                enabled = touchEnabled,
++                contentScrolling = contentScrolling,
++                pressState = pressState,
++                interactionSource = interactionSource,
++                onDragDelta = onDragDelta,
++            )
++            .height(ThumbLength)
++            .width(ThumbTouchWidth + endInset),
++    )
++    Box(
++        modifier = Modifier
++            .offset { IntOffset((ThumbTouchWidth - ThumbThickness).roundToPx(), offsetY.roundToInt()) }
+             .harmonyThumbTouch(
+                 enabled = touchEnabled,
+                 pressState = pressState,
+@@ -930,12 +968,11 @@ private class ThumbPressedState {
+ /**
+  * Records a finger that is down on the thumb without waiting for touch slop.
+  *
+- * Overlapping siblings are all hit-tested. The scroller is placed after the content, so
+- * this node is dispatched first, but the content is still in the hit path. [draggable]
+- * with `startDragImmediately` consumes the down in the initial pass and then consumes
+- * moves, which is what stops the content scroller from taking the same pointer. This
+- * tracker also consumes the down (not the moves) so a tap under the thumb cannot fire
+- * if the drag modifier is ever ordered after the content in that pass.
++ * Hit testing stops at the first overlapping sibling that is hit unless that node shares
++ * pointer input with its siblings, and these modifiers do not. The scroller is placed
++ * after the content, so a down on the thumb block never reaches the content. [draggable]
++ * with `startDragImmediately` and this tracker still consume the down, so nothing behind
++ * the thumb acts on it if the content ever joins the hit path.
+  *
+  * [waitForUpOrCancellation] is not used. It treats a consumed move as a cancel, and the
+  * draggable consumes every move while `startDragImmediately` is set, which would clear
+@@ -982,6 +1019,103 @@ private fun Modifier.harmonyThumbTouch(
+         )
+ }
+ 
++/**
++ * Grabs the thumb from beside it, but only on a hold. See [HarmonyScrollerThumb].
++ *
++ * The node shares pointer input with its siblings, so the content under it is still hit
++ * and gets the same down. Nothing is consumed until the hold succeeds. After that every
++ * change is consumed in the initial pass: the content's drag detector sees consumed moves
++ * and gives up, and the y movement goes to [onDragDelta]. [DragInteraction] start / stop
++ * on [interactionSource] marks the thumb as dragged for the scroll effect and the fade.
++ */
++private fun Modifier.harmonyHoldToGrab(
++    enabled: Boolean,
++    contentScrolling: () -> Boolean,
++    pressState: ThumbPressedState,
++    interactionSource: MutableInteractionSource,
++    onDragDelta: (Float) -> Unit,
++): Modifier {
++    if (!enabled) return this
++    return this then HoldToGrabElement(contentScrolling, pressState, interactionSource, onDragDelta)
++}
++
++private data class HoldToGrabElement(
++    val contentScrolling: () -> Boolean,
++    val pressState: ThumbPressedState,
++    val interactionSource: MutableInteractionSource,
++    val onDragDelta: (Float) -> Unit,
++) : ModifierNodeElement<HoldToGrabNode>() {
++    override fun create() = HoldToGrabNode(contentScrolling, pressState, interactionSource, onDragDelta)
++
++    override fun update(node: HoldToGrabNode) {
++        node.contentScrolling = contentScrolling
++        node.pressState = pressState
++        node.interactionSource = interactionSource
++        node.onDragDelta = onDragDelta
++    }
++}
++
++private class HoldToGrabNode(
++    var contentScrolling: () -> Boolean,
++    var pressState: ThumbPressedState,
++    var interactionSource: MutableInteractionSource,
++    var onDragDelta: (Float) -> Unit,
++) : DelegatingNode(), PointerInputModifierNode {
++    private val input = delegate(SuspendingPointerInputModifierNode { awaitHolds() })
++
++    override fun onPointerEvent(pointerEvent: PointerEvent, pass: PointerEventPass, bounds: IntSize) {
++        input.onPointerEvent(pointerEvent, pass, bounds)
++    }
++
++    override fun onCancelPointerInput() {
++        input.onCancelPointerInput()
++    }
++
++    override fun sharePointerInputWithSiblings() = true
++
++    private suspend fun PointerInputScope.awaitHolds() = awaitEachGesture {
++        val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
++        if (contentScrolling()) return@awaitEachGesture
++        val touchSlop = viewConfiguration.touchSlop
++        val letGo = withTimeoutOrNull(HoldToGrabMillis) {
++            while (true) {
++                val change = awaitPointerEvent(PointerEventPass.Final).changes
++                    .fastFirstOrNull { it.id == down.id }
++                    ?: break
++                // The down itself comes back in this pass; an item's tap detector may have consumed it.
++                if (change.changedToDownIgnoreConsumed()) continue
++                if (!change.pressed || change.isConsumed) break
++                if ((change.position - down.position).getDistance() > touchSlop) break
++            }
++        } != null
++        if (letGo) return@awaitEachGesture
++
++        pressState.pressed = true
++        val start = DragInteraction.Start()
++        interactionSource.tryEmit(start)
++        var released = false
++        try {
++            while (true) {
++                val change = awaitPointerEvent(PointerEventPass.Initial).changes
++                    .fastFirstOrNull { it.id == down.id }
++                    ?: break
++                val deltaY = change.positionChangeIgnoreConsumed().y
++                change.consume()
++                if (!change.pressed) {
++                    released = true
++                    break
++                }
++                if (deltaY != 0f) onDragDelta(deltaY)
++            }
++        } finally {
++            pressState.pressed = false
++            interactionSource.tryEmit(
++                if (released) DragInteraction.Stop(start) else DragInteraction.Cancel(start),
++            )
++        }
++    }
++}
++
+ /**
+  * Runs the upstream fade, but never while the thumb is pressed or dragging.
+  *
+@@ -1057,6 +1191,8 @@ object Scroller {
+ 
+ private val ThumbLength = 48.dp
+ private val ThumbThickness = 12.dp
++private val ThumbTouchWidth = 32.dp
++private val HoldToGrabMillis = 120L
+ private val ThumbShape = RoundedCornerShape(ThumbThickness / 2)
+ 
+ // AM -->
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt
+index 9408cdc..4c8fdeb 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt
+@@ -14,6 +14,7 @@ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.platform.testTag
+ import androidx.compose.ui.test.ComposeUiTest
+ import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.TouchInjectionScope
+ import androidx.compose.ui.test.onNodeWithTag
+ import androidx.compose.ui.test.performTouchInput
+ import androidx.compose.ui.test.runComposeUiTest
+@@ -78,6 +79,53 @@ class PanoramaMasonryFlingTest {
+         assertTrue(besideBack >= centerBack * 0.9f, "20dp $besideBack vs $centerBack")
+     }
+ 
++    @Test
++    fun `a press and hold beside the thumb grabs it`() {
++        lateinit var hold: Hold
++        runComposeUiTest { hold = holdBesideThumb(coastFirst = false) }
++        println(
++            "FLING_UI holdBeside finger=${hold.finger} expectedThumbJump=${hold.expectedThumbJump} " +
++                "duringHold=${hold.duringHold} drag=${hold.drag} inertia=${hold.inertia}",
++        )
++        assertTrue(abs(hold.duringHold) < 1f, "hold ${hold.duringHold}")
++        assertTrue(hold.drag > hold.expectedThumbJump * 0.5f, "drag ${hold.drag} vs ${hold.expectedThumbJump}")
++        assertTrue(hold.drag > hold.finger * 20f, "drag ${hold.drag} vs finger ${hold.finger}")
++        assertTrue(abs(hold.inertia) < 1f, "inertia ${hold.inertia}")
++    }
++
++    @Test
++    fun `a hold beside the thumb during a coast does not grab it`() {
++        lateinit var hold: Hold
++        runComposeUiTest { hold = holdBesideThumb(coastFirst = true) }
++        println(
++            "FLING_UI holdDuringCoast finger=${hold.finger} coastBeforeDown=${hold.coastBeforeDown} " +
++                "duringHold=${hold.duringHold} drag=${hold.drag} inertia=${hold.inertia}",
++        )
++        assertTrue(hold.coastBeforeDown > 100f, "coast ${hold.coastBeforeDown}")
++        assertTrue(abs(hold.duringHold) < 1f, "hold ${hold.duringHold}")
++        // The content follows the finger: a downward move scrolls back by about the finger travel.
++        assertTrue(hold.drag < 0f && abs(hold.drag) < hold.finger * 2f, "drag ${hold.drag} vs finger ${hold.finger}")
++    }
++
++    @Test
++    fun `a tap beside the thumb does not move the list`() {
++        var moved = Float.NaN
++        runComposeUiTest {
++            val state = PanoramaMasonryState()
++            setScrollerGrid(state)
++            val before = state.scrollOffset
++            onNodeWithTag("grid").performTouchInput {
++                down(Offset(width - 20.dp.toPx(), thumbCenterY(state)))
++                advanceEventTime(30)
++                up()
++            }
++            repeat(30) { mainClock.advanceTimeByFrame() }
++            moved = state.scrollOffset - before
++        }
++        println("FLING_UI tapBeside moved=$moved")
++        assertTrue(abs(moved) < 1f, "moved $moved")
++    }
++
+     @Test
+     fun `one epoch bump during the coast keeps most of it`() {
+         val baseline = coast(fastScroller = false)
+@@ -298,6 +346,97 @@ class PanoramaMasonryFlingTest {
+         return state.scrollOffset - atRelease
+     }
+ 
++    /** Half-scrolled grid with the fast scroller, stopped before the thumb fades out. */
++    private fun ComposeUiTest.setScrollerGrid(state: PanoramaMasonryState) {
++        setContent {
++            Box(Modifier.requiredSize(360.dp, 640.dp)) {
++                FastScrollPanoramaMasonry(
++                    columns = PanoramaColumns.Fixed(2),
++                    modifier = Modifier.fillMaxSize().testTag("grid"),
++                    state = state,
++                    thumbColor = Color.Black,
++                ) {
++                    items(count = ITEM_COUNT, key = { it }, height = { PanoramaCellHeight.Fixed(150.dp) }) {
++                        Box(Modifier.fillMaxSize())
++                    }
++                }
++            }
++        }
++        mainClock.autoAdvance = false
++        repeat(4) { mainClock.advanceTimeByFrame() }
++        state.scrollOffset = state.maxScroll / 2f
++        repeat(20) { mainClock.advanceTimeByFrame() }
++    }
++
++    private fun TouchInjectionScope.thumbTrack(state: PanoramaMasonryState): Float =
++        height - state.afterContentPadding - 48.dp.toPx()
++
++    private fun TouchInjectionScope.thumbCenterY(state: PanoramaMasonryState): Float {
++        val proportion = (state.scrollOffset / state.maxScroll).coerceIn(0f, 1f)
++        return thumbTrack(state) * proportion + 24.dp.toPx()
++    }
++
++    /**
++     * Holds a finger 20 dp from the end on the thumb for 200 ms, then drags it down and lifts.
++     * With [coastFirst] the hold lands a few frames into a center fling.
++     */
++    private fun ComposeUiTest.holdBesideThumb(coastFirst: Boolean): Hold {
++        val state = PanoramaMasonryState()
++        setScrollerGrid(state)
++        var coastBeforeDown = 0f
++        if (coastFirst) {
++            val beforeFling = state.scrollOffset
++            onNodeWithTag("grid").performTouchInput {
++                swipe(Offset(centerX, height * 0.5f), Offset(centerX, height * 0.12f), 40)
++            }
++            repeat(3) { mainClock.advanceTimeByFrame() }
++            check(state.isScrollInProgress) { "no coast" }
++            coastBeforeDown = state.scrollOffset - beforeFling
++        }
++        var finger = 0f
++        var expectedThumbJump = 0f
++        onNodeWithTag("grid").performTouchInput {
++            finger = height * 0.2f
++            expectedThumbJump = finger / thumbTrack(state) * state.maxScroll
++            down(Offset(width - 20.dp.toPx(), thumbCenterY(state)))
++        }
++        mainClock.advanceTimeByFrame()
++        val atDown = state.scrollOffset
++        mainClock.advanceTimeBy(200)
++        val afterHold = state.scrollOffset
++        repeat(5) {
++            onNodeWithTag("grid").performTouchInput {
++                advanceEventTime(if (it == 0) 200 else 16)
++                moveBy(Offset(0f, finger / 5f))
++            }
++            mainClock.advanceTimeByFrame()
++        }
++        // Still before lifting, so a release velocity has nothing to carry.
++        onNodeWithTag("grid").performTouchInput {
++            advanceEventTime(100)
++            up()
++        }
++        val atRelease = state.scrollOffset
++        repeat(60) { mainClock.advanceTimeByFrame() }
++        return Hold(
++            finger = finger,
++            expectedThumbJump = expectedThumbJump,
++            coastBeforeDown = coastBeforeDown,
++            duringHold = afterHold - atDown,
++            drag = atRelease - afterHold,
++            inertia = state.scrollOffset - atRelease,
++        )
++    }
++
++    private class Hold(
++        val finger: Float,
++        val expectedThumbJump: Float,
++        val coastBeforeDown: Float,
++        val duringHold: Float,
++        val drag: Float,
++        val inertia: Float,
++    )
++
+     private fun coast(
+         xFromEnd: Dp? = null,
+         fastScroller: Boolean = true,
