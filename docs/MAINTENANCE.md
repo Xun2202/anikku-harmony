@@ -61,6 +61,13 @@ patches/
   0028-presentation-staggered-scroller-stable-thumb.patch           瀑布流快速滚动条拇指不再每行回跳 (StaggeredGridEstimate 段与 Mihon 0020 逐字节相同)
   0029-download-quality-separate-from-playback.patch                设置 → 下载 →「下载画质」与播放分开 (harmony_download_quality, 默认最高可用)
   0030-presentation-panorama-masonry-reading-order.patch            自建全景瀑布流: 阅读顺序容差 + 列数变化当帧重排 (PanoramaMasonry*.kt 与 Mihon 0021 逐字节相同)
+  0031-presentation-panorama-auto-columns-span.patch                 全景自动列适合竖封面; 横封面 ≥3 列时跨两列 (与 Mihon 0023 同源)
+  0032-presentation-panorama-scroll-anchor-by-key.patch              全景滚动锚点按 key 存, 列表加载完整后再恢复 (书架/浏览/相关作品; 与 Mihon 0024 同源)
+  0033-presentation-panorama-layout-epoch.patch                      全景布局世代: 内容不变时跳过逐项计算 (与 Mihon 0025 逐字节相同)
+  0034-library-panorama-cover-shapes-versioned.patch                 封面形状表按版本通知, 不再整表订阅 (阈值名 RatioSwitchToPanorama; 与 Mihon 0026 同源)
+  0035-presentation-fast-scroller-hold-grab.patch                    滚动条按下即抓, 按住不淡出 (另含剧集网格 IrregularVerticalGridFastScroller; 与 Mihon 0027 同源)
+  0036-presentation-panorama-tiered-auto-columns.patch                自动列宽按网格宽分档 Tiered (常量在 PanoramaGrid.kt; 与 Mihon 0028 同源)
+  0037-presentation-fast-scroller-snapshotflow.patch                  瀑布流与剧集网格滚动条改为单个 LaunchedEffect + snapshotFlow (与 Mihon 0029 同源)
 scripts/prepare-source.sh                  套补丁 + 改版本号 (CI 与本地通用)
 scripts/write-release-index.sh             把 Releases 接口返回写到 repo 分支 (releases.json / latest.json)
 .github/workflows/harmony_preview.yml      编译、重签、发布, 然后写 Release 索引
@@ -218,7 +225,7 @@ git format-patch -o /tmp/new-patches --no-signature --zero-commit v0.3.0..HEAD
 - 0025 与 mihon-harmony 0018 同源，修全景网格滑动时资源块排版抽搐、掉帧，以及滚动条残余抽搐。根因三条：① 格子第一次按默认横版 3:2 排，图片解码完才改 2:3，瀑布流一个格子变高会把该列下面全部推下去，快速滑动时每秒几十张图各触发一次整个瀑布流重测；比例只在进程内，重启重来。② 横/竖切换时 `MangaCover.Panorama(...)` / `MangaCover.Book(...)` 是两个 Compose 调用点，`AsyncImage` 被销毁重建。③ 滚动条残余抽搐是可见格子高度在滑动中变导致估算跳，**0023 的滚动条代码没动**。
   新文件 `app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt` 与 Mihon 0018 **逐字节相同**（`cmp` 校验过），改一处要同步另一处。`SnapshotStateMap` 存已学到的高/宽，持久化到 `filesDir/harmony_panorama_cover_shapes.txt`（每行 `id ratio`，3 位小数，写临时文件再 rename，2 秒防抖，上限 20000 条丢最旧）。`App.onCreate` 里 `init` 异步加载。书架两种全景模式后台 `prefetch`（未知 id 用 `BitmapFactory` `inJustDecodeBounds` 读封面缓存尺寸，并行 4，不阻塞列表），挂在 `LibraryScreenModel`（Mihon 挂在 `LibraryViewModel`）。`LocalPanoramaGridSettled` 由瀑布流包装层提供 `{ !state.isScrollInProgress }`，`rememberCoverRatio` 只在网格静止时才把新形状写进布局（横竖同侧则立即）。`onCoverLoaded` 改为 `PanoramaCoverShapes.put`。封面单一调用点：`val cover = if (wide) MangaCover.Panorama else MangaCover.Book; cover(...)`。浏览页 `BrowseSource*Grid`、相关作品 `RelatedMangas*Grid`、`GlobalSearchCardRow` 同样注入静止判断，但没有文件预取。不改数据库、不加设置项。
   行为差异（相对 Mihon）：预取挂在 `LibraryScreenModel`；相关作品页和全局搜索横条也注入静止判断。已知局限与 Mihon 相同：从没见过的封面仍会在停下时跳一次；浏览页第一次进全景没有预取。拖滚动条中途改形状、浏览页没有预取，由 0027 补上（见下）。Animeko 不适用。
-  **待办（与 0025 无关）**：`:app:spotlessCheck` 对 `DownloadNotifier.kt` / `MangaScreenModel.kt` 有早就存在的 import 顺序告警（`AYMR` 应排在 `AMR` 前，来自更早的 Harmony 补丁）。子代理移植时顺手改过这两处，主代理已撤回。CI 不跑 spotless。下次 rebase 时顺手修。0026 / 0027 / 0028 / 0029 / 0030 都没动这两个文件，告警还在。
+  **待办（与 0025 无关）**：`:app:spotlessCheck` 对 `DownloadNotifier.kt` / `MangaScreenModel.kt` 有早就存在的 import 顺序告警（`AYMR` 应排在 `AMR` 前，来自更早的 Harmony 补丁）。子代理移植时顺手改过这两处，主代理已撤回。CI 不跑 spotless。下次 rebase 时顺手修。0026 / 0027 / 0028 / 0029 / 0030 / 0031–0037 都没动这两个文件，告警还在。
 - 0026 修「Anikku 全景紧凑比 Mihon 卡」（用户：「mihon 的全景紧凑很丝滑，滑块不卡顿，anikku 的还是会卡顿」）。C 层，Komikku 的封面组件，Mihon / Animeko 不适用。`MangaCover` 用 Coil `SubcomposeAsyncImage`：懒加载网格每个格子都再套一层（Coil 文档说它不适合 `LazyList`），每个加载中的格子都有不定型 `CircularProgressIndicator`，每帧都在画。改成同一块着色 `Box` 里的 `AsyncImage`；`onError` 时错误图标画在色块上；`DelayedLoadingIndicator` 等 400 ms（`LoadingIndicatorDelay`）才显示转圈，内存 / 磁盘缓存命中在这之前就成功，不会闪一下。`onCoverLoaded` 仍在 `onSuccess` 里调。`LibraryBadges.kt` 的 `SourceIconBadge`：`Source.icon` 改为 `remember(source.id) { source.icon }`（getter 每次组合都扫已装扩展，还可能把 drawable 重画成新 bitmap）。文件：`app/src/main/java/eu/kanade/presentation/manga/components/MangaCover.kt`、`app/src/main/java/eu/kanade/presentation/library/components/LibraryBadges.kt`。
 - 0027 与 mihon-harmony 0019 同源，补 0025 留下的两处（用户接着说 Mihon 也会抖）。① `rememberPanoramaGridSettled { state.isScrollInProgress }`：一旦在滚就立刻不算静止，连续 300 ms 没有滚动才算静止。拖快速滚动条是一串短 `scrollToItem`，两次之间 `isScrollInProgress` 为假，0025 会在拖的过程中把新形状写进布局；两下甩动之间的停顿同样。书架瀑布流、浏览页两种全景网格、`RelatedMangasComfortableGrid` / `RelatedMangasCompactGrid` 都改用它。② 浏览页 `BrowseSourceComfortableGrid` / `BrowseSourceCompactGrid` 加 `PrefetchPanoramaCoverShapes`：对分页已加载、还没上屏的条目按 128 px、`Precision.INEXACT`、内存缓存关掉去要封面，记下高/宽；下载进磁盘缓存，格子后来读同一份；离开网格就取消。相关作品页列表短，只有静止判断，没有这份预取。
   `PanoramaCoverShapes.kt` 与 Mihon 0019 **逐字节相同**（`cmp` 校验过），改一处要同步另一处。不改数据库、不加设置项。已知局限与 Mihon 相同：刚打开的浏览页第一屏在静止时仍可能翻一次；下载失败的封面保持默认横版。额外网络是把已加载未看见的那一页封面提前一点下。Animeko 不适用。
@@ -251,6 +258,23 @@ git format-patch -o /tmp/new-patches --no-signature --zero-commit v0.3.0..HEAD
   模拟器（AVD harmony34，TCG，本地 x86_64 preview）：XvXun 最新两列长列表无左侧空洞（短列只凹约 20px 时留左列）；`wm size 2200x2480` 后当帧四列，`wm size reset` 回两列不跳回顶部（左上格可能挪约一行）；快速滚动条拖动正常；书架下拉刷新触发 `LibraryUpdateJob`（manual，SUCCESS）；浏览翻页正常。真折叠屏只用 `wm size` 模拟。
 
   已知局限：没有 key 的书架过滤结果按 index 钉；标题行高写死 18sp，字体更大时被裁；`scrollToItem(0, 0)` 不计开头 content padding。Animeko 没有这套网格，不适用。
+
+- 0031–0037 与 mihon-harmony 0023–0029 一一对应、同源（用户 2026-10-14 四件，Anikku 同样：返回丢位置、2000 项惯性卡顿、按住滚动条变透明后变成上翻、自动列过宽 / 横封面过小）。根因与 Mihon §5.1 相同，这里只写本仓差异。不是卓易通平台限制。
+
+  做法与 Mihon 相同，补丁号加 8：0031 横封面 ≥3 列跨两列（`PanoramaSpan.TwoLanesWhenRoomy`）；0032 `PanoramaMasonryState.Saver` 按 key 存锚点，列表加载完整后再恢复（书架全景、浏览全景、相关作品全景）；0033 `PanoramaMasonryContentEpoch`，内容不变时跳过逐项计算（基准与 Mihon 同一份：2000 项、120 帧，每帧 0.323 ms → 0.0082 ms，每帧分配 266,776 B → 56 B）；0034 形状表按版本通知，跨 0.75 比例档等所有网格静止 300 ms 后一次提交，写快照放回主线程；0035 `startDragImmediately`，按住期间不淡出、不摘手势，触摸区 32 dp；0036 `PanoramaColumns.Tiered`（< 600 dp 最小 112 dp，≥ 600 dp 用 140 dp；360 / 420 / 459 dp → 3 列，664 / 672 dp → 4 列，800 dp → 5 列，933 / 939 dp → 6 列；比较网格自身宽度）；0037 瀑布流滚动条改为单个 `LaunchedEffect` + `snapshotFlow`。
+
+  **重做要点**（相对 Mihon，rebase 时不要抹平）：
+  - `PanoramaMasonry.kt`、`PanoramaMasonryLayout.kt`、`PanoramaMasonryLayoutTest.kt` 与 Mihon 0023–0029 里对应的三份 **逐字节相同**，改一处要同步另一处。
+  - 列宽常量在 `PanoramaGrid.kt`（Mihon 在 `LibraryComfortableGrid.kt`）。
+  - 形状阈值名是 `RatioSwitchToPanorama`（Mihon `RATIO_SWITCH_TO_PANORAMA`）。0034 改的是通知方式，不要为了 `cmp` 改这个名字。
+  - 相关作品全景和书架、浏览一起走这套锚点 / 布局 / 列宽。Mihon 没有相关作品页。
+  - 第四个滚动条 `IrregularVerticalGridFastScroller`（番剧详情页的剧集网格）在 0035 / 0037 里一起改了。Mihon 只有列表、网格、瀑布流三根。滚动条 Harmony 段仍用 `// Harmony -->` 包住。
+  - 上游列表 / 网格滚动条的 `LaunchedEffect(firstVisibleItemScrollOffset)` **不要**改成 `snapshotFlow`：它们在书架以外，改了会落后一帧。
+  - 共享测试不再依赖 `java.awt` / `com.sun.management`（预览用手写 PNG 编码，分配计数用反射），所以 AGP 8 不用改 Gradle 也能编译。
+
+  子代理（grok-4.7-high-fast）实现。主代理复跑 `:presentation-core:spotlessCheck :presentation-core:testDebugUnitTest :app:testDebugUnitTest :app:compilePreviewKotlin` 通过（presentation-core 33 通过 / 2 跳过；app 14 个）。`:app:spotlessCheck` 的 `DownloadNotifier.kt` / `MangaScreenModel.kt` import 顺序问题仍是旧待办，本轮没跑这条、也没改那两个文件。干净树 `/tmp/anikku-verify37`（`prepare-source.sh`，v0.2.0，N=18）套用成功，14 个改动文件与开发树 `cmp` 一致。没有真机 / 模拟器手势测试。流水线提交 `610c580`。series 37 张（0001–0037）。
+
+  同病：Mihon 0023–0029 同轮已修。Animeko：滚动条按住不适用（Android 端是不可拖动的 `LazyListVerticalScrollIndicator`）；惯性卡顿 / 自动列宽不适用（没有全景瀑布流，也不学习封面比例）；返回丢位置待确认（另一套导航）。
 
 ### 5.2 加新补丁
 
@@ -338,7 +362,11 @@ gh release list --repo Xun2202/anikku-harmony
 | 下载画质一直等于播放画质，找不到单独的设置 | preview.15 及之前：没指定视频的剧集走 `getBestVideo`，取扩展标成 preferred 的视频，和播放相同。只能作品页长按剧集「选择视频画质」逐集选。0029（preview.16）起 设置 → 下载 →「下载画质」（`harmony_download_quality`，默认最高可用，在「并发下载」滑块下方）。选项共 8 个。长按逐集选的仍优先。扩展只给一种画质时没有区别（RouXun 一条 HLS）。真实下载未在模拟器上跑 |
 | 手机提示版本过老 / 降级不给装 | 更新器按版本号取最大。官方出了更高的上游之后，定时 run 会自动发新底座的 preview.1；若再在更旧的上游上发一版，versionCode 更小，手机拒装。2026-10-13 Mihon 先撞上（`v0.21.1-harmony-preview.5` 低于已装的 `v0.21.2-harmony-preview.1`）。本仓同一段「Resolve release version」（提交 `af6652f`，与 mihon-harmony `fd1835633` 同源）：非 dry_run 且目标 tag 还不存在时，按「上游版本.N」`sort -V`，比已发布最高的旧就 `exit 1` 报「installs would be a downgrade」。已存在的 tag 仍 skip，定时 run 不会因此变红。发版前先看 Releases 上最新的上游底座。本地用真实 tag 列表测过：0.2.0 的 preview.15 拒绝，preview.17 放行。CI 上没实际触发过拒绝路径 |
 | `:app:spotlessCheck` 报 `DownloadNotifier.kt` / `MangaScreenModel.kt` 的 import 顺序（`AYMR` 应在 `AMR` 前） | 更早 Harmony 补丁带进来的，与 0025 无关。CI 不跑 spotless。**待办：下次 rebase 顺手修**（见 §5.1 0025） |
-| 书架「全景松散网格」每行「自动」时横版封面偏窄、挤；竖版和横版同一行时横版下面一大块空白 | preview.10 及之前：自动列宽沿用 128 dp、`LazyVerticalGrid` 整行按最高格子算。preview.11 起全景模式改瀑布流 `LazyVerticalStaggeredGrid` + 自动列宽 168 dp（补丁 0020）。手动设了每行数量的只有排布变化、宽度不变；浏览页 / 相关作品页的全景网格 preview.12 起由 0021 同样处理 |
+| 书架「全景松散网格」每行「自动」时横版封面偏窄、挤；竖版和横版同一行时横版下面一大块空白 | preview.10 及之前：自动列宽沿用 128 dp、`LazyVerticalGrid` 整行按最高格子算。preview.11 起全景模式改瀑布流 `LazyVerticalStaggeredGrid` + 自动列宽 168 dp（补丁 0020）。手动设了每行数量的只有排布变化、宽度不变；浏览页 / 相关作品页的全景网格 preview.12 起由 0021 同样处理。168 dp 在 360 dp 宽上只有 2 列，由 0036 分档取代（下一行） |
+| 全景点进条目再返回，回到最顶 | preview.17 及之前：`rememberPanoramaMasonryState` 用父组合 `SideEffect` 把锚点拷进 `rememberSaveable`，滑动不重组父组合，存下的永远是 0。0032（`v0.2.0-harmony-preview.18`）起按 key 存，列表加载完整后再恢复。书架、浏览、相关作品全景都改了。没有真机手势测试 |
+| 2000 项书架高速松开后惯性滑动一卡一卡 | 与 Mihon 0025 / 0026 / 0029 同一处。0033 加 `PanoramaMasonryContentEpoch`（2000 项、120 帧：每帧 0.323 ms → 0.0082 ms，分配 266,776 B → 56 B）。0034 形状表按版本通知，阈值名仍是 `RatioSwitchToPanorama`。0037 瀑布流滚动条改为单个 `LaunchedEffect` + `snapshotFlow`；剧集网格滚动条同样改了。可装的是 preview.18。上游列表 / 网格的 `LaunchedEffect(firstVisibleItemScrollOffset)` 故意没改 |
+| 按住滚动条快速下翻时拇指变透明，松手方向变成上翻 | 0035（preview.18）与 Mihon 0027 同源：`startDragImmediately`，按住期间不淡出、不摘手势，触摸区 32 dp。本仓多一根番剧详情页剧集网格的 `IrregularVerticalGridFastScroller`，一起修了 |
+| 全景「自动」在折叠屏只有两列，竖封面过大、横封面过小 | preview.17 及之前自动最小列宽 168 dp。0031 起横封面在 ≥3 列时跨两列。0036 起 `PanoramaColumns.Tiered`，常量在 `PanoramaGrid.kt`：网格宽 < 600 dp 最小 112 dp，≥ 600 dp 用 140 dp。360 / 420 / 459 dp → 3 列，939 dp → 6 列。比较的是网格自身宽度 |
 
 ## 8. 不要做的事
 
@@ -426,3 +454,6 @@ gh release list --repo Xun2202/anikku-harmony
   开发树 `~/work/anikku-v0.2.0` `dev-0025` 提交 `a455329`。`:presentation-core:spotlessCheck` 通过、`:presentation-core:testDebugUnitTest` 16/16、`:app:compilePreviewKotlin` 通过。`:app:spotlessCheck` 只剩已知的 `DownloadNotifier.kt` / `MangaScreenModel.kt` import 顺序告警，待办未动（§5.1）。导出 `patches/0030-presentation-panorama-masonry-reading-order.patch`（`PanoramaMasonry.kt` / `PanoramaMasonryLayout.kt` / `PanoramaMasonryLayoutTest.kt` 与 Mihon 0021 逐字节相同；`PanoramaCoverShapes.kt` 起只差阈值常量名 `RatioSwitchToPanorama` / `RATIO_SWITCH_TO_PANORAMA`）。干净 v0.2.0 树套 30 张成功（versionCode 817），15 个改动文件 `cmp` 一致。
   模拟器（AVD harmony34，TCG，本地 x86_64 preview）：XvXun 最新两列长列表无左侧空洞（短列只凹约 20px 时留左列）；`wm size 2200x2480` 后当帧四列，`wm size reset` 回两列不跳回顶部（左上格可能挪约一行）；快速滚动条拖动正常；书架下拉刷新触发 `LibraryUpdateJob`（manual，SUCCESS）；浏览翻页正常。真折叠屏只用 `wm size` 模拟。
   推 `main` `a9ecebd` → `check_patches` run 38453486938 绿 → `dry_run` run 38453489044 绿 → 正式 run 38454544696 → **`v0.2.0-harmony-preview.17`**（target `a9ecebd`），`app.anikku.beta` versionCode 817、versionName `0.2.0-harmony.17-8921`，签名 `cf7a2adc…d829` 不变，arm64 90,169,461 B（SHA-256 前缀 `e87c66110faf`；体积与 preview.16 相同，是对齐填充，分辨看 SHA-256 / versionCode），universal 282,166,071 B，DEX 含 `PanoramaMasonryLayout`；`repo` 分支 `releases.json` 第一条即此版（共 17 条）。同轮 Mihon 0021 → `v0.21.2-harmony-preview.3`。Animeko 没有这套网格，不适用。行为差异：本仓保留不规则滚动条淡出；Mihon 书架拇指停留改为约 300 ms，浏览页仍无快速滚动条。
+- 2026-10-14（07:42 UTC）与 mihon-harmony 0023–0029 同一轮四件事：返回丢位置、2000 项惯性卡顿、按住滚动条变透明后上翻、自动列过宽 / 横封面过小。根因见 §5.1 补丁 0031–0037。本仓差异：列宽常量在 `PanoramaGrid.kt`，形状阈值名 `RatioSwitchToPanorama`，相关作品全景一并改，第四个滚动条 `IrregularVerticalGridFastScroller`（番剧详情页剧集网格）在 0035 / 0037 里一起修。三个共享文件与 Mihon 逐字节相同。共享测试不再依赖 `java.awt` / `com.sun.management`，AGP 8 不用改 Gradle。`:app:spotlessCheck` 的 import 顺序告警仍是旧待办。
+  子代理（grok-4.7-high-fast）实现。主代理复跑 `:presentation-core:spotlessCheck :presentation-core:testDebugUnitTest :app:testDebugUnitTest :app:compilePreviewKotlin` 通过（presentation-core 33 通过 / 2 跳过；app 14 个）。干净树 `/tmp/anikku-verify37`（v0.2.0，N=18）套用成功，14 个改动文件与开发树 `cmp` 一致。没有真机 / 模拟器手势测试。
+  推 `main` `610c580` → `check_patches` run 38527764370 绿 → `dry_run` run 38527790664 绿 → 正式 run 38529023403 → **`v0.2.0-harmony-preview.18`**（07:42 UTC），`app.anikku.beta` versionCode 818、versionName `0.2.0-harmony.18-8928`，签名 `cf7a2adc…d829` 不变，arm64 90,185,845 B（SHA-256 前缀 `8a97b8189469`），universal 282,182,455 B，DEX 含 `PanoramaColumns$Tiered`、`holdOpaqueWhileThumbGrabbed`、`PanoramaMasonryContentEpoch`，另含 `harmonyThumbTouch`；`repo` 分支 `releases.json` 18 条，第一条即此版。series 37 张（0001–0037）。同轮 Mihon 0023–0029 → `v0.21.2-harmony-preview.5`。Animeko：滚动条按住、惯性卡顿、自动列宽不适用；返回丢位置待确认。
