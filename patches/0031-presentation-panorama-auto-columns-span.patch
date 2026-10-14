@@ -1,0 +1,1165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 06:15:55 +0000
+Subject: [PATCH] presentation: panorama auto columns fit book covers and wide
+ covers span two lanes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A folded phone showed only two panorama columns, so tall covers looked
+oversized. 168 dp was chosen so a single-column 3:2 cover would not be
+cramped. One minimum cannot suit both shapes.
+
+Auto columns are book-sized again: 104 dp, from
+lanes = (available + 4) / (min + 4) with available = window width minus
+the 16 dp horizontal padding. That is 3 columns at 360, 420, and 459 dp.
+A wide cover uses PanoramaSpan.TwoLanesWhenRoomy: two adjacent lanes when
+there are at least three, otherwise one. Related-work panorama grids,
+which Anikku has and Mihon does not, use the same span.
+
+与 mihon-harmony 0023 同源. The column constant stays in PanoramaGrid.kt,
+which is where Anikku already resolves auto columns for the shelf, browse,
+and related grids.
+---
+ .../components/BrowseSourceComfortableGrid.kt |  11 +-
+ .../components/BrowseSourceCompactGrid.kt     |  10 +-
+ .../RelatedMangasComfortableGrid.kt           |   6 +-
+ .../components/RelatedMangasCompactGrid.kt    |   6 +-
+ .../components/LibraryComfortableGrid.kt      |   8 +-
+ .../library/components/LibraryCompactGrid.kt  |   6 +-
+ .../library/components/PanoramaGrid.kt        |  23 +-
+ .../core/components/PanoramaMasonry.kt        |   3 +-
+ .../core/components/PanoramaMasonryLayout.kt  | 192 ++++++-
+ .../components/PanoramaMasonryLayoutTest.kt   | 483 +++++++++++++++++-
+ 10 files changed, 707 insertions(+), 41 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
+index b8d84a7..f1d31f2 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
+@@ -21,6 +21,7 @@ import eu.kanade.presentation.library.components.PrefetchPanoramaCoverShapes
+ import eu.kanade.presentation.library.components.TrackPanoramaCoverShapes
+ import eu.kanade.presentation.library.components.committedCoverIsWide
+ import eu.kanade.presentation.library.components.panoramaColumns
++import eu.kanade.presentation.library.components.panoramaCoverSpan
+ import eu.kanade.presentation.library.components.rememberCoverRatio
+ import eu.kanade.presentation.library.components.rememberPanoramaGridSettled
+ import exh.metadata.metadata.RaisedSearchMetadata
+@@ -51,9 +52,9 @@ fun BrowseSourceComfortableGrid(
+     // KMK <--
+ ) {
+     // Harmony -->
+-    // Panorama mode mixes 3:2 and 2:3 cells. A regular grid makes every row as tall as its tallest
+-    // cell, which leaves a hole under each wide cover; a staggered grid lets each lane flow on its
+-    // own. Auto columns use a wider minimum than the 128 dp meant for book covers.
++    // Panorama mode mixes 3:2 and 2:3 cells. Lanes flow on their own so a short cover does not
++    // stretch the whole row. Auto columns are sized for the tall cover; a wide cover spans two
++    // of them when the grid has at least three.
+     if (usePanoramaCover) {
+         // The grid owns the scroll state: a cross-band shape commit remeasures every lane.
+         val state = rememberPanoramaMasonryState()
+@@ -83,6 +84,10 @@ fun BrowseSourceComfortableGrid(
+                 items(
+                     count = mangaList.itemCount,
+                     key = { index -> mangaList.peek(index)?.value?.first?.id ?: index },
++                    span = { index ->
++                        val id = mangaList.peek(index)?.value?.first?.id
++                        panoramaCoverSpan(id == null || committedCoverIsWide(id))
++                    },
+                     height = { index ->
+                         val id = mangaList.peek(index)?.value?.first?.id
+                         PanoramaCellHeight.Cover(
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt
+index 82131cf..a6374de 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt
+@@ -21,6 +21,7 @@ import eu.kanade.presentation.library.components.PrefetchPanoramaCoverShapes
+ import eu.kanade.presentation.library.components.TrackPanoramaCoverShapes
+ import eu.kanade.presentation.library.components.committedCoverIsWide
+ import eu.kanade.presentation.library.components.panoramaColumns
++import eu.kanade.presentation.library.components.panoramaCoverSpan
+ import eu.kanade.presentation.library.components.rememberCoverRatio
+ import eu.kanade.presentation.library.components.rememberPanoramaGridSettled
+ import exh.metadata.metadata.RaisedSearchMetadata
+@@ -53,8 +54,9 @@ fun BrowseSourceCompactGrid(
+     // Harmony <--
+ ) {
+     // Harmony -->
+-    // Same two panorama problems as the comfortable browse grid: a shared row height leaves a hole
+-    // under a wide cover, and auto columns at 128 dp make that cover cramped.
++    // Panorama mode mixes 3:2 and 2:3 cells. Lanes flow on their own so a short cover does not
++    // stretch the whole row. Auto columns are sized for the tall cover; a wide cover spans two
++    // of them when the grid has at least three.
+     if (usePanoramaCover) {
+         // The grid owns the scroll state: a cross-band shape commit remeasures every lane.
+         val state = rememberPanoramaMasonryState()
+@@ -84,6 +86,10 @@ fun BrowseSourceCompactGrid(
+                 items(
+                     count = mangaList.itemCount,
+                     key = { index -> mangaList.peek(index)?.value?.first?.id ?: index },
++                    span = { index ->
++                        val id = mangaList.peek(index)?.value?.first?.id
++                        panoramaCoverSpan(id == null || committedCoverIsWide(id))
++                    },
+                     height = { index ->
+                         val id = mangaList.peek(index)?.value?.first?.id
+                         PanoramaCellHeight.Cover(
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt
+index f07ee5a..fd07eaa 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasComfortableGrid.kt
+@@ -24,6 +24,7 @@ import eu.kanade.presentation.library.components.LocalPanoramaGridSettled
+ import eu.kanade.presentation.library.components.TrackPanoramaCoverShapes
+ import eu.kanade.presentation.library.components.committedCoverIsWide
+ import eu.kanade.presentation.library.components.panoramaColumns
++import eu.kanade.presentation.library.components.panoramaCoverSpan
+ import eu.kanade.presentation.library.components.rememberPanoramaGridSettled
+ import eu.kanade.tachiyomi.ui.manga.RelatedManga
+ import tachiyomi.domain.manga.model.Manga
+@@ -56,8 +57,8 @@ fun RelatedMangasComfortableGrid(
+ ) {
+     val gridPadding = contentPadding + PaddingValues(horizontal = MaterialTheme.padding.small) // padding for scrollbar
+     // Harmony -->
+-    // Same two panorama problems as the library and the source browse grid: a shared row height
+-    // leaves a hole under a wide cover, and auto columns at 128 dp make that cover cramped.
++    // Same packing as the library panorama grid. Lanes flow on their own, and a wide cover spans
++    // two book-sized columns when the grid has at least three.
+     if (usePanoramaCover) {
+         // The grid owns the scroll state: a cross-band shape commit remeasures every lane.
+         val state = rememberPanoramaMasonryState()
+@@ -102,6 +103,7 @@ fun RelatedMangasComfortableGrid(
+                         items(
+                             count = count,
+                             key = key,
++                            span = { index -> panoramaCoverSpan(committedCoverIsWide(mangaId(index))) },
+                             height = { index ->
+                                 PanoramaCellHeight.Cover(
+                                     wide = committedCoverIsWide(mangaId(index)),
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt
+index 5d4c31c..276a0f1 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/RelatedMangasCompactGrid.kt
+@@ -24,6 +24,7 @@ import eu.kanade.presentation.library.components.LocalPanoramaGridSettled
+ import eu.kanade.presentation.library.components.TrackPanoramaCoverShapes
+ import eu.kanade.presentation.library.components.committedCoverIsWide
+ import eu.kanade.presentation.library.components.panoramaColumns
++import eu.kanade.presentation.library.components.panoramaCoverSpan
+ import eu.kanade.presentation.library.components.rememberPanoramaGridSettled
+ import eu.kanade.tachiyomi.ui.manga.RelatedManga
+ import tachiyomi.domain.manga.model.Manga
+@@ -58,8 +59,8 @@ fun RelatedMangasCompactGrid(
+ ) {
+     val gridPadding = contentPadding + PaddingValues(horizontal = MaterialTheme.padding.small) // padding for scrollbar
+     // Harmony -->
+-    // Same two panorama problems as the comfortable related grid: a shared row height leaves a
+-    // hole under a wide cover, and auto columns at 128 dp make that cover cramped.
++    // Same packing as the library panorama grid. Lanes flow on their own, and a wide cover spans
++    // two book-sized columns when the grid has at least three.
+     if (usePanoramaCover) {
+         // The grid owns the scroll state: a cross-band shape commit remeasures every lane.
+         val state = rememberPanoramaMasonryState()
+@@ -104,6 +105,7 @@ fun RelatedMangasCompactGrid(
+                         items(
+                             count = count,
+                             key = key,
++                            span = { index -> panoramaCoverSpan(committedCoverIsWide(mangaId(index))) },
+                             height = { index ->
+                                 PanoramaCellHeight.Cover(
+                                     wide = committedCoverIsWide(mangaId(index)),
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt
+index 005afec..2d83d5d 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LibraryComfortableGrid.kt
+@@ -26,10 +26,9 @@ internal fun LibraryComfortableGrid(
+     // KMK <--
+ ) {
+     // Harmony -->
+-    // Panorama mode mixes 3:2 and 2:3 cells. A regular grid makes every row as tall as its tallest
+-    // cell, which leaves a big hole under each wide cover that shares a row with a book cover; a
+-    // staggered grid lets each lane flow on its own. Wide covers also need wider auto columns than
+-    // the 128 dp meant for book covers, otherwise they come out short and cramped.
++    // Panorama mode mixes 3:2 and 2:3 cells. Lanes flow on their own so a short cover does not
++    // stretch the whole row. Auto columns are sized for the tall cover; a wide cover spans two
++    // of them when the grid has at least three.
+     if (usePanoramaCover) {
+         LazyLibraryStaggeredGrid(
+             modifier = Modifier.fillMaxSize(),
+@@ -45,6 +44,7 @@ internal fun LibraryComfortableGrid(
+                 count = items.size,
+                 key = { items[it].libraryManga.manga.id },
+                 contentType = { "library_comfortable_grid_item" },
++                span = { panoramaCoverSpan(committedCoverIsWide(items[it].libraryManga.manga.id)) },
+                 height = {
+                     PanoramaCellHeight.Cover(
+                         wide = committedCoverIsWide(items[it].libraryManga.manga.id),
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LibraryCompactGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/LibraryCompactGrid.kt
+index 055dca6..64bf6b2 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LibraryCompactGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LibraryCompactGrid.kt
+@@ -27,8 +27,9 @@ fun LibraryCompactGrid(
+     // Harmony <--
+ ) {
+     // Harmony -->
+-    // Same packing as the panorama comfortable grid: mixed 3:2 and 2:3 cells leave a hole under
+-    // the wide cover in a shared row, and auto columns at 128 dp make that cover cramped.
++    // Panorama mode mixes 3:2 and 2:3 cells. Lanes flow on their own so a short cover does not
++    // stretch the whole row. Auto columns are sized for the tall cover; a wide cover spans two
++    // of them when the grid has at least three.
+     if (usePanoramaCover) {
+         LazyLibraryStaggeredGrid(
+             modifier = Modifier.fillMaxSize(),
+@@ -44,6 +45,7 @@ fun LibraryCompactGrid(
+                 count = items.size,
+                 key = { items[it].libraryManga.manga.id },
+                 contentType = { "library_compact_grid_item" },
++                span = { panoramaCoverSpan(committedCoverIsWide(items[it].libraryManga.manga.id)) },
+                 height = {
+                     PanoramaCellHeight.Cover(
+                         wide = committedCoverIsWide(items[it].libraryManga.manga.id),
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
+index 22daf2c..7c90a22 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
+@@ -16,12 +16,31 @@ import eu.kanade.presentation.manga.components.RatioSwitchToPanorama
+ import kotlinx.coroutines.flow.first
+ import tachiyomi.domain.library.service.LibraryPreferences
+ import tachiyomi.presentation.core.components.PanoramaColumns
++import tachiyomi.presentation.core.components.PanoramaSpan
+ import uy.kohesive.injekt.Injekt
+ import uy.kohesive.injekt.api.get
+ 
+ // Harmony -->
+-/** Auto column width for a panorama grid; a 3:2 cover at this width is as tall as a 2:3 cover at 128 dp is wide. */
+-internal val PanoramaGridMinColumnWidth = 168.dp
++/**
++ * Minimum auto column for panorama grids, sized for a tall 2:3 cover.
++ *
++ * Lane count matches [tachiyomi.presentation.core.components.staggeredLaneCountAdaptive]:
++ * `lanes = (available + spacing) / (min + spacing)`,
++ * `spacing = GridHorizontalSpacer` (4 dp),
++ * `available = window width - horizontal padding`.
++ * The grid adds `PaddingValues(8.dp)` around the scaffold content padding. In portrait that
++ * horizontal padding is 16 dp, so `available = window width - 16`.
++ *
++ * 104 dp keeps a folded phone on three book-sized columns: 360 dp → 3, 420 dp → 3, 459 dp → 3.
++ * (168 dp, chosen so a single-column 3:2 cover was not cramped, left a ~360 dp folded screen
++ * on 2 columns. Wide covers span two lanes instead of asking the minimum to suit both shapes.)
++ */
++internal val PanoramaGridMinColumnWidth = 104.dp
++
++/** Wide covers span two lanes when there are at least three; tall covers stay in one. */
++internal fun panoramaCoverSpan(wide: Boolean): PanoramaSpan {
++    return if (wide) PanoramaSpan.TwoLanesWhenRoomy else PanoramaSpan.SingleLane
++}
+ 
+ /** Auto column width of the book-shaped grids. Panorama mode does not use it. */
+ private val BookGridMinColumnWidth = 128.dp
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+index 9478e1d..d9e330b 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+@@ -352,7 +352,6 @@ private fun LazyLayoutMeasureScope.measureMasonry(
+     val masonry = if (laneCount == 0 || count == 0) {
+         state.layoutCache.layout(
+             count = 0,
+-            isFullLine = { false },
+             heightOf = { _, _ -> 0 },
+             laneWidths = if (laneWidths.isEmpty()) intArrayOf(0) else laneWidths,
+             verticalSpacing = verticalPx,
+@@ -362,7 +361,7 @@ private fun LazyLayoutMeasureScope.measureMasonry(
+     } else {
+         state.layoutCache.layout(
+             count = count,
+-            isFullLine = { index -> intervals.spanAt(index) == PanoramaSpan.FullLine },
++            spanOf = { index -> intervals.spanAt(index) },
+             heightOf = { index, widthPx -> heightOf(index, widthPx) },
+             laneWidths = laneWidths,
+             verticalSpacing = verticalPx,
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt
+index 74da312..f03ad73 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt
+@@ -27,9 +27,35 @@ const val PANORAMA_TITLE_LINES = 2
+ 
+ enum class PanoramaSpan {
+     SingleLane,
++
++    /**
++     * Two adjacent lanes when the grid has at least three columns, otherwise one.
++     * Wide covers use this so the auto column can stay book-sized.
++     */
++    TwoLanesWhenRoomy,
++
+     FullLine,
+ }
+ 
++/**
++ * How a [PanoramaSpan.TwoLanesWhenRoomy] cell picks its column pair, always inside the recess limit.
++ * [Leftmost] is the reading-order rule. [LeastWaste] prefers the eligible pair whose shorter
++ * lane loses the least area (a tie stays on the left).
++ */
++enum class PanoramaPairPick {
++    Leftmost,
++    LeastWaste,
++}
++
++/**
++ * Production pair rule.
++ *
++ * A fixed-seed study (200 cells, 3 and 6 columns, 10/30/50% wide) keeps the reading-order rule.
++ * Its holes stay under 2.4% of cell area plus holes, below the 8% line where a least-waste pick
++ * would be worth the extra upward jumps. Least-waste is still implemented so the study can rerun.
++ */
++val PANORAMA_PAIR_PICK = PanoramaPairPick.Leftmost
++
+ class PanoramaMasonryRect(
+     val index: Int,
+     val lane: Int,
+@@ -38,6 +64,7 @@ class PanoramaMasonryRect(
+     val width: Int,
+     val height: Int,
+     val fullLine: Boolean,
++    val span: PanoramaSpan,
+ )
+ 
+ class PanoramaMasonryLayout(
+@@ -106,18 +133,84 @@ fun panoramaReadingLane(bottoms: IntArray, itemHeight: Int): Int {
+ }
+ 
+ /**
+- * @param heightOf item height for the width it would occupy in that lane, or the full content
+- * width when the item is a full line. Cover height depends on the lane width; a one pixel
+- * remainder can change it by a pixel, so the lane is chosen with that lane's own height.
++ * Lanes a span actually occupies. A wide cover stays in one lane when there is nowhere to span.
++ */
++fun panoramaLaneSpan(span: PanoramaSpan, laneCount: Int): Int {
++    return when (span) {
++        PanoramaSpan.FullLine -> laneCount.coerceAtLeast(1)
++        PanoramaSpan.SingleLane -> 1
++        // Harmony: two lanes only when a third exists, so a 2-column screen does not stretch one cover across the row.
++        PanoramaSpan.TwoLanesWhenRoomy -> if (laneCount >= 3) 2 else 1
++    }
++}
++
++/**
++ * Left lane of the adjacent pair whose top is within the recess limit.
++ * A pair's top is the deeper of the two lane bottoms. Exactly half is still eligible.
++ */
++fun panoramaReadingPair(bottoms: IntArray, itemHeight: Int): Int {
++    val pairs = bottoms.size - 1
++    require(pairs >= 1) { "a two-lane cell needs two columns" }
++    val limit = pairRecessLimit(bottoms, pairs, itemHeight)
++    for (index in 0 until pairs) {
++        if (pairTop(bottoms, index).toDouble() <= limit) return index
++    }
++    return 0
++}
++
++/**
++ * Left lane of the eligible pair that wastes the least area in its shorter lane.
++ * Ties stay on the leftmost pair. [laneWidths] are the column widths, not the spanned width.
++ */
++fun panoramaLeastWastePair(bottoms: IntArray, laneWidths: IntArray, itemHeight: Int): Int {
++    val pairs = bottoms.size - 1
++    require(pairs >= 1) { "a two-lane cell needs two columns" }
++    val limit = pairRecessLimit(bottoms, pairs, itemHeight)
++    var chosen = 0
++    var leastWaste = Long.MAX_VALUE
++    var found = false
++    for (index in 0 until pairs) {
++        val top = pairTop(bottoms, index)
++        if (top.toDouble() > limit) continue
++        val shorter = if (bottoms[index] <= bottoms[index + 1]) index else index + 1
++        val waste = (top - bottoms[shorter]).toLong() * laneWidths[shorter]
++        if (!found || waste < leastWaste) {
++            found = true
++            chosen = index
++            leastWaste = waste
++        }
++    }
++    return chosen
++}
++
++private fun pairTop(bottoms: IntArray, left: Int): Int {
++    return maxOf(bottoms[left], bottoms[left + 1])
++}
++
++private fun pairRecessLimit(bottoms: IntArray, pairs: Int, itemHeight: Int): Double {
++    var shortest = pairTop(bottoms, 0)
++    for (index in 1 until pairs) {
++        val top = pairTop(bottoms, index)
++        if (top < shortest) shortest = top
++    }
++    return shortest.toDouble() + itemHeight * PANORAMA_RECESS_FRACTION
++}
++
++/**
++ * @param heightOf item height for the width it occupies. A single lane passes that column's
++ * width, a two-lane cover passes the spanned width (both columns plus the gap), and a full
++ * line passes the content width. Cover height depends on that width; a one pixel remainder
++ * can change it, so the lane is chosen with that lane's own height.
+  */
+ fun layoutPanoramaMasonry(
+     count: Int,
+-    isFullLine: (Int) -> Boolean,
++    spanOf: (Int) -> PanoramaSpan = { PanoramaSpan.SingleLane },
+     heightOf: (index: Int, widthPx: Int) -> Int,
+     laneWidths: IntArray,
+     verticalSpacing: Int,
+     horizontalSpacing: Int,
+     rtl: Boolean = false,
++    pairPick: PanoramaPairPick = PANORAMA_PAIR_PICK,
+ ): PanoramaMasonryLayout {
+     val laneCount = laneWidths.size
+     require(laneCount > 0)
+@@ -129,13 +222,15 @@ fun layoutPanoramaMasonry(
+     for (index in 0 until count) {
+         val rect = placeItem(
+             index = index,
+-            fullLine = isFullLine(index),
++            span = spanOf(index),
+             heightOf = heightOf,
+             laneWidths = laneWidths,
+             offsets = offsets,
+             bottoms = bottoms,
+             contentWidth = contentWidth,
+             verticalSpacing = verticalSpacing,
++            horizontalSpacing = horizontalSpacing,
++            pairPick = pairPick,
+         )
+         rects.add(rect)
+         val bottom = rect.y + rect.height
+@@ -159,8 +254,9 @@ fun layoutPanoramaMasonry(
+ fun appendPanoramaMasonry(
+     previous: PanoramaMasonryLayout,
+     count: Int,
+-    isFullLine: (Int) -> Boolean,
++    spanOf: (Int) -> PanoramaSpan = { PanoramaSpan.SingleLane },
+     heightOf: (index: Int, widthPx: Int) -> Int,
++    pairPick: PanoramaPairPick = PANORAMA_PAIR_PICK,
+ ): PanoramaMasonryLayout {
+     val rects = ArrayList<PanoramaMasonryRect>(count)
+     rects.addAll(previous.rects)
+@@ -170,13 +266,15 @@ fun appendPanoramaMasonry(
+     for (index in previous.rects.size until count) {
+         val rect = placeItem(
+             index = index,
+-            fullLine = isFullLine(index),
++            span = spanOf(index),
+             heightOf = heightOf,
+             laneWidths = previous.laneWidths,
+             offsets = previous.laneOffsets,
+             bottoms = bottoms,
+             contentWidth = contentWidth,
+             verticalSpacing = previous.verticalSpacing,
++            horizontalSpacing = previous.horizontalSpacing,
++            pairPick = pairPick,
+         )
+         rects.add(rect)
+         val bottom = rect.y + rect.height
+@@ -210,7 +308,7 @@ class PanoramaMasonryLayoutCache {
+ 
+     fun layout(
+         count: Int,
+-        isFullLine: (Int) -> Boolean,
++        spanOf: (Int) -> PanoramaSpan = { PanoramaSpan.SingleLane },
+         heightOf: (index: Int, widthPx: Int) -> Int,
+         laneWidths: IntArray,
+         verticalSpacing: Int,
+@@ -225,7 +323,7 @@ class PanoramaMasonryLayoutCache {
+             this.laneWidths.contentEquals(laneWidths)
+         val reusable = sameGeometry &&
+             count >= previous.rects.size &&
+-            prefixUnchanged(previous, isFullLine, heightOf)
++            prefixUnchanged(previous, spanOf, heightOf)
+         val result = when {
+             reusable && count == previous.rects.size -> {
+                 structuralChange = false
+@@ -233,13 +331,13 @@ class PanoramaMasonryLayoutCache {
+             }
+             reusable -> {
+                 structuralChange = false
+-                appendPanoramaMasonry(previous, count, isFullLine, heightOf)
++                appendPanoramaMasonry(previous, count, spanOf, heightOf)
+             }
+             else -> {
+                 structuralChange = previous != null
+                 layoutPanoramaMasonry(
+                     count = count,
+-                    isFullLine = isFullLine,
++                    spanOf = spanOf,
+                     heightOf = heightOf,
+                     laneWidths = laneWidths,
+                     verticalSpacing = verticalSpacing,
+@@ -258,11 +356,13 @@ class PanoramaMasonryLayoutCache {
+ 
+     private fun prefixUnchanged(
+         previous: PanoramaMasonryLayout,
+-        isFullLine: (Int) -> Boolean,
++        spanOf: (Int) -> PanoramaSpan,
+         heightOf: (index: Int, widthPx: Int) -> Int,
+     ): Boolean {
+         for (rect in previous.rects) {
+-            if (isFullLine(rect.index) != rect.fullLine) return false
++            // Harmony: tall-to-wide flips the span. Comparing height at the old width can miss that,
++            // so a span change rebuilds from the start instead of appending after a stale prefix.
++            if (spanOf(rect.index) != rect.span) return false
+             if (heightOf(rect.index, rect.width) != rect.height) return false
+         }
+         return true
+@@ -347,15 +447,17 @@ fun panoramaCoverCellHeightPx(
+ 
+ private fun placeItem(
+     index: Int,
+-    fullLine: Boolean,
++    span: PanoramaSpan,
+     heightOf: (index: Int, widthPx: Int) -> Int,
+     laneWidths: IntArray,
+     offsets: IntArray,
+     bottoms: IntArray,
+     contentWidth: Int,
+     verticalSpacing: Int,
++    horizontalSpacing: Int,
++    pairPick: PanoramaPairPick,
+ ): PanoramaMasonryRect {
+-    if (fullLine) {
++    if (span == PanoramaSpan.FullLine) {
+         var y = bottoms[0]
+         for (lane in 1 until bottoms.size) {
+             if (bottoms[lane] > y) y = bottoms[lane]
+@@ -373,6 +475,29 @@ private fun placeItem(
+             width = contentWidth,
+             height = height,
+             fullLine = true,
++            span = PanoramaSpan.FullLine,
++        )
++    }
++    val occupied = panoramaLaneSpan(span, laneWidths.size)
++    // Harmony: wide covers occupy the pair (l, l+1). The top is the deeper bottom, and both
++    // lanes end together, so the shorter lane keeps the gap above the cell.
++    if (occupied >= 2) {
++        val (lane, height) = choosePair(bottoms, laneWidths, pairPick) { left ->
++            heightOf(index, spannedWidth(laneWidths, left, occupied, horizontalSpacing))
++        }
++        val y = pairTop(bottoms, lane)
++        val next = y + height + verticalSpacing
++        bottoms[lane] = next
++        bottoms[lane + 1] = next
++        return PanoramaMasonryRect(
++            index = index,
++            lane = lane,
++            x = minOf(offsets[lane], offsets[lane + occupied - 1]),
++            y = y,
++            width = spannedWidth(laneWidths, lane, occupied, horizontalSpacing),
++            height = height,
++            fullLine = false,
++            span = span,
+         )
+     }
+     val (lane, height) = chooseLane(bottoms) { laneIndex ->
+@@ -388,9 +513,46 @@ private fun placeItem(
+         width = laneWidths[lane],
+         height = height,
+         fullLine = false,
++        span = span,
+     )
+ }
+ 
++private fun choosePair(
++    bottoms: IntArray,
++    laneWidths: IntArray,
++    pick: PanoramaPairPick,
++    heightForPair: (Int) -> Int,
++): Pair<Int, Int> {
++    val probe = heightForPair(0).coerceAtLeast(0)
++    var lane = selectPair(bottoms, laneWidths, pick, probe)
++    val atPair = heightForPair(lane).coerceAtLeast(0)
++    if (atPair != probe) {
++        lane = selectPair(bottoms, laneWidths, pick, atPair)
++    }
++    return lane to heightForPair(lane).coerceAtLeast(0)
++}
++
++private fun selectPair(
++    bottoms: IntArray,
++    laneWidths: IntArray,
++    pick: PanoramaPairPick,
++    itemHeight: Int,
++): Int {
++    return when (pick) {
++        PanoramaPairPick.Leftmost -> panoramaReadingPair(bottoms, itemHeight)
++        PanoramaPairPick.LeastWaste -> panoramaLeastWastePair(bottoms, laneWidths, itemHeight)
++    }
++}
++
++private fun spannedWidth(laneWidths: IntArray, lane: Int, occupied: Int, spacing: Int): Int {
++    var width = 0
++    for (offset in 0 until occupied) {
++        width += laneWidths[lane + offset]
++        if (offset < occupied - 1) width += spacing
++    }
++    return width
++}
++
+ private fun chooseLane(bottoms: IntArray, heightForLane: (Int) -> Int): Pair<Int, Int> {
+     val probe = heightForLane(0).coerceAtLeast(0)
+     var lane = panoramaReadingLane(bottoms, probe)
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt
+index 89dda26..19e2892 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt
+@@ -4,7 +4,15 @@ import org.junit.jupiter.api.Assertions.assertArrayEquals
+ import org.junit.jupiter.api.Assertions.assertEquals
+ import org.junit.jupiter.api.Assertions.assertFalse
+ import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Assumptions.assumeTrue
+ import org.junit.jupiter.api.Test
++import java.io.ByteArrayOutputStream
++import java.io.File
++import java.io.OutputStream
++import java.util.zip.CRC32
++import java.util.zip.Deflater
++import kotlin.math.roundToInt
++import kotlin.random.Random
+ 
+ class PanoramaMasonryLayoutTest {
+     @Test
+@@ -48,7 +56,7 @@ class PanoramaMasonryLayoutTest {
+         val fullLine = booleanArrayOf(false, false, true)
+         val layout = layoutPanoramaMasonry(
+             count = 3,
+-            isFullLine = { fullLine[it] },
++            spanOf = { if (fullLine[it]) PanoramaSpan.FullLine else PanoramaSpan.SingleLane },
+             heightOf = { index, _ -> heights[index] },
+             laneWidths = intArrayOf(100, 100),
+             verticalSpacing = 4,
+@@ -128,7 +136,6 @@ class PanoramaMasonryLayoutTest {
+         val cache = PanoramaMasonryLayoutCache()
+         val first = cache.layout(
+             count = head.size,
+-            isFullLine = { false },
+             heightOf = { index, _ -> head[index] },
+             laneWidths = intArrayOf(100, 100),
+             verticalSpacing = 4,
+@@ -138,7 +145,6 @@ class PanoramaMasonryLayoutTest {
+         assertFalse(cache.structuralChange)
+         val appended = cache.layout(
+             count = all.size,
+-            isFullLine = { false },
+             heightOf = { index, _ -> all[index] },
+             laneWidths = intArrayOf(100, 100),
+             verticalSpacing = 4,
+@@ -158,7 +164,6 @@ class PanoramaMasonryLayoutTest {
+         val cache = PanoramaMasonryLayoutCache()
+         cache.layout(
+             count = 2,
+-            isFullLine = { false },
+             heightOf = { _, _ -> 100 },
+             laneWidths = intArrayOf(50, 50),
+             verticalSpacing = 0,
+@@ -167,7 +172,6 @@ class PanoramaMasonryLayoutTest {
+         )
+         cache.layout(
+             count = 2,
+-            isFullLine = { false },
+             heightOf = { index, _ -> if (index == 0) 180 else 100 },
+             laneWidths = intArrayOf(50, 50),
+             verticalSpacing = 0,
+@@ -196,7 +200,6 @@ class PanoramaMasonryLayoutTest {
+     fun `rtl puts the first lane on the right and keeps the extra pixel there`() {
+         val layout = layoutPanoramaMasonry(
+             count = 1,
+-            isFullLine = { false },
+             heightOf = { _, _ -> 10 },
+             laneWidths = staggeredLaneWidths(10, 3, 0),
+             verticalSpacing = 0,
+@@ -208,6 +211,200 @@ class PanoramaMasonryLayoutTest {
+         assertEquals(4, layout.rects[0].width)
+     }
+ 
++    @Test
++    fun `two columns keep a wide cover in one lane`() {
++        val layout = layoutPanoramaMasonry(
++            count = 1,
++            spanOf = { PanoramaSpan.TwoLanesWhenRoomy },
++            heightOf = { _, width -> width },
++            laneWidths = intArrayOf(90, 70),
++            verticalSpacing = 0,
++            horizontalSpacing = 4,
++        )
++        val rect = layout.rects.single()
++        assertEquals(1, panoramaLaneSpan(PanoramaSpan.TwoLanesWhenRoomy, laneCount = 2))
++        assertEquals(0, rect.lane)
++        assertEquals(0, rect.x)
++        assertEquals(90, rect.width)
++        assertEquals(90, rect.height)
++        assertEquals(PanoramaSpan.TwoLanesWhenRoomy, rect.span)
++        assertFalse(rect.fullLine)
++    }
++
++    @Test
++    fun `three columns give a wide cover two lanes and the spanned width`() {
++        val layout = layoutPanoramaMasonry(
++            count = 1,
++            spanOf = { PanoramaSpan.TwoLanesWhenRoomy },
++            heightOf = { _, width -> width },
++            laneWidths = intArrayOf(100, 100, 100),
++            verticalSpacing = 0,
++            horizontalSpacing = 4,
++        )
++        val rect = layout.rects.single()
++        assertEquals(2, panoramaLaneSpan(PanoramaSpan.TwoLanesWhenRoomy, laneCount = 3))
++        assertEquals(0, rect.lane)
++        assertEquals(0, rect.x)
++        assertEquals(204, rect.width)
++        assertEquals(204, rect.height)
++        assertEquals(PanoramaSpan.TwoLanesWhenRoomy, rect.span)
++    }
++
++    @Test
++    fun `a pair past half the item moves to the next pair`() {
++        // Spacing 0 so the lane bottom equals the cell height. Height 100 is exactly half of 200
++        // and stays on the left pair; 101 is past half and the cover moves to lanes 1 and 2.
++        val onLimit = layoutWideAfter(firstHeight = 100, wideHeight = 200)
++        assertEquals(0, onLimit.rects[1].lane)
++        assertEquals(0, onLimit.rects[1].x)
++        assertEquals(100, onLimit.rects[1].y)
++        assertEquals(204, onLimit.rects[1].width)
++        assertArrayEquals(intArrayOf(300, 300, 0), onLimit.laneBottoms)
++
++        val pastLimit = layoutWideAfter(firstHeight = 101, wideHeight = 200)
++        assertEquals(1, pastLimit.rects[1].lane)
++        assertEquals(104, pastLimit.rects[1].x)
++        assertEquals(0, pastLimit.rects[1].y)
++        assertEquals(204, pastLimit.rects[1].width)
++        assertArrayEquals(intArrayOf(101, 200, 200), pastLimit.laneBottoms)
++    }
++
++    @Test
++    fun `rtl spans the two rightmost lanes from their left edge`() {
++        val layout = layoutPanoramaMasonry(
++            count = 1,
++            spanOf = { PanoramaSpan.TwoLanesWhenRoomy },
++            heightOf = { _, _ -> 10 },
++            laneWidths = intArrayOf(4, 3, 3),
++            verticalSpacing = 0,
++            horizontalSpacing = 0,
++            rtl = true,
++        )
++        // Widths 4, 3, 3 and lane 0 on the right. The pair covers x = 3..10.
++        assertEquals(3, layout.rects[0].x)
++        assertEquals(7, layout.rects[0].width)
++        assertEquals(0, layout.rects[0].lane)
++    }
++
++    @Test
++    fun `a span change replaces the layout even when the height callback is unchanged`() {
++        val cache = PanoramaMasonryLayoutCache()
++        val widths = intArrayOf(80, 80, 80)
++        val first = cache.layout(
++            count = 2,
++            spanOf = { PanoramaSpan.SingleLane },
++            heightOf = { _, _ -> 120 },
++            laneWidths = widths,
++            verticalSpacing = 0,
++            horizontalSpacing = 4,
++            rtl = false,
++        )
++        assertFalse(cache.structuralChange)
++        assertEquals(80, first.rects[0].width)
++
++        val second = cache.layout(
++            count = 2,
++            spanOf = { index ->
++                if (index == 0) PanoramaSpan.TwoLanesWhenRoomy else PanoramaSpan.SingleLane
++            },
++            heightOf = { _, _ -> 120 },
++            laneWidths = widths,
++            verticalSpacing = 0,
++            horizontalSpacing = 4,
++            rtl = false,
++        )
++        assertTrue(cache.structuralChange)
++        assertEquals(164, second.rects[0].width)
++        assertEquals(PanoramaSpan.TwoLanesWhenRoomy, second.rects[0].span)
++        assertEquals(80, second.rects[1].width)
++        assertEquals(2, second.rects[1].lane)
++    }
++
++    @Test
++    fun `full line still clears the lanes under a two-lane cell`() {
++        val layout = layoutPanoramaMasonry(
++            count = 2,
++            spanOf = { index ->
++                if (index == 0) PanoramaSpan.TwoLanesWhenRoomy else PanoramaSpan.FullLine
++            },
++            heightOf = { index, _ -> if (index == 0) 50 else 10 },
++            laneWidths = intArrayOf(100, 100, 100),
++            verticalSpacing = 4,
++            horizontalSpacing = 4,
++        )
++        assertEquals(54, layout.rects[1].y)
++        assertEquals(308, layout.rects[1].width)
++        assertTrue(layout.rects[1].fullLine)
++        assertArrayEquals(intArrayOf(68, 68, 68), layout.laneBottoms)
++    }
++
++    @Test
++    fun `book sized minimum fits three columns at 360 dp and six at 733`() {
++        // available = screenWidth - 16 dp of horizontal padding, spacing 4 dp. See PanoramaGridMinColumnWidth.
++        assertEquals(3, staggeredLaneCountAdaptive(360 - 16, 4, 104))
++        assertEquals(3, staggeredLaneCountAdaptive(392 - 16, 4, 104))
++        assertEquals(3, staggeredLaneCountAdaptive(411 - 16, 4, 104))
++        assertEquals(6, staggeredLaneCountAdaptive(733 - 16, 4, 104))
++        assertEquals(2, staggeredLaneCountAdaptive(360 - 16, 4, 168))
++        assertEquals(4, staggeredLaneCountAdaptive(733 - 16, 4, 168))
++    }
++
++    @Test
++    fun `wide cover holes stay bounded for the reading order and least waste rules`() {
++        val spacing = 4
++        val fractions = doubleArrayOf(0.10, 0.30, 0.50)
++        val layouts = listOf(
++            3 to 109,
++            6 to 113,
++        )
++        for ((lanes, laneWidth) in layouts) {
++            for (fraction in fractions) {
++                val wide = wideMask(count = 200, fraction = fraction, seed = PANORAMA_SAMPLE_SEED)
++                val baseline = holeReport(
++                    sampleLayout(wide, lanes, laneWidth, spacing, spanWide = false, PanoramaPairPick.Leftmost),
++                )
++                val leftmost = holeReport(
++                    sampleLayout(wide, lanes, laneWidth, spacing, spanWide = true, PanoramaPairPick.Leftmost),
++                )
++                val leastWaste = holeReport(
++                    sampleLayout(wide, lanes, laneWidth, spacing, spanWide = true, PanoramaPairPick.LeastWaste),
++                )
++                assertEquals(0, baseline.wasteArea)
++                assertEquals(0, leftmost.skippedLeftPair)
++                assertTrue(leftmost.holePercent < 8.0) {
++                    "reading-order holes are ${leftmost.holePercent}% at $lanes lanes, $fraction wide"
++                }
++                println(
++                    "PANORAMA_WASTE lanes=$lanes wide=${percent(fraction)} " +
++                        "baselineHole=${fmt(baseline.holePercent)} h=${baseline.contentHeight} | " +
++                        "leftmostHole=${fmt(leftmost.holePercent)} footprint=${fmt(leftmost.footprintPercent)} " +
++                        "maxGap=${leftmost.maxGap} up=${leftmost.upwardSteps}/${leftmost.maxUpward} " +
++                        "h=${leftmost.contentHeight} | " +
++                        "leastWasteHole=${fmt(leastWaste.holePercent)} " +
++                        "footprint=${fmt(leastWaste.footprintPercent)} " +
++                        "maxGap=${leastWaste.maxGap} up=${leastWaste.upwardSteps}/${leastWaste.maxUpward} " +
++                        "skippedLeft=${leastWaste.skippedLeftPair} h=${leastWaste.contentHeight}",
++                )
++            }
++        }
++        // Measured holes stay under 8%, and least-waste skips left pairs, so production stays leftmost.
++        assertEquals(PanoramaPairPick.Leftmost, PANORAMA_PAIR_PICK)
++    }
++
++    @Test
++    fun `Preview panorama columns at 360 and 733 dp`() {
++        assumeTrue(System.getenv("PANORAMA_PREVIEW") == "1") {
++            "PANORAMA_PREVIEW=1 writes /tmp/panorama-preview"
++        }
++        val directory = File("/tmp/panorama-preview")
++        directory.mkdirs()
++        val wide = wideMask(count = 40, fraction = 0.30, seed = PANORAMA_SAMPLE_SEED)
++        writePreview(directory, "360dp-old.png", screenDp = 360, minColumnDp = 168, spanWide = false, wide = wide)
++        writePreview(directory, "360dp-new.png", screenDp = 360, minColumnDp = 104, spanWide = true, wide = wide)
++        writePreview(directory, "733dp-old.png", screenDp = 733, minColumnDp = 168, spanWide = false, wide = wide)
++        writePreview(directory, "733dp-new.png", screenDp = 733, minColumnDp = 104, spanWide = true, wide = wide)
++    }
++
+     @Test
+     fun `cover cell height follows the grid padding and the two aspect ratios`() {
+         // Lane 100, padding 4: inner 92. Wide 3/2 -> round(92 * 2 / 3) = 61. Compact = 8 + 61.
+@@ -222,7 +419,6 @@ class PanoramaMasonryLayoutTest {
+     private fun layoutFixed(heights: IntArray, lanes: Int, spacing: Int): PanoramaMasonryLayout {
+         return layoutPanoramaMasonry(
+             count = heights.size,
+-            isFullLine = { false },
+             heightOf = { index, _ -> heights[index] },
+             laneWidths = IntArray(lanes) { 100 },
+             verticalSpacing = spacing,
+@@ -239,6 +435,279 @@ class PanoramaMasonryLayoutTest {
+             width = 10,
+             height = height,
+             fullLine = false,
++            span = PanoramaSpan.SingleLane,
++        )
++    }
++
++    private fun layoutWideAfter(firstHeight: Int, wideHeight: Int): PanoramaMasonryLayout {
++        return layoutPanoramaMasonry(
++            count = 2,
++            spanOf = { index ->
++                if (index == 0) PanoramaSpan.SingleLane else PanoramaSpan.TwoLanesWhenRoomy
++            },
++            heightOf = { index, _ -> if (index == 0) firstHeight else wideHeight },
++            laneWidths = intArrayOf(100, 100, 100),
++            verticalSpacing = 0,
++            horizontalSpacing = 4,
++        )
++    }
++
++    private fun sampleLayout(
++        wide: BooleanArray,
++        lanes: Int,
++        laneWidth: Int,
++        spacing: Int,
++        spanWide: Boolean,
++        pairPick: PanoramaPairPick,
++    ): PanoramaMasonryLayout {
++        return layoutPanoramaMasonry(
++            count = wide.size,
++            spanOf = { index ->
++                if (spanWide && wide[index]) PanoramaSpan.TwoLanesWhenRoomy else PanoramaSpan.SingleLane
++            },
++            heightOf = { index, width ->
++                if (wide[index]) wideHeight(width) else tallHeight(width)
++            },
++            laneWidths = IntArray(lanes) { laneWidth },
++            verticalSpacing = spacing,
++            horizontalSpacing = spacing,
++            pairPick = pairPick,
++        )
++    }
++
++    private fun holeReport(layout: PanoramaMasonryLayout): HoleReport {
++        val bottoms = IntArray(layout.laneCount)
++        var wasteArea = 0L
++        var itemArea = 0L
++        var maxGap = 0
++        var upwardSteps = 0
++        var maxUpward = 0
++        var skippedLeftPair = 0
++        var previousY = Int.MIN_VALUE
++        for (rect in layout.rects) {
++            if (previousY != Int.MIN_VALUE && rect.y < previousY) {
++                upwardSteps++
++                maxUpward = maxOf(maxUpward, previousY - rect.y)
++            }
++            previousY = rect.y
++            itemArea += rect.width.toLong() * rect.height
++            val occupied = panoramaLaneSpan(rect.span, layout.laneCount)
++            if (occupied >= 2) {
++                val top = maxOf(bottoms[rect.lane], bottoms[rect.lane + 1])
++                check(rect.y == top) { "replay diverged at ${rect.index}" }
++                val shorter = if (bottoms[rect.lane] <= bottoms[rect.lane + 1]) rect.lane else rect.lane + 1
++                val gap = top - bottoms[shorter]
++                wasteArea += gap.toLong() * layout.laneWidths[shorter]
++                maxGap = maxOf(maxGap, gap)
++                if (panoramaReadingPair(bottoms, rect.height) != rect.lane) skippedLeftPair++
++                val next = top + rect.height + layout.verticalSpacing
++                bottoms[rect.lane] = next
++                bottoms[rect.lane + 1] = next
++            } else if (rect.fullLine) {
++                val y = bottoms.maxOrNull() ?: 0
++                val next = y + rect.height + layout.verticalSpacing
++                for (lane in bottoms.indices) bottoms[lane] = next
++            } else {
++                check(rect.y == bottoms[rect.lane]) { "replay diverged at ${rect.index}" }
++                bottoms[rect.lane] = rect.y + rect.height + layout.verticalSpacing
++            }
++        }
++        return HoleReport(
++            wasteArea = wasteArea,
++            itemArea = itemArea,
++            footprint = layout.contentWidth.toLong() * layout.contentHeight,
++            maxGap = maxGap,
++            upwardSteps = upwardSteps,
++            maxUpward = maxUpward,
++            skippedLeftPair = skippedLeftPair,
++            contentHeight = layout.contentHeight,
++        )
++    }
++
++    private fun writePreview(
++        directory: File,
++        name: String,
++        screenDp: Int,
++        minColumnDp: Int,
++        spanWide: Boolean,
++        wide: BooleanArray,
++    ) {
++        val spacing = 4
++        val available = screenDp - 16
++        val lanes = staggeredLaneCountAdaptive(available, spacing, minColumnDp)
++        val laneWidths = staggeredLaneWidths(available, lanes, spacing)
++        val layout = layoutPanoramaMasonry(
++            count = wide.size,
++            spanOf = { index ->
++                if (spanWide && wide[index]) PanoramaSpan.TwoLanesWhenRoomy else PanoramaSpan.SingleLane
++            },
++            heightOf = { index, width ->
++                if (wide[index]) wideHeight(width) else tallHeight(width)
++            },
++            laneWidths = laneWidths,
++            verticalSpacing = spacing,
++            horizontalSpacing = spacing,
++        )
++        // Harmony: android.jar has no java.awt, so the preview is a hand-written 8-bit RGB PNG.
++        val scale = 2
++        val width = (layout.contentWidth * scale).coerceAtLeast(1)
++        val height = (layout.contentHeight * scale).coerceAtLeast(1)
++        val rgb = ByteArray(width * height * 3)
++        rgb.fill(0xFF.toByte())
++        for (rect in layout.rects) {
++            fillRgbRect(
++                rgb = rgb,
++                imageWidth = width,
++                imageHeight = height,
++                x = rect.x * scale,
++                y = rect.y * scale,
++                rectWidth = rect.width * scale,
++                rectHeight = rect.height * scale,
++                color = if (wide[rect.index]) PREVIEW_WIDE_RGB else PREVIEW_TALL_RGB,
++            )
++        }
++        writeRgbPng(File(directory, name), width, height, rgb)
++    }
++
++    private fun fillRgbRect(
++        rgb: ByteArray,
++        imageWidth: Int,
++        imageHeight: Int,
++        x: Int,
++        y: Int,
++        rectWidth: Int,
++        rectHeight: Int,
++        color: Int,
++    ) {
++        val red = (color shr 16 and 0xFF).toByte()
++        val green = (color shr 8 and 0xFF).toByte()
++        val blue = (color and 0xFF).toByte()
++        val left = x.coerceAtLeast(0)
++        val top = y.coerceAtLeast(0)
++        val right = (x + rectWidth).coerceAtMost(imageWidth)
++        val bottom = (y + rectHeight).coerceAtMost(imageHeight)
++        for (row in top until bottom) {
++            var offset = (row * imageWidth + left) * 3
++            repeat(right - left) {
++                rgb[offset] = red
++                rgb[offset + 1] = green
++                rgb[offset + 2] = blue
++                offset += 3
++            }
++        }
++    }
++
++    /** Filter 0 on every row, one IDAT, zlib wrapper from [Deflater]. */
++    private fun writeRgbPng(file: File, width: Int, height: Int, rgb: ByteArray) {
++        val rowStride = width * 3
++        val raw = ByteArray(height * (1 + rowStride))
++        var source = 0
++        var dest = 0
++        repeat(height) {
++            raw[dest] = 0
++            dest += 1
++            rgb.copyInto(raw, dest, source, source + rowStride)
++            source += rowStride
++            dest += rowStride
++        }
++        val compressed = ByteArrayOutputStream()
++        val deflater = Deflater()
++        try {
++            deflater.setInput(raw)
++            deflater.finish()
++            val buffer = ByteArray(8 * 1024)
++            while (!deflater.finished()) {
++                val count = deflater.deflate(buffer)
++                compressed.write(buffer, 0, count)
++            }
++        } finally {
++            deflater.end()
++        }
++        file.outputStream().buffered().use { out ->
++            out.write(PNG_SIGNATURE)
++            writePngChunk(out, "IHDR", pngIhdr(width, height))
++            writePngChunk(out, "IDAT", compressed.toByteArray())
++            writePngChunk(out, "IEND", ByteArray(0))
++        }
++    }
++
++    private fun pngIhdr(width: Int, height: Int): ByteArray {
++        val data = ByteArray(13)
++        writeIntAt(data, 0, width)
++        writeIntAt(data, 4, height)
++        data[8] = 8
++        data[9] = 2
++        return data
++    }
++
++    private fun writePngChunk(out: OutputStream, type: String, data: ByteArray) {
++        val typeBytes = type.toByteArray(Charsets.US_ASCII)
++        writePngInt(out, data.size)
++        out.write(typeBytes)
++        out.write(data)
++        val crc = CRC32()
++        crc.update(typeBytes)
++        crc.update(data)
++        writePngInt(out, crc.value.toInt())
++    }
++
++    private fun writePngInt(out: OutputStream, value: Int) {
++        out.write(value ushr 24)
++        out.write(value ushr 16)
++        out.write(value ushr 8)
++        out.write(value)
++    }
++
++    private fun writeIntAt(data: ByteArray, offset: Int, value: Int) {
++        data[offset] = (value ushr 24).toByte()
++        data[offset + 1] = (value ushr 16).toByte()
++        data[offset + 2] = (value ushr 8).toByte()
++        data[offset + 3] = value.toByte()
++    }
++
++    private fun wideMask(count: Int, fraction: Double, seed: Long): BooleanArray {
++        val random = Random(seed)
++        return BooleanArray(count) { random.nextDouble() < fraction }
++    }
++
++    private fun tallHeight(width: Int): Int = (width * 1.5 + 40.0).roundToInt()
++
++    private fun wideHeight(width: Int): Int = (width / 1.5 + 40.0).roundToInt()
++
++    private fun percent(fraction: Double): String = "${(fraction * 100).roundToInt()}%"
++
++    private fun fmt(value: Double): String = "%.2f%%".format(value)
++
++    private class HoleReport(
++        val wasteArea: Long,
++        val itemArea: Long,
++        val footprint: Long,
++        val maxGap: Int,
++        val upwardSteps: Int,
++        val maxUpward: Int,
++        val skippedLeftPair: Int,
++        val contentHeight: Int,
++    ) {
++        val holePercent: Double
++            get() = if (itemArea + wasteArea == 0L) 0.0 else wasteArea * 100.0 / (itemArea + wasteArea)
++
++        val footprintPercent: Double
++            get() = if (footprint == 0L) 0.0 else wasteArea * 100.0 / footprint
++    }
++
++    private companion object {
++        const val PANORAMA_SAMPLE_SEED = 20261014L
++        const val PREVIEW_WIDE_RGB = 0xFFA740
++        const val PREVIEW_TALL_RGB = 0xB0D6F2
++        val PNG_SIGNATURE = byteArrayOf(
++            0x89.toByte(),
++            0x50,
++            0x4E,
++            0x47,
++            0x0D,
++            0x0A,
++            0x1A,
++            0x0A,
+         )
+     }
+ }

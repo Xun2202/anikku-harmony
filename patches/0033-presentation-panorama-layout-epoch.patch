@@ -1,0 +1,593 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 06:16:03 +0000
+Subject: [PATCH] presentation: panorama layout skips per-item work while
+ content is unchanged
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A fling remeasured every placed cell even when the items, spans, and
+lane widths had not changed. On a 2000-item shelf that per-item walk
+showed up as stutter once the finger was released.
+
+The layout cache now keys on a content epoch. While the epoch, count,
+and lane widths match, it reuses the previous placement instead of
+running the per-item work again. A band change bumps the epoch and
+reflows.
+
+与 mihon-harmony 0025 同源. The three shared panorama files are copied
+byte for byte from that commit.
+---
+ .../core/components/PanoramaMasonry.kt        |  78 ++++++-
+ .../core/components/PanoramaMasonryLayout.kt  |  39 ++--
+ .../components/PanoramaMasonryLayoutTest.kt   | 214 +++++++++++++++---
+ 3 files changed, 274 insertions(+), 57 deletions(-)
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+index 8fe7031..b4760c9 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+@@ -39,6 +39,14 @@ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+ import kotlin.math.roundToInt
+ 
++/**
++ * Bumped when a committed cover crosses the wide/tall band.
++ * Read from measure, not from the parent composition, so the grid remeasures without recomposing.
++ *
++ * Harmony: app code increments this on the main thread. Same-band ratio changes must not.
++ */
++val PanoramaMasonryContentEpoch = mutableIntStateOf(0)
++
+ /**
+  * Columns for [PanoramaMasonry]. The counts match [androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridCells].
+  */
+@@ -127,6 +135,13 @@ class PanoramaMasonryState {
+     internal var lastAnchor: PanoramaAnchor? = null
+     internal var lastKeys: List<Any>? = null
+ 
++    private var intervalContent: PanoramaIntervalContent? = null
++    private var intervalLambda: (PanoramaMasonryScope.() -> Unit)? = null
++
++    private var keyCache: List<Any>? = null
++    private var keyCacheEpoch: Long = Long.MIN_VALUE
++    private var keyCacheCount: Int = -1
++
+     val isScrollInProgress: Boolean
+         get() = scrollableState.isScrollInProgress
+ 
+@@ -231,6 +246,35 @@ class PanoramaMasonryState {
+         }
+     }
+ 
++    internal fun intervalsFor(content: PanoramaMasonryScope.() -> Unit): PanoramaIntervalContent {
++        val current = intervalContent
++        if (current != null && intervalLambda === content) return current
++        val created = PanoramaIntervalContent(content)
++        intervalContent = created
++        intervalLambda = content
++        return created
++    }
++
++    /**
++     * The previous key list when [epoch] and [count] are unchanged, otherwise null.
++     * A null result is the only path that may allocate the next list.
++     */
++    internal fun peekCachedKeys(epoch: Long, count: Int): List<Any>? {
++        val cached = keyCache
++        if (cached != null && keyCacheEpoch == epoch && keyCacheCount == count) return cached
++        return null
++    }
++
++    internal fun keysFor(epoch: Long, count: Int, keyAt: (Int) -> Any): List<Any> {
++        peekCachedKeys(epoch, count)?.let { return it }
++        val built = ArrayList<Any>(count)
++        for (index in 0 until count) built.add(keyAt(index))
++        keyCache = built
++        keyCacheEpoch = epoch
++        keyCacheCount = count
++        return built
++    }
++
+     internal fun importAnchor(saved: Any) {
+         val list = saved as? List<*> ?: return
+         val tag = list.getOrNull(0) as? Int ?: return
+@@ -332,6 +376,14 @@ private const val ANCHOR_STRING = 4
+ /** Key that cannot match a real item, so [scrollOffsetForAnchor] clamps to the saved index. */
+ private object RestoreIndexOnly
+ 
++/**
++ * High 32 bits are the shape-table version. Low 32 bits are the items-lambda identity.
++ * Lane widths are not included; the layout cache compares them on their own.
++ */
++internal fun panoramaContentEpoch(shapeEpoch: Int, intervals: Any): Long {
++    return (shapeEpoch.toLong() shl 32) xor System.identityHashCode(intervals).toLong().and(0xffffffffL)
++}
++
+ private fun sameKeyList(left: List<Any>, right: List<Any>): Boolean {
+     if (left === right) return true
+     if (left.size != right.size) return false
+@@ -471,8 +523,10 @@ private fun LazyLayoutMeasureScope.measureMasonry(
+     // Subscribes this measure to scroll-to-item requests.
+     state.scrollRequest
+ 
+-    val intervals = PanoramaIntervalContent(content)
++    val intervals = state.intervalsFor(content)
+     val count = intervals.itemCount
++    // Harmony: snapshot read in measure. A band commit remeasures without recomposing the shelf.
++    val contentEpoch = panoramaContentEpoch(PanoramaMasonryContentEpoch.intValue, intervals)
+     val direction = layoutDirection
+     val padding = args.contentPadding
+     val left = padding.calculateLeftPadding(direction).roundToPx()
+@@ -524,34 +578,38 @@ private fun LazyLayoutMeasureScope.measureMasonry(
+         }
+     }
+ 
++    val rtl = direction == LayoutDirection.Rtl
+     val masonry = if (laneCount == 0 || count == 0) {
+         state.layoutCache.layout(
+             count = 0,
++            contentEpoch = contentEpoch,
+             heightOf = { _, _ -> 0 },
+             laneWidths = if (laneWidths.isEmpty()) intArrayOf(0) else laneWidths,
+             verticalSpacing = verticalPx,
+             horizontalSpacing = horizontalPx,
+-            rtl = direction == LayoutDirection.Rtl,
++            rtl = rtl,
+         )
+     } else {
+         state.layoutCache.layout(
+             count = count,
++            contentEpoch = contentEpoch,
+             spanOf = { index -> intervals.spanAt(index) },
+             heightOf = { index, widthPx -> heightOf(index, widthPx) },
+             laneWidths = laneWidths,
+             verticalSpacing = verticalPx,
+             horizontalSpacing = horizontalPx,
+-            rtl = direction == LayoutDirection.Rtl,
++            rtl = rtl,
+         )
+     }
+ 
+-    val keys = ArrayList<Any>(masonry.rects.size)
+-    for (rect in masonry.rects) {
+-        keys.add(intervals.getKey(rect.index))
+-    }
++    // Harmony: the list is rebuilt only when the epoch or the count changes. Scroll frames reuse it.
++    val keyCount = masonry.rects.size
++    val keys = state.peekCachedKeys(contentEpoch, keyCount)
++        ?: state.keysFor(contentEpoch, keyCount) { index -> intervals.getKey(index) }
+     val viewport = if (constraints.hasBoundedHeight) constraints.maxHeight else 0
+     val total = topPad + masonry.contentHeight + bottomPad
+-    val structural = state.layoutCache.structuralChange || keysChanged(state.lastKeys, keys)
++    val structural = state.layoutCache.structuralChange ||
++        (keys !== state.lastKeys && keysChanged(state.lastKeys, keys))
+     state.applyMeasuredViewport(
+         rects = masonry.rects,
+         keys = keys,
+@@ -606,7 +664,7 @@ private fun keysChanged(previous: List<Any>?, keys: List<Any>): Boolean {
+     return false
+ }
+ 
+-private class PanoramaIntervalContent(
++internal class PanoramaIntervalContent(
+     content: PanoramaMasonryScope.() -> Unit,
+ ) : PanoramaMasonryScope, LazyLayoutIntervalContent<PanoramaInterval>() {
+     override val intervals = MutableIntervalList<PanoramaInterval>()
+@@ -661,7 +719,7 @@ private class PanoramaIntervalContent(
+     }
+ }
+ 
+-private class PanoramaInterval(
++internal class PanoramaInterval(
+     override val key: ((index: Int) -> Any)?,
+     override val type: (index: Int) -> Any?,
+     val span: (index: Int) -> PanoramaSpan,
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt
+index f03ad73..1952df8 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt
+@@ -293,8 +293,16 @@ fun appendPanoramaMasonry(
+ }
+ 
+ /**
+- * Remembers a layout and appends when only the tail grew. A lane-width change, a height change,
+- * or a shorter list replaces the whole layout and reports [structuralChange].
++ * Remembers a layout.
++ *
++ * Same [contentEpoch], lane geometry, and [count] returns the previous layout and does not call
++ * [heightOf] or [spanOf]. A longer list with that same epoch appends. Anything else rebuilds and
++ * reports [structuralChange] so the viewport can stay on its anchor in the same measure.
++ *
++ * Harmony: the epoch replaces the per-item prefix check. Scroll frames keep the epoch, so a large
++ * shelf does not allocate a height for every row. Callers bump it when a committed cover crosses
++ * the wide/tall band or the items lambda changes. Lane widths are compared on their own and always
++ * rebuild, including when a wide cover starts or stops spanning two lanes.
+  */
+ class PanoramaMasonryLayoutCache {
+     private var layout: PanoramaMasonryLayout? = null
+@@ -302,12 +310,15 @@ class PanoramaMasonryLayoutCache {
+     private var verticalSpacing: Int = Int.MIN_VALUE
+     private var horizontalSpacing: Int = Int.MIN_VALUE
+     private var rtl: Boolean = false
++    private var contentEpoch: Long = Long.MIN_VALUE
++    private var count: Int = -1
+ 
+     var structuralChange: Boolean = false
+         private set
+ 
+     fun layout(
+         count: Int,
++        contentEpoch: Long = 0L,
+         spanOf: (Int) -> PanoramaSpan = { PanoramaSpan.SingleLane },
+         heightOf: (index: Int, widthPx: Int) -> Int,
+         laneWidths: IntArray,
+@@ -321,15 +332,13 @@ class PanoramaMasonryLayoutCache {
+             horizontalSpacing == this.horizontalSpacing &&
+             rtl == this.rtl &&
+             this.laneWidths.contentEquals(laneWidths)
+-        val reusable = sameGeometry &&
+-            count >= previous.rects.size &&
+-            prefixUnchanged(previous, spanOf, heightOf)
++        val sameEpoch = previous != null && contentEpoch == this.contentEpoch
+         val result = when {
+-            reusable && count == previous.rects.size -> {
++            previous != null && sameGeometry && sameEpoch && count == this.count -> {
+                 structuralChange = false
+                 previous
+             }
+-            reusable -> {
++            previous != null && sameGeometry && sameEpoch && count > previous.rects.size -> {
+                 structuralChange = false
+                 appendPanoramaMasonry(previous, count, spanOf, heightOf)
+             }
+@@ -351,22 +360,10 @@ class PanoramaMasonryLayoutCache {
+         this.verticalSpacing = verticalSpacing
+         this.horizontalSpacing = horizontalSpacing
+         this.rtl = rtl
++        this.contentEpoch = contentEpoch
++        this.count = count
+         return result
+     }
+-
+-    private fun prefixUnchanged(
+-        previous: PanoramaMasonryLayout,
+-        spanOf: (Int) -> PanoramaSpan,
+-        heightOf: (index: Int, widthPx: Int) -> Int,
+-    ): Boolean {
+-        for (rect in previous.rects) {
+-            // Harmony: tall-to-wide flips the span. Comparing height at the old width can miss that,
+-            // so a span change rebuilds from the start instead of appending after a stale prefix.
+-            if (spanOf(rect.index) != rect.span) return false
+-            if (heightOf(rect.index, rect.width) != rect.height) return false
+-        }
+-        return true
+-    }
+ }
+ 
+ /**
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt
+index 30b9958..1b07d75 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt
+@@ -139,6 +139,7 @@ class PanoramaMasonryLayoutTest {
+         val cache = PanoramaMasonryLayoutCache()
+         val first = cache.layout(
+             count = head.size,
++            contentEpoch = 1L,
+             heightOf = { index, _ -> head[index] },
+             laneWidths = intArrayOf(100, 100),
+             verticalSpacing = 4,
+@@ -148,6 +149,7 @@ class PanoramaMasonryLayoutTest {
+         assertFalse(cache.structuralChange)
+         val appended = cache.layout(
+             count = all.size,
++            contentEpoch = 1L,
+             heightOf = { index, _ -> all[index] },
+             laneWidths = intArrayOf(100, 100),
+             verticalSpacing = 4,
+@@ -167,14 +169,16 @@ class PanoramaMasonryLayoutTest {
+         val cache = PanoramaMasonryLayoutCache()
+         cache.layout(
+             count = 2,
++            contentEpoch = 1L,
+             heightOf = { _, _ -> 100 },
+             laneWidths = intArrayOf(50, 50),
+             verticalSpacing = 0,
+             horizontalSpacing = 0,
+             rtl = false,
+         )
+-        cache.layout(
++        val replaced = cache.layout(
+             count = 2,
++            contentEpoch = 2L,
+             heightOf = { index, _ -> if (index == 0) 180 else 100 },
+             laneWidths = intArrayOf(50, 50),
+             verticalSpacing = 0,
+@@ -182,6 +186,7 @@ class PanoramaMasonryLayoutTest {
+             rtl = false,
+         )
+         assertTrue(cache.structuralChange)
++        assertEquals(180, replaced.rects[0].height)
+     }
+ 
+     @Test
+@@ -295,6 +300,7 @@ class PanoramaMasonryLayoutTest {
+         val widths = intArrayOf(80, 80, 80)
+         val first = cache.layout(
+             count = 2,
++            contentEpoch = 1L,
+             spanOf = { PanoramaSpan.SingleLane },
+             heightOf = { _, _ -> 120 },
+             laneWidths = widths,
+@@ -307,6 +313,7 @@ class PanoramaMasonryLayoutTest {
+ 
+         val second = cache.layout(
+             count = 2,
++            contentEpoch = 2L,
+             spanOf = { index ->
+                 if (index == 0) PanoramaSpan.TwoLanesWhenRoomy else PanoramaSpan.SingleLane
+             },
+@@ -526,6 +533,162 @@ class PanoramaMasonryLayoutTest {
+         assertEquals(8, restored.firstVisibleItemIndex)
+     }
+ 
++    @Test
++    fun `an unchanged epoch does no per item work across 120 frames`() {
++        val widths = intArrayOf(100, 100, 100)
++        for (count in intArrayOf(200, 8000)) {
++            val cache = PanoramaMasonryLayoutCache()
++            var heightCalls = 0
++            var spanCalls = 0
++            fun layout() = cache.layout(
++                count = count,
++                contentEpoch = 7L,
++                spanOf = {
++                    spanCalls++
++                    PanoramaSpan.SingleLane
++                },
++                heightOf = { _, _ ->
++                    heightCalls++
++                    40
++                },
++                laneWidths = widths,
++                verticalSpacing = 4,
++                horizontalSpacing = 4,
++                rtl = false,
++            )
++            layout()
++            heightCalls = 0
++            spanCalls = 0
++            repeat(120) { layout() }
++            assertEquals(0, heightCalls, "count=$count")
++            assertEquals(0, spanCalls, "count=$count")
++            assertFalse(cache.structuralChange)
++        }
++    }
++
++    @Test
++    fun `a new content epoch relayouts and keeps the anchor offset`() {
++        val cache = PanoramaMasonryLayoutCache()
++        val state = PanoramaMasonryState()
++        val keys = List(30) { it.toLong() }
++        val widths = intArrayOf(100, 100)
++        val first = cache.layout(
++            count = keys.size,
++            contentEpoch = 1L,
++            spanOf = { PanoramaSpan.SingleLane },
++            heightOf = { index, _ -> if (index % 2 == 0) 200 else 90 },
++            laneWidths = widths,
++            verticalSpacing = 0,
++            horizontalSpacing = 0,
++            rtl = false,
++        )
++        state.scrollOffset = first.rects[10].y + 8f
++        measureViewport(state, first, keys, viewport = 120)
++        val anchor = state.lastAnchor!!
++        val offset = anchor.offsetFromViewportTop
++        assertTrue(anchor.index > 0)
++
++        var heightCalls = 0
++        val second = cache.layout(
++            count = keys.size,
++            contentEpoch = 2L,
++            spanOf = { index ->
++                if (index % 2 == 0) PanoramaSpan.TwoLanesWhenRoomy else PanoramaSpan.SingleLane
++            },
++            heightOf = { index, _ ->
++                heightCalls++
++                if (index % 2 == 0) 80 else 200
++            },
++            laneWidths = widths,
++            verticalSpacing = 0,
++            horizontalSpacing = 0,
++            rtl = false,
++        )
++        assertTrue(cache.structuralChange)
++        assertTrue(heightCalls >= keys.size)
++        measureViewport(state, second, keys, viewport = 120, structural = true)
++        val top = second.rects[keys.indexOf(anchor.key)].y
++        assertEquals(offset, top - state.scrollOffset.roundToInt())
++    }
++
++    @Test
++    fun `a lane width change relayouts even when the epoch is unchanged`() {
++        val cache = PanoramaMasonryLayoutCache()
++        var calls = 0
++        val state = PanoramaMasonryState()
++        val keys = List(12) { it.toLong() }
++        val first = cache.layout(
++            count = keys.size,
++            contentEpoch = 4L,
++            heightOf = { _, _ ->
++                calls++
++                80
++            },
++            laneWidths = intArrayOf(100, 100),
++            verticalSpacing = 0,
++            horizontalSpacing = 0,
++            rtl = false,
++        )
++        state.scrollOffset = first.rects[4].y + 6f
++        measureViewport(state, first, keys, viewport = 100)
++        val offset = state.lastAnchor!!.offsetFromViewportTop
++        calls = 0
++        val second = cache.layout(
++            count = keys.size,
++            contentEpoch = 4L,
++            heightOf = { _, _ ->
++                calls++
++                80
++            },
++            laneWidths = intArrayOf(40, 40, 40, 40),
++            verticalSpacing = 0,
++            horizontalSpacing = 0,
++            rtl = false,
++        )
++        assertTrue(cache.structuralChange)
++        assertTrue(calls >= keys.size)
++        assertEquals(4, second.laneCount)
++        measureViewport(state, second, keys, viewport = 100, structural = true)
++        val index = state.lastAnchor!!.index
++        assertEquals(offset, second.rects[index].y - state.scrollOffset.roundToInt())
++    }
++
++    @Test
++    fun `key lists are rebuilt only when the epoch or the count changes`() {
++        val state = PanoramaMasonryState()
++        var builds = 0
++        val keyAt = { index: Int ->
++            builds++
++            index.toLong()
++        }
++        val first = state.keysFor(epoch = 1L, count = 10, keyAt = keyAt)
++        val second = state.keysFor(epoch = 1L, count = 10, keyAt = keyAt)
++        assertTrue(first === second)
++        assertEquals(10, builds)
++        state.keysFor(epoch = 1L, count = 12, keyAt = keyAt)
++        assertEquals(22, builds)
++        state.keysFor(epoch = 2L, count = 12, keyAt = keyAt)
++        assertEquals(34, builds)
++    }
++
++    @Test
++    fun `content epoch changes with the shape version and the items lambda`() {
++        PanoramaMasonryContentEpoch.intValue = 0
++        val intervals = Any()
++        val first = panoramaContentEpoch(PanoramaMasonryContentEpoch.intValue, intervals)
++        assertEquals(first, panoramaContentEpoch(0, intervals))
++        PanoramaMasonryContentEpoch.intValue = 1
++        assertNotEquals(first, panoramaContentEpoch(PanoramaMasonryContentEpoch.intValue, intervals))
++        assertNotEquals(first, panoramaContentEpoch(0, Any()))
++        val state = PanoramaMasonryState()
++        val content: PanoramaMasonryScope.() -> Unit = { }
++        val other: PanoramaMasonryScope.() -> Unit = { }
++        val cached = state.intervalsFor(content)
++        assertTrue(cached === state.intervalsFor(content))
++        assertTrue(cached !== state.intervalsFor(other))
++        PanoramaMasonryContentEpoch.intValue = 0
++    }
++
+     @Test
+     fun `Benchmark unchanged scroll frames`() {
+         assumeTrue(System.getenv("PANORAMA_BENCH") == "1") {
+@@ -537,7 +700,8 @@ class PanoramaMasonryLayoutTest {
+         for (index in 0 until count) {
+             ratios[index.toLong()] = if (index % 5 == 0) 0.5f else 1.5f
+         }
+-        val cache = PanoramaMasonryLayoutCache()
++        val state = PanoramaMasonryState()
++        val epoch = 1L
+         var heightCalls = 0
+         var spanCalls = 0
+         val spanOf: (Int) -> PanoramaSpan = { index ->
+@@ -555,8 +719,10 @@ class PanoramaMasonryLayoutTest {
+             PanoramaCellHeight.Cover(wide = wide, titleBelow = true)
+             if (wide) 112 else 252
+         }
+-        cache.layout(
++        val keyAt: (Int) -> Any = { it.toLong() }
++        fun frameLayout() = state.layoutCache.layout(
+             count = count,
++            contentEpoch = epoch,
+             spanOf = spanOf,
+             heightOf = heightOf,
+             laneWidths = lanes,
+@@ -564,6 +730,8 @@ class PanoramaMasonryLayoutTest {
+             horizontalSpacing = 4,
+             rtl = false,
+         )
++        val warmed = frameLayout()
++        state.keysFor(epoch, warmed.rects.size, keyAt)
+         heightCalls = 0
+         spanCalls = 0
+         // Harmony: android.jar has no com.sun.management, so the counter is reflective and optional.
+@@ -571,27 +739,20 @@ class PanoramaMasonryLayoutTest {
+         val allocatedBefore = probe?.allocatedBytes()
+         val started = System.nanoTime()
+         val frames = 120
+-        var previousKeys: List<Any>? = null
+         repeat(frames) { frame ->
+-            cache.layout(
+-                count = count,
+-                spanOf = spanOf,
+-                heightOf = heightOf,
+-                laneWidths = lanes,
+-                verticalSpacing = 4,
+-                horizontalSpacing = 4,
+-                rtl = false,
++            state.scrollOffset = frame.toFloat()
++            val layout = frameLayout()
++            val keys = state.peekCachedKeys(epoch, layout.rects.size)
++                ?: state.keysFor(epoch, layout.rects.size, keyAt)
++            state.applyMeasuredViewport(
++                rects = layout.rects,
++                keys = keys,
++                topPadding = 0,
++                viewport = 1800,
++                totalHeight = layout.contentHeight,
++                bottomPadding = 0,
++                structural = state.layoutCache.structuralChange,
+             )
+-            val keys = ArrayList<Any>(count)
+-            for (index in 0 until count) keys.add(index.toLong())
+-            if (previousKeys != null) {
+-                val shared = minOf(previousKeys!!.size, keys.size)
+-                for (index in 0 until shared) {
+-                    if (previousKeys!![index] != keys[index]) break
+-                }
+-            }
+-            previousKeys = keys
+-            if (frame == 0) Unit
+         }
+         val elapsedNanos = System.nanoTime() - started
+         val allocated = if (probe == null || allocatedBefore == null) {
+@@ -634,14 +795,15 @@ class PanoramaMasonryLayoutTest {
+         layout: PanoramaMasonryLayout,
+         keys: List<Any>,
+         viewport: Int = 800,
++        structural: Boolean? = null,
+     ) {
+         val previous = state.lastKeys
+-        var structural = state.layoutCache.structuralChange
+-        if (previous != null) {
++        var structuralChange = structural ?: state.layoutCache.structuralChange
++        if (structural == null && previous != null) {
+             val shared = minOf(previous.size, keys.size)
+             for (index in 0 until shared) {
+                 if (previous[index] != keys[index]) {
+-                    structural = true
++                    structuralChange = true
+                     break
+                 }
+             }
+@@ -653,7 +815,7 @@ class PanoramaMasonryLayoutTest {
+             viewport = viewport,
+             totalHeight = layout.contentHeight,
+             bottomPadding = 0,
+-            structural = structural,
++            structural = structuralChange,
+         )
+     }
+ 

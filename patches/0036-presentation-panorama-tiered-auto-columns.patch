@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 06:19:53 +0000
+Subject: [PATCH] presentation: panorama auto columns widen on large windows
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+One minimum cannot suit a folded phone and an unfolded window. Under
+600 dp the minimum is 112 dp, which keeps a tall cover on three columns.
+At 600 dp and above it is 140 dp, so a wide window does not add columns
+of small covers.
+
+The tier is the grid's own width: lane area plus horizontal content
+padding (16 dp in portrait). Configuration screen width is not read, so
+a split or freeform window follows the pane. Lane count stays
+staggeredLaneCountAdaptive.
+
+Pura X Max folded portrait is about 459 dp (3 columns) and unfolded
+landscape about 939 dp (6). vivo X100 Pro portrait is 360 and 420 dp,
+both 3 columns. The table is 360/420/459 → 3, 664/672 → 4, 800 → 5,
+933/939 → 6. 599 dp still uses 112 dp; 600 dp uses 140 dp.
+
+与 mihon-harmony 0028 同源. Anikku keeps the value in PanoramaGrid.kt,
+and the shelf, browse, and related grids all read it through
+panoramaColumns.
+---
+ .../library/components/PanoramaGrid.kt        | 19 +++++++---
+ .../core/components/PanoramaMasonry.kt        | 32 ++++++++++++++++
+ .../core/components/PanoramaMasonryLayout.kt  | 11 ++++++
+ .../components/PanoramaMasonryLayoutTest.kt   | 37 +++++++++++++------
+ 4 files changed, 81 insertions(+), 18 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
+index ca845ae..639940c 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
+@@ -19,7 +19,8 @@ import uy.kohesive.injekt.api.get
+ 
+ // Harmony -->
+ /**
+- * Minimum auto column for panorama grids, sized for a tall 2:3 cover.
++ * Auto columns for panorama grids. The minimum follows this grid's own width
++ * (lane area plus horizontal content padding), not the device screen width.
+  *
+  * Lane count matches [tachiyomi.presentation.core.components.staggeredLaneCountAdaptive]:
+  * `lanes = (available + spacing) / (min + spacing)`,
+@@ -28,11 +29,17 @@ import uy.kohesive.injekt.api.get
+  * The grid adds `PaddingValues(8.dp)` around the scaffold content padding. In portrait that
+  * horizontal padding is 16 dp, so `available = window width - 16`.
+  *
+- * 104 dp keeps a folded phone on three book-sized columns: 360 dp → 3, 420 dp → 3, 459 dp → 3.
+- * (168 dp, chosen so a single-column 3:2 cover was not cramped, left a ~360 dp folded screen
+- * on 2 columns. Wide covers span two lanes instead of asking the minimum to suit both shapes.)
++ * Under 600 dp the minimum is 112 dp. At 600 dp and above it is 140 dp:
++ * 360 → 3, 420 → 3, 459 → 3, 664 → 4, 672 → 4, 800 → 5, 933 → 6, 939 → 6.
++ * Pura X Max folded portrait is about 459 dp (3) and unfolded landscape about 939 dp (6).
++ * vivo X100 Pro portrait is 360 and 420 dp (3).
++ * (A single 104 dp minimum put that 939 dp window on 8 columns.)
+  */
+-internal val PanoramaGridMinColumnWidth = 104.dp
++internal val PanoramaGridMinColumnWidth = PanoramaColumns.Tiered(
++    compactMin = 112.dp,
++    expandedMin = 140.dp,
++    breakpoint = 600.dp,
++)
+ 
+ /** Wide covers span two lanes when there are at least three; tall covers stay in one. */
+ internal fun panoramaCoverSpan(wide: Boolean): PanoramaSpan {
+@@ -67,7 +74,7 @@ internal fun libraryGridCells(columnCount: Int): GridCells = CountedGridCells(co
+ 
+ internal fun panoramaColumns(columnCount: Int): PanoramaColumns {
+     return if (columnCount == 0) {
+-        PanoramaColumns.Adaptive(PanoramaGridMinColumnWidth)
++        PanoramaGridMinColumnWidth
+     } else {
+         PanoramaColumns.Fixed(columnCount)
+     }
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+index b4760c9..49930f0 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+@@ -57,6 +57,24 @@ sealed interface PanoramaColumns {
+ 
+     /** As many columns as fit at [minSize], same formula as StaggeredGridCells.Adaptive. */
+     data class Adaptive(val minSize: Dp) : PanoramaColumns
++
++    /**
++     * Adaptive columns with two minima.
++     *
++     * Narrower than [breakpoint] uses [compactMin]. [breakpoint] and wider uses [expandedMin].
++     * The width compared with [breakpoint] is this grid's own width: the lane area plus
++     * horizontal content padding. A split-screen or freeform window therefore follows the
++     * pane. [android.content.res.Configuration.screenWidthDp] is the device width and is not
++     * read here. Lane count is still [staggeredLaneCountAdaptive].
++     *
++     * [Adaptive] stays the single-minimum StaggeredGridCells.Adaptive rule. [Tiered] carries
++     * the breakpoint with the two minima, and measure selects that branch on its own.
++     */
++    data class Tiered(
++        val compactMin: Dp,
++        val expandedMin: Dp,
++        val breakpoint: Dp,
++    ) : PanoramaColumns
+ }
+ 
+ /**
+@@ -547,6 +565,20 @@ private fun LazyLayoutMeasureScope.measureMasonry(
+             spacing = horizontalPx,
+             minSize = columns.minSize.roundToPx(),
+         )
++        is PanoramaColumns.Tiered -> {
++            // Harmony: the tier is this grid's width, so a freeform pane does not inherit the device screen.
++            val windowPx = available + left + right
++            staggeredLaneCountAdaptive(
++                availableSize = available,
++                spacing = horizontalPx,
++                minSize = panoramaTieredMinSize(
++                    windowSize = windowPx,
++                    breakpoint = columns.breakpoint.roundToPx(),
++                    compactMin = columns.compactMin.roundToPx(),
++                    expandedMin = columns.expandedMin.roundToPx(),
++                ),
++            )
++        }
+     }
+     val laneWidths = staggeredLaneWidths(available, laneCount, horizontalPx)
+     val cellPadding = PANORAMA_CELL_PADDING_DP.dp.roundToPx()
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt
+index 1952df8..11e34d6 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt
+@@ -101,6 +101,17 @@ fun staggeredLaneCountAdaptive(availableSize: Int, spacing: Int, minSize: Int):
+     return maxOf((availableSize + spacing) / (minSize + spacing), 1)
+ }
+ 
++/**
++ * Column minimum for [PanoramaColumns.Tiered].
++ *
++ * [windowSize] is the grid's own width (lane area plus horizontal content padding), in the
++ * same unit as [breakpoint], [compactMin], and [expandedMin]. Narrower than [breakpoint]
++ * uses [compactMin]. [breakpoint] and wider uses [expandedMin].
++ */
++fun panoramaTieredMinSize(windowSize: Int, breakpoint: Int, compactMin: Int, expandedMin: Int): Int {
++    return if (windowSize < breakpoint) compactMin else expandedMin
++}
++
+ /**
+  * Column widths of [androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridCells.Fixed]
+  * and Adaptive. Remainder pixels go to the first lanes.
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt
+index 1b07d75..8c55be0 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt
+@@ -349,14 +349,27 @@ class PanoramaMasonryLayoutTest {
+     }
+ 
+     @Test
+-    fun `book sized minimum fits three columns at 360 dp and six at 733`() {
+-        // available = screenWidth - 16 dp of horizontal padding, spacing 4 dp. See PanoramaGridMinColumnWidth.
+-        assertEquals(3, staggeredLaneCountAdaptive(360 - 16, 4, 104))
+-        assertEquals(3, staggeredLaneCountAdaptive(392 - 16, 4, 104))
+-        assertEquals(3, staggeredLaneCountAdaptive(411 - 16, 4, 104))
+-        assertEquals(6, staggeredLaneCountAdaptive(733 - 16, 4, 104))
+-        assertEquals(2, staggeredLaneCountAdaptive(360 - 16, 4, 168))
+-        assertEquals(4, staggeredLaneCountAdaptive(733 - 16, 4, 168))
++    fun `tiered minimum stays on three phone columns and widens past 600 dp`() {
++        // available = window - 16 dp horizontal padding, spacing 4 dp. See PanoramaGridMinColumnWidth.
++        // Under 600 dp the minimum is 112. At 600 dp and above it is 140.
++        val spacing = 4
++        val padding = 16
++        val columnsByWindow = listOf(
++            360 to 3,
++            420 to 3,
++            459 to 3,
++            664 to 4,
++            672 to 4,
++            800 to 5,
++            933 to 6,
++            939 to 6,
++        )
++        for ((window, lanes) in columnsByWindow) {
++            val min = panoramaTieredMinSize(window, breakpoint = 600, compactMin = 112, expandedMin = 140)
++            assertEquals(lanes, staggeredLaneCountAdaptive(window - padding, spacing, min))
++        }
++        assertEquals(112, panoramaTieredMinSize(599, breakpoint = 600, compactMin = 112, expandedMin = 140))
++        assertEquals(140, panoramaTieredMinSize(600, breakpoint = 600, compactMin = 112, expandedMin = 140))
+     }
+ 
+     @Test
+@@ -402,7 +415,7 @@ class PanoramaMasonryLayoutTest {
+     }
+ 
+     @Test
+-    fun `Preview panorama columns at 360 and 733 dp`() {
++    fun `Preview panorama columns at 360 and 939 dp`() {
+         assumeTrue(System.getenv("PANORAMA_PREVIEW") == "1") {
+             "PANORAMA_PREVIEW=1 writes /tmp/panorama-preview"
+         }
+@@ -410,9 +423,9 @@ class PanoramaMasonryLayoutTest {
+         directory.mkdirs()
+         val wide = wideMask(count = 40, fraction = 0.30, seed = PANORAMA_SAMPLE_SEED)
+         writePreview(directory, "360dp-old.png", screenDp = 360, minColumnDp = 168, spanWide = false, wide = wide)
+-        writePreview(directory, "360dp-new.png", screenDp = 360, minColumnDp = 104, spanWide = true, wide = wide)
+-        writePreview(directory, "733dp-old.png", screenDp = 733, minColumnDp = 168, spanWide = false, wide = wide)
+-        writePreview(directory, "733dp-new.png", screenDp = 733, minColumnDp = 104, spanWide = true, wide = wide)
++        writePreview(directory, "360dp-new.png", screenDp = 360, minColumnDp = 112, spanWide = true, wide = wide)
++        writePreview(directory, "939dp-old.png", screenDp = 939, minColumnDp = 168, spanWide = false, wide = wide)
++        writePreview(directory, "939dp-new.png", screenDp = 939, minColumnDp = 140, spanWide = true, wide = wide)
+     }
+ 
+     @Test

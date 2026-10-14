@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 06:20:09 +0000
+Subject: [PATCH] presentation: fast scroller follows scroll without restarting
+ per frame
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VerticalMasonryFastScroller restarted its follow effect on every change
+of scroll offset, max scroll, and canScrollForward. A fling writes the
+offset on each frame, so that coroutine was cancelled and started again
+for every one of them and the shelf stuttered.
+
+One effect now collects a snapshotFlow of those three values. It still
+returns without moving the thumb while the thumb is dragged. The effect
+is keyed on the track height and top padding, which change with the
+layout rather than with each frame.
+
+与 mihon-harmony 0029 同源. The list scroller still assigns the thumb
+during composition. The grid scroller's
+LaunchedEffect(firstVisibleItemScrollOffset) is upstream in both trees
+and is left as it is. IrregularVerticalGridFastScroller is Anikku's own
+code, so its follow effect collects layoutInfo the same way, keyed on
+track height, top padding, and viewport height.
+---
+ .../core/components/VerticalFastScroller.kt   | 84 ++++++++++++-------
+ 1 file changed, 53 insertions(+), 31 deletions(-)
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+index fcd2327..b595610 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+@@ -62,6 +62,7 @@ import kotlinx.coroutines.CompletableDeferred
+ import kotlinx.coroutines.channels.BufferOverflow
+ import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.flow.MutableSharedFlow
++import kotlinx.coroutines.flow.collect
+ import kotlinx.coroutines.flow.collectLatest
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.flow.sample
+@@ -607,26 +608,41 @@ fun IrregularVerticalGridFastScroller(
+             }
+ 
+             // When list scrolled
+-            LaunchedEffect(state.firstVisibleItemScrollOffset, layoutInfo) {
+-                if (state.layoutInfo.totalItemsCount == 0 || isThumbDragged) return@LaunchedEffect
+-                val scrollOffset = computeScrollOffset(
+-                    state = state,
+-                    headerHeights = headerHeights,
+-                    cachedGridItemHeight = cachedGridItemHeight,
+-                )
+-                val scrollRange = computeScrollRange(
+-                    state = state,
+-                    headerHeights = headerHeights,
+-                    cachedGridItemHeight = cachedGridItemHeight,
+-                )
+-                // ANK -->
+-                // Guarding
+-                if (scrollRange <= heightPx) return@LaunchedEffect
+-                // ANK <--
+-                val proportion = scrollOffset.toFloat() / (scrollRange.toFloat() - heightPx)
+-                thumbOffsetY = trackHeightPx * proportion + thumbTopPadding
+-                scrolled.tryEmit(Unit)
++            // Harmony -->
++            // layoutInfo moves every frame. Collecting it keeps this effect alive,
++            // and a grabbed thumb is still ignored.
++            val lastScrollOffset = remember { MutableData(Int.MIN_VALUE) }
++            LaunchedEffect(trackHeightPx, thumbTopPadding, heightPx) {
++                snapshotFlow {
++                    Triple(
++                        state.layoutInfo.totalItemsCount,
++                        computeScrollOffset(
++                            state = state,
++                            headerHeights = headerHeights,
++                            cachedGridItemHeight = cachedGridItemHeight,
++                        ),
++                        computeScrollRange(
++                            state = state,
++                            headerHeights = headerHeights,
++                            cachedGridItemHeight = cachedGridItemHeight,
++                        ),
++                    )
++                }.collect { (total, scrollOffset, scrollRange) ->
++                    if (isThumbDraggedState.value) return@collect
++                    if (total == 0) return@collect
++                    // ANK -->
++                    if (scrollRange <= heightPx) return@collect
++                    // ANK <--
++                    val proportion = scrollOffset.toFloat() / (scrollRange.toFloat() - heightPx)
++                    val target = trackHeightPx * proportion + thumbTopPadding
++                    if (scrollOffset != lastScrollOffset.value) {
++                        lastScrollOffset.value = scrollOffset
++                        scrolled.tryEmit(Unit)
++                    }
++                    thumbOffsetY = target
++                }
+             }
++            // <-- Harmony
+ 
+             // Thumb alpha
+             val alpha = remember { Animatable(0f) }
+@@ -780,19 +796,25 @@ fun VerticalMasonryFastScroller(
+             }
+ 
+             val lastScrollOffset = remember { MutableData(Float.NaN) }
+-            LaunchedEffect(state.scrollOffset, state.maxScroll, state.canScrollForward) {
+-                if (isThumbDragged) return@LaunchedEffect
+-                val proportion = if (!state.canScrollForward) {
+-                    1f
+-                } else {
+-                    (state.scrollOffset / state.maxScroll).coerceIn(0f, 1f)
+-                }
+-                val target = trackHeightPx * proportion + thumbTopPadding
+-                if (state.scrollOffset != lastScrollOffset.value) {
+-                    lastScrollOffset.value = state.scrollOffset
+-                    scrolled.tryEmit(Unit)
++            // Harmony: a fling moves the offset every frame, and restarting this effect
++            // stalled the shelf. The collector stays up and still skips a grabbed thumb.
++            LaunchedEffect(trackHeightPx, thumbTopPadding) {
++                snapshotFlow {
++                    Triple(state.scrollOffset, state.maxScroll, state.canScrollForward)
++                }.collect { (scrollOffset, maxScroll, canScrollForward) ->
++                    if (isThumbDraggedState.value) return@collect
++                    val proportion = if (!canScrollForward) {
++                        1f
++                    } else {
++                        (scrollOffset / maxScroll).coerceIn(0f, 1f)
++                    }
++                    val target = trackHeightPx * proportion + thumbTopPadding
++                    if (scrollOffset != lastScrollOffset.value) {
++                        lastScrollOffset.value = scrollOffset
++                        scrolled.tryEmit(Unit)
++                    }
++                    thumbOffsetY = target
+                 }
+-                thumbOffsetY = target
+             }
+ 
+             val alpha = remember { Animatable(0f) }

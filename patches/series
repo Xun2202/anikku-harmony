@@ -28,3 +28,10 @@
 0028-presentation-staggered-scroller-stable-thumb.patch
 0029-download-quality-separate-from-playback.patch
 0030-presentation-panorama-masonry-reading-order.patch
+0031-presentation-panorama-auto-columns-span.patch
+0032-presentation-panorama-scroll-anchor-by-key.patch
+0033-presentation-panorama-layout-epoch.patch
+0034-library-panorama-cover-shapes-versioned.patch
+0035-presentation-fast-scroller-hold-grab.patch
+0036-presentation-panorama-tiered-auto-columns.patch
+0037-presentation-fast-scroller-snapshotflow.patch

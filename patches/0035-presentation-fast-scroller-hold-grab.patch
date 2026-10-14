@@ -1,0 +1,638 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 06:19:36 +0000
+Subject: [PATCH] presentation: fast scroller thumb stays grabbed while pressed
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Pressing the fast scroller faded the thumb out, and the same finger then
+dragged the shelf backwards. The hit target was removed at alpha 0, so a
+held finger that did not move stopped counting as a press.
+
+The thumb now records the finger on the down event, before touch slop,
+and stays opaque until that finger lifts. The hit rectangle stays up for
+the whole press. List, grid, and panorama scrollers share that thumb.
+Anikku still fades with FadeOutAnimationSpec, whose delay is the
+platform scroll delay. Mihon's list and grid wait two seconds.
+
+与 mihon-harmony 0027 同源. IrregularVerticalGridFastScroller is Anikku's
+own fourth scroller, on the episode grid. It now uses the same 32 dp hit
+target, press tracking, and opaque-while-held fade.
+---
+ .../core/components/VerticalFastScroller.kt   | 481 ++++++++++++------
+ 1 file changed, 318 insertions(+), 163 deletions(-)
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+index d9bda76..fcd2327 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+@@ -2,9 +2,13 @@ package tachiyomi.presentation.core.components
+ 
+ import android.view.ViewConfiguration
+ import androidx.compose.animation.core.Animatable
++import androidx.compose.animation.core.AnimationVector1D
+ import androidx.compose.animation.core.tween
+ import androidx.compose.foundation.background
++import androidx.compose.foundation.gestures.DraggableState
+ import androidx.compose.foundation.gestures.Orientation
++import androidx.compose.foundation.gestures.awaitEachGesture
++import androidx.compose.foundation.gestures.awaitFirstDown
+ import androidx.compose.foundation.gestures.draggable
+ import androidx.compose.foundation.gestures.rememberDraggableState
+ import androidx.compose.foundation.interaction.MutableInteractionSource
+@@ -31,12 +35,16 @@ import androidx.compose.runtime.State
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableFloatStateOf
+ import androidx.compose.runtime.mutableStateMapOf
++import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.setValue
+ import androidx.compose.runtime.snapshotFlow
++import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.alpha
+ import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.input.pointer.PointerEventPass
++import androidx.compose.ui.input.pointer.pointerInput
+ import androidx.compose.ui.layout.SubcomposeLayout
+ import androidx.compose.ui.platform.LocalDensity
+ import androidx.compose.ui.unit.Constraints
+@@ -45,14 +53,19 @@ import androidx.compose.ui.unit.Dp
+ import androidx.compose.ui.unit.IntOffset
+ import androidx.compose.ui.unit.LayoutDirection
+ import androidx.compose.ui.unit.dp
++import androidx.compose.ui.util.fastAny
+ import androidx.compose.ui.util.fastFirstOrNull
+ import androidx.compose.ui.util.fastForEach
+ import androidx.compose.ui.util.fastLastOrNull
+ import androidx.compose.ui.util.fastMaxBy
++import kotlinx.coroutines.CompletableDeferred
+ import kotlinx.coroutines.channels.BufferOverflow
++import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.flow.MutableSharedFlow
+ import kotlinx.coroutines.flow.collectLatest
++import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.flow.sample
++import kotlinx.coroutines.launch
+ import tachiyomi.presentation.core.components.Scroller.EXACT_HEIGHT_KEY_PREFIX
+ import tachiyomi.presentation.core.components.Scroller.STICKY_HEADER_KEY_PREFIX
+ import kotlin.math.abs
+@@ -90,7 +103,13 @@ fun VerticalFastScroller(
+             var thumbOffsetY by remember(thumbTopPadding) { mutableFloatStateOf(thumbTopPadding) }
+ 
+             val dragInteractionSource = remember { MutableInteractionSource() }
+-            val isThumbDragged by dragInteractionSource.collectIsDraggedAsState()
++            // Harmony -->
++            // Keep the State, not the Boolean. The fade coroutine outlives this composition
++            // and has to observe a press that starts after the scroll event.
++            val isThumbDraggedState = dragInteractionSource.collectIsDraggedAsState()
++            val isThumbDragged by isThumbDraggedState
++            val thumbPressed = rememberThumbPressed()
++            // Harmony <--
+             val scrolled = remember {
+                 MutableSharedFlow<Unit>(
+                     extraBufferCapacity = 1,
+@@ -179,53 +198,42 @@ fun VerticalFastScroller(
+                 scrolled
+                     .sample(100)
+                     .collectLatest {
+-                        if (thumbAllowed()) {
+-                            alpha.snapTo(1f)
++                        // Harmony -->
++                        alpha.holdOpaqueWhileThumbGrabbed(
++                            held = { thumbPressed.pressed || isThumbDraggedState.value },
++                            thumbAllowed = thumbAllowed,
++                        ) {
+                             // ANK -->
+-                            alpha.animateTo(0f, animationSpec = FadeOutAnimationSpec)
++                            animateTo(0f, animationSpec = FadeOutAnimationSpec)
+                             // ANK <--
+-                        } else {
+-                            alpha.animateTo(0f, animationSpec = ImmediateFadeOutAnimationSpec)
+                         }
++                        // Harmony <--
+                     }
+             }
+ 
+-            Box(
+-                modifier = Modifier
+-                    .offset { IntOffset(0, thumbOffsetY.roundToInt()) }
+-                    .then(
+-                        // Recompose opts
+-                        if (isThumbVisible && !listState.isScrollInProgress) {
+-                            Modifier.draggable(
+-                                interactionSource = dragInteractionSource,
+-                                orientation = Orientation.Vertical,
+-                                state = rememberDraggableState { delta ->
+-                                    val newOffsetY = thumbOffsetY + delta
+-                                    thumbOffsetY = newOffsetY.coerceIn(
+-                                        thumbTopPadding,
+-                                        thumbTopPadding + trackHeightPx,
+-                                    )
+-                                },
+-                            )
+-                        } else {
+-                            Modifier
+-                        },
++            // Harmony -->
++            // 8.dp is the upstream end inset from padding(horizontal = 8.dp). The drawn thumb
++            // stays on that edge; the extra hit width grows toward the content.
++            HarmonyScrollerThumb(
++                offsetY = thumbOffsetY,
++                alpha = alpha.value,
++                thumbColor = thumbColor,
++                endInset = 8.dp + endContentPadding,
++                touchEnabled = isThumbVisible || thumbPressed.pressed || isThumbDragged,
++                pressState = thumbPressed,
++                interactionSource = dragInteractionSource,
++                onDragDelta = { delta ->
++                    val newOffsetY = thumbOffsetY + delta
++                    thumbOffsetY = newOffsetY.coerceIn(
++                        thumbTopPadding,
++                        thumbTopPadding + trackHeightPx,
+                     )
+-                    .then(
+-                        // Exclude thumb from gesture area only when needed
+-                        if (isThumbVisible && !isThumbDragged && !listState.isScrollInProgress) {
+-                            Modifier.systemGestureExclusion()
+-                        } else {
+-                            Modifier
+-                        },
+-                    )
+-                    .height(ThumbLength)
+-                    .padding(horizontal = 8.dp)
+-                    .padding(end = endContentPadding)
+-                    .width(ThumbThickness)
+-                    .alpha(alpha.value)
+-                    .background(color = thumbColor, shape = ThumbShape),
++                },
++                excludeSystemGestures = (isThumbVisible || thumbPressed.pressed) &&
++                    !isThumbDragged &&
++                    !listState.isScrollInProgress,
+             )
++            // Harmony <--
+         }.map { it.measure(scrollerConstraints) }
+         val scrollerWidth = scrollerPlaceable.fastMaxBy { it.width }?.width ?: 0
+ 
+@@ -311,7 +319,13 @@ fun VerticalGridFastScroller(
+             var thumbOffsetY by remember(thumbTopPadding) { mutableFloatStateOf(thumbTopPadding) }
+ 
+             val dragInteractionSource = remember { MutableInteractionSource() }
+-            val isThumbDragged by dragInteractionSource.collectIsDraggedAsState()
++            // Harmony -->
++            // Keep the State, not the Boolean. The fade coroutine outlives this composition
++            // and has to observe a press that starts after the scroll event.
++            val isThumbDraggedState = dragInteractionSource.collectIsDraggedAsState()
++            val isThumbDragged by isThumbDraggedState
++            val thumbPressed = rememberThumbPressed()
++            // Harmony <--
+             val scrolled = remember {
+                 MutableSharedFlow<Unit>(
+                     extraBufferCapacity = 1,
+@@ -370,52 +384,40 @@ fun VerticalGridFastScroller(
+                 scrolled
+                     .sample(100)
+                     .collectLatest {
+-                        if (thumbAllowed()) {
+-                            alpha.snapTo(1f)
++                        // Harmony -->
++                        alpha.holdOpaqueWhileThumbGrabbed(
++                            held = { thumbPressed.pressed || isThumbDraggedState.value },
++                            thumbAllowed = thumbAllowed,
++                        ) {
+                             // ANK -->
+-                            alpha.animateTo(0f, animationSpec = FadeOutAnimationSpec)
++                            animateTo(0f, animationSpec = FadeOutAnimationSpec)
+                             // ANK <--
+-                        } else {
+-                            alpha.animateTo(0f, animationSpec = ImmediateFadeOutAnimationSpec)
+                         }
++                        // Harmony <--
+                     }
+             }
+ 
+-            Box(
+-                modifier = Modifier
+-                    .offset { IntOffset(0, thumbOffsetY.roundToInt()) }
+-                    .then(
+-                        // Recompose opts
+-                        if (isThumbVisible && !state.isScrollInProgress) {
+-                            Modifier.draggable(
+-                                interactionSource = dragInteractionSource,
+-                                orientation = Orientation.Vertical,
+-                                state = rememberDraggableState { delta ->
+-                                    val newOffsetY = thumbOffsetY + delta
+-                                    thumbOffsetY = newOffsetY.coerceIn(
+-                                        thumbTopPadding,
+-                                        thumbTopPadding + trackHeightPx,
+-                                    )
+-                                },
+-                            )
+-                        } else {
+-                            Modifier
+-                        },
+-                    )
+-                    .then(
+-                        // Exclude thumb from gesture area only when needed
+-                        if (isThumbVisible && !isThumbDragged && !state.isScrollInProgress) {
+-                            Modifier.systemGestureExclusion()
+-                        } else {
+-                            Modifier
+-                        },
++            // Harmony -->
++            HarmonyScrollerThumb(
++                offsetY = thumbOffsetY,
++                alpha = alpha.value,
++                thumbColor = thumbColor,
++                endInset = endContentPadding,
++                touchEnabled = isThumbVisible || thumbPressed.pressed || isThumbDragged,
++                pressState = thumbPressed,
++                interactionSource = dragInteractionSource,
++                onDragDelta = { delta ->
++                    val newOffsetY = thumbOffsetY + delta
++                    thumbOffsetY = newOffsetY.coerceIn(
++                        thumbTopPadding,
++                        thumbTopPadding + trackHeightPx,
+                     )
+-                    .height(ThumbLength)
+-                    .padding(end = endContentPadding)
+-                    .width(ThumbThickness)
+-                    .alpha(alpha.value)
+-                    .background(color = thumbColor, shape = ThumbShape),
++                },
++                excludeSystemGestures = (isThumbVisible || thumbPressed.pressed) &&
++                    !isThumbDragged &&
++                    !state.isScrollInProgress,
+             )
++            // Harmony <--
+         }.map { it.measure(scrollerConstraints) }
+         val scrollerWidth = scrollerPlaceable.fastMaxBy { it.width }?.width ?: 0
+ 
+@@ -542,7 +544,12 @@ fun IrregularVerticalGridFastScroller(
+             var thumbOffsetY by remember(thumbTopPadding) { mutableFloatStateOf(thumbTopPadding) }
+ 
+             val dragInteractionSource = remember { MutableInteractionSource() }
+-            val isThumbDragged by dragInteractionSource.collectIsDraggedAsState()
++            // Harmony -->
++            // Same press tracking as the other scrollers. This one is Anikku's episode grid.
++            val isThumbDraggedState = dragInteractionSource.collectIsDraggedAsState()
++            val isThumbDragged by isThumbDraggedState
++            val thumbPressed = rememberThumbPressed()
++            // <-- Harmony
+             val scrolled = remember {
+                 MutableSharedFlow<Unit>(
+                     extraBufferCapacity = 1,
+@@ -628,50 +635,40 @@ fun IrregularVerticalGridFastScroller(
+                 scrolled
+                     .sample(100)
+                     .collectLatest {
+-                        if (thumbAllowed()) {
+-                            alpha.snapTo(1f)
+-                            alpha.animateTo(0f, animationSpec = FadeOutAnimationSpec)
+-                        } else {
+-                            alpha.animateTo(0f, animationSpec = ImmediateFadeOutAnimationSpec)
++                        // Harmony -->
++                        alpha.holdOpaqueWhileThumbGrabbed(
++                            held = { thumbPressed.pressed || isThumbDraggedState.value },
++                            thumbAllowed = thumbAllowed,
++                        ) {
++                            // ANK -->
++                            animateTo(0f, animationSpec = FadeOutAnimationSpec)
++                            // ANK <--
+                         }
++                        // <-- Harmony
+                     }
+             }
+ 
+-            Box(
+-                modifier = Modifier
+-                    .offset { IntOffset(0, thumbOffsetY.roundToInt()) }
+-                    .then(
+-                        // Recompose opts
+-                        if (isThumbVisible && !state.isScrollInProgress) {
+-                            Modifier.draggable(
+-                                interactionSource = dragInteractionSource,
+-                                orientation = Orientation.Vertical,
+-                                state = rememberDraggableState { delta ->
+-                                    val newOffsetY = thumbOffsetY + delta
+-                                    thumbOffsetY = newOffsetY.coerceIn(
+-                                        thumbTopPadding,
+-                                        thumbTopPadding + trackHeightPx,
+-                                    )
+-                                },
+-                            )
+-                        } else {
+-                            Modifier
+-                        },
++            // Harmony -->
++            HarmonyScrollerThumb(
++                offsetY = thumbOffsetY,
++                alpha = alpha.value,
++                thumbColor = thumbColor,
++                endInset = endContentPadding,
++                touchEnabled = isThumbVisible || thumbPressed.pressed || isThumbDragged,
++                pressState = thumbPressed,
++                interactionSource = dragInteractionSource,
++                onDragDelta = { delta ->
++                    val newOffsetY = thumbOffsetY + delta
++                    thumbOffsetY = newOffsetY.coerceIn(
++                        thumbTopPadding,
++                        thumbTopPadding + trackHeightPx,
+                     )
+-                    .then(
+-                        // Exclude thumb from gesture area only when needed
+-                        if (isThumbVisible && !isThumbDragged && !state.isScrollInProgress) {
+-                            Modifier.systemGestureExclusion()
+-                        } else {
+-                            Modifier
+-                        },
+-                    )
+-                    .height(ThumbLength)
+-                    .padding(end = endContentPadding)
+-                    .width(ThumbThickness)
+-                    .alpha(alpha.value)
+-                    .background(color = thumbColor, shape = ThumbShape),
++                },
++                excludeSystemGestures = (isThumbVisible || thumbPressed.pressed) &&
++                    !isThumbDragged &&
++                    !state.isScrollInProgress,
+             )
++            // <-- Harmony
+         }.map { it.measure(scrollerConstraints) }
+         val scrollerWidth = scrollerPlaceable.fastMaxBy { it.width }?.width ?: 0
+ 
+@@ -755,7 +752,10 @@ fun VerticalMasonryFastScroller(
+             var thumbOffsetY by remember(thumbTopPadding) { mutableFloatStateOf(thumbTopPadding) }
+ 
+             val dragInteractionSource = remember { MutableInteractionSource() }
+-            val isThumbDragged by dragInteractionSource.collectIsDraggedAsState()
++            // State object so the fade coroutine sees a drag that starts after it is already waiting.
++            val isThumbDraggedState = dragInteractionSource.collectIsDraggedAsState()
++            val isThumbDragged by isThumbDraggedState
++            val thumbPressed = rememberThumbPressed()
+             val scrolled = remember {
+                 MutableSharedFlow<Unit>(
+                     extraBufferCapacity = 1,
+@@ -801,55 +801,36 @@ fun VerticalMasonryFastScroller(
+                 scrolled
+                     .sample(100)
+                     .collectLatest {
+-                        if (thumbAllowed()) {
+-                            alpha.snapTo(1f)
+-                            alpha.animateTo(
+-                                0f,
+-                                animationSpec = tween(
+-                                    durationMillis = ViewConfiguration.getScrollBarFadeDuration(),
+-                                    delayMillis = ViewConfiguration.getScrollDefaultDelay(),
+-                                ),
+-                            )
+-                        } else {
+-                            alpha.animateTo(0f, animationSpec = ImmediateFadeOutAnimationSpec)
++                        alpha.holdOpaqueWhileThumbGrabbed(
++                            held = { thumbPressed.pressed || isThumbDraggedState.value },
++                            thumbAllowed = thumbAllowed,
++                        ) {
++                            animateTo(0f, animationSpec = FadeOutAnimationSpec)
+                         }
+                     }
+             }
+ 
+-            Box(
+-                modifier = Modifier
+-                    .offset { IntOffset(0, thumbOffsetY.roundToInt()) }
+-                    .then(
+-                        // Stay draggable while scrollToOffset reports a scroll, or the drag
+-                        // gesture is cancelled on the frame that applies it.
+-                        if (isThumbVisible) {
+-                            Modifier.draggable(
+-                                interactionSource = dragInteractionSource,
+-                                orientation = Orientation.Vertical,
+-                                state = rememberDraggableState { delta ->
+-                                    val newOffsetY = thumbOffsetY + delta
+-                                    thumbOffsetY = newOffsetY.coerceIn(
+-                                        thumbTopPadding,
+-                                        thumbTopPadding + trackHeightPx,
+-                                    )
+-                                },
+-                            )
+-                        } else {
+-                            Modifier
+-                        },
+-                    )
+-                    .then(
+-                        if (isThumbVisible && !isThumbDragged && !state.isScrollInProgress) {
+-                            Modifier.systemGestureExclusion()
+-                        } else {
+-                            Modifier
+-                        },
++            // Stay draggable while scrollToOffset reports a scroll, or the drag gesture is
++            // cancelled on the frame that applies it. pressed / isThumbDragged keep the same
++            // pointer attached after the thumb would otherwise have faded out.
++            HarmonyScrollerThumb(
++                offsetY = thumbOffsetY,
++                alpha = alpha.value,
++                thumbColor = thumbColor,
++                endInset = endContentPadding,
++                touchEnabled = isThumbVisible || thumbPressed.pressed || isThumbDragged,
++                pressState = thumbPressed,
++                interactionSource = dragInteractionSource,
++                onDragDelta = { delta ->
++                    val newOffsetY = thumbOffsetY + delta
++                    thumbOffsetY = newOffsetY.coerceIn(
++                        thumbTopPadding,
++                        thumbTopPadding + trackHeightPx,
+                     )
+-                    .height(ThumbLength)
+-                    .padding(end = endContentPadding)
+-                    .width(ThumbThickness)
+-                    .alpha(alpha.value)
+-                    .background(color = thumbColor, shape = ThumbShape),
++                },
++                excludeSystemGestures = (isThumbVisible || thumbPressed.pressed) &&
++                    !isThumbDragged &&
++                    !state.isScrollInProgress,
+             )
+         }.map { it.measure(scrollerConstraints) }
+         val scrollerWidth = scrollerPlaceable.fastMaxBy { it.width }?.width ?: 0
+@@ -864,6 +845,180 @@ fun VerticalMasonryFastScroller(
+         }
+     }
+ }
++
++/** Hit width. The drawn thumb stays [ThumbThickness]; the remainder lies toward the content. */
++private val ThumbTouchWidth = 32.dp
++
++/**
++ * Drawn thumb stays [ThumbThickness] by [ThumbLength]. The hit rectangle is at least
++ * [ThumbTouchWidth] wide and the extra space is on the start side, toward the content.
++ * [endInset] keeps whatever gap the caller already had between the thumb and the end edge.
++ *
++ * Pointer modifiers are omitted unless [touchEnabled]. An invisible thumb must not sit
++ * on top of the content and take its clicks or scrolls. [touchEnabled] stays true for the
++ * whole press and drag, so a fade to 0 cannot detach the gesture mid-pointer.
++ */
++@Composable
++private fun HarmonyScrollerThumb(
++    offsetY: Float,
++    alpha: Float,
++    thumbColor: Color,
++    endInset: Dp,
++    touchEnabled: Boolean,
++    pressState: ThumbPressedState,
++    interactionSource: MutableInteractionSource,
++    onDragDelta: (Float) -> Unit,
++    excludeSystemGestures: Boolean,
++) {
++    val dragState = rememberDraggableState(onDragDelta)
++    Box(
++        modifier = Modifier
++            .offset { IntOffset(0, offsetY.roundToInt()) }
++            .harmonyThumbTouch(
++                enabled = touchEnabled,
++                pressState = pressState,
++                interactionSource = interactionSource,
++                state = dragState,
++                excludeSystemGestures = excludeSystemGestures,
++            )
++            .height(ThumbLength)
++            .width(ThumbTouchWidth + endInset)
++            .padding(end = endInset),
++        contentAlignment = Alignment.CenterEnd,
++    ) {
++        Box(
++            modifier = Modifier
++                .width(ThumbThickness)
++                .height(ThumbLength)
++                .alpha(alpha)
++                .background(color = thumbColor, shape = ThumbShape),
++        )
++    }
++}
++
++@Composable
++private fun rememberThumbPressed(): ThumbPressedState = remember { ThumbPressedState() }
++
++private class ThumbPressedState {
++    var pressed by mutableStateOf(false)
++}
++
++/**
++ * Records a finger that is down on the thumb without waiting for touch slop.
++ *
++ * Overlapping siblings are all hit-tested. The scroller is placed after the content, so
++ * this node is dispatched first, but the content is still in the hit path. [draggable]
++ * with `startDragImmediately` consumes the down in the initial pass and then consumes
++ * moves, which is what stops the content scroller from taking the same pointer. This
++ * tracker also consumes the down (not the moves) so a tap under the thumb cannot fire
++ * if the drag modifier is ever ordered after the content in that pass.
++ *
++ * [waitForUpOrCancellation] is not used. It treats a consumed move as a cancel, and the
++ * draggable consumes every move while `startDragImmediately` is set, which would clear
++ * [ThumbPressedState.pressed] while the finger is still down and let the thumb fade out.
++ */
++private fun Modifier.harmonyThumbTouch(
++    enabled: Boolean,
++    pressState: ThumbPressedState,
++    interactionSource: MutableInteractionSource,
++    state: DraggableState,
++    excludeSystemGestures: Boolean,
++): Modifier {
++    if (!enabled) return this
++    return this
++        .pointerInput(pressState) {
++            awaitEachGesture {
++                val down = awaitFirstDown(
++                    requireUnconsumed = false,
++                    pass = PointerEventPass.Initial,
++                )
++                pressState.pressed = true
++                down.consume()
++                try {
++                    while (awaitPointerEvent().changes.fastAny { it.pressed }) {
++                        // Consumption by draggable is expected. Only a real up ends the press.
++                    }
++                } finally {
++                    pressState.pressed = false
++                }
++            }
++        }
++        .draggable(
++            state = state,
++            orientation = Orientation.Vertical,
++            interactionSource = interactionSource,
++            startDragImmediately = true,
++        )
++        .then(
++            if (excludeSystemGestures) {
++                Modifier.systemGestureExclusion()
++            } else {
++                Modifier
++            },
++        )
++}
++
++/**
++ * Runs the upstream fade, but never while the thumb is pressed or dragging.
++ *
++ * The hit target is removed at alpha 0. A finger that is held still does not emit
++ * [scrolled][kotlinx.coroutines.flow.MutableSharedFlow], so the visibility timer would
++ * otherwise detach [harmonyThumbTouch] and the same pointer would scroll the content
++ * backwards. After release, [fade] runs from the start (its own delay included).
++ */
++private suspend fun Animatable<Float, AnimationVector1D>.holdOpaqueWhileThumbGrabbed(
++    held: () -> Boolean,
++    thumbAllowed: () -> Boolean,
++    fade: suspend Animatable<Float, AnimationVector1D>.() -> Unit,
++) {
++    if (!thumbAllowed()) {
++        if (held()) {
++            snapTo(1f)
++            awaitThumbNotHeld(held)
++        }
++        if (!held()) {
++            animateTo(0f, animationSpec = ImmediateFadeOutAnimationSpec)
++        }
++        return
++    }
++    snapTo(1f)
++    while (true) {
++        awaitThumbNotHeld(held)
++        if (fadeUnlessThumbGrabbed(held, fade)) return
++        snapTo(1f)
++    }
++}
++
++private suspend fun awaitThumbNotHeld(held: () -> Boolean) {
++    if (held()) {
++        snapshotFlow { held() }.first { !it }
++    }
++}
++
++/** @return true when [fade] finished, false when the thumb was grabbed and the fade was cancelled. */
++private suspend fun Animatable<Float, AnimationVector1D>.fadeUnlessThumbGrabbed(
++    held: () -> Boolean,
++    fade: suspend Animatable<Float, AnimationVector1D>.() -> Unit,
++): Boolean {
++    return coroutineScope {
++        val fadeFinished = CompletableDeferred<Boolean>()
++        val animation = launch {
++            this@fadeUnlessThumbGrabbed.fade()
++            fadeFinished.complete(true)
++        }
++        val grab = launch {
++            snapshotFlow { held() }.first { it }
++            fadeFinished.complete(false)
++        }
++        try {
++            fadeFinished.await()
++        } finally {
++            animation.cancel()
++            grab.cancel()
++        }
++    }
++}
++
+ // Harmony <--
+ 
+ private class MutableData<T>(var value: T)

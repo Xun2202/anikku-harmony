@@ -1,0 +1,536 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 06:16:43 +0000
+Subject: [PATCH] library: panorama cover shapes notify per version, not per
+ map read
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Every learnt ratio was written into a snapshot map. Measure read that
+map for every row, and tracking walked every id during composition, so
+one cover decode recomposed the shelf and remeasured every lane.
+
+Learnt and committed ratios are plain maps under a lock. Measure
+subscribes only to PanoramaMasonryContentEpoch, which increments when a
+committed cover crosses the wide/tall band. A same-band update changes
+the committed value and the cell's own float state, and does not bump
+the epoch. The threshold stays RatioSwitchToPanorama.
+
+与 mihon-harmony 0026 同源. Mihon names that threshold
+RATIO_SWITCH_TO_PANORAMA in CommonMangaItem; Anikku already defines it
+as RatioSwitchToPanorama in MangaCover.
+---
+ .../library/components/CommonMangaItem.kt     |  20 +-
+ .../library/components/PanoramaCoverShapes.kt | 232 +++++++++++++++---
+ .../library/components/PanoramaGrid.kt        |  31 +--
+ .../components/PanoramaCoverShapesTest.kt     |  74 ++++++
+ 4 files changed, 294 insertions(+), 63 deletions(-)
+ create mode 100644 app/src/test/java/eu/kanade/presentation/library/components/PanoramaCoverShapesTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/CommonMangaItem.kt b/app/src/main/java/eu/kanade/presentation/library/components/CommonMangaItem.kt
+index 437d5e1..80f141a 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/CommonMangaItem.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/CommonMangaItem.kt
+@@ -102,8 +102,14 @@ fun MangaCompactGridItem(
+         { _, result ->
+             val image = result.result.image
+             val width = image.width
+-            // A direct write remeasures every lane mid-fling. The grid applies a new shape once it is still.
+-            if (width > 0) PanoramaCoverShapes.put(coverData.mangaId, image.height.toFloat() / width)
++            // Harmony: same-band updates this cell. A cross-band commit waits until the grid settles.
++            if (width > 0) {
++                PanoramaCoverShapes.noteVisibleRatio(
++                    coverData.mangaId,
++                    image.height.toFloat() / width,
++                    coverRatio,
++                )
++            }
+         }
+     } else {
+         null
+@@ -272,8 +278,14 @@ fun MangaComfortableGridItem(
+         { _, result ->
+             val image = result.result.image
+             val width = image.width
+-            // A direct write remeasures every lane mid-fling. The grid applies a new shape once it is still.
+-            if (width > 0) PanoramaCoverShapes.put(coverData.mangaId, image.height.toFloat() / width)
++            // Harmony: same-band updates this cell. A cross-band commit waits until the grid settles.
++            if (width > 0) {
++                PanoramaCoverShapes.noteVisibleRatio(
++                    coverData.mangaId,
++                    image.height.toFloat() / width,
++                    coverRatio,
++                )
++            }
+         }
+     } else {
+         null
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt
+index 33ff521..d5a2e19 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaCoverShapes.kt
+@@ -1,12 +1,13 @@
+ package eu.kanade.presentation.library.components
+ 
+ import android.graphics.BitmapFactory
++import android.os.Looper
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+ import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.MutableFloatState
+ import androidx.compose.runtime.compositionLocalOf
+ import androidx.compose.runtime.getValue
+-import androidx.compose.runtime.mutableStateMapOf
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.rememberUpdatedState
+@@ -30,6 +31,7 @@ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+ import tachiyomi.domain.manga.model.Manga
+ import tachiyomi.domain.manga.model.asMangaCover
++import tachiyomi.presentation.core.components.PanoramaMasonryContentEpoch
+ import java.io.BufferedReader
+ import java.io.BufferedWriter
+ import java.io.File
+@@ -59,53 +61,73 @@ private val AlwaysSettled: () -> Boolean = { true }
+ val LocalPanoramaGridSettled = compositionLocalOf<() -> Boolean> { AlwaysSettled }
+ 
+ /**
+- * Ratios the panorama grid has committed to drawing. The masonry and the cells both read this,
+- * so a shape that is still waiting for the grid to settle does not change a lane height.
+  * Unknown covers commit as 9/16, which is on the wide side of 0.75.
++ * The masonry reads the committed value through [committedCoverIsWide], not this constant.
+  */
+-private const val WIDE_COVER_RATIO = 9f / 16f
+-
+-private val committedRatios = mutableStateMapOf<Long, Float>()
++internal const val WIDE_COVER_RATIO = 9f / 16f
+ 
+ internal fun committedCoverIsWide(mangaId: Long): Boolean {
+-    val ratio = committedRatios[mangaId] ?: WIDE_COVER_RATIO
+-    return ratio <= RatioSwitchToPanorama
++    return PanoramaCoverShapes.committedRatio(mangaId) <= RatioSwitchToPanorama
+ }
+ 
+-internal fun panoramaCommittedRatio(mangaId: Long, known: Float?, settled: Boolean): Float {
+-    val fallback = known ?: WIDE_COVER_RATIO
+-    val current = committedRatios[mangaId]
+-    if (current == null) {
+-        committedRatios[mangaId] = fallback
+-        return fallback
++/**
++ * Applies cross-band shapes once the grid has settled.
++ *
++ * Harmony: the id list is not read during composition. [PanoramaCoverShapes.put] records the id,
++ * and a side effect commits it. Scrolling does not recompose the shelf for the ratio table.
++ * [count] and [mangaIdAt] stay so call sites do not depend on a walk that subscribed every id.
++ */
++@Composable
++fun TrackPanoramaCoverShapes(count: Int, mangaIdAt: (Int) -> Long?) {
++    val token = remember { Any() }
++    val settledState = LocalPanoramaGridSettled.current
++    val listed by rememberUpdatedState(count to mangaIdAt)
++    DisposableEffect(token) {
++        onDispose { PanoramaCoverShapes.setGridScrolling(token, scrolling = false) }
+     }
+-    if (known == null || known == current) return current
+-    val sameBand = (known <= RatioSwitchToPanorama) == (current <= RatioSwitchToPanorama)
+-    if (sameBand || settled) {
+-        committedRatios[mangaId] = known
+-        return known
++    LaunchedEffect(token) {
++        snapshotFlow { settledState() to listed.first }.collect { (settled, _) ->
++            PanoramaCoverShapes.setGridScrolling(token, scrolling = !settled)
++        }
+     }
+-    return current
+ }
+ 
+ /**
+- * Commits a shape for every id the layout will size. Uses the caller's peek, not the paging
+- * accessor, so computing heights does not fetch pages.
++ * Runs snapshot writes on the owner thread. IO only decodes a ratio and updates the plain maps.
+  */
+-@Composable
+-fun TrackPanoramaCoverShapes(count: Int, mangaIdAt: (Int) -> Long?) {
+-    val settled = LocalPanoramaGridSettled.current()
+-    for (index in 0 until count) {
+-        val mangaId = mangaIdAt(index) ?: continue
+-        panoramaCommittedRatio(mangaId, PanoramaCoverShapes.get(mangaId), settled)
++internal interface PanoramaSnapshotDispatcher {
++    fun isOwnerThread(): Boolean
++
++    fun post(block: () -> Unit)
++}
++
++private object AndroidSnapshotDispatcher : PanoramaSnapshotDispatcher {
++    override fun isOwnerThread(): Boolean {
++        val looper = Looper.myLooper()
++        return looper != null && looper === Looper.getMainLooper()
++    }
++
++    override fun post(block: () -> Unit) {
++        PanoramaCoverShapes.postToOwner(block)
+     }
+ }
+ 
+ object PanoramaCoverShapes {
+-    private val ratios = mutableStateMapOf<Long, Float>()
++    private val learnt = HashMap<Long, Float>()
++    private val committed = HashMap<Long, Float>()
++    private val pendingCross = HashMap<Long, Float>()
++    private val pendingIds = LinkedHashSet<Long>()
++    private val scrollingGrids = HashSet<Any>()
+     private val stored = LinkedHashMap<Long, Float>()
+     private val gate = Any()
+     private val ready = CompletableDeferred<Unit>()
++    private val earlyFlush = ArrayList<() -> Unit>()
++
++    @Volatile
++    internal var snapshotDispatcher: PanoramaSnapshotDispatcher = AndroidSnapshotDispatcher
++
++    @Volatile
++    private var flushQueued = false
+ 
+     private var storeFile: File? = null
+     private var persistScope: CoroutineScope? = null
+@@ -121,11 +143,19 @@ object PanoramaCoverShapes {
+     private var loaded = false
+ 
+     fun init(file: File, scope: CoroutineScope) {
+-        synchronized(gate) {
++        val queued = synchronized(gate) {
+             if (initialized) return
+             initialized = true
+             storeFile = file
+             persistScope = scope
++            val pending = ArrayList(earlyFlush)
++            earlyFlush.clear()
++            pending
++        }
++        if (queued.isNotEmpty()) {
++            scope.launch(Dispatchers.Main.immediate) {
++                queued.forEach { it() }
++            }
+         }
+         scope.launch(Dispatchers.IO) {
+             try {
+@@ -143,7 +173,26 @@ object PanoramaCoverShapes {
+         }
+     }
+ 
+-    fun get(mangaId: Long): Float? = ratios[mangaId]
++    fun get(mangaId: Long): Float? = synchronized(gate) { learnt[mangaId] }
++
++    /** Committed height/width, or 9/16 when this id has never been committed. Not a snapshot read. */
++    fun committedRatio(mangaId: Long): Float = synchronized(gate) {
++        committed[mangaId] ?: WIDE_COVER_RATIO
++    }
++
++    /**
++     * Updates the cell's ratio when the committed band did not change.
++     * A cross-band change waits for [PanoramaMasonryContentEpoch] and the cell reads it there.
++     */
++    fun noteVisibleRatio(mangaId: Long, ratio: Float, coverRatio: MutableFloatState) {
++        put(mangaId, ratio)
++        val current = committedRatio(mangaId)
++        val wasWide = coverRatio.floatValue <= RatioSwitchToPanorama
++        val nowWide = current <= RatioSwitchToPanorama
++        if (wasWide == nowWide && coverRatio.floatValue != current) {
++            coverRatio.floatValue = current
++        }
++    }
+ 
+     fun put(mangaId: Long, ratio: Float) {
+         if (ratio <= 0f || ratio.isNaN() || ratio.isInfinite()) return
+@@ -157,14 +206,51 @@ object PanoramaCoverShapes {
+                 while (stored.size >= MAX_ENTRIES) {
+                     val eldest = stored.entries.iterator().next().key
+                     stored.remove(eldest)
+-                    ratios.remove(eldest)
++                    learnt.remove(eldest)
++                    pendingCross.remove(eldest)
++                    pendingIds.remove(eldest)
+                 }
+                 stored[mangaId] = ratio
+-                ratios[mangaId] = ratio
++                learnt[mangaId] = ratio
++                pendingIds.add(mangaId)
+                 true
+             }
+         }
+-        if (changed) schedulePersist()
++        if (!changed) return
++        schedulePersist()
++        // Harmony: the plain maps are updated above. The snapshot epoch is written on the owner thread.
++        scheduleFlush()
++    }
++
++    internal fun setGridScrolling(token: Any, scrolling: Boolean) {
++        val flush = synchronized(gate) {
++            val wasSettled = scrollingGrids.isEmpty()
++            if (scrolling) scrollingGrids.add(token) else scrollingGrids.remove(token)
++            !wasSettled && scrollingGrids.isEmpty()
++        }
++        if (flush) scheduleFlush()
++    }
++
++    internal fun resetForTest() {
++        synchronized(gate) {
++            learnt.clear()
++            committed.clear()
++            pendingCross.clear()
++            pendingIds.clear()
++            scrollingGrids.clear()
++            stored.clear()
++            earlyFlush.clear()
++            flushQueued = false
++            initialized = false
++            loaded = false
++            dirty = false
++            storeFile = null
++            persistJob?.cancel()
++            persistJob = null
++            persistScope = null
++        }
++        snapshotDispatcher = AndroidSnapshotDispatcher
++        PanoramaMasonryContentEpoch.intValue = 0
+     }
+ 
+     suspend fun prefetch(entries: List<Pair<Long, () -> File?>>) {
+@@ -270,19 +356,91 @@ object PanoramaCoverShapes {
+                 if (id in newer) continue
+                 stored.remove(id)
+                 stored[id] = ratio
+-                ratios[id] = ratio
++                learnt[id] = ratio
++                pendingIds.add(id)
+             }
+             for ((id, ratio) in newer) {
+                 stored.remove(id)
+                 stored[id] = ratio
+-                ratios[id] = ratio
++                learnt[id] = ratio
++                pendingIds.add(id)
+             }
+             while (stored.size > MAX_ENTRIES) {
+                 val eldest = stored.entries.iterator().next().key
+                 stored.remove(eldest)
+-                ratios.remove(eldest)
++                learnt.remove(eldest)
++                pendingIds.remove(eldest)
++                pendingCross.remove(eldest)
++            }
++        }
++        scheduleFlush()
++    }
++
++    internal fun postToOwner(block: () -> Unit) {
++        val scope = synchronized(gate) { persistScope }
++        if (scope != null) {
++            scope.launch(Dispatchers.Main.immediate) { block() }
++        } else {
++            synchronized(gate) { earlyFlush.add(block) }
++        }
++    }
++
++    private fun scheduleFlush() {
++        synchronized(gate) {
++            if (flushQueued) return
++            flushQueued = true
++        }
++        val dispatcher = snapshotDispatcher
++        if (dispatcher.isOwnerThread()) {
++            runFlush()
++        } else {
++            dispatcher.post { runFlush() }
++        }
++    }
++
++    private fun runFlush() {
++        val bump = synchronized(gate) {
++            flushQueued = false
++            applyPending(scrollingGrids.isEmpty())
++        }
++        // Harmony: one epoch for the whole batch. Same-band edits do not reach this write.
++        if (bump) PanoramaMasonryContentEpoch.intValue++
++    }
++
++    /** Caller holds [gate]. Returns whether a wide/tall band changed. */
++    private fun applyPending(settled: Boolean): Boolean {
++        var bump = false
++        val ids = ArrayList(pendingIds)
++        pendingIds.clear()
++        for (id in ids) {
++            val known = learnt[id] ?: continue
++            val current = committed[id]
++            if (current == null) {
++                committed[id] = known
++                if (!sameBand(known, WIDE_COVER_RATIO)) bump = true
++            } else if (sameBand(current, known)) {
++                committed[id] = known
++            } else if (settled) {
++                committed[id] = known
++                pendingCross.remove(id)
++                bump = true
++            } else {
++                pendingCross[id] = known
+             }
+         }
++        if (settled && pendingCross.isNotEmpty()) {
++            for ((id, ratio) in pendingCross) {
++                val current = committed[id]
++                if (current == null || !sameBand(current, ratio)) bump = true
++                committed[id] = ratio
++            }
++            pendingCross.clear()
++        }
++        return bump
++    }
++
++    private fun sameBand(left: Float, right: Float): Boolean {
++        return (left <= RatioSwitchToPanorama) == (right <= RatioSwitchToPanorama)
+     }
+ 
+     private fun write(destination: File) {
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
+index 7c90a22..ca845ae 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/PanoramaGrid.kt
+@@ -4,18 +4,15 @@ import android.content.res.Configuration
+ import androidx.compose.foundation.lazy.grid.GridCells
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.Immutable
+-import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.MutableFloatState
+ import androidx.compose.runtime.mutableFloatStateOf
+ import androidx.compose.runtime.remember
+-import androidx.compose.runtime.snapshotFlow
+ import androidx.compose.ui.platform.LocalConfiguration
+ import androidx.compose.ui.unit.Density
+ import androidx.compose.ui.unit.dp
+-import eu.kanade.presentation.manga.components.RatioSwitchToPanorama
+-import kotlinx.coroutines.flow.first
+ import tachiyomi.domain.library.service.LibraryPreferences
+ import tachiyomi.presentation.core.components.PanoramaColumns
++import tachiyomi.presentation.core.components.PanoramaMasonryContentEpoch
+ import tachiyomi.presentation.core.components.PanoramaSpan
+ import uy.kohesive.injekt.Injekt
+ import uy.kohesive.injekt.api.get
+@@ -100,27 +97,17 @@ private fun libraryColumnCount(orientation: Int): Int {
+ 
+ @Composable
+ internal fun rememberCoverRatio(mangaId: Long, usePanoramaCover: Boolean): MutableFloatState {
+-    val settled = LocalPanoramaGridSettled.current
+-    val known = PanoramaCoverShapes.get(mangaId)
+-    if (usePanoramaCover) {
+-        // Same committed value the masonry used to size the slot. Cross-band changes wait until
+-        // the grid has been still; same-band changes do not move the lane.
+-        val committed = panoramaCommittedRatio(mangaId, known, settled())
+-        val ratio = remember(mangaId) { mutableFloatStateOf(committed) }
+-        if (ratio.floatValue != committed) ratio.floatValue = committed
+-        return ratio
++    if (!usePanoramaCover) {
++        return remember(mangaId) { mutableFloatStateOf(1f) }
+     }
++    // Harmony: this cell subscribes to the layout epoch, not the whole ratio table.
++    // A cross-band commit bumps the epoch; a same-band edit does not recompose the shelf.
++    PanoramaMasonryContentEpoch.intValue
+     val ratio = remember(mangaId) {
+-        mutableFloatStateOf(known ?: 1f)
+-    }
+-    LaunchedEffect(mangaId, known) {
+-        if (known == null || known == ratio.floatValue) return@LaunchedEffect
+-        val sameShape = (known <= RatioSwitchToPanorama) == (ratio.floatValue <= RatioSwitchToPanorama)
+-        if (!sameShape) {
+-            snapshotFlow { settled() }.first { it }
+-        }
+-        ratio.floatValue = known
++        mutableFloatStateOf(PanoramaCoverShapes.committedRatio(mangaId))
+     }
++    val committed = PanoramaCoverShapes.committedRatio(mangaId)
++    if (ratio.floatValue != committed) ratio.floatValue = committed
+     return ratio
+ }
+ // Harmony <--
+diff --git a/app/src/test/java/eu/kanade/presentation/library/components/PanoramaCoverShapesTest.kt b/app/src/test/java/eu/kanade/presentation/library/components/PanoramaCoverShapesTest.kt
+new file mode 100644
+index 0000000..195c478
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/presentation/library/components/PanoramaCoverShapesTest.kt
+@@ -0,0 +1,74 @@
++package eu.kanade.presentation.library.components
++
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.BeforeEach
++import org.junit.jupiter.api.Test
++import tachiyomi.presentation.core.components.PanoramaMasonryContentEpoch
++
++class PanoramaCoverShapesTest {
++    @BeforeEach
++    fun reset() {
++        PanoramaCoverShapes.resetForTest()
++        PanoramaCoverShapes.snapshotDispatcher = ImmediateSnapshotDispatcher
++    }
++
++    @Test
++    fun `same band put does not bump the layout epoch`() {
++        val epoch = PanoramaMasonryContentEpoch.intValue
++        PanoramaCoverShapes.put(1L, 0.50f)
++        PanoramaCoverShapes.put(1L, 0.62f)
++        assertEquals(epoch, PanoramaMasonryContentEpoch.intValue)
++        assertEquals(0.62f, PanoramaCoverShapes.committedRatio(1L))
++        assertTrue(committedCoverIsWide(1L))
++    }
++
++    @Test
++    fun `a cross band commit bumps the layout epoch once the grid settles`() {
++        PanoramaCoverShapes.put(2L, 0.50f)
++        val epoch = PanoramaMasonryContentEpoch.intValue
++        val token = Any()
++        PanoramaCoverShapes.setGridScrolling(token, scrolling = true)
++        PanoramaCoverShapes.put(2L, 1.60f)
++        assertEquals(epoch, PanoramaMasonryContentEpoch.intValue)
++        assertTrue(committedCoverIsWide(2L))
++
++        PanoramaCoverShapes.setGridScrolling(token, scrolling = false)
++        assertEquals(epoch + 1, PanoramaMasonryContentEpoch.intValue)
++        assertFalse(committedCoverIsWide(2L))
++        assertEquals(1.60f, PanoramaCoverShapes.committedRatio(2L))
++    }
++
++    @Test
++    fun `put on a background thread does not write snapshot state`() {
++        val posted = ArrayList<() -> Unit>()
++        PanoramaCoverShapes.snapshotDispatcher = object : PanoramaSnapshotDispatcher {
++            override fun isOwnerThread(): Boolean = false
++
++            override fun post(block: () -> Unit) {
++                posted.add(block)
++            }
++        }
++        val epoch = PanoramaMasonryContentEpoch.intValue
++        val worker = Thread {
++            PanoramaCoverShapes.put(3L, 1.70f)
++        }
++        worker.start()
++        worker.join()
++        assertEquals(epoch, PanoramaMasonryContentEpoch.intValue)
++        assertTrue(committedCoverIsWide(3L))
++        assertTrue(posted.isNotEmpty())
++        posted.forEach { it() }
++        assertEquals(epoch + 1, PanoramaMasonryContentEpoch.intValue)
++        assertFalse(committedCoverIsWide(3L))
++    }
++}
++
++private object ImmediateSnapshotDispatcher : PanoramaSnapshotDispatcher {
++    override fun isOwnerThread(): Boolean = true
++
++    override fun post(block: () -> Unit) {
++        block()
++    }
++}
