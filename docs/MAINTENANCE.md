@@ -377,6 +377,14 @@ git format-patch -o /tmp/new-patches --no-signature --zero-commit v0.3.0..HEAD
 同病：Mihon 0036 同轮已加。Animeko 不适用：用户没报 Animeko 卡顿，它也没有全景网格；需要时可移植 `HarmonyFramePerf`，去掉全景计数器即可。
 
 
+### 0045：全景浏览分页快照刷新
+
+用户在 `v0.2.0-harmony-preview.23` 报告插件浏览页开全景后只显示部分内容，继续下滑无新条目，其他模式正常。`PanoramaMasonryState.intervalsFor` 按 content lambda 身份缓存间隔；原来在 DSL 内读取 `mangaList.itemCount` / `loadState`，新页抵达时 lambda 可被 Compose 复用，布局仍保留旧数量与 footer。
+
+两种 `BrowseSource*Grid` 的全景分支改为在组合阶段捕获 `itemSnapshotList` 和 `loadState`，DSL 使用该快照的 size / key / 封面 id。页数增长、同数量刷新和加载状态变化都会更新内容捕获；格子内保留 `mangaList[index]` 访问提示，不改插件的 PagingSource。此项与 Mihon 0044 的快照捕获同源；Mihon preview.12 已包含，Animeko 没有这套自定义全景布局、不适用。其余性能优化与末端可见项提示未随本修复扩大移植。
+
+目标 `v0.2.0-harmony-preview.24`。验证以改动文件的 Spotless 检查、目标稳定版补丁套用和一次正式签名构建为准；本轮没有 Android 真机 / 模拟器复现，连续分页及搜索 / 筛选切换由用户安装后反馈。
+
 ### 5.2 加新补丁
 
 在套完现有补丁的源码树上直接改代码并 commit（message 写清楚为什么），`git format-patch -1 --no-signature --zero-commit` 导出，

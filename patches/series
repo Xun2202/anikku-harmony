@@ -42,3 +42,4 @@
 0042-presentation-panorama-exact-scroll-delta.patch
 0043-presentation-fast-scroller-hold-to-grab.patch
 0044-app-scroll-performance-recorder.patch
+0045-browse-panorama-refresh-paging-snapshot.patch

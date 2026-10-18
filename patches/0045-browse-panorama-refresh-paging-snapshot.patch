@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 06:42:21 +0000
+Subject: [PATCH] browse: refresh panorama intervals when paging changes
+
+Capture the paging snapshot and load states outside the masonry content DSL so appended pages and same-size refreshes invalidate its identity-based interval cache. Keep per-cell paging access hints. Based on the snapshot capture in mihon-harmony 0044; Mihon preview.12 already includes that fix. Animeko has no matching custom panorama grid.
+---
+ .../components/BrowseSourceComfortableGrid.kt  | 18 +++++++++++-------
+ .../components/BrowseSourceCompactGrid.kt      | 18 +++++++++++-------
+ 2 files changed, 22 insertions(+), 14 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
+index 26315db..39b7807 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
+@@ -62,6 +62,10 @@ fun BrowseSourceComfortableGrid(
+         val settled = rememberPanoramaGridSettled { state.isScrollInProgress }
+         PrefetchPanoramaCoverShapes(mangaList.itemCount) { mangaList.peek(it)?.value?.first }
+         val shapeMode = rememberPanoramaShapeModeState()
++        // Capture paging changes in the content lambda: masonry caches intervals by its identity.
++        // Reading these only inside the DSL leaves the old count/footer after a page arrives.
++        val snapshot = mangaList.itemSnapshotList
++        val loadState = mangaList.loadState
+         CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
+             TrackPanoramaCoverShapes(mangaList.itemCount, shapeMode) { mangaList.peek(it)?.value?.first?.id }
+             val mode = shapeMode.mode
+@@ -74,7 +78,7 @@ fun BrowseSourceComfortableGrid(
+                 verticalSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
+                 horizontalSpacing = CommonMangaItemDefaults.GridHorizontalSpacer,
+             ) {
+-                if (mangaList.loadState.prepend is LoadState.Loading) {
++                if (loadState.prepend is LoadState.Loading) {
+                     item(
+                         key = "browse_source_loading_prepend",
+                         span = PanoramaSpan.FullLine,
+@@ -85,14 +89,14 @@ fun BrowseSourceComfortableGrid(
+                 }
+ 
+                 items(
+-                    count = mangaList.itemCount,
+-                    key = { index -> mangaList.peek(index)?.value?.first?.id ?: index },
++                    count = snapshot.size,
++                    key = { index -> snapshot[index]?.value?.first?.id ?: index },
+                     span = { index ->
+-                        val id = mangaList.peek(index)?.value?.first?.id
++                        val id = snapshot[index]?.value?.first?.id
+                         panoramaCoverSpan(id == null || committedCoverIsWide(id), mode)
+                     },
+                     height = { index ->
+-                        val id = mangaList.peek(index)?.value?.first?.id
++                        val id = snapshot[index]?.value?.first?.id
+                         PanoramaCellHeight.Cover(
+                             wide = id == null || committedCoverIsWide(id),
+                             titleBelow = true,
+@@ -113,8 +117,8 @@ fun BrowseSourceComfortableGrid(
+                     )
+                 }
+ 
+-                if (mangaList.loadState.refresh is LoadState.Loading ||
+-                    mangaList.loadState.append is LoadState.Loading
++                if (loadState.refresh is LoadState.Loading ||
++                    loadState.append is LoadState.Loading
+                 ) {
+                     item(
+                         key = "browse_source_loading_append",
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt
+index 4177c1c..f20eb76 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceCompactGrid.kt
+@@ -64,6 +64,10 @@ fun BrowseSourceCompactGrid(
+         val settled = rememberPanoramaGridSettled { state.isScrollInProgress }
+         PrefetchPanoramaCoverShapes(mangaList.itemCount) { mangaList.peek(it)?.value?.first }
+         val shapeMode = rememberPanoramaShapeModeState()
++        // Capture paging changes in the content lambda: masonry caches intervals by its identity.
++        // Reading these only inside the DSL leaves the old count/footer after a page arrives.
++        val snapshot = mangaList.itemSnapshotList
++        val loadState = mangaList.loadState
+         CompositionLocalProvider(LocalPanoramaGridSettled provides settled) {
+             TrackPanoramaCoverShapes(mangaList.itemCount, shapeMode) { mangaList.peek(it)?.value?.first?.id }
+             val mode = shapeMode.mode
+@@ -76,7 +80,7 @@ fun BrowseSourceCompactGrid(
+                 verticalSpacing = CommonMangaItemDefaults.GridVerticalSpacer,
+                 horizontalSpacing = CommonMangaItemDefaults.GridHorizontalSpacer,
+             ) {
+-                if (mangaList.loadState.prepend is LoadState.Loading) {
++                if (loadState.prepend is LoadState.Loading) {
+                     item(
+                         key = "browse_source_loading_prepend",
+                         span = PanoramaSpan.FullLine,
+@@ -87,14 +91,14 @@ fun BrowseSourceCompactGrid(
+                 }
+ 
+                 items(
+-                    count = mangaList.itemCount,
+-                    key = { index -> mangaList.peek(index)?.value?.first?.id ?: index },
++                    count = snapshot.size,
++                    key = { index -> snapshot[index]?.value?.first?.id ?: index },
+                     span = { index ->
+-                        val id = mangaList.peek(index)?.value?.first?.id
++                        val id = snapshot[index]?.value?.first?.id
+                         panoramaCoverSpan(id == null || committedCoverIsWide(id), mode)
+                     },
+                     height = { index ->
+-                        val id = mangaList.peek(index)?.value?.first?.id
++                        val id = snapshot[index]?.value?.first?.id
+                         PanoramaCellHeight.Cover(
+                             wide = id == null || committedCoverIsWide(id),
+                             titleBelow = false,
+@@ -115,8 +119,8 @@ fun BrowseSourceCompactGrid(
+                     )
+                 }
+ 
+-                if (mangaList.loadState.refresh is LoadState.Loading ||
+-                    mangaList.loadState.append is LoadState.Loading
++                if (loadState.refresh is LoadState.Loading ||
++                    loadState.append is LoadState.Loading
+                 ) {
+                     item(
+                         key = "browse_source_loading_append",
