@@ -153,7 +153,12 @@ jobs:
         # 不加 -Pinclude-telemetry: 不需要 Firebase, 也就不需要官方的 google-services.json.
         # -Penable-updater 打开 BuildConfig.UPDATER_ENABLED, 否则 App 不会检查更新.
         # preview 构建类型用 debug 密钥出包, 下一步再用本仓库的密钥重签.
-        run: ./gradlew assemblePreview -Penable-updater --stacktrace
+        run: |
+          ./gradlew :presentation-core:testDebugUnitTest \
+            --tests '*PanoramaMasonryLayoutTest' --tests '*PanoramaAutoColumnsTest' \
+            :app:testPreviewUnitTest \
+            --tests '*PanoramaCoverShapesTest' --tests '*PanoramaShapeModeTest' --tests '*PanoramaLayoutPolicyTest' \
+            assemblePreview -Penable-updater --stacktrace
 
       - name: Sign APKs with the Harmony key
         if: steps.existing.outputs.skip != 'true'

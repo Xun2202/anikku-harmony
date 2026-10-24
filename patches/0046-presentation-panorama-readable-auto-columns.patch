@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 16:02:24 +0000
+Subject: [PATCH] presentation: size panorama columns by readable cover width
+
+Use available width, density and cover aspect ratio rather than viewport area. Keep compact wide grids at two columns and fit typical expanded portrait/landscape widths at two/three. Shared Mihon math has the same old area-based limitation; defer its independent release outside this Anikku task.
+---
+ .../core/components/PanoramaMasonry.kt        | 10 +--
+ .../core/components/PanoramaMasonryLayout.kt  | 55 +++++---------
+ .../components/PanoramaAutoColumnsTest.kt     | 75 +++++++++++++++++++
+ .../components/PanoramaMasonryLayoutTest.kt   | 21 +++---
+ 4 files changed, 105 insertions(+), 56 deletions(-)
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaAutoColumnsTest.kt
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+index 2db5ef0..267595f 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+@@ -85,13 +85,9 @@ sealed interface PanoramaColumns {
+      * Columns whose width tracks one cover shape.
+      *
+      * [heightOverWidth] is the cover box, not a measured bitmap: 3/2 for a tall cover and 2/3
+-     * for a wide one. The target lane keeps that cover near a constant area, and grows with the
+-     * square root of this grid's own area. Lane count is whichever column width is closest to
+-     * that target.
+-     *
+-     * Harmony: the area is the measured grid (lane area plus horizontal content padding, times
+-     * the measured height). An unbounded height uses scale 1. A tie within 0.05 dp keeps the
+-     * smaller count, and a column narrower than 104 dp is not a candidate.
++     * for a wide one. Column count follows available width and readable cover dimensions;
++     * viewport height does not change the count when bars, search or the keyboard appear.
++     * Lanes remain at least 104 dp wide, with a compact two-column floor for wide covers.
+      */
+     data class Shaped(
+         val heightOverWidth: Float,
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt
+index 3d0c696..aa58b10 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryLayout.kt
+@@ -2,7 +2,6 @@ package tachiyomi.presentation.core.components
+ 
+ import kotlin.math.abs
+ import kotlin.math.roundToInt
+-import kotlin.math.sqrt
+ 
+ /**
+  * A lane stays eligible when its bottom is within half the incoming item of the shortest lane.
+@@ -114,30 +113,22 @@ fun panoramaTieredMinSize(windowSize: Int, breakpoint: Int, compactMin: Int, exp
+     return if (windowSize < breakpoint) compactMin else expandedMin
+ }
+ 
+-/**
+- * (132 - 8)^2 * 1.5. Cover area of a 132 dp tall column: the cover is the lane minus 4 dp of
+- * padding on each side, and a tall cover is 3/2 as tall as it is wide.
+- */
+-private const val PANORAMA_SHAPED_ANCHOR_AREA_DP2 = 23064.0
+-
+-/**
+- * Folded portrait grid, 459 x 552 dp. The window is 459 x 672; about 120 dp of that is the
+- * top and bottom bars, so the reference is the grid's own area.
+- */
+-private const val PANORAMA_SHAPED_REFERENCE_AREA_DP2 = 459.0 * 552.0
++/** The preferred single-lane cover height, before the cell's horizontal padding is added. */
++private const val PANORAMA_SHAPED_COVER_HEIGHT_DP = 234.0
+ private const val PANORAMA_SHAPED_MIN_LANE_DP = 104.0
+-private const val PANORAMA_SHAPED_MAX_LANE_DP = 240.0
++private const val PANORAMA_SHAPED_MAX_LANE_DP = 324.0
+ private const val PANORAMA_SHAPED_CHROME_DP = 8.0
+-private const val PANORAMA_SHAPED_TIE_DP = 0.05
+ private const val PANORAMA_SHAPED_MAX_LANES = 12
+ 
+ /**
+  * Lane count for [PanoramaColumns.Shaped].
+  *
+- * [gridWidthPx] is the lane area plus horizontal content padding. [gridHeightPx] is the measured
+- * height and is ignored when [heightBounded] is false. Sizes are pixels; [density] is px per dp.
+- * The target lane is `clamp(sqrt(area / heightOverWidth) + 8 dp, 104 dp, 240 dp)`, where
+- * `area = 23064 dp^2 * max(1, sqrt(gridArea / (459 * 552 dp^2)))`.
++ * [gridWidthPx] is the lane area plus horizontal content padding. Sizes are pixels; [density] is
++ * px per dp. [gridHeightPx] and [heightBounded] are retained for callers but do not affect the
++ * count: a keyboard or toolbar changing the grid's height must not resize covers at the same width.
++ * A lane is at most `clamp(234 dp / heightOverWidth + 8 dp, 104 dp, 324 dp)` wide. Narrower lanes
++ * are added only while they remain at least 104 dp wide. Covers no taller than they are wide use
++ * at least two lanes when both can fit, so a compact window does not leave one oversized cover.
+  */
+ fun panoramaShapedLaneCount(
+     gridWidthPx: Int,
+@@ -148,29 +139,19 @@ fun panoramaShapedLaneCount(
+     density: Float,
+     heightBounded: Boolean,
+ ): Int {
+-    if (heightOverWidth <= 0f || density <= 0f) return 1
++    if (!heightOverWidth.isFinite() || heightOverWidth <= 0f || !density.isFinite() || density <= 0f) return 1
+     val available = gridWidthPx - horizontalPaddingPx
+     if (available <= 0) return 1
+     val densityDp = density.toDouble()
+-    val scale = if (!heightBounded || gridHeightPx <= 0) {
+-        1.0
+-    } else {
+-        val reference = PANORAMA_SHAPED_REFERENCE_AREA_DP2 * densityDp * densityDp
+-        val gridArea = gridWidthPx.toDouble() * gridHeightPx.toDouble()
+-        sqrt(gridArea / reference).coerceAtLeast(1.0)
+-    }
+-    val area = PANORAMA_SHAPED_ANCHOR_AREA_DP2 * densityDp * densityDp * scale
+     val minLane = PANORAMA_SHAPED_MIN_LANE_DP * densityDp
+-    val maxLane = PANORAMA_SHAPED_MAX_LANE_DP * densityDp
+-    val ideal = (sqrt(area / heightOverWidth.toDouble()) + PANORAMA_SHAPED_CHROME_DP * densityDp)
+-        .coerceIn(minLane, maxLane)
+-    return panoramaNearestLaneCount(
+-        availablePx = available,
+-        spacingPx = spacingPx,
+-        idealPx = ideal,
+-        minLanePx = minLane,
+-        tiePx = PANORAMA_SHAPED_TIE_DP * densityDp,
+-    )
++    val maxLane = (PANORAMA_SHAPED_COVER_HEIGHT_DP / heightOverWidth.toDouble() + PANORAMA_SHAPED_CHROME_DP)
++        .coerceIn(PANORAMA_SHAPED_MIN_LANE_DP, PANORAMA_SHAPED_MAX_LANE_DP) * densityDp
++    for (lanes in 1 until PANORAMA_SHAPED_MAX_LANES) {
++        if (lanes == 1 && heightOverWidth <= 1f && panoramaLaneWidth(available, spacingPx, 2) >= minLane) continue
++        if (panoramaLaneWidth(available, spacingPx, lanes) <= maxLane) return lanes
++        if (panoramaLaneWidth(available, spacingPx, lanes + 1) < minLane) return lanes
++    }
++    return PANORAMA_SHAPED_MAX_LANES
+ }
+ 
+ /**
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaAutoColumnsTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaAutoColumnsTest.kt
+new file mode 100644
+index 0000000..d4d848a
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaAutoColumnsTest.kt
+@@ -0,0 +1,75 @@
++package tachiyomi.presentation.core.components
++
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++
++class PanoramaAutoColumnsTest {
++    @Test
++    fun `wide covers keep two columns until the available width fits three readable lanes`() {
++        val expected = listOf(
++            220 to 1,
++            320 to 2,
++            360 to 2,
++            420 to 2,
++            459 to 2,
++            600 to 2,
++            664 to 2,
++            720 to 3,
++            840 to 3,
++            939 to 3,
++            1200 to 4,
++        )
++        var previous = 0
++        for ((width, lanes) in expected) {
++            val actual = shapedLanes(width, 800, 2f / 3f)
++            assertEquals(lanes, actual, "width=$width")
++            assertTrue(actual >= previous, "adding width must not remove a lane at $width dp")
++            previous = actual
++        }
++    }
++
++    @Test
++    fun `tall covers keep three columns on ordinary compact widths`() {
++        assertEquals(2, shapedLanes(320, 800, 1.5f))
++        for (width in listOf(360, 420, 459)) {
++            assertEquals(3, shapedLanes(width, 800, 1.5f), "width=$width")
++        }
++    }
++
++    @Test
++    fun `changing grid height or boundedness does not change columns`() {
++        for (width in listOf(459, 664, 939)) {
++            for (shape in listOf(1.5f, 2f / 3f)) {
++                val expected = shapedLanes(width, 800, shape)
++                assertEquals(expected, shapedLanes(width, 100, shape), "short height width=$width shape=$shape")
++                assertEquals(
++                    expected,
++                    shapedLanes(width, 9_999, shape, heightBounded = false),
++                    "unbounded height width=$width shape=$shape",
++                )
++            }
++        }
++    }
++
++    @Test
++    fun `density scaling preserves counts and narrow lanes are rejected`() {
++        for (width in listOf(320, 459, 664, 939, 1200)) {
++            for (shape in listOf(1.5f, 2f / 3f)) {
++                val expected = shapedLanes(width, 800, shape)
++                assertEquals(
++                    expected,
++                    panoramaShapedLaneCount(width * 2, 100, 32, 8, shape, 2f, heightBounded = true),
++                    "width=$width shape=$shape",
++                )
++            }
++        }
++        // 220 - 16 dp padding leaves 204 dp: two lanes would be 100 dp, below the 104 dp floor.
++        assertEquals(1, shapedLanes(220, 800, 2f / 3f))
++        assertEquals(1, shapedLanes(220, 800, 1.5f))
++    }
++
++    private fun shapedLanes(width: Int, height: Int, shape: Float, heightBounded: Boolean = true): Int {
++        return panoramaShapedLaneCount(width, height, 16, 4, shape, 1f, heightBounded)
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt
+index 15d437a..cb37f76 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryLayoutTest.kt
+@@ -373,33 +373,30 @@ class PanoramaMasonryLayoutTest {
+     }
+ 
+     @Test
+-    fun `shaped columns follow the grid area for tall and wide covers`() {
++    fun `shaped columns follow cover shape and available width`() {
+         // Grid width x height, dp. Horizontal content padding is 8 + 8 and the gap is 4.
+-        // 933 x 300 is one column more than the window-area table: the short grid scales less.
+         val tall = 1.5f
+         val wide = 2f / 3f
+         checkShaped(459, 552, tall, 3, 145.0)
+         checkShaped(459, 552, wide, 2, 219.5)
+         checkShaped(664, 819, tall, 4, 159.0)
+-        checkShaped(664, 819, wide, 3, 640.0 / 3.0)
++        checkShaped(664, 819, wide, 2, 322.0)
+         checkShaped(939, 544, tall, 6, 150.5)
+-        checkShaped(939, 544, wide, 4, 227.75)
++        checkShaped(939, 544, wide, 3, 305.0)
+         checkShaped(360, 680, tall, 3, 112.0)
+         checkShaped(360, 680, wide, 2, 170.0)
+         checkShaped(420, 813, tall, 3, 132.0)
+         checkShaped(420, 813, wide, 2, 200.0)
+-        checkShaped(933, 300, tall, 7, 893.0 / 7.0)
+-        checkShaped(933, 300, wide, 5, 180.2)
+-        checkShaped(800, 240, tall, 6, 764.0 / 6.0)
+-        checkShaped(800, 240, wide, 4, 193.0)
++        checkShaped(933, 300, tall, 6, 149.5)
++        checkShaped(933, 300, wide, 3, 303.0)
++        checkShaped(800, 240, tall, 5, 153.6)
++        checkShaped(800, 240, wide, 3, 776.0 / 3.0)
+     }
+ 
+     @Test
+-    fun `an unbounded height uses the folded area and a narrow lane is skipped`() {
+-        // 664 x 819 tall is 4 columns. Without a height the scale stays 1 and the ideal stays 132 dp.
+-        assertEquals(5, shapedLanes(664, 819, 1.5f, heightBounded = false))
+-        assertEquals(5, shapedLanes(664, 9_999, 1.5f, heightBounded = false))
++    fun `shaped columns use the same width rule for bounded and unbounded heights`() {
+         assertEquals(4, shapedLanes(664, 819, 1.5f, heightBounded = true))
++        assertEquals(4, shapedLanes(664, 9_999, 1.5f, heightBounded = false))
+         // Density scales px and dp together, so the folded portrait tall grid stays on 3 columns.
+         assertEquals(
+             shapedLanes(459, 552, 1.5f, heightBounded = true),

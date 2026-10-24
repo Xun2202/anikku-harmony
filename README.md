@@ -50,6 +50,8 @@ Anikku 先在用户选择的 SAF 目录里创建 `Video.tmp`，再把这个 `con
 
 - **浏览页开启全景后只能看到前几页**：preview.24（补丁 0045）修复分页快照变化后仍复用旧网格条目数量的问题，覆盖普通全景与全景紧凑模式；插件自身分页和其他显示模式保持原有逻辑。连续翻页、切换搜索 / 筛选后的效果待真机确认。
 
+- **全景布局统一（preview.25）**：书架、插件浏览、作品相关推荐和复用浏览网格的季迁移页统一形状与列数策略。自动列数依据可用宽度和封面比例；典型 459 / 664 / 939 dp 横封面分别为 2 / 2 / 3 列，手动列数不变。未知横封面不再先占三列中的两列；推荐页预读附近封面，滑动中暂缓改变占位形状，真机效果待反馈。
+
 ## 下载与安装
 
 - 到 [Releases](../../releases) 下载最新的 `Anikku-<tag>-arm64-v8a.apk`（华为设备均为 arm64）。
@@ -145,6 +147,8 @@ Anikku 先在用户选择的 SAF 目录里创建 `Video.tmp`，再把这个 `con
 | [`0043-presentation-fast-scroller-hold-to-grab.patch`](./patches/0043-presentation-fast-scroller-hold-to-grab.patch) | 滚动条热区恢复 32 dp + 边距，分两段，解决 0040 之后「很难按到」。画出来的拇指（加边距）上按下即抓，内容收不到这个指针。旁边朝内容一侧的 20 dp 是 `HoldToGrabNode`（`PointerInputModifierNode`，`sharePointerInputWithSiblings() = true`），与内容共享触摸、不消费；手指按住且不超过 touch slop 达 120 ms（`HoldToGrabMillis`），且内容没在滚动（`contentScrolling`）时才抓，之后在 Initial 阶段消费所有变化、y 方向拖拇指，`DragInteraction` start / stop 标记拖动。快甩先越过 slop，照常滚内容带惯性；惯性中按下只停住内容，不算抓。重叠的兄弟节点命中测试到第一个就停，不共享就收不到事件，原 KDoc 写反了，已更正。120 ms 远小于 500 ms 长按；抓住后一移动就取消条目长按，一动不动按满 500 ms 仍会触发长按菜单。列表、网格、瀑布流，加上第四根番剧详情页剧集网格的 `IrregularVerticalGridFastScroller`。新测试 3 个（`PanoramaMasonryFlingTest`）：`a press and hold beside the thumb grabs it`、`a hold beside the thumb during a coast does not grab it`、`a tap beside the thumb does not move the list`；0040 的 `a downward flick beside the bottom thumb still coasts` 照常通过。与 mihon-harmony 0035 同源。 |
 | [`0044-app-scroll-performance-recorder.patch`](./patches/0044-app-scroll-performance-recorder.patch) | 滚动性能记录器。设置 → 高级 →「滚动性能记录（调试）」，pref `harmony_scroll_perf_recorder`（`BasePreferences.scrollPerfRecorder()`（函数）），默认关。打开且 MainActivity 在前台时，`HarmonyFramePerf` 写进首次 attach 时分配、关掉即释放的原始类型环形缓冲（约 1 MB）：FrameMetrics 每帧各阶段（独立 HandlerThread；API 31+ 带 GPU 和 DEADLINE），6000 帧；主线程 Choreographer 帧间隔 6000 个，每个带全景滚动阶段（idle / drag / fling，`PanoramaScrollTrace` 里的 volatile）和 `PanoramaFrameCounters` 的测量次数 / 耗时 / 新组合格子数；每 500 ms 的 GC 次数、进程 CPU、刷新率与模式、温控（API 29+）、省电模式。attach 后 3 秒没有帧回调（会 invalidate decor 逼一帧）时导出写「FrameMetrics 未提供」，只用 Choreographer 间隔。记录时左下角（safeDrawing 内，底栏之上）40 dp 半透明「记录」按钮，其它位置的触摸穿透；点按在滑动轨迹写 `mark user`，后台生成 `<app>_scroll_perf_<yyyyMMdd-HHmmss>.txt`，和「转储崩溃日志」一样走分享面板。导出由纯函数 `PerfReport` 只用数字生成：设备 / 窗口 / 刷新率头部；每段滚动的 fps、卡顿数、p50 / p90 / p99 / max 和主导阶段；卡顿帧各阶段均值；帧间隔分位数；最近 30 秒的卡顿帧与采样；`HARMONY_NOISE_MARKERS`（改为 `internal`）每秒计数；全景轨迹。卡顿判据：已知 DEADLINE 时 TOTAL > DEADLINE，否则 > 1.5 个 vsync。不含 logcat 原文、标题、URL、扩展列表、文件路径、账号和 `HarmonyLogBuffer`，末行 `privacy: no titles, urls, extension list or logcat text`。字符串在 `i18n-ank` base + zh-rCN 的 Harmony 段。`HarmonyFramePerf.kt` / `PanoramaFrameCounters.kt` / `PanoramaScrollTrace.kt` / `PanoramaMasonry.kt` / `HarmonyFramePerfTest.kt` 与对方逐字节相同。分析脚本：归档仓 `tools/scroll-perf-analyze/analyze.py`。与 mihon-harmony 0036 同源。 |
 | [`0045-browse-panorama-refresh-paging-snapshot.patch`](./patches/0045-browse-panorama-refresh-paging-snapshot.patch) | 全景浏览网格在组合阶段捕获分页快照和加载状态，让下一页、刷新及 loading footer 变化使布局缓存失效；仅移植 Mihon 0044 中与本问题相关的处理。 |
+| [`0046-presentation-panorama-readable-auto-columns.patch`](./patches/0046-presentation-panorama-readable-auto-columns.patch) | 按可用宽度、密度与封面比例选列；宽封面紧凑窗口保留两列，窗口高度变化不改列数。 |
+| [`0047-presentation-unify-panorama-surfaces.patch`](./patches/0047-presentation-unify-panorama-surfaces.patch) | 统一书架、浏览、相关推荐的全景宿主、占位、形状采样与有限预读，保留分页及点击回调。 |
 
 补丁按 [`patches/series`](./patches/series) 的顺序套用；已被官方合入的补丁会被 `prepare-source.sh` 自动跳过。
 
