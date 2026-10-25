@@ -623,3 +623,12 @@ gh release list --repo Xun2202/anikku-harmony
 - 导航是悬浮层：Home 手机正文不再因底栏加减 padding，顶部整体平移保持测量高度；书架/分页顶部余量放进列表 contentPadding，可随正常滚动离开。收放动画不改视口或列表 padding，不替用户拖动漫画；末项保留实际导航/投屏和系统区域的滚动余量。
 - 通用紧凑规则：字号比例≤1.3，窗口宽高比≥0.65或高度≤480dp时，标题48dp、底部48dp触控行；普通窗口保持56/64dp，大字号顶栏64dp并用官方底栏。分类保持48dp触控，不按设备型号写死。Mihon tablet NavigationSuite rail 保留，Anikku 投屏/标签/徽标保留。
 - NavigationChrome.kt、NavigationChromeScrollTracker.kt、CompactNavigationBar.kt 及纯逻辑测试两仓一致；布局回归仅按 Compose 版本选择旧包或 v2 runComposeUiTest，按0/0.5/1确定进度验证正文边界/封面坐标不变、标题与分类距离不变、上下移动进度一致，并独立验证真实动画完成隐藏与恢复；不依赖固定80ms取样。版本和构建结果以归档现状为准。
+
+## 2026-10-25：手势内锁定导航、滑块避让与统一留白
+
+- Mihon 0050 / Anikku 0051 跟进 preview.15 / preview.28：轻微来回拖动不再反复收放。父 Scaffold 在 Initial 阶段只观察触摸，不消费事件；一次按住最多改变一次显隐，所有手指松开或取消后允许下一次手势切换；6dp同向位移确认意图，惯性和横向手势不触发。
+- 恢复共用225ms缓出动画；隐藏随触摸速度从175ms缩至100ms，上下仍共用同一进度。保留系统动画缩放、无障碍/搜索/选择保护，正文视口和滚动padding不随动画变。
+- List/Grid/Masonry快速滑块轨道与宿主内容padding取最大值，避开固定展开头部/底部安全区，去掉底部重复预留。轨道在导航收放时保持不变，短窗口不足放滑块时隐藏；Anikku独有不规则网格同步处理。
+- 新的共享 browsingContentVerticalPadding 沿用窗口/字号规则：紧凑4dp、其他8dp，统一书架、浏览、Anikku相关推荐。48dp标题/分类触控与系统安全区保持；未发现重复顶部inset。Mihon相关推荐宿主不同，保留原有结构。
+- 参考：Android [每次手势生命周期](https://developer.android.com/develop/ui/compose/touch-input/pointer-input/understand-gestures)、Material [175/225ms隐藏/恢复](https://github.com/material-components/material-components-android/blob/master/lib/java/com/google/android/material/behavior/HideViewOnScrollBehavior.java)、[Headroom方向容差](https://github.com/WickyNilliams/headroom.js/blob/master/src/Headroom.js)。一次手势锁定是依据用户小红书实测反馈设计，没有声称取得小红书源码。
+- 共享NavigationChrome与tracker/spacing两仓一致；回归覆盖同手势反向锁定、松手后再切换、小幅容差、真实触摸事件和正文坐标稳定。版本、构建、产物和真机状态见归档现状。
