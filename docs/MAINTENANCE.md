@@ -615,3 +615,11 @@ gh release list --repo Xun2202/anikku-harmony
 - 底栏在 onPreScroll 首次反向用户拖动就恢复，不再等顶栏消费后的 8dp；仍不消费滚动或惯性。Mihon 用官方 NavigationSuiteScaffoldState.snapTo(Visible)，Anikku 显示 120ms / 隐藏 180ms，保留投屏和标签偏好。
 - NavigationChrome.kt 及新增回滑/布局回归在两仓同源；布局测试只按 Compose 版本选择旧包或 v2 包的 runComposeUiTest，断言相同；布局回归检查完整收起无顶部空条以及展开恢复。版本、构建和真机状态以档案仓现状为准。
 - 一手依据：[Android edge-to-edge](https://developer.android.com/develop/ui/views/layout/edge-to-edge)、[Compose Insets](https://developer.android.com/develop/ui/compose/system/insets-ui)、[Material3 顶栏滚动](https://developer.android.com/develop/ui/compose/components/app-bars)。
+
+## 2026-10-25：同步悬浮导航与阔屏紧凑尺寸
+
+- Mihon 0049 / Anikku 0050 跟进 preview.14 / preview.27 真机反馈：标题和分类不再各自压缩，二者在同一 topBar 容器整体平移；上下导航共用显隐状态和 140ms 动画。
+- 首个真实用户向上滚动即收起，首个反向拖动即恢复；去掉隐藏24dp等待，监听不消费滚动/惯性，横向切页、惯性和短列表未消费的拖动不触发隐藏。搜索、多选、触摸探索、更多页及 Anikku 投屏的保护仍保留。
+- 导航是悬浮层：Home 手机正文不再因底栏加减 padding，顶部整体平移保持测量高度；书架/分页顶部余量放进列表 contentPadding，可随正常滚动离开。收放动画不改视口或列表 padding，不替用户拖动漫画；末项保留实际导航/投屏和系统区域的滚动余量。
+- 通用紧凑规则：字号比例≤1.3，窗口宽高比≥0.65或高度≤480dp时，标题48dp、底部48dp触控行；普通窗口保持56/64dp，大字号顶栏64dp并用官方底栏。分类保持48dp触控，不按设备型号写死。Mihon tablet NavigationSuite rail 保留，Anikku 投屏/标签/徽标保留。
+- NavigationChrome.kt、NavigationChromeScrollTracker.kt、CompactNavigationBar.kt 及纯逻辑测试两仓一致；布局回归仅按 Compose 版本选择旧包或 v2 runComposeUiTest，验证中途动画时正文边界/封面坐标不变、标题与分类距离不变、上下移动进度一致。版本和构建结果以归档现状为准。

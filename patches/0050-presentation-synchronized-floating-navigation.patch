@@ -1,0 +1,1428 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 15:15:13 +0000
+Subject: [PATCH] presentation: synchronize floating navigation without moving
+ browsing content
+
+Move title and categories as one overlay, share a 140ms direction-triggered animation with the bottom bar, and keep viewport and scroll padding constant. Wide or short windows use 48dp toolbar and bottom touch rows; large fonts retain normal sizing. Shared chrome and compact navigation match Mihon 0049; keep Anikku cast controls and label preferences.
+---
+ .../presentation/components/TabbedScreen.kt   |  99 +++++-----
+ .../library/components/LibraryContent.kt      |  43 +----
+ .../library/components/LibraryTabs.kt         |  51 +++---
+ .../eu/kanade/tachiyomi/ui/home/HomeScreen.kt | 173 ++++++++++++------
+ .../kanade/tachiyomi/ui/library/LibraryTab.kt | 125 ++++++++-----
+ .../material/CompactNavigationBar.kt          |  93 ++++++++++
+ .../components/material/NavigationChrome.kt   | 134 ++++++++------
+ .../material/NavigationChromeScrollTracker.kt |  38 ++--
+ .../core/components/material/Scaffold.kt      |   6 +-
+ .../NavigationChromeConnectionTest.kt         |  22 ++-
+ .../material/NavigationChromeLayoutTest.kt    | 122 +++++++++---
+ .../NavigationChromeScrollTrackerTest.kt      |  51 +++---
+ 12 files changed, 602 insertions(+), 355 deletions(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CompactNavigationBar.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt b/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
+index c39154fd0..31fbdf8c2 100644
+--- a/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
+@@ -29,7 +29,6 @@ import eu.kanade.tachiyomi.ui.browse.feed.FeedScreenModel
+ import kotlinx.collections.immutable.ImmutableList
+ import kotlinx.collections.immutable.persistentListOf
+ import kotlinx.coroutines.launch
+-import tachiyomi.presentation.core.components.material.BrowsingNavigationChrome
+ import tachiyomi.presentation.core.components.material.Scaffold
+ import tachiyomi.presentation.core.components.material.TabText
+ import tachiyomi.presentation.core.components.material.rememberBrowsingTopAppBarScrollBehavior
+@@ -61,52 +60,43 @@ fun TabbedScreen(
+             resetKey = state.currentPage,
+         ),
+         topBar = { scrollBehavior ->
+-            val tab = tabs[state.currentPage]
+-            val searchEnabled = tab.searchEnabled
+-            // KMK -->
+-            if (bulkFavoriteState.selectionMode) {
+-                BulkSelectionToolbar(
+-                    selectedCount = bulkFavoriteState.selection.size,
+-                    isRunning = bulkFavoriteState.isRunning,
+-                    onClickClearSelection = bulkFavoriteScreenModel::toggleSelectionMode,
+-                    onChangeCategoryClick = bulkFavoriteScreenModel::addFavorite,
+-                    onSelectAll = {
+-                        feedState.items?.let { result ->
+-                            result.mapNotNull { it.results }
+-                                .flatten()
+-                                .forEach { bulkFavoriteScreenModel.select(it) }
+-                        }
+-                    },
+-                    onReverseSelection = {
+-                        feedState.items?.let { result ->
+-                            result.mapNotNull { it.results }
+-                                .flatten()
+-                                .let { bulkFavoriteScreenModel.reverseSelection(it) }
+-                        }
+-                    },
+-                )
+-            } else {
+-                // KMK <--
+-                SearchToolbar(
+-                    scrollBehavior = scrollBehavior,
+-                    titleContent = { AppBarTitle(stringResource(titleRes)) },
+-                    searchEnabled = searchEnabled,
+-                    searchQuery = if (searchEnabled) searchQuery else null,
+-                    onChangeSearchQuery = onChangeSearchQuery,
+-                    actions = { AppBarActions(tab.actions) },
+-                )
+-            }
+-        },
+-        snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
+-    ) { contentPadding ->
+-        Column(
+-            modifier = Modifier.padding(
+-                top = contentPadding.calculateTopPadding(),
+-                start = contentPadding.calculateStartPadding(LocalLayoutDirection.current),
+-                end = contentPadding.calculateEndPadding(LocalLayoutDirection.current),
+-            ),
+-        ) {
+-            BrowsingNavigationChrome {
++            Column {
++                val tab = tabs[state.currentPage]
++                val searchEnabled = tab.searchEnabled
++                // KMK -->
++                if (bulkFavoriteState.selectionMode) {
++                    BulkSelectionToolbar(
++                        selectedCount = bulkFavoriteState.selection.size,
++                        isRunning = bulkFavoriteState.isRunning,
++                        onClickClearSelection = bulkFavoriteScreenModel::toggleSelectionMode,
++                        onChangeCategoryClick = bulkFavoriteScreenModel::addFavorite,
++                        onSelectAll = {
++                            feedState.items?.let { result ->
++                                result.mapNotNull { it.results }
++                                    .flatten()
++                                    .forEach { bulkFavoriteScreenModel.select(it) }
++                            }
++                        },
++                        onReverseSelection = {
++                            feedState.items?.let { result ->
++                                result.mapNotNull { it.results }
++                                    .flatten()
++                                    .let { bulkFavoriteScreenModel.reverseSelection(it) }
++                            }
++                        },
++                    )
++                } else {
++                    // KMK <--
++                    SearchToolbar(
++                        scrollBehavior = scrollBehavior,
++                        titleContent = { AppBarTitle(stringResource(titleRes)) },
++                        searchEnabled = searchEnabled,
++                        searchQuery = if (searchEnabled) searchQuery else null,
++                        onChangeSearchQuery = onChangeSearchQuery,
++                        actions = { AppBarActions(tab.actions) },
++                    )
++                }
++
+                 PrimaryTabRow(
+                     selectedTabIndex = state.currentPage,
+                     containerColor = MaterialTheme.colorScheme.surface,
+@@ -122,14 +112,25 @@ fun TabbedScreen(
+                     }
+                 }
+             }
+-
++        },
++        snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
++    ) { contentPadding ->
++        Column(
++            modifier = Modifier.padding(
++                start = contentPadding.calculateStartPadding(LocalLayoutDirection.current),
++                end = contentPadding.calculateEndPadding(LocalLayoutDirection.current),
++            ),
++        ) {
+             HorizontalPager(
+                 modifier = Modifier.fillMaxSize(),
+                 state = state,
+                 verticalAlignment = Alignment.Top,
+             ) { page ->
+                 tabs[page].content(
+-                    PaddingValues(bottom = contentPadding.calculateBottomPadding()),
++                    PaddingValues(
++                        top = contentPadding.calculateTopPadding(),
++                        bottom = contentPadding.calculateBottomPadding(),
++                    ),
+                     snackbarHostState,
+                 )
+             }
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LibraryContent.kt b/app/src/main/java/eu/kanade/presentation/library/components/LibraryContent.kt
+index 1616db279..21da0bc8b 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LibraryContent.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LibraryContent.kt
+@@ -5,7 +5,7 @@ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.foundation.layout.calculateEndPadding
+ import androidx.compose.foundation.layout.calculateStartPadding
+ import androidx.compose.foundation.layout.padding
+-import androidx.compose.foundation.pager.rememberPagerState
++import androidx.compose.foundation.pager.PagerState
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+@@ -28,15 +28,11 @@ import kotlin.time.Duration.Companion.seconds
+ @Composable
+ fun LibraryContent(
+     categories: List<Category>,
+-    // KMK -->
+-    activeCategoryIndex: Int,
+-    // KMK <--
+     searchQuery: String?,
+     selection: Set<Long>,
+     contentPadding: PaddingValues,
+-    currentPage: Int,
++    pagerState: PagerState,
+     hasActiveFilters: Boolean,
+-    showPageTabs: Boolean,
+     onChangeCurrentPage: (Int) -> Unit,
+     onClickManga: (Long) -> Unit,
+     onContinueReadingClicked: ((LibraryManga) -> Unit)?,
+@@ -44,49 +40,19 @@ fun LibraryContent(
+     onToggleRangeSelection: (Category, LibraryManga) -> Unit,
+     onRefresh: () -> Boolean,
+     onGlobalSearchClicked: () -> Unit,
+-    getItemCountForCategory: (Category) -> Int?,
+     getDisplayMode: (Int) -> PreferenceMutableState<LibraryDisplayMode>,
+     getColumnsForOrientation: (Boolean) -> PreferenceMutableState<Int>,
+     getItemsForCategory: (Category) -> List<LibraryItem>,
+ ) {
+     Column(
+         modifier = Modifier.padding(
+-            top = contentPadding.calculateTopPadding(),
+             start = contentPadding.calculateStartPadding(LocalLayoutDirection.current),
+             end = contentPadding.calculateEndPadding(LocalLayoutDirection.current),
+         ),
+     ) {
+-        val pagerState = rememberPagerState(currentPage) { categories.size }
+-
+         val scope = rememberCoroutineScope()
+         var isRefreshing by remember(pagerState.currentPage) { mutableStateOf(false) }
+ 
+-        if (showPageTabs && categories.isNotEmpty() && (categories.size > 1 || !categories.first().isSystemCategory)) {
+-            LaunchedEffect(categories) {
+-                // KMK -->
+-                val targetPage = when {
+-                    categories.isEmpty() -> 0
+-                    activeCategoryIndex != pagerState.currentPage -> activeCategoryIndex.coerceAtMost(categories.size - 1)
+-                    pagerState.currentPage >= categories.size -> categories.size - 1
+-                    else -> pagerState.currentPage
+-                }
+-                if (targetPage != pagerState.currentPage) {
+-                    pagerState.scrollToPage(targetPage)
+-                }
+-                // KMK <--
+-            }
+-            LibraryTabs(
+-                categories = categories,
+-                pagerState = pagerState,
+-                getItemCountForCategory = getItemCountForCategory,
+-                onTabItemClick = {
+-                    scope.launch {
+-                        pagerState.animateScrollToPage(it)
+-                    }
+-                },
+-            )
+-        }
+-
+         PullRefresh(
+             refreshing = isRefreshing,
+             enabled = selection.isEmpty(),
+@@ -103,7 +69,10 @@ fun LibraryContent(
+         ) {
+             LibraryPager(
+                 state = pagerState,
+-                contentPadding = PaddingValues(bottom = contentPadding.calculateBottomPadding()),
++                contentPadding = PaddingValues(
++                    top = contentPadding.calculateTopPadding(),
++                    bottom = contentPadding.calculateBottomPadding(),
++                ),
+                 hasActiveFilters = hasActiveFilters,
+                 selection = selection,
+                 searchQuery = searchQuery,
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LibraryTabs.kt b/app/src/main/java/eu/kanade/presentation/library/components/LibraryTabs.kt
+index c372bb139..b7ae52a19 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LibraryTabs.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LibraryTabs.kt
+@@ -12,7 +12,6 @@ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.zIndex
+ import eu.kanade.presentation.category.visualName
+ import tachiyomi.domain.category.model.Category
+-import tachiyomi.presentation.core.components.material.BrowsingNavigationChrome
+ import tachiyomi.presentation.core.components.material.TabText
+ 
+ @Composable
+@@ -22,33 +21,31 @@ internal fun LibraryTabs(
+     getItemCountForCategory: (Category) -> Int?,
+     onTabItemClick: (Int) -> Unit,
+ ) {
+-    BrowsingNavigationChrome {
+-        val currentPageIndex = pagerState.currentPage.coerceAtMost(categories.lastIndex)
+-        Column(modifier = Modifier.zIndex(2f)) {
+-            PrimaryScrollableTabRow(
+-                selectedTabIndex = currentPageIndex,
+-                containerColor = MaterialTheme.colorScheme.surface,
+-                edgePadding = 0.dp,
+-                // TODO: use default when width is fixed upstream
+-                // https://issuetracker.google.com/issues/242879624
+-                divider = {},
+-            ) {
+-                categories.forEachIndexed { index, category ->
+-                    Tab(
+-                        selected = currentPageIndex == index,
+-                        onClick = { onTabItemClick(index) },
+-                        text = {
+-                            TabText(
+-                                text = category.visualName,
+-                                badgeCount = getItemCountForCategory(category),
+-                            )
+-                        },
+-                        unselectedContentColor = MaterialTheme.colorScheme.onSurface,
+-                    )
+-                }
++    val currentPageIndex = pagerState.currentPage.coerceAtMost(categories.lastIndex)
++    Column(modifier = Modifier.zIndex(2f)) {
++        PrimaryScrollableTabRow(
++            selectedTabIndex = currentPageIndex,
++            containerColor = MaterialTheme.colorScheme.surface,
++            edgePadding = 0.dp,
++            // TODO: use default when width is fixed upstream
++            // https://issuetracker.google.com/issues/242879624
++            divider = {},
++        ) {
++            categories.forEachIndexed { index, category ->
++                Tab(
++                    selected = currentPageIndex == index,
++                    onClick = { onTabItemClick(index) },
++                    text = {
++                        TabText(
++                            text = category.visualName,
++                            badgeCount = getItemCountForCategory(category),
++                        )
++                    },
++                    unselectedContentColor = MaterialTheme.colorScheme.onSurface,
++                )
+             }
+-
+-            HorizontalDivider()
+         }
++
++        HorizontalDivider()
+     }
+ }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
+index eaf65ab93..b71854747 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
+@@ -4,15 +4,16 @@ import androidx.activity.ComponentActivity
+ import androidx.activity.compose.BackHandler
+ import androidx.compose.animation.AnimatedContent
+ import androidx.compose.animation.AnimatedVisibility
+-import androidx.compose.animation.core.tween
+ import androidx.compose.animation.expandVertically
+ import androidx.compose.animation.shrinkVertically
+ import androidx.compose.animation.togetherWith
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.RowScope
+ import androidx.compose.foundation.layout.WindowInsets
+ import androidx.compose.foundation.layout.consumeWindowInsets
++import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.material3.Badge
+@@ -21,6 +22,7 @@ import androidx.compose.material3.Icon
+ import androidx.compose.material3.LocalContentColor
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.NavigationRailItem
++import androidx.compose.material3.ShortNavigationBar
+ import androidx.compose.material3.ShortNavigationBarItem
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+@@ -28,15 +30,20 @@ import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.produceState
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+-import androidx.compose.ui.input.nestedscroll.nestedScroll
++import androidx.compose.ui.layout.onSizeChanged
+ import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalDensity
+ import androidx.compose.ui.semantics.contentDescription
+ import androidx.compose.ui.semantics.semantics
+ import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.util.fastFilter
+ import androidx.compose.ui.util.fastForEach
+ import cafe.adriel.voyager.navigator.LocalNavigator
+@@ -68,9 +75,14 @@ import soup.compose.material.motion.animation.materialFadeThroughOut
+ import tachiyomi.core.common.preference.PreferenceStore
+ import tachiyomi.domain.library.service.LibraryPreferences
+ import tachiyomi.i18n.MR
+-import tachiyomi.presentation.core.components.material.NavigationBar
++import tachiyomi.presentation.core.components.material.BrowsingChromeOverlay
++import tachiyomi.presentation.core.components.material.CompactNavigationBar
++import tachiyomi.presentation.core.components.material.CompactNavigationBarItem
++import tachiyomi.presentation.core.components.material.LocalBrowsingBottomPadding
++import tachiyomi.presentation.core.components.material.LocalBrowsingNavigationBarState
+ import tachiyomi.presentation.core.components.material.NavigationRail
+ import tachiyomi.presentation.core.components.material.Scaffold
++import tachiyomi.presentation.core.components.material.isCompactBrowsingWindow
+ import tachiyomi.presentation.core.components.material.rememberBrowsingNavigationBarState
+ import tachiyomi.presentation.core.i18n.pluralStringResource
+ import uy.kohesive.injekt.Injekt
+@@ -132,13 +144,24 @@ object HomeScreen : Screen() {
+                 val castState by castManager.castState.collectAsState()
+                 val isConnected = castState == CastManager.CastState.CONNECTED
+                 val navigationScroll = rememberBrowsingNavigationBarState(
+-                    enabled = !tabletUi && bottomNavVisible && !isConnected && tabNavigator.current != MoreTab,
++                    enabled = bottomNavVisible && !isConnected && tabNavigator.current != MoreTab,
+                     resetKey = tabNavigator.current.key,
+                 )
+-                Scaffold(
+-                    modifier = Modifier.nestedScroll(navigationScroll.nestedScrollConnection),
+-                    startBar = {
+-                        if (tabletUi) {
++                val compactBar = isCompactBrowsingWindow()
++                val density = LocalDensity.current
++                var measuredBarHeight by remember { mutableStateOf(0.dp) }
++                var measuredCastHeight by remember { mutableStateOf(0.dp) }
++                CompositionLocalProvider(
++                    LocalBrowsingNavigationBarState provides navigationScroll,
++                    LocalBrowsingBottomPadding provides if (tabletUi) {
++                        0.dp
++                    } else {
++                        (if (bottomNavVisible) measuredBarHeight else 0.dp) +
++                            (if (isConnected) measuredCastHeight else 0.dp)
++                    },
++                ) {
++                    if (tabletUi) {
++                        Scaffold(startBar = {
+                             NavigationRail {
+                                 TABS
+                                     // SY -->
+@@ -148,65 +171,60 @@ object HomeScreen : Screen() {
+                                         NavigationRailItem(it/* SY --> */, alwaysShowLabel/* SY <-- */)
+                                     }
+                             }
++                        }, contentWindowInsets = WindowInsets(0)) { contentPadding ->
++                            Box(Modifier.padding(contentPadding).consumeWindowInsets(contentPadding)) {
++                                TabContent(tabNavigator)
++                            }
+                         }
+-                    },
+-                    bottomBar = {
+-                        if (!tabletUi) {
+-                            Column {
+-                                AnimatedVisibility(
+-                                    visible = isConnected,
+-                                    enter = expandVertically(),
+-                                    exit = shrinkVertically(),
+-                                ) {
+-                                    CastMiniController(
+-                                        castManager = castManager,
+-                                        modifier = Modifier
+-                                            .fillMaxWidth()
+-                                            .background(MaterialTheme.colorScheme.surfaceVariant),
+-                                    )
+-                                }
+-
+-                                AnimatedVisibility(
+-                                    visible = bottomNavVisible && navigationScroll.visible,
+-                                    enter = expandVertically(animationSpec = tween(durationMillis = 120)),
+-                                    exit = shrinkVertically(animationSpec = tween(durationMillis = 180)),
++                    } else {
++                        Box(modifier = Modifier.fillMaxSize()) {
++                            TabContent(tabNavigator)
++                            if (bottomNavVisible || isConnected) {
++                                BrowsingChromeOverlay(
++                                    state = navigationScroll,
++                                    atBottom = true,
++                                    modifier = Modifier.align(Alignment.BottomCenter),
+                                 ) {
+-                                    NavigationBar {
+-                                        TABS
+-                                            // SY -->
+-                                            .fastFilter { it.isEnabled() }
+-                                            // SY <--
+-                                            .fastForEach {
+-                                                NavigationBarItem(it/* SY --> */, alwaysShowLabel/* SY <-- */)
++                                    Column {
++                                        AnimatedVisibility(
++                                            visible = isConnected,
++                                            enter = expandVertically(),
++                                            exit = shrinkVertically(),
++                                        ) {
++                                            CastMiniController(
++                                                castManager = castManager,
++                                                modifier = Modifier.fillMaxWidth()
++                                                    .onSizeChanged {
++                                                        measuredCastHeight = with(density) { it.height.toDp() }
++                                                    }
++                                                    .background(MaterialTheme.colorScheme.surfaceVariant),
++                                            )
++                                        }
++                                        if (bottomNavVisible) {
++                                            Box(
++                                                Modifier.onSizeChanged {
++                                                    measuredBarHeight = with(density) { it.height.toDp() }
++                                                },
++                                            ) {
++                                                if (compactBar) {
++                                                    CompactNavigationBar {
++                                                        TABS.fastFilter { it.isEnabled() }.fastForEach {
++                                                            CompactNavigationItem(it, alwaysShowLabel)
++                                                        }
++                                                    }
++                                                } else {
++                                                    ShortNavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
++                                                        TABS.fastFilter { it.isEnabled() }.fastForEach {
++                                                            NavigationBarItem(it, alwaysShowLabel)
++                                                        }
++                                                    }
++                                                }
+                                             }
++                                        }
+                                     }
+                                 }
+                             }
+                         }
+-                    },
+-                    contentWindowInsets = WindowInsets(0),
+-                ) { contentPadding ->
+-                    Box(
+-                        modifier = Modifier
+-                            .padding(contentPadding)
+-                            .consumeWindowInsets(contentPadding),
+-                    ) {
+-                        AnimatedContent(
+-                            targetState = tabNavigator.current,
+-                            transitionSpec = {
+-                                materialFadeThroughIn(
+-                                    initialScale = 1f,
+-                                    durationMillis = TAB_FADE_DURATION,
+-                                ) togetherWith
+-                                    materialFadeThroughOut(durationMillis = TAB_FADE_DURATION)
+-                            },
+-                            label = "tabContent",
+-                            contentKey = { it.key },
+-                        ) {
+-                            tabNavigator.saveableState(key = "currentTab", it) {
+-                                it.Content()
+-                            }
+-                        }
+                     }
+                 }
+             }
+@@ -260,6 +278,21 @@ object HomeScreen : Screen() {
+         }
+     }
+ 
++    @Composable
++    private fun TabContent(tabNavigator: cafe.adriel.voyager.navigator.tab.TabNavigator) {
++        AnimatedContent(
++            targetState = tabNavigator.current,
++            transitionSpec = {
++                materialFadeThroughIn(initialScale = 1f, durationMillis = TAB_FADE_DURATION) togetherWith
++                    materialFadeThroughOut(durationMillis = TAB_FADE_DURATION)
++            },
++            label = "tabContent",
++            contentKey = { it.key },
++        ) {
++            tabNavigator.saveableState(key = "currentTab", it) { it.Content() }
++        }
++    }
++
+     @Composable
+     private fun NavigationBarItem(
+         tab: eu.kanade.presentation.util.Tab,
+@@ -296,6 +329,26 @@ object HomeScreen : Screen() {
+         )
+     }
+ 
++    @Composable
++    private fun RowScope.CompactNavigationItem(
++        tab: eu.kanade.presentation.util.Tab,
++        alwaysShowLabel: Boolean,
++    ) {
++        val tabNavigator = LocalTabNavigator.current
++        val navigator = LocalNavigator.currentOrThrow
++        val scope = rememberCoroutineScope()
++        val selected = tabNavigator.current::class == tab::class
++        CompactNavigationBarItem(
++            selected = selected,
++            onClick = {
++                if (!selected) tabNavigator.current = tab else scope.launch { tab.onReselect(navigator) }
++            },
++            icon = { NavigationIconItem(tab) },
++            label = tab.options.title,
++            showLabel = alwaysShowLabel || selected,
++        )
++    }
++
+     @Composable
+     fun NavigationRailItem(
+         tab: eu.kanade.presentation.util.Tab,
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt
+index cd107677d..0695e5c3a 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt
+@@ -5,7 +5,9 @@ import androidx.activity.compose.BackHandler
+ import androidx.compose.animation.graphics.res.animatedVectorResource
+ import androidx.compose.animation.graphics.res.rememberAnimatedVectorPainter
+ import androidx.compose.animation.graphics.vector.AnimatedImageVector
++import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.pager.rememberPagerState
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.automirrored.outlined.HelpOutline
+ import androidx.compose.material3.SnackbarHost
+@@ -35,6 +37,7 @@ import eu.kanade.presentation.library.DeleteLibraryMangaDialog
+ import eu.kanade.presentation.library.LibrarySettingsDialog
+ import eu.kanade.presentation.library.ResetInfoMangaDialog
+ import eu.kanade.presentation.library.components.LibraryContent
++import eu.kanade.presentation.library.components.LibraryTabs
+ import eu.kanade.presentation.library.components.LibraryToolbar
+ import eu.kanade.presentation.manga.components.LibraryBottomActionMenu
+ import eu.kanade.presentation.more.onboarding.GETTING_STARTED_URL
+@@ -144,57 +147,88 @@ data object LibraryTab : Tab {
+             started
+         }
+ 
++        val pagerState = rememberPagerState(state.coercedActiveCategoryIndex) { state.displayedCategories.size }
++        val categories = state.displayedCategories
++        val showPageTabs = (state.showCategoryTabs || !state.searchQuery.isNullOrEmpty()) &&
++            categories.isNotEmpty() && (categories.size > 1 || !categories.first().isSystemCategory)
++        if (showPageTabs) {
++            LaunchedEffect(state.displayedCategories) {
++                // KMK -->
++                val targetPage = when {
++                    state.displayedCategories.isEmpty() -> 0
++                    state.coercedActiveCategoryIndex != pagerState.currentPage -> state.coercedActiveCategoryIndex.coerceAtMost(state.displayedCategories.size - 1)
++                    pagerState.currentPage >= state.displayedCategories.size -> state.displayedCategories.size - 1
++                    else -> pagerState.currentPage
++                }
++                if (targetPage != pagerState.currentPage) {
++                    pagerState.scrollToPage(targetPage)
++                }
++                // KMK <--
++            }
++        }
++
+         Scaffold(
+             topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior(
+                 enabled = !state.selectionMode && state.searchQuery == null,
+                 resetKey = state.coercedActiveCategoryIndex,
+             ),
+             topBar = { scrollBehavior ->
+-                val title = state.getToolbarTitle(
+-                    defaultTitle = stringResource(MR.strings.label_library),
+-                    defaultCategoryTitle = stringResource(MR.strings.label_default),
+-                    page = state.coercedActiveCategoryIndex,
+-                )
+-                LibraryToolbar(
+-                    hasActiveFilters = state.hasActiveFilters,
+-                    selectedCount = state.selection.size,
+-                    title = title,
+-                    onClickUnselectAll = screenModel::clearSelection,
+-                    onClickSelectAll = screenModel::selectAll,
+-                    onClickInvertSelection = screenModel::invertSelection,
+-                    onClickFilter = screenModel::showSettingsDialog,
+-                    onClickRefresh = { onClickRefresh(state.activeCategory) },
+-                    onClickGlobalUpdate = { onClickRefresh(null) },
+-                    onClickOpenRandomManga = {
+-                        scope.launch {
+-                            val randomItem = screenModel.getRandomLibraryItemForCurrentCategory()
+-                            if (randomItem != null) {
+-                                navigator.push(MangaScreen(randomItem.libraryManga.manga.id))
++                Column {
++                    val title = state.getToolbarTitle(
++                        defaultTitle = stringResource(MR.strings.label_library),
++                        defaultCategoryTitle = stringResource(MR.strings.label_default),
++                        page = state.coercedActiveCategoryIndex,
++                    )
++                    LibraryToolbar(
++                        hasActiveFilters = state.hasActiveFilters,
++                        selectedCount = state.selection.size,
++                        title = title,
++                        onClickUnselectAll = screenModel::clearSelection,
++                        onClickSelectAll = screenModel::selectAll,
++                        onClickInvertSelection = screenModel::invertSelection,
++                        onClickFilter = screenModel::showSettingsDialog,
++                        onClickRefresh = { onClickRefresh(state.activeCategory) },
++                        onClickGlobalUpdate = { onClickRefresh(null) },
++                        onClickOpenRandomManga = {
++                            scope.launch {
++                                val randomItem = screenModel.getRandomLibraryItemForCurrentCategory()
++                                if (randomItem != null) {
++                                    navigator.push(MangaScreen(randomItem.libraryManga.manga.id))
++                                } else {
++                                    snackbarHostState.showSnackbar(
++                                        context.stringResource(MR.strings.information_no_entries_found),
++                                    )
++                                }
++                            }
++                        },
++                        onClickSyncNow = {
++                            if (!SyncDataJob.isRunning(context)) {
++                                SyncDataJob.startNow(context, manual = true)
+                             } else {
+-                                snackbarHostState.showSnackbar(
+-                                    context.stringResource(MR.strings.information_no_entries_found),
+-                                )
++                                context.toast(SYMR.strings.sync_in_progress)
+                             }
+-                        }
+-                    },
+-                    onClickSyncNow = {
+-                        if (!SyncDataJob.isRunning(context)) {
+-                            SyncDataJob.startNow(context, manual = true)
+-                        } else {
+-                            context.toast(SYMR.strings.sync_in_progress)
+-                        }
+-                    },
+-                    // SY -->
+-                    isSyncEnabled = state.isSyncEnabled,
+-                    // SY <--
+-                    searchQuery = state.searchQuery,
+-                    onSearchQueryChange = screenModel::search,
+-                    onInvalidateDownloadCache = { context ->
+-                        Injekt.get<DownloadCache>().invalidateCache()
+-                        context.toast(MR.strings.download_cache_invalidated)
+-                    },
+-                    scrollBehavior = scrollBehavior,
+-                )
++                        },
++                        // SY -->
++                        isSyncEnabled = state.isSyncEnabled,
++                        // SY <--
++                        searchQuery = state.searchQuery,
++                        onSearchQueryChange = screenModel::search,
++                        onInvalidateDownloadCache = { context ->
++                            Injekt.get<DownloadCache>().invalidateCache()
++                            context.toast(MR.strings.download_cache_invalidated)
++                        },
++                        scrollBehavior = scrollBehavior,
++                    )
++
++                    if (showPageTabs && !state.isLoading) {
++                        LibraryTabs(
++                            categories = categories,
++                            pagerState = pagerState,
++                            getItemCountForCategory = { state.getItemCountForCategory(it) },
++                            onTabItemClick = { scope.launch { pagerState.animateScrollToPage(it) } },
++                        )
++                    }
++                }
+             },
+             bottomBar = {
+                 LibraryBottomActionMenu(
+@@ -305,14 +339,12 @@ data object LibraryTab : Tab {
+                     LibraryContent(
+                         categories = state.displayedCategories,
+                         // KMK -->
+-                        activeCategoryIndex = state.coercedActiveCategoryIndex,
+                         // KMK <--
+                         searchQuery = state.searchQuery,
+                         selection = state.selection,
+                         contentPadding = contentPadding,
+-                        currentPage = state.coercedActiveCategoryIndex,
++                        pagerState = pagerState,
+                         hasActiveFilters = state.hasActiveFilters,
+-                        showPageTabs = state.showCategoryTabs || !state.searchQuery.isNullOrEmpty(),
+                         onChangeCurrentPage = screenModel::updateActiveCategoryIndex,
+                         onClickManga = { navigator.push(MangaScreen(it)) },
+                         onContinueReadingClicked = { it: LibraryManga ->
+@@ -331,7 +363,6 @@ data object LibraryTab : Tab {
+                         onGlobalSearchClicked = {
+                             navigator.push(GlobalSearchScreen(screenModel.state.value.searchQuery ?: ""))
+                         },
+-                        getItemCountForCategory = { state.getItemCountForCategory(it) },
+                         getDisplayMode = { screenModel.getDisplayMode() },
+                         getColumnsForOrientation = { screenModel.getColumnsForOrientation(it) },
+                         getItemsForCategory = { state.getItemsForCategory(it) },
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CompactNavigationBar.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CompactNavigationBar.kt
+new file mode 100644
+index 000000000..5b73a6486
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CompactNavigationBar.kt
+@@ -0,0 +1,93 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.RowScope
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.WindowInsetsSides
++import androidx.compose.foundation.layout.fillMaxHeight
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.only
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.windowInsetsPadding
++import androidx.compose.foundation.selection.selectable
++import androidx.compose.foundation.selection.selectableGroup
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.LocalContentColor
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.NavigationBarDefaults
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.semantics.Role
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++
++/** A 48dp touch row plus the real bottom system inset for short browsing windows. */
++@Composable
++fun CompactNavigationBar(
++    modifier: Modifier = Modifier,
++    containerColor: Color = MaterialTheme.colorScheme.surface,
++    windowInsets: WindowInsets = NavigationBarDefaults.windowInsets.only(WindowInsetsSides.Bottom),
++    content: @Composable RowScope.() -> Unit,
++) {
++    Row(
++        modifier = modifier
++            .fillMaxWidth()
++            .background(containerColor)
++            .windowInsetsPadding(windowInsets)
++            .height(48.dp)
++            .selectableGroup(),
++        verticalAlignment = Alignment.CenterVertically,
++        content = content,
++    )
++}
++
++@Composable
++fun RowScope.CompactNavigationBarItem(
++    selected: Boolean,
++    onClick: () -> Unit,
++    icon: @Composable () -> Unit,
++    label: String,
++    showLabel: Boolean,
++    modifier: Modifier = Modifier,
++) {
++    val color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
++    Column(
++        modifier = modifier
++            .weight(1f)
++            .fillMaxHeight()
++            .selectable(selected = selected, role = Role.Tab, onClick = onClick),
++        horizontalAlignment = Alignment.CenterHorizontally,
++        verticalArrangement = Arrangement.Center,
++    ) {
++        CompositionLocalProvider(LocalContentColor provides color) {
++            Box(
++                modifier = Modifier
++                    .size(width = 36.dp, height = 28.dp)
++                    .background(
++                        if (selected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
++                        RoundedCornerShape(14.dp),
++                    ),
++                contentAlignment = Alignment.Center,
++            ) { icon() }
++            if (showLabel) {
++                Text(
++                    text = label,
++                    fontSize = 12.sp,
++                    lineHeight = 14.sp,
++                    maxLines = 1,
++                    overflow = TextOverflow.Ellipsis,
++                )
++            }
++        }
++    }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+index 12aa57a9f..cb69df6a3 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+@@ -1,14 +1,16 @@
+ package tachiyomi.presentation.core.components.material
+ 
+ import android.view.accessibility.AccessibilityManager
++import androidx.compose.animation.core.animateFloatAsState
++import androidx.compose.animation.core.tween
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.material3.TopAppBarDefaults
+ import androidx.compose.material3.TopAppBarScrollBehavior
+-import androidx.compose.material3.rememberTopAppBarState
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.Stable
++import androidx.compose.runtime.State
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+@@ -21,6 +23,7 @@ import androidx.compose.ui.geometry.Offset
+ import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+ import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+ import androidx.compose.ui.layout.Layout
++import androidx.compose.ui.platform.LocalConfiguration
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.platform.LocalDensity
+ import androidx.compose.ui.unit.Constraints
+@@ -28,9 +31,22 @@ import androidx.compose.ui.unit.Dp
+ import androidx.compose.ui.unit.dp
+ import kotlin.math.roundToInt
+ 
+-/** Compact normal text while keeping extra room for accessibility font sizes. */
+ @Composable
+-fun navigationToolbarHeight(): Dp = if (LocalDensity.current.fontScale <= 1.3f) 56.dp else 64.dp
++fun isCompactBrowsingWindow(): Boolean {
++    val config = LocalConfiguration.current
++    return compactBrowsingWindow(config.screenWidthDp, config.screenHeightDp, LocalDensity.current.fontScale)
++}
++
++@Composable
++fun navigationToolbarHeight(): Dp = when {
++    LocalDensity.current.fontScale > 1.3f -> 64.dp
++    isCompactBrowsingWindow() -> 48.dp
++    else -> 56.dp
++}
++
++val LocalBrowsingNavigationBarState = staticCompositionLocalOf<BrowsingNavigationBarState?> { null }
++val LocalBrowsingBottomPadding = staticCompositionLocalOf { 0.dp }
++internal val LocalBrowsingChrome = staticCompositionLocalOf<BrowsingTopAppBarScrollBehavior?> { null }
+ 
+ @Composable
+ fun rememberBrowsingTopAppBarScrollBehavior(
+@@ -38,87 +54,89 @@ fun rememberBrowsingTopAppBarScrollBehavior(
+     resetKey: Any? = null,
+ ): TopAppBarScrollBehavior {
+     val canHide = enabled && !rememberTouchExplorationEnabled()
+-    val currentEnabled by rememberUpdatedState(canHide)
+-    val state = rememberTopAppBarState()
+-    LaunchedEffect(canHide, resetKey) {
+-        state.heightOffset = 0f
+-        state.contentOffset = 0f
++    val chrome = LocalBrowsingNavigationBarState.current
++        ?: rememberBrowsingNavigationBarState(enabled = canHide, resetKey = resetKey)
++    val owner = remember { Any() }
++    DisposableEffect(chrome, owner, canHide) {
++        chrome.setPinned(owner, !canHide)
++        onDispose { chrome.setPinned(owner, false) }
+     }
+-    val delegate = TopAppBarDefaults.enterAlwaysScrollBehavior(state = state, canScroll = { currentEnabled })
+-    return remember(delegate) { BrowsingTopAppBarScrollBehavior(delegate) }
++    LaunchedEffect(chrome, resetKey) { chrome.reset() }
++    val delegate = TopAppBarDefaults.pinnedScrollBehavior()
++    return remember(chrome, delegate) { BrowsingTopAppBarScrollBehavior(delegate, chrome) }
+ }
+ 
+-/** Own the full header height, including system inset, tabs and source filters. */
+ internal class BrowsingTopAppBarScrollBehavior(
+     delegate: TopAppBarScrollBehavior,
++    val chrome: BrowsingNavigationBarState,
+ ) : TopAppBarScrollBehavior by delegate {
+-    private val heights = mutableMapOf<Any, Int>()
+-
+-    fun updateHeight(key: Any, height: Int) {
+-        if (heights[key] == height) return
+-        val fraction = state.collapsedFraction
+-        if (height == 0) heights.remove(key) else heights[key] = height
+-        state.heightOffsetLimit = -heights.values.sum().toFloat()
+-        state.heightOffset = state.heightOffsetLimit * fraction
+-    }
++    override val nestedScrollConnection: NestedScrollConnection get() = chrome.nestedScrollConnection
+ }
+ 
+-internal val LocalBrowsingChrome = staticCompositionLocalOf<BrowsingTopAppBarScrollBehavior?> { null }
+-
+-/** The surrounding layout collapses browsing headers; don't collapse TopAppBar a second time. */
+ fun TopAppBarScrollBehavior?.toolbarScrollBehavior(): TopAppBarScrollBehavior? =
+     takeUnless { it is BrowsingTopAppBarScrollBehavior }
+ 
+-/** Tabs may live next to a pager, but still share the header's scroll distance and visible fraction. */
+ @Composable
+ fun BrowsingNavigationChrome(content: @Composable () -> Unit) {
+-    val behavior = LocalBrowsingChrome.current
+-    if (behavior == null) {
+-        content()
+-        return
+-    }
+-    val key = remember(behavior) { Any() }
+-    DisposableEffect(behavior, key) {
+-        onDispose { behavior.updateHeight(key, 0) }
+-    }
+-    Layout(
+-        modifier = Modifier.clipToBounds(),
+-        content = { Box { content() } },
+-    ) { measurables, constraints ->
++    val chrome = LocalBrowsingChrome.current?.chrome
++    if (chrome == null) content() else BrowsingChromeOverlay(chrome, content = content)
++}
++
++/** Keep the viewport and content padding fixed. Only the floating controls move. */
++@Composable
++fun BrowsingChromeOverlay(
++    state: BrowsingNavigationBarState,
++    atBottom: Boolean = false,
++    modifier: Modifier = Modifier,
++    content: @Composable () -> Unit,
++) {
++    Layout(modifier = modifier.clipToBounds(), content = { Box { content() } }) { measurables, constraints ->
+         val child = measurables.single().measure(constraints.copy(minHeight = 0, maxHeight = Constraints.Infinity))
+-        behavior.updateHeight(key, child.height)
+-        val hiddenHeight = (child.height * behavior.state.collapsedFraction).roundToInt()
+-        layout(child.width, child.height - hiddenHeight) {
+-            child.placeRelative(0, -hiddenHeight)
++        layout(child.width, child.height) {
++            val distance = (child.height * state.hiddenFraction).roundToInt()
++            child.placeRelative(0, if (atBottom) distance else -distance)
+         }
+     }
+ }
+ 
+ @Stable
+-class BrowsingNavigationBarState internal constructor(
+-    private val tracker: NavigationChromeScrollTracker,
+-    private val enabled: () -> Boolean,
+-) {
++class BrowsingNavigationBarState internal constructor(private val enabled: () -> Boolean) {
++    private val tracker = NavigationChromeScrollTracker()
++    private val pinnedOwners = mutableSetOf<Any>()
++    internal var animation: State<Float>? = null
++    val hiddenFraction: Float get() = animation?.value ?: 0f
+     var visible by mutableStateOf(true)
+         private set
+ 
++    internal fun setPinned(owner: Any, pinned: Boolean) {
++        if (pinned) {
++            pinnedOwners.add(owner)
++            reset()
++        } else {
++            pinnedOwners.remove(owner)
++        }
++    }
++
+     fun reset() {
+         tracker.reset()
+         visible = true
+     }
+ 
++    private fun canHide() = enabled() && pinnedOwners.isEmpty()
++
+     val nestedScrollConnection = object : NestedScrollConnection {
+         override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+-            // Observe before enterAlways consumes the return drag, otherwise the bottom bar lags.
+-            if (enabled() && source == NestedScrollSource.UserInput && available.y > 0f) reset()
++            if (canHide()) {
++                visible = tracker.onPreScroll(available.x, available.y, source == NestedScrollSource.UserInput)
++            }
+             return Offset.Zero
+         }
+ 
+         override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+-            if (enabled()) {
+-                visible = tracker.onScroll(consumed.y, available.y, source == NestedScrollSource.UserInput)
++            if (canHide()) {
++                visible = tracker.onPostScroll(consumed.x, consumed.y, source == NestedScrollSource.UserInput)
+             }
+-            // Observe only: never steal drag distance or fling velocity from content/pull-to-refresh.
++            // Never consume drag or velocity, or move the content on behalf of the controls.
+             return Offset.Zero
+         }
+     }
+@@ -126,18 +144,14 @@ class BrowsingNavigationBarState internal constructor(
+ 
+ @Composable
+ fun rememberBrowsingNavigationBarState(enabled: Boolean, resetKey: Any?): BrowsingNavigationBarState {
+-    val density = LocalDensity.current
+     val canHide = enabled && !rememberTouchExplorationEnabled()
+     val currentEnabled by rememberUpdatedState(canHide)
+-    val state = remember(density.density) {
+-        BrowsingNavigationBarState(
+-            tracker = NavigationChromeScrollTracker(
+-                hideDistance = with(density) { 24.dp.toPx() },
+-                showDistance = with(density) { 8.dp.toPx() },
+-            ),
+-            enabled = { currentEnabled },
+-        )
+-    }
++    val state = remember { BrowsingNavigationBarState { currentEnabled } }
++    state.animation = animateFloatAsState(
++        targetValue = if (state.visible) 0f else 1f,
++        animationSpec = tween(durationMillis = 140),
++        label = "browsingChrome",
++    )
+     LaunchedEffect(state, canHide, resetKey) { state.reset() }
+     return state
+ }
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
+index b51ec7bf5..bc0ab27c0 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
+@@ -1,33 +1,27 @@
+ package tachiyomi.presentation.core.components.material
+ 
+-/** Direction hysteresis for navigation chrome; flings and unconsumed end overscroll never hide it. */
+-internal class NavigationChromeScrollTracker(
+-    private val hideDistance: Float,
+-    private val showDistance: Float,
+-) {
+-    var visible: Boolean = true
++import kotlin.math.abs
++
++/** First real upward scroll hides both bars; first reverse drag shows both, without distance delays. */
++internal class NavigationChromeScrollTracker {
++    var visible = true
+         private set
+-    private var travel = 0f
+ 
+     fun reset() {
+         visible = true
+-        travel = 0f
+     }
+ 
+-    fun onScroll(consumedY: Float, availableY: Float, userInput: Boolean): Boolean {
+-        if (!userInput) return visible
+-        if (consumedY == 0f) {
+-            if (availableY > 0f) reset()
+-            return visible
+-        }
+-        if (travel * consumedY < 0f) travel = 0f
+-        travel += consumedY
+-        if (visible && travel <= -hideDistance) {
+-            visible = false
+-            travel = 0f
+-        } else if (!visible && travel >= showDistance) {
+-            reset()
+-        }
++    fun onPreScroll(x: Float, y: Float, userInput: Boolean): Boolean {
++        if (userInput && y > abs(x)) visible = true
++        return visible
++    }
++
++    fun onPostScroll(x: Float, y: Float, userInput: Boolean): Boolean {
++        if (userInput && -y > abs(x)) visible = false
+         return visible
+     }
+ }
++
++/** Window shape, not device model or orientation; short windows and wide foldables need less chrome. */
++internal fun compactBrowsingWindow(widthDp: Int, heightDp: Int, fontScale: Float): Boolean =
++    widthDp > 0 && heightDp > 0 && fontScale <= 1.3f && (heightDp <= 480 || widthDp >= heightDp * 0.65f)
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/Scaffold.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/Scaffold.kt
+index e23263688..7a61eae02 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/Scaffold.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/Scaffold.kt
+@@ -28,6 +28,7 @@ import androidx.compose.foundation.layout.calculateStartPadding
+ import androidx.compose.foundation.layout.exclude
+ import androidx.compose.foundation.layout.onConsumedWindowInsetsChanged
+ import androidx.compose.foundation.layout.only
++import androidx.compose.foundation.layout.union
+ import androidx.compose.material3.ExperimentalMaterial3Api
+ import androidx.compose.material3.FabPosition
+ import androidx.compose.material3.FloatingActionButton
+@@ -122,11 +123,12 @@ fun Scaffold(
+     contentWindowInsets: WindowInsets = ScaffoldDefaults.contentWindowInsets,
+     content: @Composable (PaddingValues) -> Unit,
+ ) {
++    val homeInsets = contentWindowInsets.union(WindowInsets(bottom = LocalBrowsingBottomPadding.current))
+     val browsingBehavior = topBarScrollBehavior as? BrowsingTopAppBarScrollBehavior
+     val browsingInsets = if (browsingBehavior != null) {
+-        contentWindowInsets.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom)
++        homeInsets.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom)
+     } else {
+-        contentWindowInsets
++        homeInsets
+     }
+     CompositionLocalProvider(LocalBrowsingChrome provides browsingBehavior) {
+         // Tachiyomi: Handle consumed window insets
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
+index bf79aef74..046ddddfa 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
+@@ -12,20 +12,20 @@ import org.junit.jupiter.api.Test
+ class NavigationChromeConnectionTest {
+     @Test
+     fun `observing navigation changes never consumes content drag or fling`() = runBlocking {
+-        val state = BrowsingNavigationBarState(NavigationChromeScrollTracker(24f, 8f)) { true }
++        val state = BrowsingNavigationBarState { true }
+         val connection = state.nestedScrollConnection
+         assertEquals(Offset.Zero, connection.onPostScroll(Offset(0f, -40f), Offset.Zero, NestedScrollSource.UserInput))
+         assertFalse(state.visible)
+         assertEquals(Velocity.Zero, connection.onPreFling(Velocity(0f, -3000f)))
+         assertEquals(Velocity.Zero, connection.onPostFling(Velocity(0f, -3000f), Velocity.Zero))
+         assertFalse(state.visible)
+-        assertEquals(Offset.Zero, connection.onPostScroll(Offset(0f, 8f), Offset.Zero, NestedScrollSource.UserInput))
++        assertEquals(Offset.Zero, connection.onPreScroll(Offset(0f, 1f), NestedScrollSource.UserInput))
+         assertTrue(state.visible)
+     }
+ 
+     @Test
+-    fun `first reverse drag reveals bottom before the top bar consumes it`() {
+-        val state = BrowsingNavigationBarState(NavigationChromeScrollTracker(24f, 8f)) { true }
++    fun `first reverse drag restores the shared state without waiting for content consumption`() {
++        val state = BrowsingNavigationBarState { true }
+         val connection = state.nestedScrollConnection
+         connection.onPostScroll(Offset(0f, -40f), Offset.Zero, NestedScrollSource.UserInput)
+         assertFalse(state.visible)
+@@ -38,9 +38,21 @@ class NavigationChromeConnectionTest {
+         assertTrue(state.visible)
+     }
+ 
++    @Test
++    fun `a pinned search or selection header keeps the shared bottom bar visible`() {
++        val state = BrowsingNavigationBarState { true }
++        val owner = Any()
++        state.setPinned(owner, true)
++        state.nestedScrollConnection.onPostScroll(Offset(0f, -1f), Offset.Zero, NestedScrollSource.UserInput)
++        assertTrue(state.visible)
++        state.setPinned(owner, false)
++        state.nestedScrollConnection.onPostScroll(Offset(0f, -1f), Offset.Zero, NestedScrollSource.UserInput)
++        assertFalse(state.visible)
++    }
++
+     @Test
+     fun `disabled automatic hiding leaves navigation available`() {
+-        val state = BrowsingNavigationBarState(NavigationChromeScrollTracker(24f, 8f)) { false }
++        val state = BrowsingNavigationBarState { false }
+         state.nestedScrollConnection.onPostScroll(Offset(0f, -500f), Offset.Zero, NestedScrollSource.UserInput)
+         assertTrue(state.visible)
+     }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
+index 95b4c613d..da192b180 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
+@@ -4,11 +4,18 @@ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.WindowInsets
+ import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
+-import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.rememberLazyListState
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.TopAppBarScrollBehavior
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.input.nestedscroll.NestedScrollSource
++import androidx.compose.ui.layout.onGloballyPositioned
++import androidx.compose.ui.layout.positionInRoot
+ import androidx.compose.ui.platform.testTag
+ import androidx.compose.ui.test.ExperimentalTestApi
+ import androidx.compose.ui.test.onNodeWithTag
+@@ -16,6 +23,7 @@ import androidx.compose.ui.test.runComposeUiTest
+ import androidx.compose.ui.unit.dp
+ import org.junit.Test
+ import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
+ import org.junit.jupiter.api.Assertions.assertTrue
+ import org.junit.runner.RunWith
+ import org.robolectric.RobolectricTestRunner
+@@ -28,32 +36,102 @@ import org.robolectric.annotation.GraphicsMode
+ @Config(sdk = [34])
+ class NavigationChromeLayoutTest {
+     @Test
+-    fun `toolbar inset and body tabs collapse without leaving a strip and restore together`() = runComposeUiTest {
+-        lateinit var behavior: TopAppBarScrollBehavior
++    fun `both floating bars move together without resizing or displacing comic content`() = runComposeUiTest {
++        lateinit var chrome: BrowsingNavigationBarState
++        var titleY = 0f
++        var tabsY = 0f
++        var bottomY = 0f
++        var bottomHeight = 0
++        var headerHeight = 0
+         setContent {
+             MaterialTheme {
+-                behavior = rememberBrowsingTopAppBarScrollBehavior()
+-                Scaffold(
+-                    topBarScrollBehavior = behavior,
+-                    // Deliberately nonzero: collapsed content must not inherit this top gap.
+-                    contentWindowInsets = WindowInsets(0, 24, 0, 16),
+-                    topBar = { Box(Modifier.height(80.dp)) },
+-                ) { padding ->
+-                    Column(Modifier.fillMaxSize().padding(top = padding.calculateTopPadding())) {
+-                        BrowsingNavigationChrome { Box(Modifier.height(48.dp)) }
+-                        Box(Modifier.fillMaxSize().testTag("content"))
++                chrome = rememberBrowsingNavigationBarState(enabled = true, resetKey = Unit)
++                CompositionLocalProvider(
++                    LocalBrowsingNavigationBarState provides chrome,
++                    LocalBrowsingBottomPadding provides 72.dp,
++                ) {
++                    Box(Modifier.fillMaxSize()) {
++                        val behavior = rememberBrowsingTopAppBarScrollBehavior()
++                        Scaffold(
++                            topBarScrollBehavior = behavior,
++                            contentWindowInsets = WindowInsets(0, 24, 0, 16),
++                            topBar = {
++                                Column(Modifier.onGloballyPositioned { headerHeight = it.size.height }) {
++                                    Box(
++                                        Modifier.fillMaxWidth().height(80.dp).onGloballyPositioned {
++                                            titleY = it.positionInRoot().y
++                                        },
++                                    )
++                                    Box(
++                                        Modifier.fillMaxWidth().height(48.dp).onGloballyPositioned {
++                                            tabsY = it.positionInRoot().y
++                                        },
++                                    )
++                                }
++                            },
++                        ) { padding ->
++                            LazyColumn(
++                                modifier = Modifier.fillMaxSize().testTag("viewport"),
++                                state = rememberLazyListState(initialFirstVisibleItemIndex = 5),
++                                contentPadding = padding,
++                            ) {
++                                items(100) { index ->
++                                    Box(Modifier.fillMaxWidth().height(120.dp).testTag("cover-$index"))
++                                }
++                            }
++                        }
++                        BrowsingChromeOverlay(chrome, atBottom = true, modifier = Modifier.align(Alignment.BottomCenter)) {
++                            Box(
++                                Modifier.fillMaxWidth().height(72.dp).onGloballyPositioned {
++                                    bottomY = it.positionInRoot().y
++                                    bottomHeight = it.size.height
++                                },
++                            )
++                        }
+                     }
+                 }
+             }
+         }
+         waitForIdle()
+-        val expandedTop = onNodeWithTag("content").fetchSemanticsNode().boundsInRoot.top
+-        assertTrue(expandedTop > 0f)
+-        runOnIdle { behavior.state.heightOffset = behavior.state.heightOffsetLimit }
+-        waitForIdle()
+-        assertEquals(0f, onNodeWithTag("content").fetchSemanticsNode().boundsInRoot.top, 1f)
+-        runOnIdle { behavior.state.heightOffset = 0f }
+-        waitForIdle()
+-        assertEquals(expandedTop, onNodeWithTag("content").fetchSemanticsNode().boundsInRoot.top, 1f)
++        val viewport = onNodeWithTag("viewport").fetchSemanticsNode().boundsInRoot
++        val cover = onNodeWithTag("cover-5").fetchSemanticsNode().boundsInRoot
++        val titleStart = titleY
++        val tabDistance = tabsY - titleY
++        val bottomStart = bottomY
++        mainClock.autoAdvance = false
++        runOnIdle {
++            assertEquals(
++                Offset.Zero,
++                chrome.nestedScrollConnection.onPostScroll(
++                    Offset(0f, -1f),
++                    Offset.Zero,
++                    NestedScrollSource.UserInput,
++                ),
++            )
++            assertFalse(chrome.visible)
++        }
++        mainClock.advanceTimeBy(80)
++        runOnIdle {
++            assertTrue(chrome.hiddenFraction > 0f && chrome.hiddenFraction < 1f)
++            assertEquals(tabDistance, tabsY - titleY, 1f)
++            assertEquals((titleStart - titleY) / headerHeight, (bottomY - bottomStart) / bottomHeight, 0.02f)
++        }
++        assertEquals(viewport, onNodeWithTag("viewport").fetchSemanticsNode().boundsInRoot)
++        assertEquals(cover, onNodeWithTag("cover-5").fetchSemanticsNode().boundsInRoot)
++        mainClock.advanceTimeBy(200)
++        runOnIdle { assertEquals(1f, chrome.hiddenFraction) }
++        assertEquals(cover, onNodeWithTag("cover-5").fetchSemanticsNode().boundsInRoot)
++        runOnIdle {
++            chrome.nestedScrollConnection.onPreScroll(Offset(0f, 1f), NestedScrollSource.UserInput)
++            assertTrue(chrome.visible)
++        }
++        mainClock.advanceTimeBy(200)
++        runOnIdle {
++            assertEquals(0f, chrome.hiddenFraction)
++            assertEquals(titleStart, titleY, 1f)
++            assertEquals(bottomStart, bottomY, 1f)
++        }
++        assertEquals(viewport, onNodeWithTag("viewport").fetchSemanticsNode().boundsInRoot)
++        assertEquals(cover, onNodeWithTag("cover-5").fetchSemanticsNode().boundsInRoot)
+     }
+ }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
+index 6eab8adcc..72f22d9b1 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
+@@ -6,38 +6,41 @@ import org.junit.jupiter.api.Test
+ 
+ class NavigationChromeScrollTrackerTest {
+     @Test
+-    fun `browse forward hides and a short reverse drag reveals navigation`() {
+-        val state = NavigationChromeScrollTracker(24f, 8f)
+-        assertTrue(state.onScroll(-12f, 0f, true))
+-        assertFalse(state.onScroll(-12f, 0f, true))
+-        assertFalse(state.onScroll(4f, 0f, true))
+-        assertTrue(state.onScroll(4f, 0f, true))
++    fun `first consumed upward pixel hides and first reverse pixel restores`() {
++        val tracker = NavigationChromeScrollTracker()
++        assertFalse(tracker.onPostScroll(0f, -1f, true))
++        assertTrue(tracker.onPreScroll(0f, 1f, true))
+     }
+ 
+     @Test
+-    fun `flings horizontal gestures and unscrollable content do not hide navigation`() {
+-        val state = NavigationChromeScrollTracker(24f, 8f)
+-        assertTrue(state.onScroll(-100f, 0f, false))
+-        assertTrue(state.onScroll(0f, 0f, true))
+-        assertTrue(state.onScroll(0f, -100f, true))
++    fun `horizontal swipes flings and unconsumed short list drags do not hide`() {
++        val tracker = NavigationChromeScrollTracker()
++        assertTrue(tracker.onPostScroll(-50f, -1f, true))
++        assertTrue(tracker.onPostScroll(0f, -50f, false))
++        assertTrue(tracker.onPreScroll(0f, -50f, true))
++        assertTrue(tracker.onPostScroll(0f, 0f, true))
++        assertFalse(tracker.onPostScroll(0f, -1f, true))
++        assertFalse(tracker.onPreScroll(50f, 1f, true))
++        assertFalse(tracker.onPreScroll(0f, 50f, false))
+     }
+ 
+     @Test
+-    fun `direction changes reset travel and reaching the top restores navigation`() {
+-        val state = NavigationChromeScrollTracker(24f, 8f)
+-        assertTrue(state.onScroll(-20f, 0f, true))
+-        assertTrue(state.onScroll(2f, 0f, true))
+-        assertTrue(state.onScroll(-10f, 0f, true))
+-        assertFalse(state.onScroll(-14f, 0f, true))
+-        assertTrue(state.onScroll(0f, 1f, true))
++    fun `screen changes restore visible navigation`() {
++        val tracker = NavigationChromeScrollTracker()
++        tracker.onPostScroll(0f, -1f, true)
++        tracker.reset()
++        assertTrue(tracker.visible)
+     }
+ 
+     @Test
+-    fun `changing tabs or entering an action mode can restore navigation`() {
+-        val state = NavigationChromeScrollTracker(24f, 8f)
+-        assertFalse(state.onScroll(-30f, 0f, true))
+-        state.reset()
+-        assertTrue(state.visible)
+-        assertTrue(state.onScroll(-10f, 0f, true))
++    fun `wide and short windows use compact navigation without tying it to a model`() {
++        assertTrue(compactBrowsingWindow(360, 526, 1f))
++        assertTrue(compactBrowsingWindow(432, 632, 1f))
++        assertTrue(compactBrowsingWindow(664, 939, 1f))
++        assertTrue(compactBrowsingWindow(939, 664, 1f))
++        assertTrue(compactBrowsingWindow(320, 480, 1f))
++        assertFalse(compactBrowsingWindow(393, 873, 1f))
++        assertFalse(compactBrowsingWindow(664, 939, 1.5f))
++        assertFalse(compactBrowsingWindow(0, 0, 1f))
+     }
+ }
