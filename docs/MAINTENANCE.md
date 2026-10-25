@@ -680,7 +680,9 @@ gh release list --repo Xun2202/anikku-harmony
 ## 2026-10-26：历史长列表回归修复、更新同构与窗口恢复
 
 - 用户安装19/32后反馈历史多记录卡死、详情返回闪退、卡片过宽且无显示选择；定位0057对每条卡片使用PanoramaCellHeight.Measure导致整份列表在主线程compose/measure。0059改原生LazyVerticalStaggeredGrid，只组合视口，日期FullLine，history-id/chapter-id稳定键，原生Saver恢复位置；不截断历史、不禁用封面。真实返回闪退无手机stack，删除旧自定义测量/可变hashCode恢复路径并做保存恢复回归，仍待装包确认。
-- 历史与更新共用TimelineGrid/Card/Display：标题叠封面；历史下方时间+继续/收藏/删除一行，已收藏保留禁用图标；更新保留时间/继续/下载、已读/书签/番外标志、多选、Anikku分组展开和滑动动作。三模式（紧凑、全景、列表）及自动/2–6列分别持久化，自动密度沿用书架宽度档，窄窗口将手动列数限制到卡片至少140dp，展开后使用原偏好。详情与继续入口分开。
+- 历史与更新共用TimelineGrid/Card/Display：标题叠封面；历史下方时间+继续/收藏/删除一行，已收藏保留禁用图标；更新保留时间/继续/下载、已读/书签/番外标志、多选、Anikku分组展开和滑动动作。三模式（紧凑、全景、列表）及自动/2–6列分别持久化，自动密度参考书架最小宽度规则（Anikku固定128dp提高至动作所需140dp），窄窗口将手动列数限制到卡片至少140dp，展开后使用原偏好。详情与继续入口分开。
 - 封面比例只对可见卡片读取、随item保存；书架紧凑模式右侧3动作占位48→40dp，24dp图标不变。历史/更新新增原生瀑布滑块复用既有玻璃/手势，进度按条目估算，不测量全部封面。
 - Window策略在AndroidX edge-to-edge后重施cutout与透明栏，在resize/Resume/focus恢复刷新；导航visible持久化、初始effect不再无条件reset，实际tab/category变化仍reset，尺寸/字号变化结束旧手势并刷新冻结轨道。未声称卓易通强制letterbox已真机消失。Animeko独立Compose Multiplatform与更新/历史结构，不直接移植。
 - 必要检查：轻量SpotlessApply/Check、导航纯逻辑测试；CI新增TimelineGridTest验证10,000条只compose视口、远跳、详情移除/恢复、折叠宽度变化、记录大幅删减。正式CI同时编译签名。此前cache-only20/33两次构建已取消，未发布，0058手动更新缓存修复随本轮一起交付。发布/签名/run/索引以归档现状为准。
+
+- 后续0060/0061：旧筛选的全景开关写入同一Timeline mode；全景文案使用KMR。首次正式编译40228486744的2项Timeline UI回归通过，但app编译暴露An无Mihon的autoColumnMinWidth，改用本仓固定最小卡宽规则后重编译。

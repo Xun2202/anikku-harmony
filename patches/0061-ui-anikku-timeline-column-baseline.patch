@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 20:02:31 +0000
+Subject: [PATCH] ui: use Anikku column baseline for timeline cards
+
+---
+ .../java/eu/kanade/presentation/history/HistoryScreen.kt   | 4 +---
+ .../java/eu/kanade/presentation/updates/UpdatesScreen.kt   | 7 +------
+ 2 files changed, 2 insertions(+), 9 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/presentation/history/HistoryScreen.kt b/app/src/main/java/eu/kanade/presentation/history/HistoryScreen.kt
+index c17fb7798..5fa8495e6 100644
+--- a/app/src/main/java/eu/kanade/presentation/history/HistoryScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/history/HistoryScreen.kt
+@@ -17,7 +17,6 @@ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
+-import androidx.compose.ui.platform.LocalConfiguration
+ import androidx.compose.ui.tooling.preview.PreviewLightDark
+ import androidx.compose.ui.tooling.preview.PreviewParameter
+ import androidx.compose.ui.unit.dp
+@@ -31,7 +30,6 @@ import eu.kanade.presentation.components.TimelineDisplayMode
+ import eu.kanade.presentation.components.relativeDateText
+ import eu.kanade.presentation.components.rememberTimelineDisplay
+ import eu.kanade.presentation.history.components.HistoryItem
+-import eu.kanade.presentation.library.components.autoColumnMinWidth
+ import eu.kanade.presentation.theme.TachiyomiPreviewTheme
+ import eu.kanade.presentation.updates.formatProgress
+ import eu.kanade.tachiyomi.ui.history.HistoryScreenModel
+@@ -192,7 +190,7 @@ private fun HistoryScreenContent(
+         },
+         fullLine = { history[it] is HistoryUiModel.Header },
+         columns = if (display.mode == TimelineDisplayMode.List) 1 else display.columns,
+-        minColumnWidth = maxOf(140.dp, autoColumnMinWidth(LocalConfiguration.current.screenWidthDp.dp)),
++        minColumnWidth = 140.dp,
+         contentPadding = contentPadding,
+     ) { index ->
+         when (val item = history[index]) {
+diff --git a/app/src/main/java/eu/kanade/presentation/updates/UpdatesScreen.kt b/app/src/main/java/eu/kanade/presentation/updates/UpdatesScreen.kt
+index 674659aa6..d3e3fa440 100644
+--- a/app/src/main/java/eu/kanade/presentation/updates/UpdatesScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/updates/UpdatesScreen.kt
+@@ -21,7 +21,6 @@ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.runtime.setValue
+ import androidx.compose.ui.Modifier
+-import androidx.compose.ui.platform.LocalConfiguration
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.util.fastAll
+ import androidx.compose.ui.util.fastAny
+@@ -31,7 +30,6 @@ import eu.kanade.presentation.components.TimelineDisplay
+ import eu.kanade.presentation.components.TimelineDisplayAction
+ import eu.kanade.presentation.components.TimelineDisplayMode
+ import eu.kanade.presentation.components.rememberTimelineDisplay
+-import eu.kanade.presentation.library.components.autoColumnMinWidth
+ import eu.kanade.presentation.manga.components.ChapterDownloadAction
+ import eu.kanade.presentation.manga.components.MangaBottomActionMenu
+ import eu.kanade.tachiyomi.data.download.model.Download
+@@ -165,10 +163,7 @@ fun UpdateScreen(
+                         },
+                         fullLine = { it == 0 || models[it - 1] is UpdatesUiModel.Header },
+                         columns = if (display.mode == TimelineDisplayMode.List) 1 else display.columns,
+-                        minColumnWidth = maxOf(
+-                            140.dp,
+-                            autoColumnMinWidth(LocalConfiguration.current.screenWidthDp.dp),
+-                        ),
++                        minColumnWidth = 140.dp,
+                         contentPadding = contentPadding,
+                     ) { index ->
+                         if (index == 0) {
