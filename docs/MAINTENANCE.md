@@ -669,3 +669,10 @@ gh release list --repo Xun2202/anikku-harmony
 - Anikku按进入页面时的id形状快照排版，优先既有形状缓存，启用全景的未知封面用宽占位；后续加载只学习比例，下次进入采用，避免逐图重排已有卡片。数据层、日期生成和继续下章逻辑保留。
 - 两仓共享PinnedBrowsingGlass：更多页内容作为独立Haze source，给Home底栏提供背景，系统状态栏单独磨砂层；导航由页面生命周期pin为可见，离开释放。仅更多页应用，不改变详情顶栏透明规则；保留API/软件半透明回退。
 - 验证使用必要格式检查、补丁完整tree复现与现有正式构建/回归；卡片视觉、触控与磨砂帧率由用户安装反馈。Animeko结构独立且用户指定两款，不直接移植。
+
+## 2026-10-26：手动检查更新强制刷新
+
+- 用户明确Mihon手动检查仍找不到新版，当前r8227(0b7915655)经旧APK确认是preview.18，而服务端已发布preview.19（r8228/ef65a8f3c）。版本元组比较正常；定位到forceCheck虽到达domain，ReleaseServiceImpl却未向HTTP传递，仍用默认max-age=10min和磁盘缓存。真实手机缓存响应不可见，不能把症状归因当作真机复现。
+- 0058新增两仓字节一致ReleaseCheckRequest：自动检查原GET不变；手动请求FORCE_NETWORK/no-cache，并追加_harmony_check时间戳改变缓存key，保留已有查询参数。mirror、API回退及Anikku单条latest入口均传forceCheck；保持原超时/取消/失败提示，不通过清除全应用缓存来解决。
+- 真实OkHttp磁盘缓存回归：fresh旧响应下自动命中缓存，手动走网络获得新JSON；验证请求no-cache/时间戳及per_page保留。用真实helper加最小GET适配在临时JVM工程跑2项通过（20秒），正式CI再编译。旧已安装包仍可能需等旧缓存过期或覆盖升级一次；安装本修复后才改变后续手动检查。
+- Animeko使用独立Ktor HarmonyForkUpdates，也读取raw镜像，但无该forceCheck丢失路径；其CDN/客户端时效需单独证据后适配，本轮不直接移植。版本/签名/更新索引以归档现状为准。

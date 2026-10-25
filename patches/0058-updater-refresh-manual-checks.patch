@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 19:38:54 +0000
+Subject: [PATCH] updater: fetch fresh release metadata for manual checks
+
+Shared Mihon and Anikku 0058. Pass forceCheck to mirror and API requests. Bypass device cache and use a fresh query key for manual checks, retaining automatic cache policy.
+---
+ .../data/release/ReleaseCheckRequest.kt       | 16 ++++++++++++
+ .../data/release/ReleaseServiceImpl.kt        | 26 ++++++++++++++-----
+ 2 files changed, 36 insertions(+), 6 deletions(-)
+ create mode 100644 data/src/main/java/tachiyomi/data/release/ReleaseCheckRequest.kt
+
+diff --git a/data/src/main/java/tachiyomi/data/release/ReleaseCheckRequest.kt b/data/src/main/java/tachiyomi/data/release/ReleaseCheckRequest.kt
+new file mode 100644
+index 000000000..671df40f3
+--- /dev/null
++++ b/data/src/main/java/tachiyomi/data/release/ReleaseCheckRequest.kt
+@@ -0,0 +1,16 @@
++package tachiyomi.data.release
++
++import eu.kanade.tachiyomi.network.GET
++import okhttp3.CacheControl
++import okhttp3.HttpUrl.Companion.toHttpUrl
++import okhttp3.Request
++
++/** Manual checks must fetch fresh metadata; automatic checks retain the normal cache policy. */
++internal fun releaseCheckRequest(url: String, forceCheck: Boolean): Request {
++    if (!forceCheck) return GET(url)
++    val freshUrl = url.toHttpUrl().newBuilder()
++        .addQueryParameter("_harmony_check", System.currentTimeMillis().toString())
++        .build()
++    // no-cache bypasses the device cache; a fresh key also avoids an old CDN edge response.
++    return GET(freshUrl, cache = CacheControl.FORCE_NETWORK)
++}
+diff --git a/data/src/main/java/tachiyomi/data/release/ReleaseServiceImpl.kt b/data/src/main/java/tachiyomi/data/release/ReleaseServiceImpl.kt
+index 10a6b7981..97fdec607 100644
+--- a/data/src/main/java/tachiyomi/data/release/ReleaseServiceImpl.kt
++++ b/data/src/main/java/tachiyomi/data/release/ReleaseServiceImpl.kt
+@@ -1,7 +1,6 @@
+ package tachiyomi.data.release
+ 
+ import android.os.Build
+-import eu.kanade.tachiyomi.network.GET
+ import eu.kanade.tachiyomi.network.NetworkHelper
+ import eu.kanade.tachiyomi.network.awaitSuccess
+ import eu.kanade.tachiyomi.network.parseAs
+@@ -28,7 +27,7 @@ class ReleaseServiceImpl(
+      * hour per IP, which phones behind carrier NAT or a shared proxy exhaust within minutes (HTTP 403). The API
+      * stays as the fallback for when the mirror is unreachable or has not been written yet.
+      */
+-    private suspend fun listReleases(repository: String): List<GithubRelease> {
++    private suspend fun listReleases(repository: String, forceCheck: Boolean): List<GithubRelease> {
+         val mirrorClient = networkService.client.newBuilder()
+             .connectTimeout(MIRROR_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+             .readTimeout(MIRROR_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+@@ -37,7 +36,12 @@ class ReleaseServiceImpl(
+         return try {
+             with(json) {
+                 mirrorClient
+-                    .newCall(GET("https://raw.githubusercontent.com/$repository/repo/releases.json"))
++                    .newCall(
++                        releaseCheckRequest(
++                            "https://raw.githubusercontent.com/$repository/repo/releases.json",
++                            forceCheck,
++                        ),
++                    )
+                     .awaitSuccess()
+                     .parseAs<List<GithubRelease>>()
+             }
+@@ -47,7 +51,12 @@ class ReleaseServiceImpl(
+             logcat(LogPriority.WARN, e) { "Release mirror unavailable, falling back to the GitHub API" }
+             with(json) {
+                 networkService.client
+-                    .newCall(GET("https://api.github.com/repos/$repository/releases"))
++                    .newCall(
++                        releaseCheckRequest(
++                            "https://api.github.com/repos/$repository/releases",
++                            forceCheck,
++                        ),
++                    )
+                     .awaitSuccess()
+                     .parseAs<List<GithubRelease>>()
+             }
+@@ -58,7 +67,12 @@ class ReleaseServiceImpl(
+     override suspend fun latest(arguments: GetApplicationRelease.Arguments): Release? {
+         val release = with(json) {
+             networkService.client
+-                .newCall(GET("https://api.github.com/repos/${arguments.repository}/releases/latest"))
++                .newCall(
++                    releaseCheckRequest(
++                        "https://api.github.com/repos/${arguments.repository}/releases/latest",
++                        arguments.forceCheck,
++                    ),
++                )
+                 .awaitSuccess()
+                 .parseAs<GithubRelease>()
+         }
+@@ -78,7 +92,7 @@ class ReleaseServiceImpl(
+     // KMK -->
+     override suspend fun releaseNotes(arguments: GetApplicationRelease.Arguments): List<Release> {
+         // Harmony -->
+-        return listReleases(arguments.repository)
++        return listReleases(arguments.repository, arguments.forceCheck)
+             // Harmony <--
+             .mapNotNull { release ->
+                 val downloadLink = getDownloadLink(release = release, isFoss = arguments.isFoss) ?: return@mapNotNull null
