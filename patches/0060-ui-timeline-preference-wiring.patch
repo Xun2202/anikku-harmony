@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 19:57:01 +0000
+Subject: [PATCH] ui: connect legacy panorama switches to timeline display mode
+
+---
+ .../eu/kanade/presentation/components/TimelineDisplay.kt | 3 ++-
+ .../history/components/HistoryFilterDialog.kt            | 9 ++++++---
+ .../kanade/presentation/updates/UpdatesFilterDialog.kt   | 9 ++++++---
+ 3 files changed, 14 insertions(+), 7 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/presentation/components/TimelineDisplay.kt b/app/src/main/java/eu/kanade/presentation/components/TimelineDisplay.kt
+index b8dda4d2a..758b4a555 100644
+--- a/app/src/main/java/eu/kanade/presentation/components/TimelineDisplay.kt
++++ b/app/src/main/java/eu/kanade/presentation/components/TimelineDisplay.kt
+@@ -27,6 +27,7 @@ import androidx.compose.ui.unit.dp
+ import eu.kanade.domain.ui.UiPreferences
+ import tachiyomi.core.common.preference.Preference
+ import tachiyomi.i18n.MR
++import tachiyomi.i18n.kmk.KMR
+ import tachiyomi.presentation.core.i18n.stringResource
+ import tachiyomi.presentation.core.util.collectAsState
+ import uy.kohesive.injekt.Injekt
+@@ -65,7 +66,7 @@ internal fun TimelineDisplayAction(display: TimelineDisplay) {
+             title = { Text(stringResource(MR.strings.action_display_mode)) },
+             text = {
+                 Column {
+-                    val names = listOf(MR.strings.action_display_grid, MR.strings.action_display_grid_panorama, MR.strings.action_display_list)
++                    val names = listOf(MR.strings.action_display_grid, KMR.strings.action_display_grid_panorama, MR.strings.action_display_list)
+                     TimelineDisplayMode.entries.forEachIndexed { index, mode ->
+                         Row(
+                             Modifier.fillMaxWidth().selectable(
+diff --git a/app/src/main/java/eu/kanade/presentation/history/components/HistoryFilterDialog.kt b/app/src/main/java/eu/kanade/presentation/history/components/HistoryFilterDialog.kt
+index 53949a73f..95e8a3121 100644
+--- a/app/src/main/java/eu/kanade/presentation/history/components/HistoryFilterDialog.kt
++++ b/app/src/main/java/eu/kanade/presentation/history/components/HistoryFilterDialog.kt
+@@ -19,6 +19,8 @@ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import eu.kanade.presentation.components.TabbedDialog
+ import eu.kanade.presentation.components.TabbedDialogPaddings
++import eu.kanade.presentation.components.TimelineDisplayMode
++import eu.kanade.presentation.components.rememberTimelineDisplay
+ import eu.kanade.tachiyomi.ui.history.HistorySettingsScreenModel
+ import kotlinx.collections.immutable.persistentListOf
+ import tachiyomi.domain.history.service.HistoryPreferences
+@@ -79,11 +81,12 @@ private fun ColumnScope.FilterSheet(
+ 
+     HorizontalDivider(modifier = Modifier.padding(MaterialTheme.padding.small))
+ 
+-    val panoramaCover by screenModel.historyPreferences.usePanoramaCover().collectAsState()
++    val display = rememberTimelineDisplay("history")
++    val panoramaCover = display.mode == TimelineDisplayMode.Panorama
+ 
+     Row(
+         modifier = Modifier
+-            .clickable { screenModel.toggleSwitch(HistoryPreferences::usePanoramaCover) }
++            .clickable { display.modePreference.set(if (panoramaCover) 0 else 1) }
+             .fillMaxWidth()
+             .padding(horizontal = SettingsItemsPaddings.Horizontal),
+         verticalAlignment = Alignment.CenterVertically,
+@@ -97,7 +100,7 @@ private fun ColumnScope.FilterSheet(
+ 
+         Switch(
+             checked = panoramaCover,
+-            onCheckedChange = { screenModel.toggleSwitch(HistoryPreferences::usePanoramaCover) },
++            onCheckedChange = { display.modePreference.set(if (panoramaCover) 0 else 1) },
+         )
+     }
+ }
+diff --git a/app/src/main/java/eu/kanade/presentation/updates/UpdatesFilterDialog.kt b/app/src/main/java/eu/kanade/presentation/updates/UpdatesFilterDialog.kt
+index f4ec7c01a..16e8d164b 100644
+--- a/app/src/main/java/eu/kanade/presentation/updates/UpdatesFilterDialog.kt
++++ b/app/src/main/java/eu/kanade/presentation/updates/UpdatesFilterDialog.kt
+@@ -19,6 +19,8 @@ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import eu.kanade.presentation.components.TabbedDialog
+ import eu.kanade.presentation.components.TabbedDialogPaddings
++import eu.kanade.presentation.components.TimelineDisplayMode
++import eu.kanade.presentation.components.rememberTimelineDisplay
+ import eu.kanade.tachiyomi.ui.updates.UpdatesSettingsScreenModel
+ import kotlinx.collections.immutable.persistentListOf
+ import tachiyomi.domain.updates.service.UpdatesPreferences
+@@ -115,11 +117,12 @@ private fun ColumnScope.FilterSheet(
+     // KMK -->
+     HorizontalDivider(modifier = Modifier.padding(MaterialTheme.padding.small))
+ 
+-    val panoramaCover by screenModel.updatesPreferences.usePanoramaCover().collectAsState()
++    val display = rememberTimelineDisplay("updates")
++    val panoramaCover = display.mode == TimelineDisplayMode.Panorama
+ 
+     Row(
+         modifier = Modifier
+-            .clickable { screenModel.toggleSwitch(UpdatesPreferences::usePanoramaCover) }
++            .clickable { display.modePreference.set(if (panoramaCover) 0 else 1) }
+             .fillMaxWidth()
+             .padding(horizontal = SettingsItemsPaddings.Horizontal),
+         verticalAlignment = Alignment.CenterVertically,
+@@ -133,7 +136,7 @@ private fun ColumnScope.FilterSheet(
+ 
+         Switch(
+             checked = panoramaCover,
+-            onCheckedChange = { screenModel.toggleSwitch(UpdatesPreferences::usePanoramaCover) },
++            onCheckedChange = { display.modePreference.set(if (panoramaCover) 0 else 1) },
+         )
+     }
+     // KMK <--
