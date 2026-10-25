@@ -686,3 +686,10 @@ gh release list --repo Xun2202/anikku-harmony
 - 必要检查：轻量SpotlessApply/Check、导航纯逻辑测试；CI新增TimelineGridTest验证10,000条只compose视口、远跳、详情移除/恢复、折叠宽度变化、记录大幅删减。正式CI同时编译签名。此前cache-only20/33两次构建已取消，未发布，0058手动更新缓存修复随本轮一起交付。发布/签名/run/索引以归档现状为准。
 
 - 后续0060/0061：旧筛选的全景开关写入同一Timeline mode；全景文案使用KMR。首次正式编译40228486744的2项Timeline UI回归通过，但app编译暴露An无Mihon的autoColumnMinWidth，改用本仓固定最小卡宽规则后重编译。
+
+## 2026-10-26：时间线全景与书架跨列对齐
+
+- 用户反馈21前/34前历史全景三列等宽、横封面无法正常放大，外屏时间和动作显示不全。前版原生Staggered仅SingleLane/FullLine，没有书架的双列卡片，是确切差异。全景改用书架的panoramaAutoColumns/panoramaCoverSpan和主导形状判定；紧凑/列表继续原生懒布局。主导横封面时使用宽列；竖图主导的混排允许横图跨两列（沿既有书架规则，非按设备型号写死）。
+- 不恢复旧的逐条Measure：新增PanoramaCellHeight.TimelineCover，直接按宽度/封面比+36dp footer计算高度；日期行按字号+padding计算。只组合视口卡片/日期，稳定history-id/chapter-id及锚点Saver保留；封面band本页固定、主导模式变化刷新，避免图片逐张到达挤动。最小单列140dp并计入字体缩放，手动列数同样受可读宽度约束。
+- 同源TimelineTime强制Locale.ROOT/DecimalStyle.STANDARD的HH:mm纯ASCII数字；History/Updates共用36dp footer，28×36dp动作、18dp图标，时间最少44dp。已收藏实心心形且保留防重复收藏状态。Anikku下载文件大小移到副标题，保留原显示偏好/异步获取/下载操作，避免独立大小文字挤满操作行。
+- 检查：时间locale回归覆盖美式12小时环境、阿拉伯locale、午夜/下午/null；Compose新增全景双列宽度、10,000条含日期只组合视口、远跳、详情保存恢复/宽度变化/记录缩短。不扩大到全应用视觉验收；外屏观感仍由用户安装反馈。Animeko独立历史/布局，不直接移植此Tachiyomi规则。版本/运行/签名/索引以归档现状为准。
