@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
-Date: Sun, 25 Oct 2026 15:15:13 +0000
+Date: Sun, 25 Oct 2026 15:29:02 +0000
 Subject: [PATCH] presentation: synchronize floating navigation without moving
  browsing content
 
@@ -16,9 +16,9 @@ Move title and categories as one overlay, share a 140ms direction-triggered anim
  .../material/NavigationChromeScrollTracker.kt |  38 ++--
  .../core/components/material/Scaffold.kt      |   6 +-
  .../NavigationChromeConnectionTest.kt         |  22 ++-
- .../material/NavigationChromeLayoutTest.kt    | 122 +++++++++---
+ .../material/NavigationChromeLayoutTest.kt    | 142 ++++++++++++--
  .../NavigationChromeScrollTrackerTest.kt      |  51 +++---
- 12 files changed, 602 insertions(+), 355 deletions(-)
+ 12 files changed, 624 insertions(+), 353 deletions(-)
  create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CompactNavigationBar.kt
 
 diff --git a/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt b/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
@@ -1201,10 +1201,10 @@ index bf79aef74..046ddddfa 100644
          assertTrue(state.visible)
      }
 diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
-index 95b4c613d..da192b180 100644
+index 95b4c613d..243cd0102 100644
 --- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
 +++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
-@@ -4,11 +4,18 @@ import androidx.compose.foundation.layout.Box
+@@ -4,11 +4,19 @@ import androidx.compose.foundation.layout.Box
  import androidx.compose.foundation.layout.Column
  import androidx.compose.foundation.layout.WindowInsets
  import androidx.compose.foundation.layout.fillMaxSize
@@ -1216,6 +1216,7 @@ index 95b4c613d..da192b180 100644
  import androidx.compose.material3.MaterialTheme
 -import androidx.compose.material3.TopAppBarScrollBehavior
 +import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.mutableFloatStateOf
 +import androidx.compose.ui.Alignment
  import androidx.compose.ui.Modifier
 +import androidx.compose.ui.geometry.Offset
@@ -1225,7 +1226,7 @@ index 95b4c613d..da192b180 100644
  import androidx.compose.ui.platform.testTag
  import androidx.compose.ui.test.ExperimentalTestApi
  import androidx.compose.ui.test.onNodeWithTag
-@@ -16,6 +23,7 @@ import androidx.compose.ui.test.runComposeUiTest
+@@ -16,6 +24,7 @@ import androidx.compose.ui.test.runComposeUiTest
  import androidx.compose.ui.unit.dp
  import org.junit.Test
  import org.junit.jupiter.api.Assertions.assertEquals
@@ -1233,14 +1234,15 @@ index 95b4c613d..da192b180 100644
  import org.junit.jupiter.api.Assertions.assertTrue
  import org.junit.runner.RunWith
  import org.robolectric.RobolectricTestRunner
-@@ -28,32 +36,102 @@ import org.robolectric.annotation.GraphicsMode
+@@ -28,32 +37,125 @@ import org.robolectric.annotation.GraphicsMode
  @Config(sdk = [34])
  class NavigationChromeLayoutTest {
      @Test
 -    fun `toolbar inset and body tabs collapse without leaving a strip and restore together`() = runComposeUiTest {
 -        lateinit var behavior: TopAppBarScrollBehavior
 +    fun `both floating bars move together without resizing or displacing comic content`() = runComposeUiTest {
-+        lateinit var chrome: BrowsingNavigationBarState
++        val progress = mutableFloatStateOf(0f)
++        val chrome = BrowsingNavigationBarState { true }.apply { animation = progress }
 +        var titleY = 0f
 +        var tabsY = 0f
 +        var bottomY = 0f
@@ -1258,7 +1260,6 @@ index 95b4c613d..da192b180 100644
 -                    Column(Modifier.fillMaxSize().padding(top = padding.calculateTopPadding())) {
 -                        BrowsingNavigationChrome { Box(Modifier.height(48.dp)) }
 -                        Box(Modifier.fillMaxSize().testTag("content"))
-+                chrome = rememberBrowsingNavigationBarState(enabled = true, resetKey = Unit)
 +                CompositionLocalProvider(
 +                    LocalBrowsingNavigationBarState provides chrome,
 +                    LocalBrowsingBottomPadding provides 72.dp,
@@ -1309,17 +1310,11 @@ index 95b4c613d..da192b180 100644
 -        val expandedTop = onNodeWithTag("content").fetchSemanticsNode().boundsInRoot.top
 -        assertTrue(expandedTop > 0f)
 -        runOnIdle { behavior.state.heightOffset = behavior.state.heightOffsetLimit }
--        waitForIdle()
--        assertEquals(0f, onNodeWithTag("content").fetchSemanticsNode().boundsInRoot.top, 1f)
--        runOnIdle { behavior.state.heightOffset = 0f }
--        waitForIdle()
--        assertEquals(expandedTop, onNodeWithTag("content").fetchSemanticsNode().boundsInRoot.top, 1f)
 +        val viewport = onNodeWithTag("viewport").fetchSemanticsNode().boundsInRoot
 +        val cover = onNodeWithTag("cover-5").fetchSemanticsNode().boundsInRoot
 +        val titleStart = titleY
 +        val tabDistance = tabsY - titleY
 +        val bottomStart = bottomY
-+        mainClock.autoAdvance = false
 +        runOnIdle {
 +            assertEquals(
 +                Offset.Zero,
@@ -1331,7 +1326,8 @@ index 95b4c613d..da192b180 100644
 +            )
 +            assertFalse(chrome.visible)
 +        }
-+        mainClock.advanceTimeBy(80)
++        runOnIdle { progress.floatValue = 0.5f }
++        waitForIdle()
 +        runOnIdle {
 +            assertTrue(chrome.hiddenFraction > 0f && chrome.hiddenFraction < 1f)
 +            assertEquals(tabDistance, tabsY - titleY, 1f)
@@ -1339,14 +1335,16 @@ index 95b4c613d..da192b180 100644
 +        }
 +        assertEquals(viewport, onNodeWithTag("viewport").fetchSemanticsNode().boundsInRoot)
 +        assertEquals(cover, onNodeWithTag("cover-5").fetchSemanticsNode().boundsInRoot)
-+        mainClock.advanceTimeBy(200)
++        runOnIdle { progress.floatValue = 1f }
++        waitForIdle()
 +        runOnIdle { assertEquals(1f, chrome.hiddenFraction) }
 +        assertEquals(cover, onNodeWithTag("cover-5").fetchSemanticsNode().boundsInRoot)
 +        runOnIdle {
 +            chrome.nestedScrollConnection.onPreScroll(Offset(0f, 1f), NestedScrollSource.UserInput)
 +            assertTrue(chrome.visible)
 +        }
-+        mainClock.advanceTimeBy(200)
++        runOnIdle { progress.floatValue = 0f }
++        waitForIdle()
 +        runOnIdle {
 +            assertEquals(0f, chrome.hiddenFraction)
 +            assertEquals(titleStart, titleY, 1f)
@@ -1354,6 +1352,30 @@ index 95b4c613d..da192b180 100644
 +        }
 +        assertEquals(viewport, onNodeWithTag("viewport").fetchSemanticsNode().boundsInRoot)
 +        assertEquals(cover, onNodeWithTag("cover-5").fetchSemanticsNode().boundsInRoot)
++    }
++
++    @Test
++    fun `shared animation completes both direction changes`() = runComposeUiTest {
++        lateinit var chrome: BrowsingNavigationBarState
++        setContent { chrome = rememberBrowsingNavigationBarState(enabled = true, resetKey = Unit) }
+         waitForIdle()
+-        assertEquals(0f, onNodeWithTag("content").fetchSemanticsNode().boundsInRoot.top, 1f)
+-        runOnIdle { behavior.state.heightOffset = 0f }
++        runOnIdle {
++            chrome.nestedScrollConnection.onPostScroll(Offset(0f, -1f), Offset.Zero, NestedScrollSource.UserInput)
++        }
+         waitForIdle()
+-        assertEquals(expandedTop, onNodeWithTag("content").fetchSemanticsNode().boundsInRoot.top, 1f)
++        runOnIdle {
++            assertFalse(chrome.visible)
++            assertEquals(1f, chrome.hiddenFraction, "Shared animation must reach the hidden position")
++        }
++        runOnIdle { chrome.nestedScrollConnection.onPreScroll(Offset(0f, 1f), NestedScrollSource.UserInput) }
++        waitForIdle()
++        runOnIdle {
++            assertTrue(chrome.visible)
++            assertEquals(0f, chrome.hiddenFraction, "Shared animation must return to the visible position")
++        }
      }
  }
 diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
