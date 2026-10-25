@@ -632,3 +632,11 @@ gh release list --repo Xun2202/anikku-harmony
 - 新的共享 browsingContentVerticalPadding 沿用窗口/字号规则：紧凑4dp、其他8dp，统一书架、浏览、Anikku相关推荐。48dp标题/分类触控与系统安全区保持；未发现重复顶部inset。Mihon相关推荐宿主不同，保留原有结构。
 - 参考：Android [每次手势生命周期](https://developer.android.com/develop/ui/compose/touch-input/pointer-input/understand-gestures)、Material [175/225ms隐藏/恢复](https://github.com/material-components/material-components-android/blob/master/lib/java/com/google/android/material/behavior/HideViewOnScrollBehavior.java)、[Headroom方向容差](https://github.com/WickyNilliams/headroom.js/blob/master/src/Headroom.js)。一次手势锁定是依据用户小红书实测反馈设计，没有声称取得小红书源码。
 - 共享NavigationChrome与tracker/spacing两仓一致；回归覆盖同手势反向锁定、松手后再切换、小幅容差、真实触摸事件和正文坐标稳定。版本、构建、产物和真机状态见归档现状。
+
+## 2026-10-26：紧凑单行导航、磨砂背景与滑块联动
+
+- Mihon 0051 / Anikku 0052 跟进 preview.16/29：阔/矮窗口把书架分类或浏览分页放进标题行下拉选择，保留左右Pager和搜索/多选入口；普通窗口保持两行。标题触控48dp，底栏在48dp行上方增加8dp徽标空间。
+- 首屏顶部留白未滑走时，导航收起进度受实际第0项位移约束，不先飞走露空条；List/Grid使用含padding区域的第0项offset，避免矮行提前失去首项。中部仍悬浮，不改正文视口/滚动padding；保留一次触摸一次显隐与225ms恢复/速度感知收起。
+- 快速滑块随可见导航调整轨道，系统区/FAB额外间距分开保留；按下/拖动冻结直到松手。视觉16dp、直接命中28dp，额外侧区仍短按住抓取，不扩大整条边缘热区。首末钉0/1并实际到达；修规则网格过期范围缓存及Anikku不规则网格先返回导致高度无法初始化。
+- 两款列表导航复用Haze 1.7.2（Anikku原已使用）：18dp背景模糊、深浅色半透明tint和轻噪点，正文作为source，图标文字保持清晰。非硬件加速/API<31自动用可读半透明底色；磨砂观感和性能待真机。详情MangaToolbar显式Color.Transparent，不加入磨砂、不随滚动或选择状态变色。
+- NavigationChrome/BrowsingGlass/BrowsingScrollInsets/BrowsingScrollGeometry/BrowsingTabSelector/CompactNavigationBar两仓同源。回归覆盖首屏短行对齐、正文不被推拉、气泡原始坐标、分类菜单可达及系统/FAB轨道边界。Anikku独有IrregularGrid与源码Scaffold保留差异。版本/构建/签名/索引以归档现状为准。
