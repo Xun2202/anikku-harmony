@@ -693,3 +693,10 @@ gh release list --repo Xun2202/anikku-harmony
 - 不恢复旧的逐条Measure：新增PanoramaCellHeight.TimelineCover，直接按宽度/封面比+36dp footer计算高度；日期行按字号+padding计算。只组合视口卡片/日期，稳定history-id/chapter-id及锚点Saver保留；封面band本页固定、主导模式变化刷新，避免图片逐张到达挤动。最小单列140dp并计入字体缩放，手动列数同样受可读宽度约束。
 - 同源TimelineTime强制Locale.ROOT/DecimalStyle.STANDARD的HH:mm纯ASCII数字；History/Updates共用36dp footer，28×36dp动作、18dp图标，时间最少44dp。已收藏实心心形且保留防重复收藏状态。Anikku下载文件大小移到副标题，保留原显示偏好/异步获取/下载操作，避免独立大小文字挤满操作行。
 - 检查：时间locale回归覆盖美式12小时环境、阿拉伯locale、午夜/下午/null；Compose新增全景双列宽度、10,000条含日期只组合视口、远跳、详情保存恢复/宽度变化/记录缩短。不扩大到全应用视觉验收；外屏观感仍由用户安装反馈。Animeko独立历史/布局，不直接移植此Tachiyomi规则。版本/运行/签名/索引以归档现状为准。
+
+## 2026-10-26：正文横屏侧边安全区与分类选中动画
+
+- 用户截图中上下导航背景已经铺满，只有书架正文左侧留出约系统状态栏宽的黑边。根因是内层浏览Scaffold默认使用系统安全区的Horizontal部分，再经LibraryContent的start/end padding整体缩进；此前只重设窗口cutout策略不足以消除此正文边距。
+- 浏览Scaffold默认正文insets统一为vertical safe区域 + horizontal navigationBars；图片可延伸至侧边摄像头区域，侧面真实系统导航按钮仍留空间。标题/工具栏使用自身安全区，普通详情及显式传入insets不改。Mihon/Anikku分别保留material3包装与自定义Scaffold的实现。新增回归覆盖竖→左横→右横→竖、底部安全区、侧边导航按钮和普通详情显式边距。此为代码几何验证，Pura真机效果待安装反馈。
+- 分类选中条从每个tab条件创建，改为单一绘制的2dp选中条；250ms FastOutSlowIn动画穿过各tab真实位置/宽度，滚动偏移直接读取，保留RTL、边缘渐隐和系统动画缩放。新增中途位置/宽度、滚动偏移和未测量lazy tab回归。
+- Anikku首次候选编译发现Shaped缺少Mihon已有的minLane参数，补齐可选可读宽度下限，默认104dp保持旧书架行为。先前候选未发布，已将上述修复一并纳入本版；版本/构建结果见归档现状。

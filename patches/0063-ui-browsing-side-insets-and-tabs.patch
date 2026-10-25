@@ -1,0 +1,326 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 20:45:00 +0000
+Subject: [PATCH] ui: remove browsing cutout gutter and animate category
+ indicator
+
+Keep browsing content behind side cutouts while preserving side navigation-button insets and explicit detail insets. Animate a single category underline over measured tab positions. Add rotation/inset geometry and unequal tab width regressions. Anikku also gains the optional shaped-column readability floor required by timeline panorama; existing library defaults stay unchanged.
+---
+ .../core/components/PanoramaMasonry.kt        | 11 ++-
+ .../material/BrowsingContentInsets.kt         | 19 ++++
+ .../material/BrowsingTabSelector.kt           | 49 ++++++++--
+ .../core/components/material/Scaffold.kt      |  6 +-
+ .../material/NavigationChromeInsetsTest.kt    | 91 +++++++++++++++++++
+ .../NavigationChromeTabIndicatorTest.kt       | 28 ++++++
+ 6 files changed, 194 insertions(+), 10 deletions(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingContentInsets.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeInsetsTest.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeTabIndicatorTest.kt
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+index 9476551c6..a88fd060f 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+@@ -92,6 +92,7 @@ sealed interface PanoramaColumns {
+      */
+     data class Shaped(
+         val heightOverWidth: Float,
++        val minLane: Dp = 104.dp,
+     ) : PanoramaColumns
+ }
+ 
+@@ -656,7 +657,7 @@ private fun LazyLayoutMeasureScope.measureMasonry(
+         is PanoramaColumns.Shaped -> {
+             // Harmony: same grid width as Tiered. Height is the measure constraint; infinite height is scale 1.
+             val boundedHeight = constraints.hasBoundedHeight
+-            panoramaShapedLaneCount(
++            val shaped = panoramaShapedLaneCount(
+                 gridWidthPx = available + left + right,
+                 gridHeightPx = if (boundedHeight) constraints.maxHeight else 0,
+                 horizontalPaddingPx = left + right,
+@@ -665,6 +666,14 @@ private fun LazyLayoutMeasureScope.measureMasonry(
+                 density = density,
+                 heightBounded = boundedHeight,
+             )
++            if (columns.minLane <= 104.dp) {
++                shaped
++            } else {
++                minOf(
++                    shaped,
++                    staggeredLaneCountAdaptive(available, horizontalPx, columns.minLane.roundToPx()),
++                )
++            }
+         }
+     }
+     val laneWidths = staggeredLaneWidths(available, laneCount, horizontalPx)
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingContentInsets.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingContentInsets.kt
+new file mode 100644
+index 000000000..47910d4ba
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingContentInsets.kt
+@@ -0,0 +1,19 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.WindowInsetsSides
++import androidx.compose.foundation.layout.navigationBars
++import androidx.compose.foundation.layout.only
++import androidx.compose.foundation.layout.union
++import androidx.compose.material3.ScaffoldDefaults
++import androidx.compose.runtime.Composable
++
++/** Covers draw behind side cutouts; real side navigation controls still reserve their space.
++ * Toolbar controls retain their own safe insets. Explicit Scaffold insets are not changed.
++ */
++@Composable
++internal fun browsingContentWindowInsets(
++    safeInsets: WindowInsets = ScaffoldDefaults.contentWindowInsets,
++    navigationInsets: WindowInsets = WindowInsets.navigationBars,
++): WindowInsets = safeInsets.only(WindowInsetsSides.Vertical)
++    .union(navigationInsets.only(WindowInsetsSides.Horizontal))
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt
+index 724d5d746..f813d8706 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt
+@@ -1,6 +1,8 @@
+ package tachiyomi.presentation.core.components.material
+ 
+-import androidx.compose.foundation.background
++import androidx.compose.animation.core.FastOutSlowInEasing
++import androidx.compose.animation.core.animateFloatAsState
++import androidx.compose.animation.core.tween
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.BoxWithConstraints
+@@ -16,15 +18,16 @@ import androidx.compose.foundation.lazy.itemsIndexed
+ import androidx.compose.foundation.lazy.rememberLazyListState
+ import androidx.compose.foundation.selection.selectable
+ import androidx.compose.foundation.selection.selectableGroup
+-import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.ProvideTextStyle
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.drawWithContent
++import androidx.compose.ui.geometry.CornerRadius
+ import androidx.compose.ui.geometry.Offset
+ import androidx.compose.ui.geometry.Size
+ import androidx.compose.ui.graphics.BlendMode
+@@ -53,6 +56,12 @@ fun BrowsingTabSelector(
+     val selected = selectedIndex.coerceIn(labels.indices)
+     val state = rememberLazyListState(initialFirstVisibleItemIndex = selected)
+     val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
++    val indicatorColor = MaterialTheme.colorScheme.primary
++    val animatedSelection by animateFloatAsState(
++        targetValue = selected.toFloat(),
++        animationSpec = tween(durationMillis = 250, easing = FastOutSlowInEasing),
++        label = "browsingTabIndicator",
++    )
+     LaunchedEffect(selected, labels.size) {
+         val item = state.layoutInfo.visibleItemsInfo.firstOrNull { it.index == selected }
+         if (item == null || item.offset < 0 || item.offset + item.size > state.layoutInfo.viewportEndOffset) {
+@@ -81,6 +90,22 @@ fun BrowsingTabSelector(
+                     .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+                     .drawWithContent {
+                         drawContent()
++                        val visible = state.layoutInfo.visibleItemsInfo
++                        val inset = 8.dp.toPx()
++                        val indicator = browsingTabIndicatorBounds(animatedSelection.coerceIn(0f, labels.lastIndex.toFloat())) { index ->
++                            visible.firstOrNull { it.index == index }?.let {
++                                (it.offset + inset) to (it.size - 2 * inset).coerceAtLeast(0f)
++                            }
++                        }
++                        indicator?.let { (start, width) ->
++                            val x = if (rtl) size.width - start - width else start
++                            drawRoundRect(
++                                color = indicatorColor,
++                                topLeft = Offset(x, size.height - 2.dp.toPx()),
++                                size = Size(width, 2.dp.toPx()),
++                                cornerRadius = CornerRadius(1.dp.toPx()),
++                            )
++                        }
+                         val edge = 10.dp.toPx().coerceAtMost(size.width / 2)
+                         val fadeLeft = if (rtl) state.canScrollForward else state.canScrollBackward
+                         val fadeRight = if (rtl) state.canScrollBackward else state.canScrollForward
+@@ -130,15 +155,23 @@ fun BrowsingTabSelector(
+                                 TabText(label, badges.getOrNull(index))
+                             }
+                         }
+-                        if (index == selected) {
+-                            Box(
+-                                Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(2.dp)
+-                                    .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(1.dp)),
+-                            )
+-                        }
+                     }
+                 }
+             }
+         }
+     }
+ }
++
++/** Interpolate the real tab widths; scroll offsets are read fresh rather than animated twice. */
++internal fun browsingTabIndicatorBounds(
++    selection: Float,
++    boundsAt: (Int) -> Pair<Float, Float>?,
++): Pair<Float, Float>? {
++    val lower = selection.toInt()
++    val upper = kotlin.math.ceil(selection).toInt()
++    val start = boundsAt(lower) ?: return boundsAt(upper)
++    val end = boundsAt(upper) ?: return start
++    val fraction = selection - lower
++    return (start.first + (end.first - start.first) * fraction) to
++        (start.second + (end.second - start.second) * fraction)
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/Scaffold.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/Scaffold.kt
+index 22e87eaae..e881beb0c 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/Scaffold.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/Scaffold.kt
+@@ -129,7 +129,11 @@ fun Scaffold(
+     floatingActionButtonPosition: FabPosition = FabPosition.End,
+     containerColor: Color = MaterialTheme.colorScheme.background,
+     contentColor: Color = contentColorFor(containerColor),
+-    contentWindowInsets: WindowInsets = ScaffoldDefaults.contentWindowInsets,
++    contentWindowInsets: WindowInsets = if (topBarScrollBehavior is BrowsingTopAppBarScrollBehavior) {
++        browsingContentWindowInsets()
++    } else {
++        ScaffoldDefaults.contentWindowInsets
++    },
+     content: @Composable (PaddingValues) -> Unit,
+ ) {
+     val parentRefreshBoundary = LocalPullRefreshTopBoundary.current
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeInsetsTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeInsetsTest.kt
+new file mode 100644
+index 000000000..2d57da044
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeInsetsTest.kt
+@@ -0,0 +1,91 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.onNodeWithTag
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.unit.dp
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.robolectric.annotation.GraphicsMode
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@GraphicsMode(GraphicsMode.Mode.LEGACY)
++@Config(sdk = [34])
++class NavigationChromeInsetsTest {
++    @Test
++    fun `portrait then either landscape cutout keeps browsing covers at the window edges`() = runComposeUiTest {
++        var safe by mutableStateOf<WindowInsets>(WindowInsets(0, 80, 0, 16))
++        setContent {
++            MaterialTheme {
++                Box(Modifier.size(360.dp, 480.dp).testTag("viewport")) {
++                    Scaffold(
++                        topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior(),
++                        contentWindowInsets = browsingContentWindowInsets(safe, WindowInsets(0, 0, 0, 16)),
++                    ) { padding ->
++                        Box(Modifier.fillMaxSize().padding(padding)) { Box(Modifier.fillMaxSize().testTag("covers")) }
++                    }
++                }
++            }
++        }
++        val viewport = onNodeWithTag("viewport").fetchSemanticsNode().boundsInRoot
++        for (insets in listOf(WindowInsets(80, 24, 0, 16), WindowInsets(0, 24, 80, 16), WindowInsets(0, 80, 0, 16))) {
++            runOnIdle { safe = insets }
++            waitForIdle()
++            val covers = onNodeWithTag("covers").fetchSemanticsNode().boundsInRoot
++            assertEquals(viewport.left, covers.left, 0.5f)
++            assertEquals(viewport.right, covers.right, 0.5f)
++            assertEquals(viewport.bottom - 16f, covers.bottom, 0.5f)
++        }
++    }
++
++    @Test
++    fun `real side navigation buttons keep their space while camera inset does not`() = runComposeUiTest {
++        setContent {
++            MaterialTheme {
++                Box(Modifier.size(360.dp, 480.dp).testTag("viewport")) {
++                    Scaffold(
++                        topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior(),
++                        contentWindowInsets = browsingContentWindowInsets(WindowInsets(80, 24, 0, 16), WindowInsets(0, 0, 48, 0)),
++                    ) { padding ->
++                        Box(Modifier.fillMaxSize().padding(padding)) { Box(Modifier.fillMaxSize().testTag("covers")) }
++                    }
++                }
++            }
++        }
++        val viewport = onNodeWithTag("viewport").fetchSemanticsNode().boundsInRoot
++        val covers = onNodeWithTag("covers").fetchSemanticsNode().boundsInRoot
++        assertEquals(viewport.left, covers.left, 0.5f)
++        assertEquals(viewport.right - 48f, covers.right, 0.5f)
++    }
++
++    @Test
++    fun `explicit insets remain honored by ordinary detail scaffolds`() = runComposeUiTest {
++        setContent {
++            MaterialTheme {
++                Box(Modifier.size(360.dp, 480.dp).testTag("viewport")) {
++                    Scaffold(contentWindowInsets = WindowInsets(80, 24, 0, 16)) { padding ->
++                        Box(Modifier.fillMaxSize().padding(padding)) { Box(Modifier.fillMaxSize().testTag("detail")) }
++                    }
++                }
++            }
++        }
++        val viewport = onNodeWithTag("viewport").fetchSemanticsNode().boundsInRoot
++        val detail = onNodeWithTag("detail").fetchSemanticsNode().boundsInRoot
++        assertEquals(viewport.left + 80f, detail.left, 0.5f)
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeTabIndicatorTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeTabIndicatorTest.kt
+new file mode 100644
+index 000000000..a0a08a8ec
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeTabIndicatorTest.kt
+@@ -0,0 +1,28 @@
++package tachiyomi.presentation.core.components.material
++
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertNull
++import org.junit.jupiter.api.Test
++
++class NavigationChromeTabIndicatorTest {
++    @Test
++    fun `selection passes through intermediate position and width between unequal tabs`() {
++        val bounds = mapOf(0 to (8f to 32f), 1 to (56f to 112f))
++        assertEquals(8f to 32f, browsingTabIndicatorBounds(0f, bounds::get))
++        assertEquals(32f to 72f, browsingTabIndicatorBounds(0.5f, bounds::get))
++        assertEquals(56f to 112f, browsingTabIndicatorBounds(1f, bounds::get))
++        // Scrolling moves the current geometry directly, without another offset animation.
++        assertEquals(
++            12f to 72f,
++            browsingTabIndicatorBounds(0.5f) { index ->
++                bounds[index]?.let { (it.first - 20f) to it.second }
++            },
++        )
++    }
++
++    @Test
++    fun `unmeasured lazy tabs do not crash indicator rendering`() {
++        assertNull(browsingTabIndicatorBounds(0.5f) { null })
++        assertEquals(8f to 32f, browsingTabIndicatorBounds(0.5f) { if (it == 0) 8f to 32f else null })
++    }
++}
