@@ -1,12 +1,9 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
-Date: Sun, 25 Oct 2026 18:29:35 +0000
+Date: Sun, 25 Oct 2026 18:40:23 +0000
 Subject: [PATCH] presentation: reveal floating navigation at the list end
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
 
-Mihon与Anikku 0055同源。List/Grid/Masonry用真实尾部余量与bottom chrome高度联动恢复上下导航；到端点锁定本手势并落定动画，离开不闪、不推正文、不吞滚动；包含程序跳转与过底回拉回归。
+Mihon and Anikku 0055 share tail geometry and gesture locking; the viewport stays fixed.
 ---
  .../presentation/core/components/LazyGrid.kt  | 35 +++++++-
  .../presentation/core/components/LazyList.kt  | 18 +++-
@@ -391,7 +388,7 @@ index 36728b647..015666943 100644
 +    }
  }
 diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
-index ec0b549df..9274397d3 100644
+index ec0b549df..e373ccbb7 100644
 --- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
 +++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
 @@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.height
@@ -428,7 +425,7 @@ index ec0b549df..9274397d3 100644
 +    fun `programmatic end reveals both bars and leaving end keeps them visible`() = runComposeUiTest {
 +        lateinit var chrome: BrowsingNavigationBarState
 +        lateinit var scope: CoroutineScope
-+        val listState = LazyListState(initialFirstVisibleItemIndex = 10)
++        val listState = LazyListState(firstVisibleItemIndex = 10)
 +        var headerY = 0f
 +        var bottomY = 0f
 +        var bottomHeight = 0
