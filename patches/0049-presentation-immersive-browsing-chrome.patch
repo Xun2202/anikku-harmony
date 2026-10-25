@@ -1,0 +1,632 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 14:27:23 +0000
+Subject: [PATCH] presentation: collapse complete browsing headers and reveal
+ navigation immediately
+
+Use one surface color, transparent system areas and a shared header height including categories and filters. Observe reverse drag before the top bar consumes it. Shared chrome implementation and regressions match Mihon 0048; Anikku uses a 120ms bottom reveal and preserves cast controls.
+---
+ .../kanade/presentation/components/AppBar.kt  |  8 ++-
+ .../presentation/components/TabbedScreen.kt   | 28 +++++----
+ .../library/components/LibraryTabs.kt         | 50 ++++++++-------
+ .../eu/kanade/tachiyomi/ui/home/HomeScreen.kt | 11 ++--
+ .../kanade/tachiyomi/ui/library/LibraryTab.kt |  3 +-
+ .../kanade/tachiyomi/ui/main/MainActivity.kt  | 22 +------
+ .../core/components/material/NavigationBar.kt |  5 +-
+ .../components/material/NavigationChrome.kt   | 62 ++++++++++++++++++-
+ .../core/components/material/Scaffold.kt      | 59 +++++++++++-------
+ .../NavigationChromeConnectionTest.kt         | 15 +++++
+ .../material/NavigationChromeLayoutTest.kt    | 59 ++++++++++++++++++
+ 11 files changed, 232 insertions(+), 90 deletions(-)
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/components/AppBar.kt b/app/src/main/java/eu/kanade/presentation/components/AppBar.kt
+index 43223a567..92f71e29c 100644
+--- a/app/src/main/java/eu/kanade/presentation/components/AppBar.kt
++++ b/app/src/main/java/eu/kanade/presentation/components/AppBar.kt
+@@ -1,6 +1,5 @@
+ package eu.kanade.presentation.components
+ 
+-import tachiyomi.presentation.core.components.material.navigationToolbarHeight
+ import androidx.compose.foundation.basicMarquee
+ import androidx.compose.foundation.interaction.MutableInteractionSource
+ import androidx.compose.foundation.layout.Box
+@@ -60,6 +59,8 @@ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+ import kotlinx.collections.immutable.ImmutableList
+ import tachiyomi.i18n.MR
++import tachiyomi.presentation.core.components.material.navigationToolbarHeight
++import tachiyomi.presentation.core.components.material.toolbarScrollBehavior
+ import tachiyomi.presentation.core.i18n.stringResource
+ import tachiyomi.presentation.core.util.clearFocusOnSoftKeyboardHide
+ import tachiyomi.presentation.core.util.runOnEnterKeyPressed
+@@ -177,8 +178,11 @@ fun AppBar(
+                 containerColor = backgroundColor ?: MaterialTheme.colorScheme.surfaceColorAtElevation(
+                     elevation = if (isActionMode) 3.dp else 0.dp,
+                 ),
++                scrolledContainerColor = backgroundColor ?: MaterialTheme.colorScheme.surfaceColorAtElevation(
++                    elevation = if (isActionMode) 3.dp else 0.dp,
++                ),
+             ),
+-            scrollBehavior = scrollBehavior,
++            scrollBehavior = scrollBehavior.toolbarScrollBehavior(),
+         )
+     }
+ }
+diff --git a/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt b/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
+index 392491a22..c39154fd0 100644
+--- a/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
+@@ -1,6 +1,5 @@
+ package eu.kanade.presentation.components
+ 
+-import tachiyomi.presentation.core.components.material.rememberBrowsingTopAppBarScrollBehavior
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.foundation.layout.calculateEndPadding
+@@ -30,8 +29,10 @@ import eu.kanade.tachiyomi.ui.browse.feed.FeedScreenModel
+ import kotlinx.collections.immutable.ImmutableList
+ import kotlinx.collections.immutable.persistentListOf
+ import kotlinx.coroutines.launch
++import tachiyomi.presentation.core.components.material.BrowsingNavigationChrome
+ import tachiyomi.presentation.core.components.material.Scaffold
+ import tachiyomi.presentation.core.components.material.TabText
++import tachiyomi.presentation.core.components.material.rememberBrowsingTopAppBarScrollBehavior
+ import tachiyomi.presentation.core.i18n.stringResource
+ 
+ @Composable
+@@ -105,17 +106,20 @@ fun TabbedScreen(
+                 end = contentPadding.calculateEndPadding(LocalLayoutDirection.current),
+             ),
+         ) {
+-            PrimaryTabRow(
+-                selectedTabIndex = state.currentPage,
+-                modifier = Modifier.zIndex(1f),
+-            ) {
+-                tabs.forEachIndexed { index, tab ->
+-                    Tab(
+-                        selected = state.currentPage == index,
+-                        onClick = { scope.launch { state.animateScrollToPage(index) } },
+-                        text = { TabText(text = stringResource(tab.titleRes), badgeCount = tab.badgeNumber) },
+-                        unselectedContentColor = MaterialTheme.colorScheme.onSurface,
+-                    )
++            BrowsingNavigationChrome {
++                PrimaryTabRow(
++                    selectedTabIndex = state.currentPage,
++                    containerColor = MaterialTheme.colorScheme.surface,
++                    modifier = Modifier.zIndex(1f),
++                ) {
++                    tabs.forEachIndexed { index, tab ->
++                        Tab(
++                            selected = state.currentPage == index,
++                            onClick = { scope.launch { state.animateScrollToPage(index) } },
++                            text = { TabText(text = stringResource(tab.titleRes), badgeCount = tab.badgeNumber) },
++                            unselectedContentColor = MaterialTheme.colorScheme.onSurface,
++                        )
++                    }
+                 }
+             }
+ 
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LibraryTabs.kt b/app/src/main/java/eu/kanade/presentation/library/components/LibraryTabs.kt
+index 6aa87a01e..c372bb139 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LibraryTabs.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LibraryTabs.kt
+@@ -12,6 +12,7 @@ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.zIndex
+ import eu.kanade.presentation.category.visualName
+ import tachiyomi.domain.category.model.Category
++import tachiyomi.presentation.core.components.material.BrowsingNavigationChrome
+ import tachiyomi.presentation.core.components.material.TabText
+ 
+ @Composable
+@@ -21,30 +22,33 @@ internal fun LibraryTabs(
+     getItemCountForCategory: (Category) -> Int?,
+     onTabItemClick: (Int) -> Unit,
+ ) {
+-    val currentPageIndex = pagerState.currentPage.coerceAtMost(categories.lastIndex)
+-    Column(modifier = Modifier.zIndex(2f)) {
+-        PrimaryScrollableTabRow(
+-            selectedTabIndex = currentPageIndex,
+-            edgePadding = 0.dp,
+-            // TODO: use default when width is fixed upstream
+-            // https://issuetracker.google.com/issues/242879624
+-            divider = {},
+-        ) {
+-            categories.forEachIndexed { index, category ->
+-                Tab(
+-                    selected = currentPageIndex == index,
+-                    onClick = { onTabItemClick(index) },
+-                    text = {
+-                        TabText(
+-                            text = category.visualName,
+-                            badgeCount = getItemCountForCategory(category),
+-                        )
+-                    },
+-                    unselectedContentColor = MaterialTheme.colorScheme.onSurface,
+-                )
++    BrowsingNavigationChrome {
++        val currentPageIndex = pagerState.currentPage.coerceAtMost(categories.lastIndex)
++        Column(modifier = Modifier.zIndex(2f)) {
++            PrimaryScrollableTabRow(
++                selectedTabIndex = currentPageIndex,
++                containerColor = MaterialTheme.colorScheme.surface,
++                edgePadding = 0.dp,
++                // TODO: use default when width is fixed upstream
++                // https://issuetracker.google.com/issues/242879624
++                divider = {},
++            ) {
++                categories.forEachIndexed { index, category ->
++                    Tab(
++                        selected = currentPageIndex == index,
++                        onClick = { onTabItemClick(index) },
++                        text = {
++                            TabText(
++                                text = category.visualName,
++                                badgeCount = getItemCountForCategory(category),
++                            )
++                        },
++                        unselectedContentColor = MaterialTheme.colorScheme.onSurface,
++                    )
++                }
+             }
+-        }
+ 
+-        HorizontalDivider()
++            HorizontalDivider()
++        }
+     }
+ }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
+index d536a4fb3..eaf65ab93 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
+@@ -1,11 +1,10 @@
+ package eu.kanade.tachiyomi.ui.home
+ 
+-import tachiyomi.presentation.core.components.material.rememberBrowsingNavigationBarState
+-import androidx.compose.ui.input.nestedscroll.nestedScroll
+ import androidx.activity.ComponentActivity
+ import androidx.activity.compose.BackHandler
+ import androidx.compose.animation.AnimatedContent
+ import androidx.compose.animation.AnimatedVisibility
++import androidx.compose.animation.core.tween
+ import androidx.compose.animation.expandVertically
+ import androidx.compose.animation.shrinkVertically
+ import androidx.compose.animation.togetherWith
+@@ -21,8 +20,8 @@ import androidx.compose.material3.BadgedBox
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.LocalContentColor
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.ShortNavigationBarItem
+ import androidx.compose.material3.NavigationRailItem
++import androidx.compose.material3.ShortNavigationBarItem
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.CompositionLocalProvider
+@@ -33,6 +32,7 @@ import androidx.compose.runtime.produceState
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.input.nestedscroll.nestedScroll
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.semantics.contentDescription
+ import androidx.compose.ui.semantics.semantics
+@@ -71,6 +71,7 @@ import tachiyomi.i18n.MR
+ import tachiyomi.presentation.core.components.material.NavigationBar
+ import tachiyomi.presentation.core.components.material.NavigationRail
+ import tachiyomi.presentation.core.components.material.Scaffold
++import tachiyomi.presentation.core.components.material.rememberBrowsingNavigationBarState
+ import tachiyomi.presentation.core.i18n.pluralStringResource
+ import uy.kohesive.injekt.Injekt
+ import uy.kohesive.injekt.api.get
+@@ -167,8 +168,8 @@ object HomeScreen : Screen() {
+ 
+                                 AnimatedVisibility(
+                                     visible = bottomNavVisible && navigationScroll.visible,
+-                                    enter = expandVertically(),
+-                                    exit = shrinkVertically(),
++                                    enter = expandVertically(animationSpec = tween(durationMillis = 120)),
++                                    exit = shrinkVertically(animationSpec = tween(durationMillis = 180)),
+                                 ) {
+                                     NavigationBar {
+                                         TABS
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt
+index 71a66655c..cd107677d 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt
+@@ -1,6 +1,5 @@
+ package eu.kanade.tachiyomi.ui.library
+ 
+-import tachiyomi.presentation.core.components.material.rememberBrowsingTopAppBarScrollBehavior
+ import android.content.Context
+ import androidx.activity.compose.BackHandler
+ import androidx.compose.animation.graphics.res.animatedVectorResource
+@@ -77,6 +76,7 @@ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.kmk.KMR
+ import tachiyomi.i18n.sy.SYMR
+ import tachiyomi.presentation.core.components.material.Scaffold
++import tachiyomi.presentation.core.components.material.rememberBrowsingTopAppBarScrollBehavior
+ import tachiyomi.presentation.core.i18n.stringResource
+ import tachiyomi.presentation.core.screens.EmptyScreen
+ import tachiyomi.presentation.core.screens.EmptyScreenAction
+@@ -193,7 +193,6 @@ data object LibraryTab : Tab {
+                         Injekt.get<DownloadCache>().invalidateCache()
+                         context.toast(MR.strings.download_cache_invalidated)
+                     },
+-                    // Keep category tabs available while the toolbar scrolls away.
+                     scrollBehavior = scrollBehavior,
+                 )
+             },
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/main/MainActivity.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/main/MainActivity.kt
+index 7cffd4ad5..7d8c32d8d 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/main/MainActivity.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/main/MainActivity.kt
+@@ -18,18 +18,14 @@ import androidx.activity.enableEdgeToEdge
+ import androidx.activity.result.ActivityResult
+ import androidx.activity.result.ActivityResultLauncher
+ import androidx.activity.result.contract.ActivityResultContracts
+-import androidx.compose.foundation.background
+ import androidx.compose.foundation.isSystemInDarkTheme
+ import androidx.compose.foundation.layout.Box
+-import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.WindowInsets
+ import androidx.compose.foundation.layout.WindowInsetsSides
+ import androidx.compose.foundation.layout.consumeWindowInsets
+-import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.navigationBars
+ import androidx.compose.foundation.layout.only
+ import androidx.compose.foundation.layout.padding
+-import androidx.compose.foundation.layout.windowInsetsBottomHeight
+ import androidx.compose.foundation.layout.windowInsetsPadding
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
+@@ -39,9 +35,7 @@ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.setValue
+-import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+-import androidx.compose.ui.draw.alpha
+ import androidx.compose.ui.graphics.luminance
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.core.animation.doOnEnd
+@@ -99,7 +93,6 @@ import eu.kanade.tachiyomi.ui.player.PlayerActivity
+ import eu.kanade.tachiyomi.util.system.HarmonyFramePerf
+ import eu.kanade.tachiyomi.util.system.HarmonyFramePerfButton
+ import eu.kanade.tachiyomi.util.system.dpToPx
+-import eu.kanade.tachiyomi.util.system.isNavigationBarNeedsScrim
+ import eu.kanade.tachiyomi.util.system.toast
+ import eu.kanade.tachiyomi.util.system.updaterEnabled
+ import eu.kanade.tachiyomi.util.view.setComposeContent
+@@ -225,6 +218,9 @@ class MainActivity : BaseActivity() {
+                     statusBarStyle = if (statusBarBackgroundColor.luminance() > 0.5) lightStyle else darkStyle,
+                     navigationBarStyle = if (isSystemInDarkTheme) darkStyle else lightStyle,
+                 )
++                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
++                    window.isNavigationBarContrastEnforced = false
++                }
+             }
+ 
+             Navigator(
+@@ -282,18 +278,6 @@ class MainActivity : BaseActivity() {
+                                 .padding(contentPadding)
+                                 .consumeWindowInsets(contentPadding),
+                         )
+-
+-                        // Draw navigation bar scrim when needed
+-                        if (remember { isNavigationBarNeedsScrim() }) {
+-                            Spacer(
+-                                modifier = Modifier
+-                                    .align(Alignment.BottomCenter)
+-                                    .fillMaxWidth()
+-                                    .windowInsetsBottomHeight(WindowInsets.navigationBars)
+-                                    .alpha(0.8f)
+-                                    .background(MaterialTheme.colorScheme.surfaceContainer),
+-                            )
+-                        }
+                     }
+                 }
+ 
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationBar.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationBar.kt
+index b5f26b764..810e54e83 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationBar.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationBar.kt
+@@ -9,14 +9,15 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.unit.Dp
++import androidx.compose.ui.unit.dp
+ 
+ /** The native compact bar keeps 64dp minimum height and grows with accessibility text. */
+ @Composable
+ fun NavigationBar(
+     modifier: Modifier = Modifier,
+-    containerColor: Color = NavigationBarDefaults.containerColor,
++    containerColor: Color = MaterialTheme.colorScheme.surface,
+     contentColor: Color = MaterialTheme.colorScheme.contentColorFor(containerColor),
+-    tonalElevation: Dp = NavigationBarDefaults.Elevation,
++    tonalElevation: Dp = 0.dp,
+     windowInsets: WindowInsets = NavigationBarDefaults.windowInsets,
+     content: @Composable () -> Unit,
+ ) {
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+index 3fcd756e6..12aa57a9f 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+@@ -1,6 +1,7 @@
+ package tachiyomi.presentation.core.components.material
+ 
+ import android.view.accessibility.AccessibilityManager
++import androidx.compose.foundation.layout.Box
+ import androidx.compose.material3.TopAppBarDefaults
+ import androidx.compose.material3.TopAppBarScrollBehavior
+ import androidx.compose.material3.rememberTopAppBarState
+@@ -13,13 +14,19 @@ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.rememberUpdatedState
+ import androidx.compose.runtime.setValue
++import androidx.compose.runtime.staticCompositionLocalOf
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clipToBounds
+ import androidx.compose.ui.geometry.Offset
+ import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+ import androidx.compose.ui.input.nestedscroll.NestedScrollSource
++import androidx.compose.ui.layout.Layout
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.unit.Constraints
+ import androidx.compose.ui.unit.Dp
+ import androidx.compose.ui.unit.dp
++import kotlin.math.roundToInt
+ 
+ /** Compact normal text while keeping extra room for accessibility font sizes. */
+ @Composable
+@@ -37,7 +44,54 @@ fun rememberBrowsingTopAppBarScrollBehavior(
+         state.heightOffset = 0f
+         state.contentOffset = 0f
+     }
+-    return TopAppBarDefaults.enterAlwaysScrollBehavior(state = state, canScroll = { currentEnabled })
++    val delegate = TopAppBarDefaults.enterAlwaysScrollBehavior(state = state, canScroll = { currentEnabled })
++    return remember(delegate) { BrowsingTopAppBarScrollBehavior(delegate) }
++}
++
++/** Own the full header height, including system inset, tabs and source filters. */
++internal class BrowsingTopAppBarScrollBehavior(
++    delegate: TopAppBarScrollBehavior,
++) : TopAppBarScrollBehavior by delegate {
++    private val heights = mutableMapOf<Any, Int>()
++
++    fun updateHeight(key: Any, height: Int) {
++        if (heights[key] == height) return
++        val fraction = state.collapsedFraction
++        if (height == 0) heights.remove(key) else heights[key] = height
++        state.heightOffsetLimit = -heights.values.sum().toFloat()
++        state.heightOffset = state.heightOffsetLimit * fraction
++    }
++}
++
++internal val LocalBrowsingChrome = staticCompositionLocalOf<BrowsingTopAppBarScrollBehavior?> { null }
++
++/** The surrounding layout collapses browsing headers; don't collapse TopAppBar a second time. */
++fun TopAppBarScrollBehavior?.toolbarScrollBehavior(): TopAppBarScrollBehavior? =
++    takeUnless { it is BrowsingTopAppBarScrollBehavior }
++
++/** Tabs may live next to a pager, but still share the header's scroll distance and visible fraction. */
++@Composable
++fun BrowsingNavigationChrome(content: @Composable () -> Unit) {
++    val behavior = LocalBrowsingChrome.current
++    if (behavior == null) {
++        content()
++        return
++    }
++    val key = remember(behavior) { Any() }
++    DisposableEffect(behavior, key) {
++        onDispose { behavior.updateHeight(key, 0) }
++    }
++    Layout(
++        modifier = Modifier.clipToBounds(),
++        content = { Box { content() } },
++    ) { measurables, constraints ->
++        val child = measurables.single().measure(constraints.copy(minHeight = 0, maxHeight = Constraints.Infinity))
++        behavior.updateHeight(key, child.height)
++        val hiddenHeight = (child.height * behavior.state.collapsedFraction).roundToInt()
++        layout(child.width, child.height - hiddenHeight) {
++            child.placeRelative(0, -hiddenHeight)
++        }
++    }
+ }
+ 
+ @Stable
+@@ -54,6 +108,12 @@ class BrowsingNavigationBarState internal constructor(
+     }
+ 
+     val nestedScrollConnection = object : NestedScrollConnection {
++        override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
++            // Observe before enterAlways consumes the return drag, otherwise the bottom bar lags.
++            if (enabled() && source == NestedScrollSource.UserInput && available.y > 0f) reset()
++            return Offset.Zero
++        }
++
+         override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+             if (enabled()) {
+                 visible = tracker.onScroll(consumed.y, available.y, source == NestedScrollSource.UserInput)
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/Scaffold.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/Scaffold.kt
+index a4ac52822..e23263688 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/Scaffold.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/Scaffold.kt
+@@ -21,11 +21,13 @@ package tachiyomi.presentation.core.components.material
+ import androidx.compose.foundation.layout.MutableWindowInsets
+ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.WindowInsetsSides
+ import androidx.compose.foundation.layout.asPaddingValues
+ import androidx.compose.foundation.layout.calculateEndPadding
+ import androidx.compose.foundation.layout.calculateStartPadding
+ import androidx.compose.foundation.layout.exclude
+ import androidx.compose.foundation.layout.onConsumedWindowInsetsChanged
++import androidx.compose.foundation.layout.only
+ import androidx.compose.material3.ExperimentalMaterial3Api
+ import androidx.compose.material3.FabPosition
+ import androidx.compose.material3.FloatingActionButton
+@@ -38,6 +40,7 @@ import androidx.compose.material3.TopAppBarScrollBehavior
+ import androidx.compose.material3.contentColorFor
+ import androidx.compose.material3.rememberTopAppBarState
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.runtime.Immutable
+ import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
+@@ -119,30 +122,38 @@ fun Scaffold(
+     contentWindowInsets: WindowInsets = ScaffoldDefaults.contentWindowInsets,
+     content: @Composable (PaddingValues) -> Unit,
+ ) {
+-    // Tachiyomi: Handle consumed window insets
+-    val remainingWindowInsets = remember { MutableWindowInsets() }
+-    androidx.compose.material3.Surface(
+-        modifier = Modifier
+-            .nestedScroll(topBarScrollBehavior.nestedScrollConnection)
+-            .onConsumedWindowInsetsChanged {
+-                remainingWindowInsets.insets = contentWindowInsets.exclude(
+-                    it,
+-                )
+-            }
+-            .then(modifier),
+-        color = containerColor,
+-        contentColor = contentColor,
+-    ) {
+-        ScaffoldLayout(
+-            fabPosition = floatingActionButtonPosition,
+-            topBar = { topBar(topBarScrollBehavior) },
+-            startBar = startBar,
+-            bottomBar = bottomBar,
+-            content = content,
+-            snackbar = snackbarHost,
+-            contentWindowInsets = remainingWindowInsets,
+-            fab = floatingActionButton,
+-        )
++    val browsingBehavior = topBarScrollBehavior as? BrowsingTopAppBarScrollBehavior
++    val browsingInsets = if (browsingBehavior != null) {
++        contentWindowInsets.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom)
++    } else {
++        contentWindowInsets
++    }
++    CompositionLocalProvider(LocalBrowsingChrome provides browsingBehavior) {
++        // Tachiyomi: Handle consumed window insets
++        val remainingWindowInsets = remember { MutableWindowInsets() }
++        androidx.compose.material3.Surface(
++            modifier = Modifier
++                .nestedScroll(topBarScrollBehavior.nestedScrollConnection)
++                .onConsumedWindowInsetsChanged {
++                    remainingWindowInsets.insets = browsingInsets.exclude(
++                        it,
++                    )
++                }
++                .then(modifier),
++            color = if (browsingBehavior != null) MaterialTheme.colorScheme.surface else containerColor,
++            contentColor = contentColor,
++        ) {
++            ScaffoldLayout(
++                fabPosition = floatingActionButtonPosition,
++                topBar = { BrowsingNavigationChrome { topBar(topBarScrollBehavior) } },
++                startBar = startBar,
++                bottomBar = bottomBar,
++                content = content,
++                snackbar = snackbarHost,
++                contentWindowInsets = remainingWindowInsets,
++                fab = floatingActionButton,
++            )
++        }
+     }
+ }
+ 
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
+index c5c1468e1..bf79aef74 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
+@@ -23,6 +23,21 @@ class NavigationChromeConnectionTest {
+         assertTrue(state.visible)
+     }
+ 
++    @Test
++    fun `first reverse drag reveals bottom before the top bar consumes it`() {
++        val state = BrowsingNavigationBarState(NavigationChromeScrollTracker(24f, 8f)) { true }
++        val connection = state.nestedScrollConnection
++        connection.onPostScroll(Offset(0f, -40f), Offset.Zero, NestedScrollSource.UserInput)
++        assertFalse(state.visible)
++        connection.onPreScroll(Offset(0f, 1f), NestedScrollSource.SideEffect)
++        assertFalse(state.visible)
++        connection.onPreScroll(Offset(5f, 0f), NestedScrollSource.UserInput)
++        assertFalse(state.visible)
++        assertEquals(Offset.Zero, connection.onPreScroll(Offset(0f, 1f), NestedScrollSource.UserInput))
++        connection.onPostScroll(Offset.Zero, Offset.Zero, NestedScrollSource.UserInput)
++        assertTrue(state.visible)
++    }
++
+     @Test
+     fun `disabled automatic hiding leaves navigation available`() {
+         val state = BrowsingNavigationBarState(NavigationChromeScrollTracker(24f, 8f)) { false }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
+new file mode 100644
+index 000000000..05ff22d81
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
+@@ -0,0 +1,59 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.TopAppBarScrollBehavior
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.onNodeWithTag
++import androidx.compose.ui.test.v2.runComposeUiTest
++import androidx.compose.ui.unit.dp
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.robolectric.annotation.GraphicsMode
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@GraphicsMode(GraphicsMode.Mode.LEGACY)
++@Config(sdk = [34])
++class NavigationChromeLayoutTest {
++    @Test
++    fun `toolbar inset and body tabs collapse without leaving a strip and restore together`() = runComposeUiTest {
++        lateinit var behavior: TopAppBarScrollBehavior
++        setContent {
++            MaterialTheme {
++                behavior = rememberBrowsingTopAppBarScrollBehavior()
++                Scaffold(
++                    topBarScrollBehavior = behavior,
++                    // Deliberately nonzero: collapsed content must not inherit this top gap.
++                    contentWindowInsets = WindowInsets(0, 24, 0, 16),
++                    topBar = { Box(Modifier.height(80.dp)) },
++                ) { padding ->
++                    Column(Modifier.fillMaxSize().padding(top = padding.calculateTopPadding())) {
++                        BrowsingNavigationChrome { Box(Modifier.height(48.dp)) }
++                        Box(Modifier.fillMaxSize().testTag("content"))
++                    }
++                }
++            }
++        }
++        waitForIdle()
++        val expandedTop = onNodeWithTag("content").fetchSemanticsNode().boundsInRoot.top
++        assertTrue(expandedTop > 0f)
++        runOnIdle { behavior.state.heightOffset = behavior.state.heightOffsetLimit }
++        waitForIdle()
++        assertEquals(0f, onNodeWithTag("content").fetchSemanticsNode().boundsInRoot.top, 1f)
++        runOnIdle { behavior.state.heightOffset = 0f }
++        waitForIdle()
++        assertEquals(expandedTop, onNodeWithTag("content").fetchSemanticsNode().boundsInRoot.top, 1f)
++    }
++}

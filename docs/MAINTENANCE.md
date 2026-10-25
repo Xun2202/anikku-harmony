@@ -607,3 +607,11 @@ gh release list --repo Xun2202/anikku-harmony
 - 组件差异：Mihon 保留 NavigationSuiteScaffold，手机改用 ShortNavigationBarCompact；Anikku 用 ShortNavigationBar/ShortNavigationBarItem，隐藏未选中标签的旧偏好仍保留，投屏连接期间底栏不自动收起；Anikku 相关推荐页也接入标题收起。
 - 机器检查覆盖方向阈值、边界/短列表、复位、不吞滚动/惯性以及列数不随高度变化。双应用签名构建与更新索引见归档仓现状；实际手感、字体与系统安全区由用户安装反馈。Animeko 使用独立 AniTopAppBar/多平台导航，不直接移植本次 Tachiyomi 组件。
 - 依据：[华为 Pura X Max 官方比例](https://consumer.huawei.com/cn/phones/pura-x-max/specs/)、[Material3 顶栏行为](https://developer.android.com/reference/kotlin/androidx/compose/material3/TopAppBarDefaults)。不根据手机型号或物理像素写死 dp。
+
+## 2026-10-25：整块导航收起、透明系统区域与快速恢复
+
+- Mihon 0048 / Anikku 0049 跟进用户对 preview.13 / preview.26 的反馈：标题、分类、底栏统一使用 surface，标题滚动后也不变色；移除 MainActivity 手工底部遮罩，Android 10+ 关闭系统导航栏对比遮罩。保留时钟、状态图标和系统手势条。
+- 浏览 Scaffold 用共同高度与折叠比例收起标题、顶部系统 inset、分类及源筛选行；完全收起后正文可画到透明状态栏下。底部安全 inset 仍作为列表末项滚动空间，避免最后一项被手势条遮住。普通详情/设置页不启用整块收起；搜索、多选和触摸探索仍复位并禁用自动隐藏。
+- 底栏在 onPreScroll 首次反向用户拖动就恢复，不再等顶栏消费后的 8dp；仍不消费滚动或惯性。Mihon 用官方 NavigationSuiteScaffoldState.snapTo(Visible)，Anikku 显示 120ms / 隐藏 180ms，保留投屏和标签偏好。
+- NavigationChrome.kt 及新增回滑/布局回归在两仓同源；布局回归检查完整收起无顶部空条以及展开恢复。版本、构建和真机状态以档案仓现状为准。
+- 一手依据：[Android edge-to-edge](https://developer.android.com/develop/ui/views/layout/edge-to-edge)、[Compose Insets](https://developer.android.com/develop/ui/compose/system/insets-ui)、[Material3 顶栏滚动](https://developer.android.com/develop/ui/compose/components/app-bars)。
