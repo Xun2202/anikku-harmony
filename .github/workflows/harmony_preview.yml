@@ -160,6 +160,22 @@ jobs:
             --tests '*PanoramaCoverShapesTest' --tests '*PanoramaShapeModeTest' --tests '*PanoramaLayoutPolicyTest' \
             assemblePreview -Penable-updater --stacktrace
 
+      - name: Print navigation regression failures
+        if: failure()
+        env:
+          TEST_RESULTS: ${{ runner.temp }}/anikku/presentation-core/build/test-results/testDebugUnitTest
+        run: |
+          python3 - <<'PY_REPORT'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          for report in Path(os.environ['TEST_RESULTS']).glob('TEST-*NavigationChrome*.xml'):
+              for case in ET.parse(report).getroot().findall('testcase'):
+                  for failure in case.findall('failure'):
+                      print(case.attrib.get('name'), failure.attrib.get('message'))
+                      print(failure.text or '')
+          PY_REPORT
+
       - name: Sign APKs with the Harmony key
         if: steps.existing.outputs.skip != 'true'
         env:
