@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
-Date: Sun, 25 Oct 2026 16:50:05 +0000
+Date: Sun, 25 Oct 2026 16:57:38 +0000
 Subject: [PATCH] presentation: polish compact glass navigation and scroll
  geometry
 
@@ -1099,7 +1099,7 @@ index 000000000..552fb500f
 +    }
 +}
 diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CompactNavigationBar.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CompactNavigationBar.kt
-index 5b73a6486..b610b0d76 100644
+index 5b73a6486..952d15b93 100644
 --- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CompactNavigationBar.kt
 +++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CompactNavigationBar.kt
 @@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
@@ -1115,7 +1115,7 @@ index 5b73a6486..b610b0d76 100644
  import androidx.compose.ui.unit.sp
  
 -/** A 48dp touch row plus the real bottom system inset for short browsing windows. */
-+/** A 48dp touch row, 8dp badge headroom, and the real bottom system inset. */
++/** A 48dp touch row, 16dp badge headroom, and the real bottom system inset. */
  @Composable
  fun CompactNavigationBar(
      modifier: Modifier = Modifier,
@@ -1123,7 +1123,7 @@ index 5b73a6486..b610b0d76 100644
              .fillMaxWidth()
              .background(containerColor)
              .windowInsetsPadding(windowInsets)
-+            .padding(top = 8.dp)
++            .padding(top = 16.dp)
              .height(48.dp)
              .selectableGroup(),
          verticalAlignment = Alignment.CenterVertically,
