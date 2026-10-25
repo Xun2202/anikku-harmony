@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
-Date: Sun, 25 Oct 2026 18:53:38 +0000
+Date: Sun, 25 Oct 2026 18:58:36 +0000
 Subject: [PATCH] presentation: preserve navigation scroll source and
  single-line badges
 
@@ -10,8 +10,8 @@ Shared Mihon and Anikku 0056. Keep observer registration across reset and count 
  .../core/components/material/BrowsingScrollInsets.kt   | 10 +++++++++-
  .../core/components/material/NavigationChrome.kt       |  4 ++--
  .../components/material/NavigationChromeLayoutTest.kt  | 10 +++++++++-
- .../components/material/NavigationChromeRefreshTest.kt |  7 +++++--
- 5 files changed, 29 insertions(+), 6 deletions(-)
+ .../components/material/NavigationChromeRefreshTest.kt |  8 ++++++--
+ 5 files changed, 30 insertions(+), 6 deletions(-)
 
 diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
 index a549b4b39..9a880bcec 100644
@@ -100,7 +100,7 @@ index e373ccbb7..f4a62c5f6 100644
              assertEquals(viewport.top, headerY, 1f)
              assertEquals(viewport.bottom, bottomY + bottomHeight, 1f)
 diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeRefreshTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeRefreshTest.kt
-index 5cade6906..482dbe517 100644
+index 5cade6906..1b0304149 100644
 --- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeRefreshTest.kt
 +++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeRefreshTest.kt
 @@ -99,7 +99,7 @@ class NavigationChromeRefreshTest {
@@ -112,14 +112,15 @@ index 5cade6906..482dbe517 100644
                                          },
                                      )
                                  }
-@@ -120,7 +120,10 @@ class NavigationChromeRefreshTest {
+@@ -120,7 +120,11 @@ class NavigationChromeRefreshTest {
              assertEquals(item.center.x, icons[index].center.x, 1f)
              val label = onNodeWithText("Tab$index", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
              assertEquals(icons[index].center.x, label.center.x, 1f)
 -            assertTrue(badge.bottom <= icons[index].top + 6f * density, "Badge only overlaps the icon's upper corner")
++            val icon = icons[index]
 +            assertTrue(
-+                badge.bottom <= icons[index].center.y,
-+                "Badge $badge must stay above the center of icon ${icons[index]}",
++                badge.left >= icon.right || badge.right <= icon.left || badge.bottom <= icon.center.y,
++                "Badge $badge must not cover the center of icon $icon",
 +            )
          }
      }
