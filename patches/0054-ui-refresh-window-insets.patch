@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:29:35 +0000
+Subject: [PATCH] ui: refresh edge-to-edge insets after window changes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Mihon与Anikku 0054同源。主窗口在内容挂载前设定边到边与cutout策略；实际尺寸变化后合并请求新Insets，onResume重新协调，销毁清监听，不改变Compose安全区。处理冷启动竖屏后首次横屏黑边；真机待验。Anikku保留旧Compose UI测试入口兼容。
+---
+ .../kanade/tachiyomi/ui/main/MainActivity.kt  |  2 +
+ .../util/system/HarmonyWindowInsets.kt        | 66 +++++++++++++++++++
+ .../material/NavigationChromeLayoutTest.kt    |  2 +-
+ .../material/NavigationChromeRefreshTest.kt   |  2 +-
+ 4 files changed, 70 insertions(+), 2 deletions(-)
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyWindowInsets.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/main/MainActivity.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/main/MainActivity.kt
+index 7d8c32d8d..4f1873c2b 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/main/MainActivity.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/main/MainActivity.kt
+@@ -93,6 +93,7 @@ import eu.kanade.tachiyomi.ui.player.PlayerActivity
+ import eu.kanade.tachiyomi.util.system.HarmonyFramePerf
+ import eu.kanade.tachiyomi.util.system.HarmonyFramePerfButton
+ import eu.kanade.tachiyomi.util.system.dpToPx
++import eu.kanade.tachiyomi.util.system.installHarmonyWindowInsets
+ import eu.kanade.tachiyomi.util.system.toast
+ import eu.kanade.tachiyomi.util.system.updaterEnabled
+ import eu.kanade.tachiyomi.util.view.setComposeContent
+@@ -162,6 +163,7 @@ class MainActivity : BaseActivity() {
+         val splashScreen = if (isLaunch) installSplashScreen() else null
+ 
+         super.onCreate(savedInstanceState)
++        installHarmonyWindowInsets()
+ 
+         if (isLaunch) {
+             Migrator.awaitAndRelease()
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyWindowInsets.kt b/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyWindowInsets.kt
+new file mode 100644
+index 000000000..26f78e4cc
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyWindowInsets.kt
+@@ -0,0 +1,66 @@
++package eu.kanade.tachiyomi.util.system
++
++import android.os.Build
++import android.view.View
++import android.view.WindowManager
++import androidx.activity.ComponentActivity
++import androidx.core.view.ViewCompat
++import androidx.core.view.WindowCompat
++import androidx.lifecycle.DefaultLifecycleObserver
++import androidx.lifecycle.LifecycleOwner
++
++/** Reconcile edge-to-edge geometry after rotation/folding, once the new window bounds are laid out. */
++fun ComponentActivity.installHarmonyWindowInsets() {
++    val decor = window.decorView
++    fun applyLayoutPolicy() {
++        WindowCompat.setDecorFitsSystemWindows(window, false)
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++            val cutoutMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
++            } else {
++                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
++            }
++            if (window.attributes.layoutInDisplayCutoutMode != cutoutMode) {
++                window.attributes = window.attributes.apply { layoutInDisplayCutoutMode = cutoutMode }
++            }
++        }
++    }
++    val refresh = Runnable {
++        if (!isFinishing && !isDestroyed) {
++            applyLayoutPolicy()
++            // Ask for insets against the new bounds, not the portrait values received before layout.
++            ViewCompat.requestApplyInsets(decor)
++        }
++    }
++    fun scheduleRefresh() {
++        decor.removeCallbacks(refresh)
++        decor.post(refresh)
++    }
++    val boundsListener = View.OnLayoutChangeListener {
++            _,
++            left,
++            top,
++            right,
++            bottom,
++            oldLeft,
++            oldTop,
++            oldRight,
++            oldBottom,
++        ->
++        if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop) {
++            scheduleRefresh()
++        }
++    }
++    // Apply before Compose/migration content is attached, including a recreated landscape Activity.
++    applyLayoutPolicy()
++    decor.addOnLayoutChangeListener(boundsListener)
++    lifecycle.addObserver(object : DefaultLifecycleObserver {
++        override fun onResume(owner: LifecycleOwner) = scheduleRefresh()
++
++        override fun onDestroy(owner: LifecycleOwner) {
++            decor.removeCallbacks(refresh)
++            decor.removeOnLayoutChangeListener(boundsListener)
++            owner.lifecycle.removeObserver(this)
++        }
++    })
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
+index 80992b1b6..ec0b549df 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
+@@ -33,7 +33,7 @@ import androidx.compose.ui.test.onNodeWithText
+ import androidx.compose.ui.test.performClick
+ import androidx.compose.ui.test.performScrollToIndex
+ import androidx.compose.ui.test.performTouchInput
+-import androidx.compose.ui.test.v2.runComposeUiTest
++import androidx.compose.ui.test.runComposeUiTest
+ import androidx.compose.ui.unit.dp
+ import org.junit.Test
+ import org.junit.jupiter.api.Assertions.assertEquals
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeRefreshTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeRefreshTest.kt
+index df5ed6120..5cade6906 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeRefreshTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeRefreshTest.kt
+@@ -24,7 +24,7 @@ import androidx.compose.ui.test.ExperimentalTestApi
+ import androidx.compose.ui.test.hasProgressBarRangeInfo
+ import androidx.compose.ui.test.onNodeWithTag
+ import androidx.compose.ui.test.onNodeWithText
+-import androidx.compose.ui.test.v2.runComposeUiTest
++import androidx.compose.ui.test.runComposeUiTest
+ import androidx.compose.ui.unit.Density
+ import androidx.compose.ui.unit.dp
+ import org.junit.Test

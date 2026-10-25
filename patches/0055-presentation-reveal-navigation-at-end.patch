@@ -1,0 +1,511 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:29:35 +0000
+Subject: [PATCH] presentation: reveal floating navigation at the list end
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Mihon与Anikku 0055同源。List/Grid/Masonry用真实尾部余量与bottom chrome高度联动恢复上下导航；到端点锁定本手势并落定动画，离开不闪、不推正文、不吞滚动；包含程序跳转与过底回拉回归。
+---
+ .../presentation/core/components/LazyGrid.kt  | 35 +++++++-
+ .../presentation/core/components/LazyList.kt  | 18 +++-
+ .../core/components/PanoramaMasonry.kt        | 10 ++-
+ .../material/BrowsingScrollGeometry.kt        | 20 +++++
+ .../material/BrowsingScrollInsets.kt          | 40 +++++++--
+ .../components/material/NavigationChrome.kt   | 39 +++++++-
+ .../material/NavigationChromeScrollTracker.kt |  7 ++
+ .../material/NavigationChromeGeometryTest.kt  | 34 +++++++
+ .../material/NavigationChromeLayoutTest.kt    | 89 +++++++++++++++++++
+ 9 files changed, 280 insertions(+), 12 deletions(-)
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/LazyGrid.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/LazyGrid.kt
+index 745423dee..460fa1d02 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/LazyGrid.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/LazyGrid.kt
+@@ -13,6 +13,7 @@ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.unit.Dp
+ import androidx.compose.ui.unit.dp
++import tachiyomi.presentation.core.components.material.browsingTrailingRemaining
+ import tachiyomi.presentation.core.components.material.observeBrowsingLeadingScroll
+ 
+ @Composable
+@@ -38,7 +39,22 @@ fun FastScrollLazyVerticalGrid(
+         columns = columns,
+         arrangement = horizontalArrangement,
+         contentPadding = contentPadding,
+-        modifier = modifier.observeBrowsingLeadingScroll {
++        modifier = modifier.observeBrowsingLeadingScroll(
++            // Reverse layouts use the opposite physical edge; do not apply normal bottom geometry.
++            trailingRemaining = if (reverseLayout) {
++                null
++            } else {
++                {
++                    val info = state.layoutInfo
++                    browsingTrailingRemaining(
++                        terminalVisible = info.totalItemsCount > 0 && info.visibleItemsInfo.any { it.index == info.totalItemsCount - 1 },
++                        lastItemBottom = info.visibleItemsInfo.maxOfOrNull { it.offset.y + it.size.height } ?: 0,
++                        afterPadding = info.afterContentPadding,
++                        viewportEnd = info.viewportEndOffset,
++                    )
++                }
++            },
++        ) {
+             state.layoutInfo.visibleItemsInfo.firstOrNull { it.index == 0 }
+                 ?.let { -it.offset.y.toFloat() } ?: Float.POSITIVE_INFINITY
+         },
+@@ -86,7 +102,22 @@ fun FastScrollIrregularLazyVerticalGrid(
+         columns = columns,
+         arrangement = horizontalArrangement,
+         contentPadding = contentPadding,
+-        modifier = modifier.observeBrowsingLeadingScroll {
++        modifier = modifier.observeBrowsingLeadingScroll(
++            // Reverse layouts use the opposite physical edge; do not apply normal bottom geometry.
++            trailingRemaining = if (reverseLayout) {
++                null
++            } else {
++                {
++                    val info = state.layoutInfo
++                    browsingTrailingRemaining(
++                        terminalVisible = info.totalItemsCount > 0 && info.visibleItemsInfo.any { it.index == info.totalItemsCount - 1 },
++                        lastItemBottom = info.visibleItemsInfo.maxOfOrNull { it.offset.y + it.size.height } ?: 0,
++                        afterPadding = info.afterContentPadding,
++                        viewportEnd = info.viewportEndOffset,
++                    )
++                }
++            },
++        ) {
+             state.layoutInfo.visibleItemsInfo.firstOrNull { it.index == 0 }
+                 ?.let { -it.offset.y.toFloat() } ?: Float.POSITIVE_INFINITY
+         },
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/LazyList.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/LazyList.kt
+index 0ee441716..6351ff789 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/LazyList.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/LazyList.kt
+@@ -14,6 +14,7 @@ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.platform.LocalDensity
+ import androidx.compose.ui.platform.LocalLayoutDirection
+ import androidx.compose.ui.unit.dp
++import tachiyomi.presentation.core.components.material.browsingTrailingRemaining
+ import tachiyomi.presentation.core.components.material.observeBrowsingLeadingScroll
+ import tachiyomi.presentation.core.util.drawVerticalScrollbar
+ 
+@@ -71,7 +72,22 @@ fun FastScrollLazyColumn(
+ ) {
+     VerticalFastScroller(
+         listState = state,
+-        modifier = modifier.observeBrowsingLeadingScroll {
++        modifier = modifier.observeBrowsingLeadingScroll(
++            // Reverse layouts use the opposite physical edge; do not apply normal bottom geometry.
++            trailingRemaining = if (reverseLayout) {
++                null
++            } else {
++                {
++                    val info = state.layoutInfo
++                    browsingTrailingRemaining(
++                        terminalVisible = info.totalItemsCount > 0 && info.visibleItemsInfo.any { it.index == info.totalItemsCount - 1 },
++                        lastItemBottom = info.visibleItemsInfo.maxOfOrNull { it.offset + it.size } ?: 0,
++                        afterPadding = info.afterContentPadding,
++                        viewportEnd = info.viewportEndOffset,
++                    )
++                }
++            },
++        ) {
+             state.layoutInfo.visibleItemsInfo.firstOrNull { it.index == 0 }
+                 ?.let { -it.offset.toFloat() } ?: Float.POSITIVE_INFINITY
+         },
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+index 9b4846984..6a5fa26b6 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+@@ -566,7 +566,15 @@ fun FastScrollPanoramaMasonry(
+ ) {
+     VerticalMasonryFastScroller(
+         state = state,
+-        modifier = modifier.observeBrowsingLeadingScroll {
++        modifier = modifier.observeBrowsingLeadingScroll(
++            trailingRemaining = {
++                if (state.viewportHeight > 0 && state.contentHeight > 0) {
++                    (state.maxScroll - state.scrollOffset).coerceAtLeast(0f)
++                } else {
++                    Float.POSITIVE_INFINITY
++                }
++            },
++        ) {
+             state.scrollOffset
+         },
+         thumbAllowed = thumbAllowed,
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingScrollGeometry.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingScrollGeometry.kt
+index 1f804ad69..ed06160c1 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingScrollGeometry.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingScrollGeometry.kt
+@@ -16,3 +16,23 @@ internal fun browsingTrackInset(padding: Float, chromeHeight: Float, hidden: Flo
+     if (chromeHeight <= 0f || padding + 1f < chromeHeight) return padding
+     return (padding - chromeHeight + max(systemInset, chromeHeight * (1f - hidden))).coerceAtMost(padding)
+ }
++
++/** Bring both controls back with the real trailing spacer, including the system bottom inset. */
++internal fun browsingTrailingHiddenFraction(animated: Float, remaining: Float?, bottomHeight: Float): Float =
++    if (remaining == null || bottomHeight <= 0f) {
++        animated
++    } else {
++        min(animated, (remaining / bottomHeight).coerceIn(0f, 1f))
++    }
++
++/** Unknown tail geometry must never be mistaken for the end of a not-yet-measured list. */
++internal fun browsingTrailingRemaining(
++    terminalVisible: Boolean,
++    lastItemBottom: Int,
++    afterPadding: Int,
++    viewportEnd: Int,
++): Float = if (terminalVisible) {
++    (lastItemBottom + afterPadding - viewportEnd).coerceAtLeast(0).toFloat()
++} else {
++    Float.POSITIVE_INFINITY
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingScrollInsets.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingScrollInsets.kt
+index 31b340ac5..295da5620 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingScrollInsets.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingScrollInsets.kt
+@@ -5,39 +5,69 @@ import androidx.compose.foundation.layout.navigationBars
+ import androidx.compose.foundation.layout.statusBars
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.rememberUpdatedState
++import androidx.compose.runtime.snapshotFlow
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.geometry.Offset
+ import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+ import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+ import androidx.compose.ui.input.nestedscroll.nestedScroll
++import androidx.compose.ui.layout.boundsInWindow
++import androidx.compose.ui.layout.onGloballyPositioned
+ import androidx.compose.ui.platform.LocalDensity
+ import androidx.compose.ui.unit.Dp
++import kotlinx.coroutines.flow.collect
++import kotlinx.coroutines.flow.distinctUntilChanged
+ 
+ /** Each scroll event selects the active pager page; offscreen precomposed pages never drive the header. */
+ @Composable
+-fun Modifier.observeBrowsingLeadingScroll(leadingOffset: () -> Float): Modifier {
++fun Modifier.observeBrowsingLeadingScroll(
++    trailingRemaining: (() -> Float)? = null,
++    leadingOffset: () -> Float,
++): Modifier {
+     val chrome = LocalBrowsingChrome.current?.chrome ?: return this
+     val currentOffset by rememberUpdatedState(leadingOffset)
++    val currentTail by rememberUpdatedState(trailingRemaining)
+     val activeSource = remember(chrome) { { currentOffset() } }
++    val activeTail = remember(chrome) { { currentTail?.invoke() ?: Float.POSITIVE_INFINITY } }
++    fun activate() {
++        chrome.leadingOffset = activeSource
++        chrome.trailingRemaining = activeTail
++    }
++    LaunchedEffect(chrome, activeSource, activeTail) {
++        snapshotFlow { chrome.leadingOffset === activeSource && activeTail() <= 0.5f }
++            .distinctUntilChanged()
++            .collect { atEnd -> if (atEnd) chrome.revealAtEnd() }
++    }
+     DisposableEffect(chrome, activeSource) {
+-        onDispose { if (chrome.leadingOffset === activeSource) chrome.leadingOffset = null }
++        onDispose {
++            if (chrome.leadingOffset === activeSource) {
++                chrome.leadingOffset = null
++                chrome.trailingRemaining = null
++            }
++        }
+     }
+     val connection = remember(chrome, activeSource) {
+         object : NestedScrollConnection {
+             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+-                if (kotlin.math.abs(available.y) > kotlin.math.abs(available.x)) chrome.leadingOffset = activeSource
++                if (kotlin.math.abs(available.y) > kotlin.math.abs(available.x)) activate()
+                 return Offset.Zero
+             }
+             override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+-                if (kotlin.math.abs(consumed.y) > kotlin.math.abs(consumed.x)) chrome.leadingOffset = activeSource
++                if (kotlin.math.abs(consumed.y) > kotlin.math.abs(consumed.x)) activate()
+                 return Offset.Zero
+             }
+         }
+     }
+-    return nestedScroll(connection)
++    return onGloballyPositioned { coordinates ->
++        // A programmatic jump may precede any touch. Only a page actually intersecting the
++        // clipped window can become the initial owner; precomposed offscreen pages cannot.
++        val bounds = coordinates.boundsInWindow()
++        if (chrome.leadingOffset == null && bounds.width > 0f && bounds.height > 0f) activate()
++    }.nestedScroll(connection)
+ }
+ 
+ private class FrozenBrowsingTrack(var insets: Pair<Dp, Dp>? = null)
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+index 807ce8e3b..5d0f224c7 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+@@ -126,8 +126,13 @@ class BrowsingNavigationBarState internal constructor(
+     internal var headerHeightPx by mutableFloatStateOf(0f)
+     internal var bottomHeightPx by mutableFloatStateOf(0f)
+     internal var leadingOffset: (() -> Float)? by mutableStateOf(null)
++    internal var trailingRemaining: (() -> Float)? by mutableStateOf(null)
+     val hiddenFraction: Float
+-        get() = browsingLeadingHiddenFraction(animation?.value ?: 0f, leadingOffset?.invoke(), headerHeightPx)
++        get() = browsingTrailingHiddenFraction(
++            browsingLeadingHiddenFraction(animation?.value ?: 0f, leadingOffset?.invoke(), headerHeightPx),
++            trailingRemaining?.invoke(),
++            bottomHeightPx,
++        )
+     var visible by mutableStateOf(true)
+         private set
+     internal var animationDurationMillis by mutableIntStateOf(225)
+@@ -137,6 +142,7 @@ class BrowsingNavigationBarState internal constructor(
+     internal fun beginGesture() {
+         tracker.beginGesture()
+         gestureSpeedDpPerSecond = 0f
++        if (atEnd()) revealAtEnd()
+     }
+ 
+     internal fun endGesture() {
+@@ -162,22 +168,49 @@ class BrowsingNavigationBarState internal constructor(
+     fun reset() {
+         tracker.reset()
+         leadingOffset = null
++        trailingRemaining = null
+         updateVisibility(true)
+     }
+ 
++    internal fun revealAtEnd() {
++        tracker.revealAtEnd()
++        updateVisibility(true)
++        // The trailing spacer has already revealed both bars. Settle the backing animation too,
++        // so an immediate reversal cannot uncover an old hidden value when the tail cap is removed.
++        animationDurationMillis = 0
++    }
++
++    private fun atEnd() = trailingRemaining?.invoke()?.let { it <= 0.5f } == true
++
+     private fun canHide() = enabled() && pinnedOwners.isEmpty()
+ 
+     val nestedScrollConnection = object : NestedScrollConnection {
+         override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+             if (canHide()) {
+-                updateVisibility(tracker.onPreScroll(available.x, available.y, source == NestedScrollSource.UserInput))
++                if (atEnd()) {
++                    revealAtEnd()
++                } else {
++                    updateVisibility(
++                        tracker.onPreScroll(
++                            available.x,
++                            available.y,
++                            source == NestedScrollSource.UserInput,
++                        ),
++                    )
++                }
+             }
+             return Offset.Zero
+         }
+ 
+         override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+             if (canHide()) {
+-                updateVisibility(tracker.onPostScroll(consumed.x, consumed.y, source == NestedScrollSource.UserInput))
++                if (atEnd()) {
++                    revealAtEnd()
++                } else {
++                    updateVisibility(
++                        tracker.onPostScroll(consumed.x, consumed.y, source == NestedScrollSource.UserInput),
++                    )
++                }
+             }
+             // Never consume drag or velocity, or move the content on behalf of the controls.
+             return Offset.Zero
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
+index a243d307b..fdf75265f 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
+@@ -29,6 +29,13 @@ internal class NavigationChromeScrollTracker(private val intentDistance: Float =
+         pendingDistance = 0f
+     }
+ 
++    fun revealAtEnd() {
++        visible = true
++        pendingDistance = 0f
++        // Reaching the boundary overrides a hide, but does not unlock the pressed finger.
++        switchedThisGesture = gestureActive
++    }
++
+     fun onPreScroll(x: Float, y: Float, userInput: Boolean): Boolean {
+         if (userInput && y > abs(x)) observe(y)
+         return visible
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGeometryTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGeometryTest.kt
+index 36728b647..015666943 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGeometryTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGeometryTest.kt
+@@ -1,6 +1,8 @@
+ package tachiyomi.presentation.core.components.material
+ 
+ import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertTrue
+ import org.junit.jupiter.api.Test
+ 
+ class NavigationChromeGeometryTest {
+@@ -27,4 +29,36 @@ class NavigationChromeGeometryTest {
+         assertEquals(20f, browsingTrackInset(20f, 0f, 1f, 16f))
+         assertEquals(96f, browsingTrackInset(152f, 80f, 1f, 24f))
+     }
++
++    @Test
++    fun `trailing spacer brings both bars back including the real bottom inset`() {
++        assertEquals(1f, browsingTrailingHiddenFraction(1f, Float.POSITIVE_INFINITY, 72f))
++        assertEquals(1f, browsingTrailingHiddenFraction(1f, 100f, 72f))
++        assertEquals(0.5f, browsingTrailingHiddenFraction(1f, 36f, 72f))
++        assertEquals(0f, browsingTrailingHiddenFraction(1f, 0f, 72f))
++        assertEquals(0.2f, browsingTrailingHiddenFraction(0.2f, 36f, 72f))
++        assertEquals(1f, browsingTrailingHiddenFraction(1f, 0f, 0f))
++    }
++
++    @Test
++    fun `terminal geometry counts after padding and never treats an unknown tail as end`() {
++        assertEquals(Float.POSITIVE_INFINITY, browsingTrailingRemaining(false, 450, 72, 500))
++        assertEquals(22f, browsingTrailingRemaining(true, 450, 72, 500))
++        assertEquals(0f, browsingTrailingRemaining(true, 428, 72, 500))
++        assertEquals(0f, browsingTrailingRemaining(true, 200, 72, 500))
++    }
++
++    @Test
++    fun `reaching end overrides a hide without unlocking the current gesture`() {
++        val tracker = NavigationChromeScrollTracker()
++        tracker.beginGesture()
++        assertFalse(tracker.onPostScroll(0f, -20f, true))
++        tracker.revealAtEnd()
++        assertTrue(tracker.visible)
++        assertTrue(tracker.onPostScroll(0f, -100f, true))
++        tracker.endGesture()
++        tracker.beginGesture()
++        assertTrue(tracker.onPreScroll(0f, 20f, true))
++        assertFalse(tracker.onPostScroll(0f, -20f, true))
++    }
+ }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
+index ec0b549df..9274397d3 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
+@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.layout.width
+ import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.LazyListState
+ import androidx.compose.foundation.lazy.rememberLazyListState
+ import androidx.compose.material3.Badge
+ import androidx.compose.material3.MaterialTheme
+@@ -17,6 +18,7 @@ import androidx.compose.material3.Text
+ import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.runtime.mutableFloatStateOf
+ import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.geometry.Offset
+@@ -35,6 +37,8 @@ import androidx.compose.ui.test.performScrollToIndex
+ import androidx.compose.ui.test.performTouchInput
+ import androidx.compose.ui.test.runComposeUiTest
+ import androidx.compose.ui.unit.dp
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.launch
+ import org.junit.Test
+ import org.junit.jupiter.api.Assertions.assertEquals
+ import org.junit.jupiter.api.Assertions.assertFalse
+@@ -345,4 +349,89 @@ class NavigationChromeLayoutTest {
+         val category = onNodeWithText("Category 8").fetchSemanticsNode().boundsInRoot
+         assertTrue(category.left >= title.right && category.right <= controls.left)
+     }
++
++    @Test
++    fun `programmatic end reveals both bars and leaving end keeps them visible`() = runComposeUiTest {
++        lateinit var chrome: BrowsingNavigationBarState
++        lateinit var scope: CoroutineScope
++        val listState = LazyListState(initialFirstVisibleItemIndex = 10)
++        var headerY = 0f
++        var bottomY = 0f
++        var bottomHeight = 0
++        setContent {
++            MaterialTheme {
++                scope = rememberCoroutineScope()
++                chrome = rememberBrowsingNavigationBarState(enabled = true, resetKey = Unit)
++                CompositionLocalProvider(
++                    LocalBrowsingNavigationBarState provides chrome,
++                    LocalBrowsingBottomPadding provides 72.dp,
++                ) {
++                    Box(Modifier.fillMaxSize()) {
++                        Scaffold(
++                            topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior(),
++                            contentWindowInsets = WindowInsets(0),
++                            topBar = {
++                                Box(
++                                    Modifier.fillMaxWidth().height(100.dp).onGloballyPositioned {
++                                        headerY = it.positionInRoot().y
++                                    },
++                                )
++                            },
++                        ) { padding ->
++                            FastScrollLazyColumn(
++                                modifier = Modifier.fillMaxSize().testTag("tail-viewport"),
++                                state = listState,
++                                contentPadding = padding,
++                            ) {
++                                items(30) { Box(Modifier.fillMaxWidth().height(80.dp)) }
++                            }
++                        }
++                        BrowsingChromeOverlay(
++                            state = chrome,
++                            atBottom = true,
++                            modifier = Modifier.align(Alignment.BottomCenter),
++                        ) {
++                            Box(
++                                Modifier.fillMaxWidth().height(72.dp).onGloballyPositioned {
++                                    bottomY = it.positionInRoot().y
++                                    bottomHeight = it.size.height
++                                },
++                            )
++                        }
++                    }
++                }
++            }
++        }
++        waitForIdle()
++        val viewport = onNodeWithTag("tail-viewport").fetchSemanticsNode().boundsInRoot
++        runOnIdle {
++            chrome.beginGesture()
++            chrome.nestedScrollConnection.onPostScroll(Offset(0f, -20f), Offset.Zero, NestedScrollSource.UserInput)
++        }
++        waitForIdle()
++        runOnIdle { assertFalse(chrome.visible) }
++        runOnIdle { scope.launch { listState.scrollToItem(29) } }
++        waitForIdle()
++        runOnIdle {
++            assertFalse(listState.canScrollForward)
++            assertTrue(chrome.visible)
++            assertEquals(0f, chrome.hiddenFraction)
++            assertEquals(viewport.top, headerY, 1f)
++            assertEquals(viewport.bottom, bottomY + bottomHeight, 1f)
++            chrome.endGesture()
++            chrome.beginGesture()
++            chrome.nestedScrollConnection.onPostScroll(Offset.Zero, Offset(0f, -100f), NestedScrollSource.UserInput)
++            assertTrue(chrome.visible, "Pushing past the bottom must not arm an invisible hide")
++            assertEquals(0, chrome.animationDurationMillis)
++        }
++        runOnIdle { scope.launch { listState.scrollToItem(10) } }
++        waitForIdle()
++        runOnIdle {
++            chrome.nestedScrollConnection.onPostScroll(Offset(0f, -20f), Offset.Zero, NestedScrollSource.UserInput)
++            assertTrue(chrome.visible, "Reversing the same finger out of the bottom must not hide the controls again")
++            assertEquals(0f, chrome.hiddenFraction)
++            chrome.endGesture()
++        }
++        assertEquals(viewport, onNodeWithTag("tail-viewport").fetchSemanticsNode().boundsInRoot)
++    }
+ }
