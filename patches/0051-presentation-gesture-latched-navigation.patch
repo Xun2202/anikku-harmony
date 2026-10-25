@@ -1,12 +1,10 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
-Date: Sun, 25 Oct 2026 16:04:22 +0000
-Subject: [PATCH] presentation: stabilize navigation within each touch gesture
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+Date: Sun, 25 Oct 2026 16:05:56 +0000
+Subject: [PATCH] presentation: stabilize navigation gestures and keep
+ scrollers inside safe tracks
 
-与 Mihon 0050 同源：一次触摸只切换一次导航，6dp意图容差，225ms恢复和速度感知收起；统一内容留白并让快速滑块避开悬浮导航。正文视口保持稳定。
+Mihon 0050 and Anikku 0051 share gesture, animation and spacing logic. Observe without consuming input, allow one transition per touch, and preserve the content viewport.
 ---
  .../components/BrowseSourceComfortableGrid.kt |  3 +-
  .../components/BrowseSourceCompactGrid.kt     |  3 +-
@@ -21,7 +19,7 @@ Content-Transfer-Encoding: 8bit
  .../presentation/core/components/LazyGrid.kt  | 10 ++-
  .../presentation/core/components/LazyList.kt  |  1 +
  .../core/components/PanoramaMasonry.kt        |  5 +-
- .../core/components/VerticalFastScroller.kt   | 65 +++++++++-------
+ .../core/components/VerticalFastScroller.kt   | 69 ++++++++++-------
  .../material/BrowsingContentSpacing.kt        |  9 +++
  .../components/material/NavigationChrome.kt   | 77 +++++++++++++++++--
  .../material/NavigationChromeScrollTracker.kt | 44 ++++++++++-
@@ -29,7 +27,7 @@ Content-Transfer-Encoding: 8bit
  .../NavigationChromeConnectionTest.kt         | 27 +++++--
  .../material/NavigationChromeLayoutTest.kt    | 62 +++++++++++++--
  .../NavigationChromeScrollTrackerTest.kt      | 66 +++++++++++++---
- 21 files changed, 331 insertions(+), 76 deletions(-)
+ 21 files changed, 333 insertions(+), 78 deletions(-)
  create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingContentSpacing.kt
 
 diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceComfortableGrid.kt
@@ -321,7 +319,7 @@ index 267595ffe..900c89e07 100644
      ) {
          PanoramaMasonry(
 diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
-index 02362339c..b08ea077f 100644
+index 02362339c..3a01765a8 100644
 --- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
 +++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
 @@ -134,17 +134,18 @@ fun VerticalFastScroller(
@@ -350,6 +348,15 @@ index 02362339c..b08ea077f 100644
  
              val visibleItems = layoutInfo.visibleItemsInfo
              val topItem = visibleItems.fastFirstOrNull {
+@@ -197,7 +198,7 @@ fun VerticalFastScroller(
+ 
+             // When list scrolled
+             if (layoutInfo.totalItemsCount != 0 && !isThumbDragged) {
+-                val proportion = 1f - remainingSections / maxRemainingSections
++                val proportion = (1f - remainingSections / maxRemainingSections).coerceIn(0f, 1f)
+                 thumbOffsetY = trackHeightPx * proportion + thumbTopPadding
+                 if (stableScrollInProgress) scrolled.tryEmit(Unit)
+             }
 @@ -345,13 +346,17 @@ fun VerticalGridFastScroller(
                  )
              }
@@ -382,15 +389,17 @@ index 02362339c..b08ea077f 100644
                  val rowNumber = (scrollAmt / avgSizePerRow).toInt()
                  val rowOffset = scrollAmt - rowNumber * avgSizePerRow
  
-@@ -383,7 +388,7 @@ fun VerticalGridFastScroller(
+@@ -383,8 +388,8 @@ fun VerticalGridFastScroller(
                      LazyGridItemInfo doesn't always give the accurate height of the object, so we clamp the proportion
                      at 1 to ensure that there are no issues due to this -- ideally we would correctly compute the value
                   */
 -                val extraScrollRange = (scrollRange.toFloat() - heightPx).coerceAtLeast(1f)
+-                val proportion = (scrollOffset.toFloat() / extraScrollRange).coerceAtMost(1f)
 +                val extraScrollRange = (scrollRange.toFloat() - scrollViewportHeightPx).coerceAtLeast(1f)
-                 val proportion = (scrollOffset.toFloat() / extraScrollRange).coerceAtMost(1f)
++                val proportion = (scrollOffset.toFloat() / extraScrollRange).coerceIn(0f, 1f)
                  thumbOffsetY = trackHeightPx * proportion + thumbTopPadding
                  scrolled.tryEmit(Unit)
+             }
 @@ -570,13 +575,17 @@ fun IrregularVerticalGridFastScroller(
                  )
              }
