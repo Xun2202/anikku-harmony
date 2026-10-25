@@ -1,0 +1,613 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 13:29:34 +0000
+Subject: [PATCH] presentation: use compact navigation and reveal it on reverse
+ scrolling
+
+Shared navigation policy with Mihon 0047. Use native Material3 ShortNavigationBar, preserve labels preference, tablet rails, multi-select and casting. Opt browsing toolbars into enterAlways, keeping category tabs and safety insets. The observer never consumes drag distance or fling velocity.
+---
+ .../kanade/presentation/components/AppBar.kt  |  2 +
+ .../presentation/components/TabbedScreen.kt   |  8 +-
+ .../presentation/history/HistoryScreen.kt     |  4 +
+ .../presentation/updates/UpdatesScreen.kt     |  4 +
+ .../source/browse/BrowseSourceScreen.kt       |  7 +-
+ .../eu/kanade/tachiyomi/ui/home/HomeScreen.kt | 50 ++++++----
+ .../kanade/tachiyomi/ui/library/LibraryTab.kt |  9 +-
+ .../tachiyomi/ui/manga/RelatedMangasScreen.kt |  4 +
+ .../core/components/material/NavigationBar.kt | 26 ++---
+ .../components/material/NavigationChrome.kt   | 96 +++++++++++++++++++
+ .../material/NavigationChromeScrollTracker.kt | 33 +++++++
+ .../NavigationChromeConnectionTest.kt         | 32 +++++++
+ .../NavigationChromeScrollTrackerTest.kt      | 43 +++++++++
+ 13 files changed, 275 insertions(+), 43 deletions(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/components/AppBar.kt b/app/src/main/java/eu/kanade/presentation/components/AppBar.kt
+index 9d3a9a328..43223a567 100644
+--- a/app/src/main/java/eu/kanade/presentation/components/AppBar.kt
++++ b/app/src/main/java/eu/kanade/presentation/components/AppBar.kt
+@@ -1,5 +1,6 @@
+ package eu.kanade.presentation.components
+ 
++import tachiyomi.presentation.core.components.material.navigationToolbarHeight
+ import androidx.compose.foundation.basicMarquee
+ import androidx.compose.foundation.interaction.MutableInteractionSource
+ import androidx.compose.foundation.layout.Box
+@@ -142,6 +143,7 @@ fun AppBar(
+         modifier = modifier,
+     ) {
+         TopAppBar(
++            expandedHeight = navigationToolbarHeight(),
+             navigationIcon = {
+                 if (isActionMode) {
+                     IconButton(onClick = onCancelActionMode) {
+diff --git a/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt b/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
+index 5799bcf96..392491a22 100644
+--- a/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
+@@ -1,5 +1,6 @@
+ package eu.kanade.presentation.components
+ 
++import tachiyomi.presentation.core.components.material.rememberBrowsingTopAppBarScrollBehavior
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.foundation.layout.calculateEndPadding
+@@ -54,7 +55,11 @@ fun TabbedScreen(
+     // KMK <--
+ 
+     Scaffold(
+-        topBar = {
++        topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior(
++            enabled = searchQuery == null && !bulkFavoriteState.selectionMode,
++            resetKey = state.currentPage,
++        ),
++        topBar = { scrollBehavior ->
+             val tab = tabs[state.currentPage]
+             val searchEnabled = tab.searchEnabled
+             // KMK -->
+@@ -82,6 +87,7 @@ fun TabbedScreen(
+             } else {
+                 // KMK <--
+                 SearchToolbar(
++                    scrollBehavior = scrollBehavior,
+                     titleContent = { AppBarTitle(stringResource(titleRes)) },
+                     searchEnabled = searchEnabled,
+                     searchQuery = if (searchEnabled) searchQuery else null,
+diff --git a/app/src/main/java/eu/kanade/presentation/history/HistoryScreen.kt b/app/src/main/java/eu/kanade/presentation/history/HistoryScreen.kt
+index c0a010f0f..79827b231 100644
+--- a/app/src/main/java/eu/kanade/presentation/history/HistoryScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/history/HistoryScreen.kt
+@@ -1,5 +1,6 @@
+ package eu.kanade.presentation.history
+ 
++import tachiyomi.presentation.core.components.material.rememberBrowsingTopAppBarScrollBehavior
+ import androidx.activity.compose.BackHandler
+ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.foundation.layout.padding
+@@ -69,6 +70,9 @@ fun HistoryScreen(
+     // KMK <--
+ 
+     Scaffold(
++        topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior(
++            enabled = state.searchQuery == null && !state.selectionMode,
++        ),
+         topBar = { scrollBehavior ->
+             // KMK -->
+             when {
+diff --git a/app/src/main/java/eu/kanade/presentation/updates/UpdatesScreen.kt b/app/src/main/java/eu/kanade/presentation/updates/UpdatesScreen.kt
+index 4c6ed40aa..f6a09b335 100644
+--- a/app/src/main/java/eu/kanade/presentation/updates/UpdatesScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/updates/UpdatesScreen.kt
+@@ -1,5 +1,6 @@
+ package eu.kanade.presentation.updates
+ 
++import tachiyomi.presentation.core.components.material.rememberBrowsingTopAppBarScrollBehavior
+ import androidx.activity.compose.BackHandler
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.padding
+@@ -82,6 +83,9 @@ fun UpdateScreen(
+     BackHandler(enabled = state.selectionMode, onBack = { onSelectAll(false) })
+ 
+     Scaffold(
++        topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior(
++            enabled = !state.selectionMode,
++        ),
+         topBar = { scrollBehavior ->
+             UpdatesAppBar(
+                 onCalendarClicked = { onCalendarClicked() },
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreen.kt
+index c5f83cada..cdd3803dc 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreen.kt
+@@ -1,5 +1,6 @@
+ package eu.kanade.tachiyomi.ui.browse.source.browse
+ 
++import tachiyomi.presentation.core.components.material.rememberBrowsingTopAppBarScrollBehavior
+ import androidx.activity.compose.BackHandler
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.horizontalScroll
+@@ -182,7 +183,10 @@ data class BrowseSourceScreen(
+         var topBarHeight by remember { mutableIntStateOf(0) }
+         // <-- AY
+         Scaffold(
+-            topBar = {
++            topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior(
++                enabled = state.toolbarQuery == null && !bulkFavoriteState.selectionMode,
++            ),
++            topBar = { scrollBehavior ->
+                 Column(
+                     modifier = Modifier
+                         .background(MaterialTheme.colorScheme.surface)
+@@ -212,6 +216,7 @@ data class BrowseSourceScreen(
+                     } else {
+                         // KMK <--
+                         BrowseSourceToolbar(
++                            scrollBehavior = scrollBehavior,
+                             searchQuery = state.toolbarQuery,
+                             onSearchQueryChange = screenModel::setToolbarQuery,
+                             source = screenModel.source,
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
+index fd9467eb7..d536a4fb3 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
+@@ -1,5 +1,7 @@
+ package eu.kanade.tachiyomi.ui.home
+ 
++import tachiyomi.presentation.core.components.material.rememberBrowsingNavigationBarState
++import androidx.compose.ui.input.nestedscroll.nestedScroll
+ import androidx.activity.ComponentActivity
+ import androidx.activity.compose.BackHandler
+ import androidx.compose.animation.AnimatedContent
+@@ -10,7 +12,6 @@ import androidx.compose.animation.togetherWith
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+-import androidx.compose.foundation.layout.RowScope
+ import androidx.compose.foundation.layout.WindowInsets
+ import androidx.compose.foundation.layout.consumeWindowInsets
+ import androidx.compose.foundation.layout.fillMaxWidth
+@@ -20,7 +21,7 @@ import androidx.compose.material3.BadgedBox
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.LocalContentColor
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.NavigationBarItem
++import androidx.compose.material3.ShortNavigationBarItem
+ import androidx.compose.material3.NavigationRailItem
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+@@ -123,9 +124,20 @@ object HomeScreen : Screen() {
+         ) { tabNavigator ->
+             // Provide usable navigator to content screen
+             CompositionLocalProvider(LocalNavigator provides navigator) {
++                val tabletUi = isTabletUi()
++                val bottomNavVisible by produceState(initialValue = true) {
++                    showBottomNavEvent.receiveAsFlow().collectLatest { value = it }
++                }
++                val castState by castManager.castState.collectAsState()
++                val isConnected = castState == CastManager.CastState.CONNECTED
++                val navigationScroll = rememberBrowsingNavigationBarState(
++                    enabled = !tabletUi && bottomNavVisible && !isConnected && tabNavigator.current != MoreTab,
++                    resetKey = tabNavigator.current.key,
++                )
+                 Scaffold(
++                    modifier = Modifier.nestedScroll(navigationScroll.nestedScrollConnection),
+                     startBar = {
+-                        if (isTabletUi()) {
++                        if (tabletUi) {
+                             NavigationRail {
+                                 TABS
+                                     // SY -->
+@@ -138,10 +150,8 @@ object HomeScreen : Screen() {
+                         }
+                     },
+                     bottomBar = {
+-                        if (!isTabletUi()) {
++                        if (!tabletUi) {
+                             Column {
+-                                val isConnected =
+-                                    castManager.castState.collectAsState().value == CastManager.CastState.CONNECTED
+                                 AnimatedVisibility(
+                                     visible = isConnected,
+                                     enter = expandVertically(),
+@@ -155,11 +165,8 @@ object HomeScreen : Screen() {
+                                     )
+                                 }
+ 
+-                                val bottomNavVisible by produceState(initialValue = true) {
+-                                    showBottomNavEvent.receiveAsFlow().collectLatest { value = it }
+-                                }
+                                 AnimatedVisibility(
+-                                    visible = bottomNavVisible,
++                                    visible = bottomNavVisible && navigationScroll.visible,
+                                     enter = expandVertically(),
+                                     exit = shrinkVertically(),
+                                 ) {
+@@ -253,7 +260,7 @@ object HomeScreen : Screen() {
+     }
+ 
+     @Composable
+-    private fun RowScope.NavigationBarItem(
++    private fun NavigationBarItem(
+         tab: eu.kanade.presentation.util.Tab,
+         // SY -->
+         alwaysShowLabel: Boolean,
+@@ -263,7 +270,7 @@ object HomeScreen : Screen() {
+         val navigator = LocalNavigator.currentOrThrow
+         val scope = rememberCoroutineScope()
+         val selected = tabNavigator.current::class == tab::class
+-        NavigationBarItem(
++        ShortNavigationBarItem(
+             selected = selected,
+             onClick = {
+                 if (!selected) {
+@@ -273,15 +280,18 @@ object HomeScreen : Screen() {
+                 }
+             },
+             icon = { NavigationIconItem(tab) },
+-            label = {
+-                Text(
+-                    text = tab.options.title,
+-                    style = MaterialTheme.typography.labelLarge,
+-                    maxLines = 1,
+-                    overflow = TextOverflow.Ellipsis,
+-                )
++            label = if (alwaysShowLabel || selected) {
++                {
++                    Text(
++                        text = tab.options.title,
++                        style = MaterialTheme.typography.labelLarge,
++                        maxLines = 1,
++                        overflow = TextOverflow.Ellipsis,
++                    )
++                }
++            } else {
++                null
+             },
+-            alwaysShowLabel = /* SY --> */alwaysShowLabel, /* SY <-- */
+         )
+     }
+ 
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt
+index fe612a179..71a66655c 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt
+@@ -1,5 +1,6 @@
+ package eu.kanade.tachiyomi.ui.library
+ 
++import tachiyomi.presentation.core.components.material.rememberBrowsingTopAppBarScrollBehavior
+ import android.content.Context
+ import androidx.activity.compose.BackHandler
+ import androidx.compose.animation.graphics.res.animatedVectorResource
+@@ -144,6 +145,10 @@ data object LibraryTab : Tab {
+         }
+ 
+         Scaffold(
++            topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior(
++                enabled = !state.selectionMode && state.searchQuery == null,
++                resetKey = state.coercedActiveCategoryIndex,
++            ),
+             topBar = { scrollBehavior ->
+                 val title = state.getToolbarTitle(
+                     defaultTitle = stringResource(MR.strings.label_library),
+@@ -188,8 +193,8 @@ data object LibraryTab : Tab {
+                         Injekt.get<DownloadCache>().invalidateCache()
+                         context.toast(MR.strings.download_cache_invalidated)
+                     },
+-                    // For scroll overlay when no tab
+-                    scrollBehavior = scrollBehavior.takeIf { !state.showCategoryTabs },
++                    // Keep category tabs available while the toolbar scrolls away.
++                    scrollBehavior = scrollBehavior,
+                 )
+             },
+             bottomBar = {
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/manga/RelatedMangasScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/manga/RelatedMangasScreen.kt
+index b34cabab5..610ca90fc 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/manga/RelatedMangasScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/manga/RelatedMangasScreen.kt
+@@ -1,5 +1,6 @@
+ package eu.kanade.tachiyomi.ui.manga
+ 
++import tachiyomi.presentation.core.components.material.rememberBrowsingTopAppBarScrollBehavior
+ import android.content.res.Configuration
+ import androidx.compose.foundation.lazy.grid.GridCells
+ import androidx.compose.material3.SnackbarHost
+@@ -48,6 +49,9 @@ fun RelatedMangasScreen(
+ 
+     var topBarHeight by remember { mutableIntStateOf(0) }
+     Scaffold(
++        topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior(
++            enabled = !bulkFavoriteState.selectionMode,
++        ),
+         topBar = { scrollBehavior ->
+             if (bulkFavoriteState.selectionMode) {
+                 BulkSelectionToolbar(
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationBar.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationBar.kt
+index 2f7f431e7..b5f26b764 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationBar.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationBar.kt
+@@ -1,26 +1,16 @@
+ package tachiyomi.presentation.core.components.material
+ 
+-import androidx.compose.foundation.layout.Row
+-import androidx.compose.foundation.layout.RowScope
+ import androidx.compose.foundation.layout.WindowInsets
+-import androidx.compose.foundation.layout.fillMaxWidth
+-import androidx.compose.foundation.layout.height
+-import androidx.compose.foundation.layout.windowInsetsPadding
+-import androidx.compose.foundation.selection.selectableGroup
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.NavigationBarDefaults
++import androidx.compose.material3.ShortNavigationBar
+ import androidx.compose.material3.contentColorFor
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.unit.Dp
+-import androidx.compose.ui.unit.dp
+ 
+-/**
+- * M3 Navbar with no horizontal spacer
+- *
+- * @see [androidx.compose.material3.NavigationBar]
+- */
++/** The native compact bar keeps 64dp minimum height and grows with accessibility text. */
+ @Composable
+ fun NavigationBar(
+     modifier: Modifier = Modifier,
+@@ -28,7 +18,7 @@ fun NavigationBar(
+     contentColor: Color = MaterialTheme.colorScheme.contentColorFor(containerColor),
+     tonalElevation: Dp = NavigationBarDefaults.Elevation,
+     windowInsets: WindowInsets = NavigationBarDefaults.windowInsets,
+-    content: @Composable RowScope.() -> Unit,
++    content: @Composable () -> Unit,
+ ) {
+     androidx.compose.material3.Surface(
+         color = containerColor,
+@@ -36,12 +26,10 @@ fun NavigationBar(
+         tonalElevation = tonalElevation,
+         modifier = modifier,
+     ) {
+-        Row(
+-            modifier = Modifier
+-                .fillMaxWidth()
+-                .windowInsetsPadding(windowInsets)
+-                .height(80.dp)
+-                .selectableGroup(),
++        ShortNavigationBar(
++            containerColor = containerColor,
++            contentColor = contentColor,
++            windowInsets = windowInsets,
+             content = content,
+         )
+     }
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+new file mode 100644
+index 000000000..3fcd756e6
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+@@ -0,0 +1,96 @@
++package tachiyomi.presentation.core.components.material
++
++import android.view.accessibility.AccessibilityManager
++import androidx.compose.material3.TopAppBarDefaults
++import androidx.compose.material3.TopAppBarScrollBehavior
++import androidx.compose.material3.rememberTopAppBarState
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.Stable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberUpdatedState
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
++import androidx.compose.ui.input.nestedscroll.NestedScrollSource
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.unit.Dp
++import androidx.compose.ui.unit.dp
++
++/** Compact normal text while keeping extra room for accessibility font sizes. */
++@Composable
++fun navigationToolbarHeight(): Dp = if (LocalDensity.current.fontScale <= 1.3f) 56.dp else 64.dp
++
++@Composable
++fun rememberBrowsingTopAppBarScrollBehavior(
++    enabled: Boolean = true,
++    resetKey: Any? = null,
++): TopAppBarScrollBehavior {
++    val canHide = enabled && !rememberTouchExplorationEnabled()
++    val currentEnabled by rememberUpdatedState(canHide)
++    val state = rememberTopAppBarState()
++    LaunchedEffect(canHide, resetKey) {
++        state.heightOffset = 0f
++        state.contentOffset = 0f
++    }
++    return TopAppBarDefaults.enterAlwaysScrollBehavior(state = state, canScroll = { currentEnabled })
++}
++
++@Stable
++class BrowsingNavigationBarState internal constructor(
++    private val tracker: NavigationChromeScrollTracker,
++    private val enabled: () -> Boolean,
++) {
++    var visible by mutableStateOf(true)
++        private set
++
++    fun reset() {
++        tracker.reset()
++        visible = true
++    }
++
++    val nestedScrollConnection = object : NestedScrollConnection {
++        override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
++            if (enabled()) {
++                visible = tracker.onScroll(consumed.y, available.y, source == NestedScrollSource.UserInput)
++            }
++            // Observe only: never steal drag distance or fling velocity from content/pull-to-refresh.
++            return Offset.Zero
++        }
++    }
++}
++
++@Composable
++fun rememberBrowsingNavigationBarState(enabled: Boolean, resetKey: Any?): BrowsingNavigationBarState {
++    val density = LocalDensity.current
++    val canHide = enabled && !rememberTouchExplorationEnabled()
++    val currentEnabled by rememberUpdatedState(canHide)
++    val state = remember(density.density) {
++        BrowsingNavigationBarState(
++            tracker = NavigationChromeScrollTracker(
++                hideDistance = with(density) { 24.dp.toPx() },
++                showDistance = with(density) { 8.dp.toPx() },
++            ),
++            enabled = { currentEnabled },
++        )
++    }
++    LaunchedEffect(state, canHide, resetKey) { state.reset() }
++    return state
++}
++
++@Composable
++private fun rememberTouchExplorationEnabled(): Boolean {
++    val context = LocalContext.current
++    val manager = remember(context) { context.getSystemService(AccessibilityManager::class.java) }
++    var enabled by remember(manager) { mutableStateOf(manager?.isTouchExplorationEnabled == true) }
++    DisposableEffect(manager) {
++        val listener = AccessibilityManager.TouchExplorationStateChangeListener { enabled = it }
++        manager?.addTouchExplorationStateChangeListener(listener)
++        onDispose { manager?.removeTouchExplorationStateChangeListener(listener) }
++    }
++    return enabled
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
+new file mode 100644
+index 000000000..b51ec7bf5
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
+@@ -0,0 +1,33 @@
++package tachiyomi.presentation.core.components.material
++
++/** Direction hysteresis for navigation chrome; flings and unconsumed end overscroll never hide it. */
++internal class NavigationChromeScrollTracker(
++    private val hideDistance: Float,
++    private val showDistance: Float,
++) {
++    var visible: Boolean = true
++        private set
++    private var travel = 0f
++
++    fun reset() {
++        visible = true
++        travel = 0f
++    }
++
++    fun onScroll(consumedY: Float, availableY: Float, userInput: Boolean): Boolean {
++        if (!userInput) return visible
++        if (consumedY == 0f) {
++            if (availableY > 0f) reset()
++            return visible
++        }
++        if (travel * consumedY < 0f) travel = 0f
++        travel += consumedY
++        if (visible && travel <= -hideDistance) {
++            visible = false
++            travel = 0f
++        } else if (!visible && travel >= showDistance) {
++            reset()
++        }
++        return visible
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
+new file mode 100644
+index 000000000..c5c1468e1
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
+@@ -0,0 +1,32 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.input.nestedscroll.NestedScrollSource
++import androidx.compose.ui.unit.Velocity
++import kotlinx.coroutines.runBlocking
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++
++class NavigationChromeConnectionTest {
++    @Test
++    fun `observing navigation changes never consumes content drag or fling`() = runBlocking {
++        val state = BrowsingNavigationBarState(NavigationChromeScrollTracker(24f, 8f)) { true }
++        val connection = state.nestedScrollConnection
++        assertEquals(Offset.Zero, connection.onPostScroll(Offset(0f, -40f), Offset.Zero, NestedScrollSource.UserInput))
++        assertFalse(state.visible)
++        assertEquals(Velocity.Zero, connection.onPreFling(Velocity(0f, -3000f)))
++        assertEquals(Velocity.Zero, connection.onPostFling(Velocity(0f, -3000f), Velocity.Zero))
++        assertFalse(state.visible)
++        assertEquals(Offset.Zero, connection.onPostScroll(Offset(0f, 8f), Offset.Zero, NestedScrollSource.UserInput))
++        assertTrue(state.visible)
++    }
++
++    @Test
++    fun `disabled automatic hiding leaves navigation available`() {
++        val state = BrowsingNavigationBarState(NavigationChromeScrollTracker(24f, 8f)) { false }
++        state.nestedScrollConnection.onPostScroll(Offset(0f, -500f), Offset.Zero, NestedScrollSource.UserInput)
++        assertTrue(state.visible)
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
+new file mode 100644
+index 000000000..6eab8adcc
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
+@@ -0,0 +1,43 @@
++package tachiyomi.presentation.core.components.material
++
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++
++class NavigationChromeScrollTrackerTest {
++    @Test
++    fun `browse forward hides and a short reverse drag reveals navigation`() {
++        val state = NavigationChromeScrollTracker(24f, 8f)
++        assertTrue(state.onScroll(-12f, 0f, true))
++        assertFalse(state.onScroll(-12f, 0f, true))
++        assertFalse(state.onScroll(4f, 0f, true))
++        assertTrue(state.onScroll(4f, 0f, true))
++    }
++
++    @Test
++    fun `flings horizontal gestures and unscrollable content do not hide navigation`() {
++        val state = NavigationChromeScrollTracker(24f, 8f)
++        assertTrue(state.onScroll(-100f, 0f, false))
++        assertTrue(state.onScroll(0f, 0f, true))
++        assertTrue(state.onScroll(0f, -100f, true))
++    }
++
++    @Test
++    fun `direction changes reset travel and reaching the top restores navigation`() {
++        val state = NavigationChromeScrollTracker(24f, 8f)
++        assertTrue(state.onScroll(-20f, 0f, true))
++        assertTrue(state.onScroll(2f, 0f, true))
++        assertTrue(state.onScroll(-10f, 0f, true))
++        assertFalse(state.onScroll(-14f, 0f, true))
++        assertTrue(state.onScroll(0f, 1f, true))
++    }
++
++    @Test
++    fun `changing tabs or entering an action mode can restore navigation`() {
++        val state = NavigationChromeScrollTracker(24f, 8f)
++        assertFalse(state.onScroll(-30f, 0f, true))
++        state.reset()
++        assertTrue(state.visible)
++        assertTrue(state.onScroll(-10f, 0f, true))
++    }
++}

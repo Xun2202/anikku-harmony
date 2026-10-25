@@ -597,3 +597,13 @@ gh release list --repo Xun2202/anikku-harmony
 - 2026-10-14 用户：解锁后第一下滑不动，随后说「要不不加这个解锁后第一下不动了，好像又没有问题了」，诊断提交已撤掉，没有发版。
 - 2026-10-14（13:37 UTC）用户：想记录上下滑 / 惯性时的帧率或耗时，「有时候又很丝滑」，要一个调试按钮导出脱敏日志，不依赖 IP 或 token。补丁 0044（与 mihon-harmony 0036 同源）：设置 → 高级 →「滚动性能记录（调试）」，左下角「记录」按钮经分享面板导出只含数字的文件；归档仓新增 `tools/scroll-perf-analyze/analyze.py`。推 `main` `4137fa1b9` → `check_patches` run 38570497489 绿 → `dry_run` run 38570550124 绿 → 正式 run 38572074220 → **`v0.2.0-harmony-preview.23`**（13:37 UTC），`app.anikku.beta` versionCode 823、versionName `0.2.0-harmony.23-8935`，签名 `cf7a2adc…d829` 不变，arm64 90,202,229 B（SHA-256 前缀 `5d2ea23ce55a`），DEX 含 `harmony_scroll_perf_recorder`、`privacy: no titles`。开发树 HEAD 复跑 `:presentation-core:testDebugUnitTest :app:testDebugUnitTest` 通过（presentation-core 59 个用例，0 失败，2 跳过；app 27 个）。
 - 2026-10-14（13:43 UTC）`repo` 分支索引按 `created_at` 倒序（`7170c6e`，`release_index` run 38574203527）：GitHub 列表接口把 mihon-harmony preview.10 排在 6 个旧版之后，App 按版本号取最大所以不受影响，但只取第一页时新版可能被挤出。三个流水线同一改动。同时更正补丁 0043 正文里的同源编号（原写成 mihon-harmony 0036），只改提交信息，代码不变。
+
+## 2026-10-25：紧凑导航与浏览时收起
+
+- 顶栏普通字号采用 56dp，大字号保留 64dp；底部改用官方 64dp 最小高度的短导航组件，文字需要时可增长，保留系统安全区与至少 48dp 触控尺寸。
+- 书架、更新、历史、来源/扩展页和源内容列表的标题用 Material3 `enterAlwaysScrollBehavior`，分类/筛选行仍可操作；搜索、多选、屏幕朗读时不自动收起标题。
+- 底栏复用既有显示动画，只观察真实用户纵向滚动：向后累计 24dp 收起，反向 8dp 显示；横向切页、惯性与无法滚动的空/短列表不会触发隐藏，不消费位移或惯性。切换标签、选择模式复位，更多页和侧边导航保持可用。
+- Mihon 0046 复用 Anikku 0046 的宽度分列算法，避免收起导航改变视口高度时换列；保留 Mihon 的 minLane 限制、局部重排与缓存。Mihon 0047 / Anikku 0048 的 `NavigationChrome.kt`、`NavigationChromeScrollTracker.kt` 及对应测试逐字节相同。
+- 组件差异：Mihon 保留 NavigationSuiteScaffold，手机改用 ShortNavigationBarCompact；Anikku 用 ShortNavigationBar/ShortNavigationBarItem，隐藏未选中标签的旧偏好仍保留，投屏连接期间底栏不自动收起；Anikku 相关推荐页也接入标题收起。
+- 机器检查覆盖方向阈值、边界/短列表、复位、不吞滚动/惯性以及列数不随高度变化。双应用签名构建与更新索引见归档仓现状；实际手感、字体与系统安全区由用户安装反馈。Animeko 使用独立 AniTopAppBar/多平台导航，不直接移植本次 Tachiyomi 组件。
+- 依据：[华为 Pura X Max 官方比例](https://consumer.huawei.com/cn/phones/pura-x-max/specs/)、[Material3 顶栏行为](https://developer.android.com/reference/kotlin/androidx/compose/material3/TopAppBarDefaults)。不根据手机型号或物理像素写死 dp。

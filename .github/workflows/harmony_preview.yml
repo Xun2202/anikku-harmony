@@ -155,7 +155,7 @@ jobs:
         # preview 构建类型用 debug 密钥出包, 下一步再用本仓库的密钥重签.
         run: |
           ./gradlew :presentation-core:testDebugUnitTest \
-            --tests '*PanoramaMasonryLayoutTest' --tests '*PanoramaAutoColumnsTest' \
+            --tests '*PanoramaMasonryLayoutTest' --tests '*PanoramaAutoColumnsTest' --tests '*NavigationChrome*' \
             :app:testPreviewUnitTest \
             --tests '*PanoramaCoverShapesTest' --tests '*PanoramaShapeModeTest' --tests '*PanoramaLayoutPolicyTest' \
             assemblePreview -Penable-updater --stacktrace
