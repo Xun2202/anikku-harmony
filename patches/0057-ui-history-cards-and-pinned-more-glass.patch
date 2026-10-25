@@ -1,0 +1,779 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 19:15:48 +0000
+Subject: [PATCH] ui: show dated history cards and pin glass navigation on More
+
+Shared Mihon and Anikku 0057. Open details from history cards, retain explicit resume and management actions. More provides a glass backdrop and keeps the controls visible.
+---
+ .../presentation/history/HistoryScreen.kt     |  71 ++++-
+ .../history/components/HistoryItem.kt         | 123 ++++----
+ .../eu/kanade/presentation/more/MoreScreen.kt | 275 +++++++++---------
+ .../material/PinnedBrowsingGlass.kt           |  41 +++
+ 4 files changed, 293 insertions(+), 217 deletions(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/PinnedBrowsingGlass.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/history/HistoryScreen.kt b/app/src/main/java/eu/kanade/presentation/history/HistoryScreen.kt
+index 79827b231..96636cdbd 100644
+--- a/app/src/main/java/eu/kanade/presentation/history/HistoryScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/history/HistoryScreen.kt
+@@ -1,10 +1,8 @@
+ package eu.kanade.presentation.history
+ 
+-import tachiyomi.presentation.core.components.material.rememberBrowsingTopAppBarScrollBehavior
+ import androidx.activity.compose.BackHandler
+ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.foundation.layout.padding
+-import androidx.compose.foundation.lazy.items
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.outlined.Checklist
+ import androidx.compose.material.icons.outlined.DeleteSweep
+@@ -17,19 +15,23 @@ import androidx.compose.material3.SnackbarHost
+ import androidx.compose.material3.SnackbarHostState
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.MutableFloatState
++import androidx.compose.runtime.mutableFloatStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.tooling.preview.PreviewLightDark
+ import androidx.compose.ui.tooling.preview.PreviewParameter
++import androidx.compose.ui.unit.dp
+ import eu.kanade.presentation.components.AppBar
+ import eu.kanade.presentation.components.AppBarActions
+ import eu.kanade.presentation.components.AppBarTitle
+ import eu.kanade.presentation.components.SearchToolbar
+ import eu.kanade.presentation.components.relativeDateText
+ import eu.kanade.presentation.history.components.HistoryItem
++import eu.kanade.presentation.library.components.PanoramaCoverShapes
++import eu.kanade.presentation.library.components.WIDE_COVER_RATIO
+ import eu.kanade.presentation.theme.TachiyomiPreviewTheme
+ import eu.kanade.presentation.updates.formatProgress
+-import eu.kanade.presentation.util.animateItemFastScroll
+ import eu.kanade.tachiyomi.ui.history.HistoryScreenModel
+ import eu.kanade.tachiyomi.ui.history.HistoryScreenModel.HistorySelectionOptions
+ import kotlinx.collections.immutable.persistentListOf
+@@ -37,13 +39,18 @@ import tachiyomi.domain.history.model.HistoryWithRelations
+ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.aniyomi.AYMR
+ import tachiyomi.i18n.ank.AMR
+-import tachiyomi.presentation.core.components.FastScrollLazyColumn
++import tachiyomi.presentation.core.components.FastScrollPanoramaMasonry
+ import tachiyomi.presentation.core.components.ListGroupHeader
++import tachiyomi.presentation.core.components.PanoramaCellHeight
++import tachiyomi.presentation.core.components.PanoramaColumns
++import tachiyomi.presentation.core.components.PanoramaSpan
+ import tachiyomi.presentation.core.components.material.Scaffold
++import tachiyomi.presentation.core.components.material.rememberBrowsingTopAppBarScrollBehavior
+ import tachiyomi.presentation.core.i18n.stringResource
+ import tachiyomi.presentation.core.screens.EmptyScreen
+ import tachiyomi.presentation.core.screens.LoadingScreen
+ import tachiyomi.presentation.core.theme.active
++import tachiyomi.presentation.core.util.plus
+ import java.time.LocalDate
+ 
+ @Composable
+@@ -172,23 +179,42 @@ private fun HistoryScreenContent(
+     usePanoramaCover: Boolean,
+     // KMK <--
+ ) {
+-    FastScrollLazyColumn(
+-        contentPadding = contentPadding,
++    // Keep each id's first known band for this page lifetime, including offscreen cells.
++    val frozenCoverRatios = remember { mutableMapOf<Long, MutableFloatState>() }
++    val coverRatios = remember(history) {
++        history.filterIsInstance<HistoryUiModel.Item>().associate { item ->
++            val id = item.item.mangaId
++            id to frozenCoverRatios.getOrPut(id) {
++                mutableFloatStateOf(PanoramaCoverShapes.get(id) ?: PanoramaCoverShapes.committedRatioOrNull(id) ?: WIDE_COVER_RATIO)
++            }
++        }
++    }
++    FastScrollPanoramaMasonry(
++        columns = if (usePanoramaCover) {
++            // Use this pane's width, keeping wide cards readable in expanded windows.
++            PanoramaColumns.Tiered(compactMin = 160.dp, expandedMin = 240.dp, breakpoint = 600.dp)
++        } else {
++            PanoramaColumns.Adaptive(160.dp)
++        },
++        contentPadding = contentPadding + PaddingValues(horizontal = 1.dp),
++        horizontalSpacing = 3.dp,
++        verticalSpacing = 3.dp,
+     ) {
+         items(
+-            items = history,
+-            key = { "history-${it.hashCode()}" },
+-            contentType = {
+-                when (it) {
++            count = history.size,
++            key = { index -> "history-${history[index].hashCode()}" },
++            span = { index -> if (history[index] is HistoryUiModel.Header) PanoramaSpan.FullLine else PanoramaSpan.SingleLane },
++            height = { PanoramaCellHeight.Measure },
++            contentType = { index ->
++                when (history[index]) {
+                     is HistoryUiModel.Header -> "header"
+                     is HistoryUiModel.Item -> "item"
+                 }
+             },
+-        ) { item ->
+-            when (item) {
++        ) { index ->
++            when (val item = history[index]) {
+                 is HistoryUiModel.Header -> {
+                     ListGroupHeader(
+-                        modifier = Modifier.animateItemFastScroll(),
+                         text = relativeDateText(item.date),
+                     )
+                 }
+@@ -198,9 +224,21 @@ private fun HistoryScreenContent(
+                     val isSelected = remember(state.selection) { value.chapterId in state.selection }
+                     // KMK <--
+                     HistoryItem(
+-                        modifier = Modifier.animateItemFastScroll(),
+                         history = value,
+-                        onClickCover = { onClickCover(value) },
++                        onClickCover = {
++                            if (selectionMode) {
++                                onHistorySelected(value, HistorySelectionOptions(selected = !isSelected, fromLongPress = false))
++                            } else {
++                                onClickCover(value)
++                            }
++                        },
++                        onClickResume = {
++                            if (selectionMode) {
++                                onHistorySelected(value, HistorySelectionOptions(selected = !isSelected, fromLongPress = false))
++                            } else {
++                                onClickResume(value)
++                            }
++                        },
+                         // KMK -->
+                         onClick = {
+                             when {
+@@ -211,7 +249,7 @@ private fun HistoryScreenContent(
+                                         fromLongPress = false,
+                                     ),
+                                 )
+-                                else -> onClickResume(value)
++                                else -> onClickCover(value)
+                             }
+                         },
+                         onLongClick = {
+@@ -239,6 +277,7 @@ private fun HistoryScreenContent(
+                             },
+                         hasUnread = value.unreadCount > 0,
+                         usePanoramaCover = usePanoramaCover,
++                        coverRatio = coverRatios.getValue(value.mangaId),
+                         // KMK <--
+                     )
+                 }
+diff --git a/app/src/main/java/eu/kanade/presentation/history/components/HistoryItem.kt b/app/src/main/java/eu/kanade/presentation/history/components/HistoryItem.kt
+index 09151e6a4..ebba03a77 100644
+--- a/app/src/main/java/eu/kanade/presentation/history/components/HistoryItem.kt
++++ b/app/src/main/java/eu/kanade/presentation/history/components/HistoryItem.kt
+@@ -1,13 +1,17 @@
+ package eu.kanade.presentation.history.components
+ 
++import androidx.compose.foundation.background
+ import androidx.compose.foundation.combinedClickable
++import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.Row
+-import androidx.compose.foundation.layout.fillMaxHeight
+-import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.filled.Circle
++import androidx.compose.material.icons.filled.PlayArrow
+ import androidx.compose.material.icons.outlined.Delete
+ import androidx.compose.material.icons.outlined.FavoriteBorder
+ import androidx.compose.material3.Icon
+@@ -22,6 +26,7 @@ import androidx.compose.runtime.mutableFloatStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+ import androidx.compose.ui.platform.LocalHapticFeedback
+@@ -30,7 +35,7 @@ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.tooling.preview.PreviewLightDark
+ import androidx.compose.ui.tooling.preview.PreviewParameter
+ import androidx.compose.ui.unit.dp
+-import eu.kanade.presentation.manga.components.DotSeparatorText
++import eu.kanade.presentation.library.components.PanoramaCoverShapes
+ import eu.kanade.presentation.manga.components.MangaCover
+ import eu.kanade.presentation.manga.components.MangaCoverHide
+ import eu.kanade.presentation.manga.components.RatioSwitchToPanorama
+@@ -43,16 +48,14 @@ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.aniyomi.AYMR
+ import tachiyomi.i18n.ank.AMR
+ import tachiyomi.presentation.core.components.material.DISABLED_ALPHA
+-import tachiyomi.presentation.core.components.material.padding
+ import tachiyomi.presentation.core.i18n.stringResource
+ import tachiyomi.presentation.core.util.selectedBackground
+ 
+-private val HistoryItemHeight = 96.dp
+-
+ @Composable
+ fun HistoryItem(
+     history: HistoryWithRelations,
+     onClickCover: () -> Unit,
++    onClickResume: () -> Unit,
+     // KMK -->
+     onClick: () -> Unit,
+     onLongClick: () -> Unit,
+@@ -72,9 +75,11 @@ fun HistoryItem(
+     val haptic = LocalHapticFeedback.current
+     val textAlpha = if (history.read) DISABLED_ALPHA else 1f
+     // KMK <--
+-    Row(
++    Column(
+         modifier = modifier
+-            // KMK -->
++            .fillMaxWidth()
++            .clip(MaterialTheme.shapes.small)
++            .background(MaterialTheme.colorScheme.surfaceContainerLow)
+             .selectedBackground(selected)
+             .combinedClickable(
+                 onClick = onClick,
+@@ -82,11 +87,7 @@ fun HistoryItem(
+                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                     onLongClick()
+                 },
+-            )
+-            // KMK <--
+-            .height(HistoryItemHeight)
+-            .padding(horizontal = MaterialTheme.padding.medium, vertical = MaterialTheme.padding.small),
+-        verticalAlignment = Alignment.CenterVertically,
++            ),
+     ) {
+         // KMK -->
+         val mangaCover = history.coverData
+@@ -95,7 +96,7 @@ fun HistoryItem(
+         val onBgColor = mangaCover.dominantCoverColors?.second
+         if (DebugToggles.HIDE_COVER_IMAGE_ONLY_SHOW_COLOR.enabled) {
+             MangaCoverHide.Book(
+-                modifier = Modifier.fillMaxHeight(),
++                modifier = Modifier.fillMaxWidth(),
+                 bgColor = bgColor ?: MaterialTheme.colorScheme.surface.takeIf { selected },
+                 tint = onBgColor,
+                 size = MangaCover.Size.Medium,
+@@ -103,7 +104,7 @@ fun HistoryItem(
+         } else {
+             if (usePanoramaCover && coverIsWide) {
+                 MangaCover.Panorama(
+-                    modifier = Modifier.fillMaxHeight()
++                    modifier = Modifier.fillMaxWidth()
+                         // KMK -->
+                         .combinedClickable(
+                             onClick = onClickCover,
+@@ -120,14 +121,18 @@ fun HistoryItem(
+                     size = MangaCover.Size.Medium,
+                     onCoverLoaded = { _, result ->
+                         val image = result.result.image
+-                        coverRatio.floatValue = image.height.toFloat() / image.width
++                        if (image.width > 0) {
++                            val ratio = image.height.toFloat() / image.width
++                            // Learn for the next history visit; this page's measured band stays fixed.
++                            PanoramaCoverShapes.put(history.mangaId, ratio)
++                        }
+                     },
+                     // KMK <--
+                 )
+             } else {
+                 // KMK <--
+                 MangaCover.Book(
+-                    modifier = Modifier.fillMaxHeight()
++                    modifier = Modifier.fillMaxWidth()
+                         // KMK -->
+                         .combinedClickable(
+                             onClick = onClickCover,
+@@ -144,29 +149,26 @@ fun HistoryItem(
+                     size = MangaCover.Size.Medium,
+                     onCoverLoaded = { _, result ->
+                         val image = result.result.image
+-                        coverRatio.floatValue = image.height.toFloat() / image.width
++                        if (image.width > 0) {
++                            val ratio = image.height.toFloat() / image.width
++                            // Learn for the next history visit; this page's measured band stays fixed.
++                            PanoramaCoverShapes.put(history.mangaId, ratio)
++                        }
+                     },
+                     // KMK <--
+                 )
+             }
+         }
+-        Column(
+-            modifier = Modifier
+-                .weight(1f)
+-                .padding(start = MaterialTheme.padding.medium, end = MaterialTheme.padding.small),
+-        ) {
++        Column(Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
+             Text(
+                 text = history.title,
+-                // KMK -->
+                 color = LocalContentColor.current.copy(alpha = textAlpha),
+-                // KMK <--
+                 fontWeight = FontWeight.SemiBold,
+                 maxLines = 2,
+                 overflow = TextOverflow.Ellipsis,
+                 style = MaterialTheme.typography.bodyMedium,
+             )
+-            val readAt = remember { history.readAt?.toTimestampString() ?: "" }
+-            // KMK -->
++            val readAt = remember(history.readAt) { history.readAt?.toTimestampString() ?: "" }
+             Row(
+                 verticalAlignment = Alignment.CenterVertically,
+                 modifier = Modifier.padding(top = 4.dp),
+@@ -175,59 +177,49 @@ fun HistoryItem(
+                     Icon(
+                         imageVector = Icons.Filled.Circle,
+                         contentDescription = stringResource(AMR.strings.action_filter_unfinished_anime),
+-                        modifier = Modifier
+-                            .height(8.dp)
+-                            .padding(end = 4.dp),
++                        modifier = Modifier.size(8.dp),
+                         tint = MaterialTheme.colorScheme.primary,
+                     )
++                    Spacer(Modifier.size(4.dp))
+                 }
+-                // KMK <--
+                 Text(
+                     text = if (history.chapterNumber > -1) {
+-                        stringResource(
+-                            AYMR.strings.recent_anime_time,
+-                            formatChapterNumber(history.chapterNumber),
+-                            readAt,
+-                        )
++                        stringResource(AYMR.strings.recent_anime_time, formatChapterNumber(history.chapterNumber), readAt)
+                     } else {
+                         readAt
+                     },
+-                    // KMK -->
+                     color = LocalContentColor.current.copy(alpha = textAlpha),
+                     style = MaterialTheme.typography.bodySmall,
+-                    // KMK <--
+                 )
+-                // KMK -->
+-                if (readProgress != null) {
+-                    DotSeparatorText()
+-                    Text(
+-                        text = readProgress,
+-                        maxLines = 1,
+-                        color = LocalContentColor.current.copy(alpha = textAlpha),
+-                        style = MaterialTheme.typography.bodySmall,
+-                        overflow = TextOverflow.Ellipsis,
+-                    )
+-                }
+-                // KMK <--
+             }
+-        }
+-
+-        if (!history.coverData.isMangaFavorite) {
+-            IconButton(onClick = onClickFavorite) {
+-                Icon(
+-                    imageVector = Icons.Outlined.FavoriteBorder,
+-                    contentDescription = stringResource(MR.strings.add_to_library),
+-                    tint = MaterialTheme.colorScheme.onSurface,
++            if (readProgress != null) {
++                Text(
++                    text = readProgress,
++                    color = LocalContentColor.current.copy(alpha = textAlpha),
++                    style = MaterialTheme.typography.bodySmall,
++                    maxLines = 1,
++                    overflow = TextOverflow.Ellipsis,
+                 )
+             }
+         }
+-
+-        IconButton(onClick = onClickDelete) {
+-            Icon(
+-                imageVector = Icons.Outlined.Delete,
+-                contentDescription = stringResource(MR.strings.action_delete),
+-                tint = MaterialTheme.colorScheme.onSurface,
+-            )
++        Row(
++            modifier = Modifier.fillMaxWidth(),
++            horizontalArrangement = Arrangement.SpaceBetween,
++            verticalAlignment = Alignment.CenterVertically,
++        ) {
++            IconButton(onClick = onClickResume, modifier = Modifier.size(48.dp)) {
++                Icon(Icons.Filled.PlayArrow, stringResource(MR.strings.action_resume))
++            }
++            if (!history.coverData.isMangaFavorite) {
++                IconButton(onClick = onClickFavorite, modifier = Modifier.size(48.dp)) {
++                    Icon(Icons.Outlined.FavoriteBorder, stringResource(MR.strings.add_to_library))
++                }
++            } else {
++                Spacer(Modifier.size(48.dp))
++            }
++            IconButton(onClick = onClickDelete, modifier = Modifier.size(48.dp)) {
++                Icon(Icons.Outlined.Delete, stringResource(MR.strings.action_delete))
++            }
+         }
+     }
+ }
+@@ -243,6 +235,7 @@ private fun HistoryItemPreviews(
+             HistoryItem(
+                 history = historyWithRelations,
+                 onClickCover = {},
++                onClickResume = {},
+                 // KMK -->
+                 onClick = {},
+                 onLongClick = {},
+diff --git a/app/src/main/java/eu/kanade/presentation/more/MoreScreen.kt b/app/src/main/java/eu/kanade/presentation/more/MoreScreen.kt
+index 4e0b62bd4..b58869893 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/MoreScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/MoreScreen.kt
+@@ -46,6 +46,7 @@ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.aniyomi.AYMR
+ import tachiyomi.i18n.kmk.KMR
+ import tachiyomi.presentation.core.components.ScrollbarLazyColumn
++import tachiyomi.presentation.core.components.material.PinnedBrowsingGlass
+ import tachiyomi.presentation.core.components.material.Scaffold
+ import tachiyomi.presentation.core.components.material.TextButton
+ import tachiyomi.presentation.core.components.material.padding
+@@ -78,156 +79,158 @@ fun MoreScreen(
+ ) {
+     val uriHandler = LocalUriHandler.current
+ 
+-    Scaffold { contentPadding ->
+-        ScrollbarLazyColumn(
+-            // KMK: use contentPadding as preferable padding for ScrollbarLazyColumn when not using stickyHeader
+-            contentPadding = contentPadding,
+-        ) {
+-            item {
+-                LogoHeader()
+-            }
+-            item {
+-                SwitchPreferenceWidget(
+-                    title = stringResource(MR.strings.label_downloaded_only),
+-                    subtitle = stringResource(MR.strings.downloaded_only_summary),
+-                    icon = Icons.Outlined.CloudOff,
+-                    checked = downloadedOnly,
+-                    onCheckedChanged = onDownloadedOnlyChange,
+-                )
+-            }
+-            item {
+-                SwitchPreferenceWidget(
+-                    title = stringResource(MR.strings.pref_incognito_mode),
+-                    subtitle = stringResource(MR.strings.pref_incognito_mode_summary),
+-                    // KMK -->
+-                    icon = rememberAnimatedVectorPainter(
+-                        AnimatedImageVector.animatedVectorResource(R.drawable.anim_incognito),
+-                        incognitoMode,
+-                    ),
+-                    // KMK <--
+-                    checked = incognitoMode,
+-                    onCheckedChanged = onIncognitoModeChange,
+-                )
+-            }
++    PinnedBrowsingGlass {
++        Scaffold { contentPadding ->
++            ScrollbarLazyColumn(
++                // KMK: use contentPadding as preferable padding for ScrollbarLazyColumn when not using stickyHeader
++                contentPadding = contentPadding,
++            ) {
++                item {
++                    LogoHeader()
++                }
++                item {
++                    SwitchPreferenceWidget(
++                        title = stringResource(MR.strings.label_downloaded_only),
++                        subtitle = stringResource(MR.strings.downloaded_only_summary),
++                        icon = Icons.Outlined.CloudOff,
++                        checked = downloadedOnly,
++                        onCheckedChanged = onDownloadedOnlyChange,
++                    )
++                }
++                item {
++                    SwitchPreferenceWidget(
++                        title = stringResource(MR.strings.pref_incognito_mode),
++                        subtitle = stringResource(MR.strings.pref_incognito_mode_summary),
++                        // KMK -->
++                        icon = rememberAnimatedVectorPainter(
++                            AnimatedImageVector.animatedVectorResource(R.drawable.anim_incognito),
++                            incognitoMode,
++                        ),
++                        // KMK <--
++                        checked = incognitoMode,
++                        onCheckedChanged = onIncognitoModeChange,
++                    )
++                }
++
++                item { HorizontalDivider() }
+ 
+-            item { HorizontalDivider() }
++                // SY -->
++                if (!showNavUpdates) {
++                    item {
++                        TextPreferenceWidget(
++                            title = stringResource(MR.strings.label_recent_updates),
++                            icon = Icons.Outlined.NewReleases,
++                            onPreferenceClick = onClickUpdates,
++                        )
++                    }
++                }
++                if (!showNavHistory) {
++                    item {
++                        TextPreferenceWidget(
++                            title = stringResource(MR.strings.history),
++                            icon = Icons.Outlined.History,
++                            onPreferenceClick = onClickHistory,
++                        )
++                    }
++                }
++                // SY <--
+ 
+-            // SY -->
+-            if (!showNavUpdates) {
+                 item {
++                    val downloadQueueState = downloadQueueStateProvider()
+                     TextPreferenceWidget(
+-                        title = stringResource(MR.strings.label_recent_updates),
++                        title = stringResource(MR.strings.label_download_queue),
++                        subtitle = when (downloadQueueState) {
++                            DownloadQueueState.Stopped -> null
++                            is DownloadQueueState.Paused -> {
++                                val pending = downloadQueueState.pending
++                                if (pending == 0) {
++                                    stringResource(MR.strings.paused)
++                                } else {
++                                    "${stringResource(MR.strings.paused)} • ${
++                                        pluralStringResource(
++                                            MR.plurals.download_queue_summary,
++                                            count = pending,
++                                            pending,
++                                        )
++                                    }"
++                                }
++                            }
++                            is DownloadQueueState.Downloading -> {
++                                val pending = downloadQueueState.pending
++                                pluralStringResource(MR.plurals.download_queue_summary, count = pending, pending)
++                            }
++                        },
++                        icon = Icons.Outlined.GetApp,
++                        onPreferenceClick = onClickDownloadQueue,
++                    )
++                }
++                item {
++                    TextPreferenceWidget(
++                        title = stringResource(MR.strings.categories),
++                        icon = Icons.AutoMirrored.Outlined.Label,
++                        onPreferenceClick = onClickCategories,
++                    )
++                }
++                item {
++                    TextPreferenceWidget(
++                        title = stringResource(MR.strings.label_stats),
++                        icon = Icons.Outlined.QueryStats,
++                        onPreferenceClick = onClickStats,
++                    )
++                }
++                // KMK -->
++                item {
++                    TextPreferenceWidget(
++                        title = stringResource(KMR.strings.option_label_library_update_errors),
+                         icon = Icons.Outlined.NewReleases,
+-                        onPreferenceClick = onClickUpdates,
++                        onPreferenceClick = onClickLibraryUpdateErrors,
+                     )
+                 }
+-            }
+-            if (!showNavHistory) {
++                // KMK <--
+                 item {
+                     TextPreferenceWidget(
+-                        title = stringResource(MR.strings.history),
+-                        icon = Icons.Outlined.History,
+-                        onPreferenceClick = onClickHistory,
++                        title = stringResource(MR.strings.label_data_storage),
++                        icon = Icons.Outlined.Storage,
++                        onPreferenceClick = onClickDataAndStorage,
+                     )
+                 }
+-            }
+-            // SY <--
+-
+-            item {
+-                val downloadQueueState = downloadQueueStateProvider()
+-                TextPreferenceWidget(
+-                    title = stringResource(MR.strings.label_download_queue),
+-                    subtitle = when (downloadQueueState) {
+-                        DownloadQueueState.Stopped -> null
+-                        is DownloadQueueState.Paused -> {
+-                            val pending = downloadQueueState.pending
+-                            if (pending == 0) {
+-                                stringResource(MR.strings.paused)
+-                            } else {
+-                                "${stringResource(MR.strings.paused)} • ${
+-                                    pluralStringResource(
+-                                        MR.plurals.download_queue_summary,
+-                                        count = pending,
+-                                        pending,
+-                                    )
+-                                }"
+-                            }
+-                        }
+-                        is DownloadQueueState.Downloading -> {
+-                            val pending = downloadQueueState.pending
+-                            pluralStringResource(MR.plurals.download_queue_summary, count = pending, pending)
+-                        }
+-                    },
+-                    icon = Icons.Outlined.GetApp,
+-                    onPreferenceClick = onClickDownloadQueue,
+-                )
+-            }
+-            item {
+-                TextPreferenceWidget(
+-                    title = stringResource(MR.strings.categories),
+-                    icon = Icons.AutoMirrored.Outlined.Label,
+-                    onPreferenceClick = onClickCategories,
+-                )
+-            }
+-            item {
+-                TextPreferenceWidget(
+-                    title = stringResource(MR.strings.label_stats),
+-                    icon = Icons.Outlined.QueryStats,
+-                    onPreferenceClick = onClickStats,
+-                )
+-            }
+-            // KMK -->
+-            item {
+-                TextPreferenceWidget(
+-                    title = stringResource(KMR.strings.option_label_library_update_errors),
+-                    icon = Icons.Outlined.NewReleases,
+-                    onPreferenceClick = onClickLibraryUpdateErrors,
+-                )
+-            }
+-            // KMK <--
+-            item {
+-                TextPreferenceWidget(
+-                    title = stringResource(MR.strings.label_data_storage),
+-                    icon = Icons.Outlined.Storage,
+-                    onPreferenceClick = onClickDataAndStorage,
+-                )
+-            }
+ 
+-            item { HorizontalDivider() }
++                item { HorizontalDivider() }
+ 
+-            item {
+-                TextPreferenceWidget(
+-                    title = stringResource(MR.strings.label_settings),
+-                    icon = Icons.Outlined.Settings,
+-                    onPreferenceClick = onClickSettings,
+-                )
+-            }
+-            item {
+-                TextPreferenceWidget(
+-                    title = stringResource(AYMR.strings.label_player_settings),
+-                    icon = Icons.Outlined.VideoSettings,
+-                    onPreferenceClick = onClickPlayerSettings,
+-                )
+-            }
+-            item {
+-                TextPreferenceWidget(
+-                    title = stringResource(MR.strings.pref_category_about),
+-                    icon = Icons.Outlined.Info,
+-                    onPreferenceClick = onClickAbout,
+-                )
+-            }
+-            item {
+-                TextPreferenceWidget(
+-                    title = stringResource(MR.strings.label_help),
+-                    icon = Icons.AutoMirrored.Outlined.HelpOutline,
+-                    onPreferenceClick = { uriHandler.openUri(Constants.URL_HELP) },
+-                )
+-            }
+-            // KMK -->
+-            item {
+-                Sponsor()
++                item {
++                    TextPreferenceWidget(
++                        title = stringResource(MR.strings.label_settings),
++                        icon = Icons.Outlined.Settings,
++                        onPreferenceClick = onClickSettings,
++                    )
++                }
++                item {
++                    TextPreferenceWidget(
++                        title = stringResource(AYMR.strings.label_player_settings),
++                        icon = Icons.Outlined.VideoSettings,
++                        onPreferenceClick = onClickPlayerSettings,
++                    )
++                }
++                item {
++                    TextPreferenceWidget(
++                        title = stringResource(MR.strings.pref_category_about),
++                        icon = Icons.Outlined.Info,
++                        onPreferenceClick = onClickAbout,
++                    )
++                }
++                item {
++                    TextPreferenceWidget(
++                        title = stringResource(MR.strings.label_help),
++                        icon = Icons.AutoMirrored.Outlined.HelpOutline,
++                        onPreferenceClick = { uriHandler.openUri(Constants.URL_HELP) },
++                    )
++                }
++                // KMK -->
++                item {
++                    Sponsor()
++                }
++                // KMK <--
+             }
+-            // KMK <--
+         }
+     }
+ }
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/PinnedBrowsingGlass.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/PinnedBrowsingGlass.kt
+new file mode 100644
+index 000000000..1be361106
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/PinnedBrowsingGlass.kt
+@@ -0,0 +1,41 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.statusBars
++import androidx.compose.foundation.layout.windowInsetsTopHeight
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++
++/** Static home pages still provide a backdrop for the bottom navigation and the status strip. */
++@Composable
++fun PinnedBrowsingGlass(content: @Composable () -> Unit) {
++    val chrome = LocalBrowsingNavigationBarState.current
++    if (chrome == null) {
++        content()
++        return
++    }
++    val owner = remember { Any() }
++    DisposableEffect(chrome, owner) {
++        chrome.setPinned(owner, true)
++        onDispose { chrome.setPinned(owner, false) }
++    }
++    Box(Modifier.fillMaxSize()) {
++        // The source is a sibling of the status effect, and excludes both navigation overlays.
++        Box(Modifier.fillMaxSize().browsingGlassSource(chrome), propagateMinConstraints = true) {
++            content()
++        }
++        Box(
++            Modifier
++                .align(Alignment.TopCenter)
++                .fillMaxWidth()
++                .windowInsetsTopHeight(WindowInsets.statusBars)
++                .browsingGlassBackground(chrome),
++        )
++    }
++}
