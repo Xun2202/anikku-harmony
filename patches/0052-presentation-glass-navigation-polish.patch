@@ -1,13 +1,10 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
-Date: Sun, 25 Oct 2026 16:40:45 +0000
+Date: Sun, 25 Oct 2026 16:50:05 +0000
 Subject: [PATCH] presentation: polish compact glass navigation and scroll
  geometry
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
 
-与 Mihon 0051 同源：阔屏分类合并标题行，徽标顶部预留8dp；首屏导航跟随实际位移，滑块动态轨道与抓取冻结；Haze磨砂背景，详情页顶栏始终透明。
+Mihon 0051 and Anikku 0052 share glass, leading-scroll, badge and compact-selector components. Detail toolbars remain transparent.
 ---
  .../kanade/presentation/components/AppBar.kt  |   9 +-
  .../presentation/components/TabbedScreen.kt   |  44 +++--
@@ -30,8 +27,8 @@ Content-Transfer-Encoding: 8bit
  .../components/material/NavigationChrome.kt   |  15 +-
  .../core/components/material/Scaffold.kt      |   6 +-
  .../material/NavigationChromeGeometryTest.kt  |  30 +++
- .../material/NavigationChromeLayoutTest.kt    | 109 +++++++++++
- 22 files changed, 572 insertions(+), 102 deletions(-)
+ .../material/NavigationChromeLayoutTest.kt    | 119 ++++++++++++
+ 22 files changed, 582 insertions(+), 102 deletions(-)
  create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
  create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingScrollGeometry.kt
  create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingScrollInsets.kt
@@ -1253,7 +1250,7 @@ index 000000000..36728b647
 +    }
 +}
 diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
-index 163065a97..05bc88450 100644
+index 163065a97..d7316577d 100644
 --- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
 +++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
 @@ -6,9 +6,14 @@ import androidx.compose.foundation.layout.WindowInsets
@@ -1288,7 +1285,7 @@ index 163065a97..05bc88450 100644
  
  @OptIn(ExperimentalTestApi::class)
  @RunWith(RobolectricTestRunner::class)
-@@ -210,4 +218,105 @@ class NavigationChromeLayoutTest {
+@@ -210,4 +218,115 @@ class NavigationChromeLayoutTest {
              assertEquals(0f, chrome.hiddenFraction, "Shared animation must return to the visible position")
          }
      }
@@ -1352,31 +1349,41 @@ index 163065a97..05bc88450 100644
 +        var badgeBottom = 0f
 +        setContent {
 +            MaterialTheme {
-+                CompactNavigationBar(modifier = Modifier.testTag("compact-bar"), windowInsets = WindowInsets(0)) {
-+                    CompactNavigationBarItem(
-+                        selected = false,
-+                        onClick = {},
-+                        label = "Browse",
-+                        showLabel = true,
-+                        icon = {
-+                            BadgedBox(badge = {
-+                                Badge(
-+                                    Modifier.testTag("update-badge").onGloballyPositioned {
-+                                        badgeTop = it.positionInRoot().y
-+                                        badgeBottom = badgeTop + it.size.height
-+                                    },
-+                                ) { Text("99") }
-+                            }) {
-+                                Box(Modifier.size(24.dp))
-+                            }
-+                        },
-+                    )
++                // Test the actual clipping overlay, including headroom outside the selectable row.
++                BrowsingChromeOverlay(
++                    state = rememberBrowsingNavigationBarState(enabled = false, resetKey = Unit),
++                    atBottom = true,
++                    modifier = Modifier.testTag("compact-bar"),
++                ) {
++                    CompactNavigationBar(windowInsets = WindowInsets(0)) {
++                        CompactNavigationBarItem(
++                            selected = false,
++                            onClick = {},
++                            label = "Browse",
++                            showLabel = true,
++                            icon = {
++                                BadgedBox(badge = {
++                                    Badge(
++                                        Modifier.testTag("update-badge").onGloballyPositioned {
++                                            badgeTop = it.positionInRoot().y
++                                            badgeBottom = badgeTop + it.size.height
++                                        },
++                                    ) { Text("99") }
++                                }) {
++                                    Box(Modifier.size(24.dp))
++                                }
++                            },
++                        )
++                    }
 +                }
 +            }
 +        }
 +        waitForIdle()
 +        val bar = onNodeWithTag("compact-bar").fetchSemanticsNode().boundsInRoot
-+        assertTrue(badgeTop >= bar.top && badgeBottom <= bar.bottom)
++        assertTrue(
++            badgeBottom > badgeTop && badgeTop >= bar.top && badgeBottom <= bar.bottom,
++            "Badge [$badgeTop, $badgeBottom] must fit inside the clipping overlay [${bar.top}, ${bar.bottom}]",
++        )
 +    }
 +
 +    @Test
