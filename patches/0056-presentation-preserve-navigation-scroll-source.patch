@@ -1,17 +1,40 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
-Date: Sun, 25 Oct 2026 18:47:48 +0000
-Subject: [PATCH] presentation: preserve scroll observer registration across
- navigation reset
+Date: Sun, 25 Oct 2026 18:53:38 +0000
+Subject: [PATCH] presentation: preserve navigation scroll source and
+ single-line badges
 
-Shared Mihon and Anikku 0056. Observer lifetime owns the active source; reset cannot erase a registration after first placement. Keep badge assertions tied to visible icon geometry rather than a fixed font-metric estimate.
+Shared Mihon and Anikku 0056. Keep observer registration across reset and count badges on one line.
 ---
+ .../java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt     |  4 ++++
  .../core/components/material/BrowsingScrollInsets.kt   | 10 +++++++++-
  .../core/components/material/NavigationChrome.kt       |  4 ++--
  .../components/material/NavigationChromeLayoutTest.kt  | 10 +++++++++-
- .../components/material/NavigationChromeRefreshTest.kt |  5 ++++-
- 4 files changed, 24 insertions(+), 5 deletions(-)
+ .../components/material/NavigationChromeRefreshTest.kt |  7 +++++--
+ 5 files changed, 29 insertions(+), 6 deletions(-)
 
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
+index a549b4b39..9a880bcec 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
+@@ -405,6 +405,8 @@ object HomeScreen : Screen() {
+                         )
+                         Text(
+                             text = if (compact && count > 99) "99+" else count.toString(),
++                            maxLines = 1,
++                            softWrap = false,
+                             modifier = Modifier.semantics { contentDescription = desc },
+                         )
+                     }
+@@ -424,6 +426,8 @@ object HomeScreen : Screen() {
+                         )
+                         Text(
+                             text = if (compact && count > 99) "99+" else count.toString(),
++                            maxLines = 1,
++                            softWrap = false,
+                             modifier = Modifier.semantics { contentDescription = desc },
+                         )
+                     }
 diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingScrollInsets.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingScrollInsets.kt
 index 295da5620..d008abf76 100644
 --- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingScrollInsets.kt
@@ -77,9 +100,18 @@ index e373ccbb7..f4a62c5f6 100644
              assertEquals(viewport.top, headerY, 1f)
              assertEquals(viewport.bottom, bottomY + bottomHeight, 1f)
 diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeRefreshTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeRefreshTest.kt
-index 5cade6906..760484198 100644
+index 5cade6906..482dbe517 100644
 --- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeRefreshTest.kt
 +++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeRefreshTest.kt
+@@ -99,7 +99,7 @@ class NavigationChromeRefreshTest {
+                                                             origin.y + it.size.height,
+                                                         )
+                                                 },
+-                                            ) { Text("999") }
++                                            ) { Text("99+", maxLines = 1, softWrap = false) }
+                                         },
+                                     )
+                                 }
 @@ -120,7 +120,10 @@ class NavigationChromeRefreshTest {
              assertEquals(item.center.x, icons[index].center.x, 1f)
              val label = onNodeWithText("Tab$index", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
