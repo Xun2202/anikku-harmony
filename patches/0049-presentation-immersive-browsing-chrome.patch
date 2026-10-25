@@ -567,7 +567,7 @@ index c5c1468e1..bf79aef74 100644
          val state = BrowsingNavigationBarState(NavigationChromeScrollTracker(24f, 8f)) { false }
 diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
 new file mode 100644
-index 000000000..05ff22d81
+index 000000000..95b4c613d
 --- /dev/null
 +++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
 @@ -0,0 +1,59 @@
@@ -585,7 +585,7 @@ index 000000000..05ff22d81
 +import androidx.compose.ui.platform.testTag
 +import androidx.compose.ui.test.ExperimentalTestApi
 +import androidx.compose.ui.test.onNodeWithTag
-+import androidx.compose.ui.test.v2.runComposeUiTest
++import androidx.compose.ui.test.runComposeUiTest
 +import androidx.compose.ui.unit.dp
 +import org.junit.Test
 +import org.junit.jupiter.api.Assertions.assertEquals
