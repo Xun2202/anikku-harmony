@@ -157,7 +157,7 @@ jobs:
           ./gradlew :presentation-core:testDebugUnitTest \
             --tests '*PanoramaMasonryLayoutTest' --tests '*PanoramaMasonryFlingTest.a coast from the content survives and a coast from the thumb does not' --tests '*PanoramaAutoColumnsTest' --tests '*NavigationChrome*' --tests '*Timeline*Test' \
             :app:testPreviewUnitTest \
-            --tests '*PanoramaCoverShapesTest' --tests '*PanoramaShapeModeTest' --tests '*PanoramaLayoutPolicyTest' \
+            --tests '*PanoramaCoverShapesTest' --tests '*PanoramaShapeModeTest' --tests '*PanoramaLayoutPolicyTest' --tests '*HarmonyFramePerfTest' \
             -Penable-updater --stacktrace
           ./gradlew assemblePreview -Penable-updater --stacktrace
 

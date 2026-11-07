@@ -1,0 +1,999 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 16:59:41 +0000
+Subject: [PATCH] fix(ui): renew window captures and lighten scroll recording
+
+Shared render lifetime, draw observer and contact glow with Mihon 0076. Fresh-process folding lags even without recording; restart restores smoothness, so recorder overhead alone cannot explain the report. Renew only the public Haze source node at owner/window/density boundaries, releasing its captured layer while retaining list composition and position. Track migrated focus/draw observer owners and clean up listeners and queued work. Default to actual draw callbacks and a 2 s ordinary-priority sampler, without continuous Choreographer or FrameMetrics. Guard sessions and lifecycle bindings against old callbacks. Mihon format5 retains detailed recording as an explicit heavier option; Anikku format2 keeps a compact light-only adapter. Callback rate is not presented FPS; unavailable timing stays explicit. Brighten and widen the capsule contact core without changing gestures, typography or geometry. Device folding results remain to be verified.
+---
+ .../tachiyomi/util/system/HarmonyFramePerf.kt | 191 ++++++++----------
+ .../util/system/HarmonyWindowInsets.kt        |  43 +++-
+ .../util/system/HarmonyFramePerfTest.kt       |  34 +++-
+ .../core/components/DrawPerfObserver.kt       |  91 +++++++++
+ .../core/components/FastScrollerGlass.kt      |   3 +-
+ .../core/components/WindowHazeSource.kt       |  82 ++++++++
+ .../core/components/material/BrowsingGlass.kt |   4 +-
+ .../components/material/NavigationCapsule.kt  |   7 +-
+ .../NavigationChromeDrawPerfObserverTest.kt   | 128 ++++++++++++
+ .../NavigationChromeViewportSourceTest.kt     |  82 ++++++++
+ 10 files changed, 544 insertions(+), 121 deletions(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/DrawPerfObserver.kt
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/WindowHazeSource.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeDrawPerfObserverTest.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeViewportSourceTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerf.kt b/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerf.kt
+index 30087f46a..f84850001 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerf.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerf.kt
+@@ -6,13 +6,10 @@ import android.os.Build
+ import android.os.Debug
+ import android.os.Handler
+ import android.os.HandlerThread
+-import android.os.Looper
+ import android.os.PowerManager
+ import android.os.Process
+ import android.os.SystemClock
+-import android.view.Choreographer
+ import android.view.Display
+-import android.view.FrameMetrics
+ import android.view.Window
+ import androidx.activity.ComponentActivity
+ import androidx.compose.foundation.background
+@@ -46,6 +43,7 @@ import androidx.lifecycle.repeatOnLifecycle
+ import eu.kanade.tachiyomi.util.CrashLogUtil
+ import eu.kanade.tachiyomi.util.storage.getUriCompat
+ import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
+ import kotlinx.coroutines.flow.Flow
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+@@ -53,6 +51,7 @@ import kotlinx.coroutines.flow.asStateFlow
+ import kotlinx.coroutines.flow.distinctUntilChanged
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
++import tachiyomi.presentation.core.components.DrawPerfObserver
+ import tachiyomi.presentation.core.components.PanoramaFrameCounters
+ import tachiyomi.presentation.core.components.PanoramaScrollTrace
+ import java.text.SimpleDateFormat
+@@ -67,26 +66,19 @@ import kotlin.math.ceil
+ /**
+  * Harmony: on-device scroll performance recorder, behind a debug switch that is off by default.
+  *
+- * While switched on and the activity is started it keeps, in primitive ring buffers:
+- * FrameMetrics per rendered frame (callback on its own HandlerThread), the Choreographer vsync
+- * interval per main-thread frame with the panorama scroll phase / measure / compose counters,
+- * and a 500 ms sample of GC count, process CPU, display refresh rate, thermal status and battery
+- * saver. The export holds only those numbers, per-second counts of 卓易通 graphics-layer logcat
+- * lines and [PanoramaScrollTrace]; no titles, URLs, extension list or logcat text.
+- *
+- * Shared byte for byte between mihon-harmony and anikku-harmony.
++ * Uses actual ViewTreeObserver draw callbacks and a normal-priority 2 s sampler.
++ * Draw callback rates are not presented FPS; FrameMetrics and continuous vsync polling are disabled.
++ * The export contains numeric diagnostics only, with no titles, URLs or logcat text.
+  */
+ object HarmonyFramePerf {
+ 
+-    private const val FRAME_CAPACITY = 6000
+     private const val TICK_CAPACITY = 6000
+     private const val SAMPLE_CAPACITY = 1200
+-    private const val SAMPLE_INTERVAL_MS = 500L
+-    private const val FIRST_FRAME_TIMEOUT_MS = 3000L
++    private const val SAMPLE_INTERVAL_MS = 2000L
+ 
+-    /** About 1 MB, allocated on the first attach and dropped when the switch is turned off. */
++    /** Primitive buffers allocated on attach and dropped when recording is switched off. */
+     private class Buffers {
+-        val frames = PerfRing(FRAME_CAPACITY, PerfReport.FRAME_WIDTH)
++        val frames = PerfRing(1, PerfReport.FRAME_WIDTH)
+         val ticks = PerfRing(TICK_CAPACITY, PerfReport.TICK_WIDTH)
+         val samples = PerfRing(SAMPLE_CAPACITY, PerfReport.SAMPLE_WIDTH)
+     }
+@@ -101,40 +93,40 @@ object HarmonyFramePerf {
+     // Main thread only.
+     private var window: Window? = null
+     private var thread: HandlerThread? = null
+-    private var metricsListener: Window.OnFrameMetricsAvailableListener? = null
++    private var drawObserver: DrawPerfObserver? = null
++
++    @Volatile private var generation = 0L
++    private var binding: Job? = null
++    private var boundActivity = java.lang.ref.WeakReference<ComponentActivity>(null)
++    private var bindingGeneration = 0L
+     private var ticking = false
+     private var lastTickNanos = 0L
+ 
+     // Written on the main thread, read on the sampler thread.
+     @Volatile private var handler: Handler? = null
+ 
+-    @Volatile private var appContext: Context? = null
+-
+-    @Volatile private var display: Display? = null
+-
+     @Volatile private var startedNanos = 0L
+ 
+     @Volatile private var startedWallMs = 0L
+ 
+-    @Volatile private var firstFrameSeen = false
+-
+     @Volatile private var frameMetricsLate = false
+ 
+     @Volatile private var frameMetricsError: String? = null
+ 
+-    // Sampler thread only.
+-    private var lastGcCount = -1L
+-    private var lastCpuMs = -1L
+-
+     /**
+      * Records while [enabled] emits true and [activity] is started. Turning the switch off
+      * also drops what was recorded.
+      */
+     fun bind(activity: ComponentActivity, enabled: Flow<Boolean>) {
+-        activity.lifecycleScope.launch {
++        if (boundActivity.get() === activity && binding?.isActive == true) return
++        val bindingOwner = ++bindingGeneration
++        binding?.cancel()
++        boundActivity = java.lang.ref.WeakReference(activity)
++        binding = activity.lifecycleScope.launch {
+             activity.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                 try {
+                     enabled.distinctUntilChanged().collect { on ->
++                        if (bindingOwner != bindingGeneration) return@collect
+                         if (on) {
+                             attach(activity)
+                         } else {
+@@ -143,7 +135,7 @@ object HarmonyFramePerf {
+                         }
+                     }
+                 } finally {
+-                    detach()
++                    if (bindingOwner == bindingGeneration) detach()
+                 }
+             }
+         }
+@@ -152,53 +144,58 @@ object HarmonyFramePerf {
+     private fun attach(activity: Activity) {
+         if (window === activity.window) return
+         detach()
+-        appContext = activity.applicationContext
+         if (buffers == null) buffers = Buffers()
+         if (startedWallMs == 0L) {
+             startedWallMs = System.currentTimeMillis()
+             startedNanos = System.nanoTime()
+         }
+-        val samplerThread = HandlerThread("HarmonyFramePerf").also { it.start() }
++        val owner = buffers ?: return
++        val epoch = generation
++        val context = activity.applicationContext
++        val currentDisplay = displayOf(activity)
++        val samplerThread = HandlerThread("HarmonyPerfLight").also { it.start() }
+         val samplerHandler = Handler(samplerThread.looper)
+         thread = samplerThread
+         handler = samplerHandler
+         window = activity.window
+-        display = displayOf(activity)
+-        firstFrameSeen = false
+-        frameMetricsLate = false
+-        frameMetricsError = null
+-        val listener = Window.OnFrameMetricsAvailableListener { _, metrics, _ -> onFrameMetrics(metrics) }
+-        try {
+-            activity.window.addOnFrameMetricsAvailableListener(listener, samplerHandler)
+-            metricsListener = listener
+-        } catch (e: Throwable) {
+-            frameMetricsError = e.javaClass.simpleName
+-        }
+-        lastGcCount = -1L
+-        lastCpuMs = -1L
+-        samplerHandler.post(sampler)
+-        samplerHandler.postDelayed(firstFrameCheck, FIRST_FRAME_TIMEOUT_MS)
++        samplerHandler.post(object : Runnable {
++            private var lastGcCount = -1L
++            private var lastCpuMs = -1L
++            override fun run() {
++                if (generation != epoch) return
++                val gc = runCatching { Debug.getRuntimeStat("art.gc.gc-count")?.toLongOrNull() }.getOrNull() ?: -1L
++                val cpu = Process.getElapsedCpuTime()
++                val gcDelta = if (gc >= 0 && lastGcCount >= 0) gc - lastGcCount else -1L
++                val cpuDelta = if (lastCpuMs >= 0) cpu - lastCpuMs else 0L
++                lastGcCount = gc
++                lastCpuMs = cpu
++                runCatching { sample(owner, epoch, context, currentDisplay, gcDelta, cpuDelta) }
++                if (generation == epoch) samplerHandler.postDelayed(this, SAMPLE_INTERVAL_MS)
++            }
++        })
+         lastTickNanos = 0L
++        PanoramaFrameCounters.enabled = false
+         PanoramaFrameCounters.reset()
+         ticking = true
+-        Choreographer.getInstance().postFrameCallback(tickCallback)
+-        // One frame right away, so an idle screen does not read as "FrameMetrics not provided".
++        drawObserver = DrawPerfObserver(activity.window.decorView) { arrival ->
++            if (generation == epoch) onTick(arrival, owner)
++        }.also { it.start() }
+         activity.window.decorView.invalidate()
+         recordingState.value = true
+     }
+ 
+     private fun detach() {
+-        val attached = window ?: return
+-        metricsListener?.let { listener -> runCatching { attached.removeOnFrameMetricsAvailableListener(listener) } }
+-        metricsListener = null
+-        window = null
++        generation++
+         ticking = false
+-        Choreographer.getInstance().removeFrameCallback(tickCallback)
++        drawObserver?.stop()
++        drawObserver = null
++        window = null
++        PanoramaFrameCounters.enabled = false
++        PanoramaFrameCounters.reset()
+         handler?.removeCallbacksAndMessages(null)
+         thread?.quitSafely()
+         handler = null
+         thread = null
+-        display = null
+         recordingState.value = false
+     }
+ 
+@@ -208,13 +205,11 @@ object HarmonyFramePerf {
+         startedNanos = 0L
+     }
+ 
+-    private val tickCallback = Choreographer.FrameCallback { frameTimeNanos -> onTick(frameTimeNanos) }
+-
+-    private fun onTick(frameTimeNanos: Long) {
++    private fun onTick(frameTimeNanos: Long, owner: Buffers) {
+         if (!ticking) return
+         val previous = lastTickNanos
+         lastTickNanos = frameTimeNanos
+-        val ticks = buffers?.ticks ?: return
++        val ticks = owner.ticks
+         synchronized(ticks) {
+             // Counters read here were filled by the previous frame's composition and measure.
+             val last = ticks.lastRow()
+@@ -232,57 +227,20 @@ object HarmonyFramePerf {
+             ticks[row + PerfReport.T_COMPOSED] = 0L
+         }
+         PanoramaFrameCounters.reset()
+-        Choreographer.getInstance().postFrameCallback(tickCallback)
+     }
+ 
+-    private fun onFrameMetrics(metrics: FrameMetrics) {
+-        if (!firstFrameSeen) firstFrameSeen = true
+-        if (metrics.getMetric(FrameMetrics.FIRST_DRAW_FRAME) == 1L) return
+-        val frames = buffers?.frames ?: return
+-        val modern = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+-        synchronized(frames) {
+-            val row = frames.appendRow()
+-            frames[row + PerfReport.F_INTENDED_VSYNC] = metrics.getMetric(FrameMetrics.INTENDED_VSYNC_TIMESTAMP)
+-            frames[row + PerfReport.F_VSYNC] = metrics.getMetric(FrameMetrics.VSYNC_TIMESTAMP)
+-            frames[row + PerfReport.F_TOTAL] = metrics.getMetric(FrameMetrics.TOTAL_DURATION)
+-            frames[row + PerfReport.F_DELAY] = metrics.getMetric(FrameMetrics.UNKNOWN_DELAY_DURATION)
+-            frames[row + PerfReport.F_INPUT] = metrics.getMetric(FrameMetrics.INPUT_HANDLING_DURATION)
+-            frames[row + PerfReport.F_ANIMATION] = metrics.getMetric(FrameMetrics.ANIMATION_DURATION)
+-            frames[row + PerfReport.F_LAYOUT] = metrics.getMetric(FrameMetrics.LAYOUT_MEASURE_DURATION)
+-            frames[row + PerfReport.F_DRAW] = metrics.getMetric(FrameMetrics.DRAW_DURATION)
+-            frames[row + PerfReport.F_SYNC] = metrics.getMetric(FrameMetrics.SYNC_DURATION)
+-            frames[row + PerfReport.F_COMMAND] = metrics.getMetric(FrameMetrics.COMMAND_ISSUE_DURATION)
+-            frames[row + PerfReport.F_SWAP] = metrics.getMetric(FrameMetrics.SWAP_BUFFERS_DURATION)
+-            frames[row + PerfReport.F_GPU] = if (modern) metrics.getMetric(FrameMetrics.GPU_DURATION) else -1L
+-            frames[row + PerfReport.F_DEADLINE] = if (modern) metrics.getMetric(FrameMetrics.DEADLINE) else -1L
+-        }
+-    }
+-
+-    private val firstFrameCheck = Runnable {
+-        if (!firstFrameSeen) frameMetricsLate = true
+-    }
+-
+-    private val sampler = object : Runnable {
+-        override fun run() {
+-            sample()
+-            // A detach may have quit this thread and started another one; do not post onto that.
+-            val current = handler ?: return
+-            if (current.looper == Looper.myLooper()) current.postDelayed(this, SAMPLE_INTERVAL_MS)
+-        }
+-    }
+-
+-    private fun sample() {
+-        val context = appContext ?: return
+-        val gc = Debug.getRuntimeStat("art.gc.gc-count")?.toLongOrNull() ?: -1L
+-        val cpu = Process.getElapsedCpuTime()
+-        val gcDelta = if (gc >= 0 && lastGcCount >= 0) gc - lastGcCount else 0L
+-        val cpuDelta = if (lastCpuMs >= 0) cpu - lastCpuMs else 0L
+-        lastGcCount = gc
+-        lastCpuMs = cpu
+-        val currentDisplay = display
++    private fun sample(
++        owner: Buffers,
++        epoch: Long,
++        context: Context,
++        currentDisplay: Display?,
++        gcDelta: Long,
++        cpuDelta: Long,
++    ) {
+         val mode = currentDisplay?.mode
+         val power = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+-        val samples = buffers?.samples ?: return
++        if (generation != epoch) return
++        val samples = owner.samples
+         synchronized(samples) {
+             val row = samples.appendRow()
+             samples[row + PerfReport.S_TIME] = System.nanoTime()
+@@ -378,6 +336,7 @@ object HarmonyFramePerf {
+             thermalStatus = thermalStatus(power),
+             powerSave = power?.isPowerSaveMode == true,
+             uptimeMs = SystemClock.elapsedRealtime(),
++            producer = "view_draw",
+         )
+     }
+ 
+@@ -493,6 +452,7 @@ class PerfHeader(
+     val thermalStatus: Int,
+     val powerSave: Boolean,
+     val uptimeMs: Long,
++    val producer: String = "choreographer",
+ )
+ 
+ /** Fixed-width rows of longs in one array. Callers hold the ring's monitor. */
+@@ -752,7 +712,12 @@ object PerfReport {
+         val haveFrames = frames.rows > 0
+ 
+         out.appendLine("# ${header.appLabel} scroll performance log")
+-        out.appendLine("format: harmony-scroll-perf 1")
++        out.appendLine("format: harmony-scroll-perf 2")
++        out.appendLine("producer: ${header.producer}")
++        if (header.producer == "view_draw") {
++            out.appendLine("# Actual ViewTreeObserver draw intervals; callback rate is not presented FPS.")
++            out.appendLine("# Callback gaps include idle pauses and do not prove displayed jank; samples every 2 s.")
++        }
+         out.appendLine("app_id: ${header.appId}")
+         out.appendLine("version: ${header.versionName} (${header.versionCode})")
+         out.appendLine("device: ${header.brand} / ${header.model}")
+@@ -770,6 +735,8 @@ object PerfReport {
+         out.appendLine("recorded_seconds: ${(input.nowNanos - input.startedNanos) / SECOND_NS}")
+         out.appendLine("vsync_ms: ${ms(periodAt(samples, input.nowNanos, fallbackRate))}")
+         when {
++            header.producer == "view_draw" ->
++                out.appendLine("frame_metrics: disabled (light mode); TOTAL_DURATION / GPU unavailable")
+             haveFrames && input.frameMetricsLate ->
+                 out.appendLine("frame_metrics: provided (${frames.rows} frames; first frame came after the 3 s check)")
+             haveFrames -> out.appendLine("frame_metrics: provided (${frames.rows} frames)")
+@@ -895,7 +862,7 @@ object PerfReport {
+         if (listed == 0) out.appendLine("# none")
+         out.appendLine()
+ 
+-        out.appendLine("## Last 30 s: 500 ms samples")
++        out.appendLine(if (header.producer == "view_draw") "## Last 30 s: 2 s samples" else "## Last 30 s: 500 ms samples")
+         out.appendLine("# gc = GC count delta, cpu_ms = process CPU delta, refresh = Display.refreshRate")
+         for (row in 0 until samples.rows) {
+             val time = samples[row, S_TIME]
+@@ -925,7 +892,15 @@ object PerfReport {
+         input.trace.forEach { out.appendLine(it) }
+         out.appendLine()
+         out.appendLine(PRIVACY_LINE)
+-        return out.toString()
++        return if (header.producer == "view_draw") {
++            out.toString().replace("source=choreographer", "source=view_draw")
++                .replace("frames are vsync ticks", "frames are draw callbacks")
++                .replace("fps=", "draw_callbacks_per_s=")
++                .replace("Choreographer", "Draw callback")
++                .replace("choreographer scope=", "view_draw scope=")
++        } else {
++            out.toString()
++        }
+     }
+ 
+     private val PHASES = intArrayOf(
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyWindowInsets.kt b/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyWindowInsets.kt
+index 4936fab19..35dce4965 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyWindowInsets.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyWindowInsets.kt
+@@ -10,18 +10,24 @@ import androidx.core.view.ViewCompat
+ import androidx.core.view.WindowCompat
+ import androidx.lifecycle.DefaultLifecycleObserver
+ import androidx.lifecycle.LifecycleOwner
++import tachiyomi.presentation.core.components.PanoramaScrollTrace
+ 
+ /** Reconcile edge-to-edge geometry after rotation/folding, once the new window bounds are laid out. */
+ fun ComponentActivity.installHarmonyWindowInsets() {
+     val decor = window.decorView
++    val ownerId = System.identityHashCode(this)
++    var closed = false
++    var focusOwner: ViewTreeObserver? = null
++    PanoramaScrollTrace.log(0, "window install owner=$ownerId")
+     val refresh = Runnable {
+-        if (!isFinishing && !isDestroyed) {
++        if (!closed && !isFinishing && !isDestroyed) {
+             applyHarmonyWindowInsets()
+             // Ask for insets against the new bounds, not the portrait values received before layout.
+             ViewCompat.requestApplyInsets(decor)
+         }
+     }
+     fun scheduleRefresh() {
++        if (closed) return
+         decor.removeCallbacks(refresh)
+         decor.post(refresh)
+     }
+@@ -37,13 +43,39 @@ fun ComponentActivity.installHarmonyWindowInsets() {
+             oldBottom,
+         ->
+         if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop) {
++            PanoramaScrollTrace.log(
++                0,
++                "window bounds owner=$ownerId ${oldRight - oldLeft}x${oldBottom - oldTop}->${right - left}x${bottom - top}",
++            )
+             scheduleRefresh()
+         }
+     }
+     val focusListener = ViewTreeObserver.OnWindowFocusChangeListener { focused ->
+         if (focused) scheduleRefresh()
+     }
+-    decor.viewTreeObserver.addOnWindowFocusChangeListener(focusListener)
++    fun removeFocusListener() {
++        val old = focusOwner
++        if (old?.isAlive == true) old.removeOnWindowFocusChangeListener(focusListener)
++        val current = decor.viewTreeObserver
++        if (current !== old && current.isAlive) current.removeOnWindowFocusChangeListener(focusListener)
++        focusOwner = null
++    }
++    fun attachFocusListener() {
++        removeFocusListener()
++        if (closed) return
++        decor.viewTreeObserver.also { focusOwner = it }.addOnWindowFocusChangeListener(focusListener)
++    }
++    val attachment = object : View.OnAttachStateChangeListener {
++        override fun onViewAttachedToWindow(v: View) {
++            // Floating observers merge into the live tree. Remove any migrated copy before
++            // registering, and retain the live owner for cleanup after a later detach.
++            attachFocusListener()
++            scheduleRefresh()
++        }
++        override fun onViewDetachedFromWindow(v: View) = removeFocusListener()
++    }
++    attachFocusListener()
++    decor.addOnAttachStateChangeListener(attachment)
+     // Apply before Compose/migration content is attached, including a recreated landscape Activity.
+     applyHarmonyWindowInsets()
+     decor.addOnLayoutChangeListener(boundsListener)
+@@ -51,11 +83,12 @@ fun ComponentActivity.installHarmonyWindowInsets() {
+         override fun onResume(owner: LifecycleOwner) = scheduleRefresh()
+ 
+         override fun onDestroy(owner: LifecycleOwner) {
++            closed = true
+             decor.removeCallbacks(refresh)
+             decor.removeOnLayoutChangeListener(boundsListener)
+-            if (decor.viewTreeObserver.isAlive) {
+-                decor.viewTreeObserver.removeOnWindowFocusChangeListener(focusListener)
+-            }
++            decor.removeOnAttachStateChangeListener(attachment)
++            removeFocusListener()
++            PanoramaScrollTrace.log(0, "window destroy owner=$ownerId")
+             owner.lifecycle.removeObserver(this)
+         }
+     })
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerfTest.kt b/app/src/test/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerfTest.kt
+index ac5478b6c..dfded79ca 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerfTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerfTest.kt
+@@ -125,11 +125,42 @@ class HarmonyFramePerfTest {
+         assertTrue(text.trimEnd().endsWith(PerfReport.PRIVACY_LINE), text)
+     }
+ 
++    @Test
++    fun `light export labels actual draws instead of presented FPS or FrameMetrics`() {
++        val full = syntheticInput(producer = "view_draw")
++        val input = PerfReportInput(
++            header = full.header,
++            frames = PerfTable.of(PerfReport.FRAME_WIDTH),
++            ticks = full.ticks,
++            samples = full.samples,
++            frameMetricsLate = false,
++            frameMetricsError = null,
++            noiseMarkers = emptyList(),
++            noise = TreeMap(),
++            trace = emptyList(),
++            startedNanos = full.startedNanos,
++            startedWallMs = full.startedWallMs,
++            nowNanos = full.nowNanos,
++            nowWallMs = full.nowWallMs,
++            timeZone = full.timeZone,
++        )
++        val text = PerfReport.format(input)
++        assertTrue(text.contains("format: harmony-scroll-perf 2"), text)
++        assertTrue(text.contains("producer: view_draw"), text)
++        assertTrue(text.contains("frame_metrics: disabled (light mode); TOTAL_DURATION / GPU unavailable"), text)
++        assertTrue(text.contains("source=view_draw"), text)
++        assertTrue(text.contains("draw_callbacks_per_s="), text)
++        assertTrue(text.contains("not presented FPS"), text)
++        assertTrue(text.contains("p50/p90/p99/max are tick intervals ms"), text)
++        assertFalse(text.contains("fps="), text)
++        assertFalse(text.contains("frame_metrics: provided"), text)
++    }
++
+     /**
+      * 12 s at 60 Hz: idle, a drag, a fling whose every 15th frame is a 30 ms layout frame, then
+      * a second drag with slow sync frames, and a switch to 90 Hz at 11.5 s.
+      */
+-    private fun syntheticInput(): PerfReportInput {
++    private fun syntheticInput(producer: String = "choreographer"): PerfReportInput {
+         val ticks = ArrayList<LongArray>()
+         val frames = ArrayList<LongArray>()
+         var previous = 0L
+@@ -227,6 +258,7 @@ class HarmonyFramePerfTest {
+             thermalStatus = 0,
+             powerSave = false,
+             uptimeMs = 93_784_000L,
++            producer = producer,
+         )
+         return PerfReportInput(
+             header = header,
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/DrawPerfObserver.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/DrawPerfObserver.kt
+new file mode 100644
+index 000000000..e645ce6d7
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/DrawPerfObserver.kt
+@@ -0,0 +1,91 @@
++package tachiyomi.presentation.core.components
++
++import android.os.Handler
++import android.os.Looper
++import android.view.View
++import android.view.ViewTreeObserver
++
++/** Main-thread draw observer. Stopping during dispatch defers removal, never delivery. */
++class DrawPerfObserver(private val view: View, private val onDraw: (Long) -> Unit) {
++    private val mainHandler = Handler(Looper.getMainLooper())
++    private var listener: ViewTreeObserver.OnDrawListener? = null
++    private var observer: ViewTreeObserver? = null
++    private var dispatching = false
++    private var running = false
++    private var registration = 0L
++    private val attachment = object : View.OnAttachStateChangeListener {
++        override fun onViewAttachedToWindow(v: View) = requestBind()
++        override fun onViewDetachedFromWindow(v: View) {
++            registration++
++            unbind()
++        }
++    }
++
++    fun start() {
++        if (running) return
++        running = true
++        view.addOnAttachStateChangeListener(attachment)
++        requestBind()
++    }
++
++    private fun requestBind() {
++        val token = ++registration
++        unbind()
++        if (dispatching) mainHandler.post { bind(token) } else bind(token)
++    }
++
++    private fun bind(token: Long, retry: Boolean = true) {
++        if (!running || token != registration) return
++        val owner = view.viewTreeObserver
++        val callback = object : ViewTreeObserver.OnDrawListener {
++            override fun onDraw() {
++                if (!running || token != registration || listener !== this) return
++                dispatching = true
++                try {
++                    this@DrawPerfObserver.onDraw(System.nanoTime())
++                } finally {
++                    dispatching = false
++                }
++            }
++        }
++        observer = owner
++        listener = callback
++        try {
++            owner.addOnDrawListener(callback)
++        } catch (_: IllegalStateException) {
++            observer = null
++            listener = null
++            if (retry) mainHandler.post { bind(token, retry = false) }
++        }
++    }
++
++    fun stop() {
++        running = false
++        registration++
++        view.removeOnAttachStateChangeListener(attachment)
++        unbind()
++    }
++
++    private fun unbind() {
++        val callback = listener ?: return
++        val owner = observer
++        listener = null
++        observer = null
++        val remove = Runnable {
++            if (owner?.isAlive == true) owner.removeOnDrawListener(callback)
++            val current = view.viewTreeObserver
++            if (current !== owner && current.isAlive) current.removeOnDrawListener(callback)
++        }
++        if (dispatching) {
++            mainHandler.post(remove)
++        } else {
++            try {
++                remove.run()
++            } catch (_: IllegalStateException) {
++                // Another listener may be dispatching this same tree. Do not depend on the
++                // View reattaching to execute cleanup after a fold or Activity replacement.
++                mainHandler.post(remove)
++            }
++        }
++    }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/FastScrollerGlass.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/FastScrollerGlass.kt
+index 03a78388e..868481b06 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/FastScrollerGlass.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/FastScrollerGlass.kt
+@@ -17,7 +17,6 @@ import dev.chrisbanes.haze.HazeState
+ import dev.chrisbanes.haze.HazeStyle
+ import dev.chrisbanes.haze.HazeTint
+ import dev.chrisbanes.haze.hazeEffect
+-import dev.chrisbanes.haze.hazeSource
+ 
+ @Composable
+ internal fun rememberFastScrollerGlass(): HazeState? {
+@@ -32,7 +31,7 @@ internal fun Modifier.fastScrollerGlassSource(state: HazeState?): Modifier =
+     if (state == null || !ScrollGlassDiagnostics.enabled) {
+         this
+     } else {
+-        recordScrollSource(PanoramaFrameCounters.SCROLLER_SOURCE).hazeSource(state)
++        recordScrollSource(PanoramaFrameCounters.SCROLLER_SOURCE).windowHazeSource(state, PanoramaFrameCounters.SCROLLER_SOURCE)
+     }
+ 
+ @Composable
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/WindowHazeSource.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/WindowHazeSource.kt
+new file mode 100644
+index 000000000..1aab9cde0
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/WindowHazeSource.kt
+@@ -0,0 +1,82 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.ExperimentalComposeUiApi
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.node.DelegatingNode
++import androidx.compose.ui.node.ModifierNodeElement
++import androidx.compose.ui.node.invalidateDraw
++import androidx.compose.ui.platform.InspectorInfo
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.platform.LocalView
++import androidx.compose.ui.platform.LocalWindowInfo
++import dev.chrisbanes.haze.ExperimentalHazeApi
++import dev.chrisbanes.haze.HazeSourceNode
++import dev.chrisbanes.haze.HazeState
++
++internal data class HazeViewport(
++    val owner: Any,
++    val width: Int,
++    val height: Int,
++    val density: Float,
++    val token: Any? = null,
++    val displayId: Int = -1,
++) {
++    val valid: Boolean get() = width > 0 && height > 0
++}
++
++/** Keep list composition and position; replace only the captured layer at a window boundary. */
++@Composable
++@OptIn(ExperimentalComposeUiApi::class)
++internal fun Modifier.windowHazeSource(state: HazeState, kind: Int): Modifier {
++    val size = LocalWindowInfo.current.containerSize
++    val view = LocalView.current
++    return viewportHazeSource(
++        state,
++        HazeViewport(view, size.width, size.height, LocalDensity.current.density, view.windowToken, view.display?.displayId ?: -1),
++        kind,
++    )
++}
++
++internal fun Modifier.viewportHazeSource(state: HazeState, viewport: HazeViewport, kind: Int): Modifier =
++    this.then(WindowHazeSourceElement(state, viewport, kind))
++
++private data class WindowHazeSourceElement(
++    val state: HazeState,
++    val viewport: HazeViewport,
++    val kind: Int,
++) : ModifierNodeElement<WindowHazeSourceNode>() {
++    override fun create() = WindowHazeSourceNode(state, viewport)
++    override fun update(node: WindowHazeSourceNode) = node.update(state, viewport, kind)
++    override fun InspectorInfo.inspectableProperties() {
++        name = "windowHazeSource"
++    }
++}
++
++@OptIn(ExperimentalHazeApi::class)
++private class WindowHazeSourceNode(state: HazeState, private var viewport: HazeViewport) :
++    DelegatingNode() {
++    private var source = delegate(HazeSourceNode(state))
++
++    fun update(state: HazeState, next: HazeViewport, nextKind: Int) {
++        val ownerChanged = viewport.owner !== next.owner || viewport.displayId != next.displayId ||
++            (viewport.token != null && next.token != null && viewport.token !== next.token)
++        val sizeChanged = viewport.valid && next.valid &&
++            (viewport.width != next.width || viewport.height != next.height || viewport.density != next.density)
++        if (ownerChanged || sizeChanged) {
++            // Haze 1.7.2 keeps the layer on ordinary size updates. Its public source-node
++            // lifecycle releases the old layer on detach and registers a fresh area on attach.
++            undelegate(source)
++            source = delegate(HazeSourceNode(state))
++            if (source.isAttached) source.invalidateDraw()
++            PanoramaScrollTrace.log(
++                0,
++                "glass viewport reset kind=$nextKind ${viewport.width}x${viewport.height}->${next.width}x${next.height} " +
++                    "density=${viewport.density}->${next.density} owner=$ownerChanged",
++            )
++        } else if (source.state !== state) {
++            source.state = state
++        }
++        if (next.valid || ownerChanged) viewport = next
++    }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
+index f71499aa5..b51679252 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
+@@ -12,10 +12,10 @@ import androidx.compose.ui.unit.dp
+ import dev.chrisbanes.haze.HazeStyle
+ import dev.chrisbanes.haze.HazeTint
+ import dev.chrisbanes.haze.hazeEffect
+-import dev.chrisbanes.haze.hazeSource
+ import tachiyomi.presentation.core.components.PanoramaFrameCounters
+ import tachiyomi.presentation.core.components.ScrollGlassDiagnostics
+ import tachiyomi.presentation.core.components.recordScrollSource
++import tachiyomi.presentation.core.components.windowHazeSource
+ 
+ /** Blur only the content behind the controls, leaving icons, labels and badges sharp. */
+ @Composable
+@@ -51,7 +51,7 @@ internal fun Modifier.browsingGlassSource(state: BrowsingNavigationBarState?): M
+     ) {
+         this
+     } else {
+-        recordScrollSource(PanoramaFrameCounters.NAVIGATION_SOURCE).hazeSource(state.glassState)
++        recordScrollSource(PanoramaFrameCounters.NAVIGATION_SOURCE).windowHazeSource(state.glassState, PanoramaFrameCounters.NAVIGATION_SOURCE)
+     }
+ 
+ @Composable
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+index f96860468..e5e9523fb 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+@@ -236,9 +236,10 @@ fun NavigationCapsule(
+                             // A bright contact core sits exactly under the finger. The wide halo remains faint.
+                             drawRect(
+                                 Brush.radialGradient(
+-                                    0f to Color.White.copy(alpha = 0.62f * strength),
+-                                    0.10f to Color.White.copy(alpha = 0.34f * strength),
+-                                    0.35f to Color.White.copy(alpha = 0.065f * strength),
++                                    0f to Color.White.copy(alpha = 0.88f * strength),
++                                    0.06f to Color.White.copy(alpha = 0.82f * strength),
++                                    0.18f to Color.White.copy(alpha = 0.50f * strength),
++                                    0.36f to Color.White.copy(alpha = 0.075f * strength),
+                                     0.70f to Color.White.copy(alpha = 0.012f * strength),
+                                     1f to Color.Transparent,
+                                     center = touchPosition,
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeDrawPerfObserverTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeDrawPerfObserverTest.kt
+new file mode 100644
+index 000000000..1c1a456e3
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeDrawPerfObserverTest.kt
+@@ -0,0 +1,128 @@
++package tachiyomi.presentation.core.components
++
++import android.app.Activity
++import android.os.Looper
++import android.view.View
++import android.view.ViewTreeObserver
++import android.widget.FrameLayout
++import org.junit.Assert.assertEquals
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.Robolectric
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.Shadows.shadowOf
++import org.robolectric.annotation.Config
++
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34])
++class NavigationChromeDrawPerfObserverTest {
++    @Test
++    fun anotherDrawListenerCanStopSamplingWithoutMutatingDispatch() {
++        val controller = Robolectric.buildActivity(Activity::class.java).setup()
++        val view = controller.get().window.decorView
++        var draws = 0
++        val observer = DrawPerfObserver(view) { draws++ }
++        val stopper = ViewTreeObserver.OnDrawListener { observer.stop() }
++        view.viewTreeObserver.addOnDrawListener(stopper)
++        observer.start()
++        view.viewTreeObserver.dispatchOnDraw()
++        assertEquals(0, draws)
++        shadowOf(Looper.getMainLooper()).idle()
++        view.viewTreeObserver.removeOnDrawListener(stopper)
++        view.viewTreeObserver.dispatchOnDraw()
++        assertEquals(0, draws)
++        controller.pause().stop().destroy()
++    }
++
++    @Test
++    fun detachAndReattachMovesTheListenerWithoutRevivingTheOldOwner() {
++        val controller = Robolectric.buildActivity(Activity::class.java).setup()
++        val activity = controller.get()
++        val root = FrameLayout(activity)
++        activity.setContentView(root)
++        val view = View(activity)
++        var draws = 0
++        val observer = DrawPerfObserver(view) { draws++ }
++        observer.start()
++        root.addView(view)
++        root.viewTreeObserver.dispatchOnDraw()
++        assertEquals(1, draws)
++        root.removeView(view)
++        root.viewTreeObserver.dispatchOnDraw()
++        assertEquals(1, draws)
++        root.addView(view)
++        root.viewTreeObserver.dispatchOnDraw()
++        assertEquals(2, draws)
++        observer.stop()
++        root.viewTreeObserver.dispatchOnDraw()
++        assertEquals(2, draws)
++        controller.pause().stop().destroy()
++    }
++
++    @Test
++    fun actualDrawDispatchStopsAndRestartsWithoutDuplicateDelivery() {
++        val controller = Robolectric.buildActivity(Activity::class.java).setup()
++        val view = controller.get().window.decorView
++        var draws = 0
++        val observer = DrawPerfObserver(view) { draws++ }
++        observer.start()
++        observer.start()
++        view.viewTreeObserver.dispatchOnDraw()
++        assertEquals(1, draws)
++        observer.stop()
++        view.viewTreeObserver.dispatchOnDraw()
++        assertEquals(1, draws)
++        observer.start()
++        view.viewTreeObserver.dispatchOnDraw()
++        assertEquals(2, draws)
++        observer.stop()
++        controller.pause().stop().destroy()
++    }
++
++    @Test
++    fun stopAcrossAttachmentDisablesBothCapturedAndCurrentObserver() {
++        val controller = Robolectric.buildActivity(Activity::class.java).setup()
++        val activity = controller.get()
++        val view = View(activity)
++        val captured = view.viewTreeObserver
++        var draws = 0
++        val observer = DrawPerfObserver(view) { draws++ }
++        observer.start()
++        captured.dispatchOnDraw()
++        assertEquals(1, draws)
++        activity.setContentView(view)
++        observer.stop()
++        if (captured.isAlive) captured.dispatchOnDraw()
++        view.viewTreeObserver.dispatchOnDraw()
++        assertEquals(1, draws)
++        observer.start()
++        view.viewTreeObserver.dispatchOnDraw()
++        assertEquals(2, draws)
++        observer.stop()
++        controller.pause().stop().destroy()
++    }
++
++    @Test
++    fun stoppingInsideDrawDefersRemovalButImmediatelyPreventsDelivery() {
++        val controller = Robolectric.buildActivity(Activity::class.java).setup()
++        val view = controller.get().window.decorView
++        var draws = 0
++        lateinit var observer: DrawPerfObserver
++        observer = DrawPerfObserver(view) {
++            draws++
++            observer.stop()
++        }
++        observer.start()
++        view.viewTreeObserver.dispatchOnDraw()
++        view.viewTreeObserver.dispatchOnDraw()
++        assertEquals(1, draws)
++        shadowOf(Looper.getMainLooper()).idle()
++        view.viewTreeObserver.dispatchOnDraw()
++        assertEquals(1, draws)
++        observer.start()
++        view.viewTreeObserver.dispatchOnDraw()
++        assertEquals(2, draws)
++        shadowOf(Looper.getMainLooper()).idle()
++        controller.pause().stop().destroy()
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeViewportSourceTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeViewportSourceTest.kt
+new file mode 100644
+index 000000000..7258a38c6
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeViewportSourceTest.kt
+@@ -0,0 +1,82 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.requiredSize
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.LazyListState
++import androidx.compose.runtime.SideEffect
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.test.junit4.createComposeRule
++import androidx.compose.ui.unit.dp
++import dev.chrisbanes.haze.HazeArea
++import dev.chrisbanes.haze.HazeState
++import org.junit.Rule
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertNotNull
++import org.junit.jupiter.api.Assertions.assertNotSame
++import org.junit.jupiter.api.Assertions.assertNull
++import org.junit.jupiter.api.Assertions.assertSame
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.robolectric.annotation.GraphicsMode
++
++@RunWith(RobolectricTestRunner::class)
++@GraphicsMode(GraphicsMode.Mode.NATIVE)
++@Config(sdk = [34])
++class NavigationChromeViewportSourceTest {
++    @get:Rule
++    val compose = createComposeRule()
++
++    @Test
++    fun `window changes release old source layers without replacing list state or content`() {
++        val owner = Any()
++        val viewport = mutableStateOf(HazeViewport(owner, 400, 800, 1f))
++        val haze = HazeState()
++        val list = LazyListState(firstVisibleItemIndex = 20, firstVisibleItemScrollOffset = 7)
++        var token: Any? = null
++        compose.setContent {
++            Box(
++                Modifier.requiredSize(viewport.value.width.dp, viewport.value.height.dp)
++                    .viewportHazeSource(haze, viewport.value, 0),
++            ) {
++                val remembered = remember { Any() }
++                SideEffect { token = remembered }
++                LazyColumn(Modifier.fillMaxSize(), state = list) {
++                    items(2000) { Box(Modifier.fillMaxSize().height(80.dp)) }
++                }
++            }
++        }
++        compose.waitForIdle()
++        lateinit var previous: HazeArea
++        var originalToken: Any? = null
++        compose.runOnIdle {
++            previous = haze.areas.single()
++            assertNotNull(previous.contentLayer)
++            originalToken = token
++            assertEquals(20, list.firstVisibleItemIndex)
++            assertEquals(7, list.firstVisibleItemScrollOffset)
++        }
++        repeat(3) { index ->
++            compose.runOnIdle {
++                viewport.value = if (index % 2 == 0) HazeViewport(owner, 800, 400, 1f) else HazeViewport(owner, 400, 800, 1f)
++            }
++            compose.waitForIdle()
++            compose.runOnIdle {
++                val current = haze.areas.single()
++                assertNotSame(previous, current)
++                assertNull(previous.contentLayer, "The detached source must release its captured layer")
++                assertNotNull(current.contentLayer)
++                assertSame(originalToken, token, "A render-resource update must preserve list composition")
++                assertEquals(20, list.firstVisibleItemIndex)
++                assertEquals(7, list.firstVisibleItemScrollOffset)
++                previous = current
++            }
++        }
++    }
++}
