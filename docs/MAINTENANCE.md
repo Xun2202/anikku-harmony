@@ -780,3 +780,5 @@ gh release list --repo Xun2202/anikku-harmony
 - 胶囊亮心0.62→0.88，增加0.06半径处0.82及0.18处0.50的亮区，再向外衰减；2.8h总半径、淡入淡出/跟手形变、字号、对称圆角/留白和防点穿均保留。不新增参数镜像测试，实际光感由安装反馈。
 - Anikku格式2仅轻量view_draw；保留本应用简洁报告模型，不扩移Mihon详细采样/A-B菜单。CI在已有app:testPreviewUnitTest目标加入HarmonyFramePerfTest筛选，不增加另一套App构建变体。公共生产helper/窗口工具和两份生命周期测试逐字节一致。
 - Animeko使用独立导航/玻璃实现，无此Tachiyomi记录器或窗口工具，不直接移植；不能据此排除其独立窗口性能问题。签名、版本/hash/更新索引与真机待验以私有归档现状为准。
+
+- 0080只补真实绘制测试步骤：Robolectric的layout idle不保证draw，首次contentLayer仍null。每次先capture实际root再断言分配/释放，保留全部旧layer清理、新area唯一、内容身份与滚动位置检查；生产代码不变。首次候选止于此测试，未发布。

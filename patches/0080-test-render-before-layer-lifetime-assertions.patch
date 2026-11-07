@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 17:05:31 +0000
+Subject: [PATCH] test(ui): render the capture before asserting layer lifetime
+
+Shared test fixture with Mihon 0077. Robolectric layout-idle does not guarantee a draw, so the first production Haze contentLayer was still null. Capture the real root before initial and resized layer assertions. Keep all release, replacement, uniqueness, composition and scroll-position checks; no production changes.
+---
+ .../core/components/NavigationChromeViewportSourceTest.kt   | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeViewportSourceTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeViewportSourceTest.kt
+index 7258a38c6..24dbe162f 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeViewportSourceTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeViewportSourceTest.kt
+@@ -10,7 +10,9 @@ import androidx.compose.runtime.SideEffect
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.test.captureToImage
+ import androidx.compose.ui.test.junit4.createComposeRule
++import androidx.compose.ui.test.onRoot
+ import androidx.compose.ui.unit.dp
+ import dev.chrisbanes.haze.HazeArea
+ import dev.chrisbanes.haze.HazeState
+@@ -53,6 +55,9 @@ class NavigationChromeViewportSourceTest {
+             }
+         }
+         compose.waitForIdle()
++        // Robolectric may finish layout without drawing. Capture forces the production
++        // Haze draw path to allocate its layer before checking release/replacement.
++        compose.onRoot().captureToImage()
+         lateinit var previous: HazeArea
+         var originalToken: Any? = null
+         compose.runOnIdle {
+@@ -67,6 +72,7 @@ class NavigationChromeViewportSourceTest {
+                 viewport.value = if (index % 2 == 0) HazeViewport(owner, 800, 400, 1f) else HazeViewport(owner, 400, 800, 1f)
+             }
+             compose.waitForIdle()
++            compose.onRoot().captureToImage()
+             compose.runOnIdle {
+                 val current = haze.areas.single()
+                 assertNotSame(previous, current)

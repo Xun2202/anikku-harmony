@@ -77,3 +77,4 @@
 0077-test-compat-compose-entry-point.patch
 0078-test-current-thumb-grab-boundary.patch
 0079-ui-window-capture-lifetime-and-light-recorder.patch
+0080-test-render-before-layer-lifetime-assertions.patch
