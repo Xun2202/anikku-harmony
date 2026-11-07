@@ -1,0 +1,744 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 09:03:34 +0000
+Subject: [PATCH] fix(ui): fit capsule corners and own its full touch surface
+
+Shared with Mihon 0069. Correct side/bottom margin equality using the supplied Pura screenshot as an approximate 1264x1848 fixture, not a new device-specific runtime rule. Use runtime screen corner metadata/resources, with a documented generic fallback, and support asymmetric lower corners. One initial-pass router owns all glass taps and drags, including end padding and cancellation; preserve child accessibility semantics. Strengthen solid selected words and transmitted/reflected glass light; keep the texture and shader behind the labels.
+---
+ .../core/components/material/BrowsingGlass.kt |   8 +-
+ .../material/CapsuleNavigationLabel.kt        |   9 +-
+ .../components/material/CapsuleRefraction.kt  |  73 +++++--
+ .../components/material/NavigationCapsule.kt  | 188 +++++++++++++-----
+ .../material/NavigationCapsuleGeometry.kt     |  34 ++++
+ .../NavigationChromeCapsuleGeometryTest.kt    |  38 ++++
+ .../material/NavigationChromeCapsuleTest.kt   | 127 +++++++++++-
+ 7 files changed, 396 insertions(+), 81 deletions(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsuleGeometry.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleGeometryTest.kt
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
+index 82932a489..33a712a21 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
+@@ -20,11 +20,11 @@ internal fun Modifier.browsingGlassBackground(state: BrowsingNavigationBarState,
+     val surface = MaterialTheme.colorScheme.surface
+     val dark = surface.luminance() < 0.5f
+     val tint = if (thin) {
+-        if (dark) 0.18f else 0.14f
++        0.10f
+     } else {
+         if (dark) 0.72f else 0.64f
+     }
+-    val fallback = if (thin) 0.24f else 0.94f
++    val fallback = if (thin) 0.18f else 0.94f
+     if (Build.VERSION.SDK_INT < 31 || !LocalView.current.isHardwareAccelerated) {
+         return background(surface.copy(alpha = fallback))
+     }
+@@ -33,8 +33,8 @@ internal fun Modifier.browsingGlassBackground(state: BrowsingNavigationBarState,
+         style = HazeStyle(
+             backgroundColor = surface,
+             tint = HazeTint(surface.copy(alpha = tint)),
+-            blurRadius = if (thin) 8.dp else 18.dp,
+-            noiseFactor = if (thin) 0.01f else 0.03f,
++            blurRadius = if (thin) 4.dp else 18.dp,
++            noiseFactor = if (thin) 0.005f else 0.03f,
+             fallbackTint = HazeTint(surface.copy(alpha = fallback)),
+         ),
+     )
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt
+index fa04dcd80..f9f78302d 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt
+@@ -13,6 +13,7 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.compositeOver
+ import androidx.compose.ui.layout.Layout
+ import androidx.compose.ui.semantics.Role
+ import androidx.compose.ui.text.font.FontWeight
+@@ -33,14 +34,18 @@ internal fun RowScope.CapsuleNavigationLabel(
+     val preview = LocalCapsulePreview.current
+     val active = if (index != null && preview != null) index == preview else selected
+     val ink by animateColorAsState(
+-        if (active) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
++        if (active) {
++            MaterialTheme.colorScheme.primary
++        } else {
++            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f).compositeOver(MaterialTheme.colorScheme.surface)
++        },
+         tween(160),
+         label = "capsuleWord",
+     )
+     val style = MaterialTheme.typography.labelLarge.copy(
+         fontSize = 14.sp,
+         lineHeight = 18.sp,
+-        fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
++        fontWeight = if (active) FontWeight.Bold else FontWeight.Medium,
+     )
+     Layout(
+         modifier = modifier.weight(1f).fillMaxHeight().selectable(
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt
+index fb1bc426f..396e65747 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt
+@@ -15,12 +15,12 @@ import androidx.compose.ui.unit.IntSize
+ 
+ /** Bend the already sampled backdrop only; labels are a separate, sharp sibling layer. */
+ @Composable
+-internal fun Modifier.capsuleRefraction(size: IntSize, radius: Float): Modifier {
++internal fun Modifier.capsuleRefraction(size: IntSize, radii: CapsuleCornerRadii): Modifier {
+     if (Build.VERSION.SDK_INT < 33 || !LocalView.current.isHardwareAccelerated || size.width <= 0 || size.height <= 0) {
+         return this
+     }
+-    val effect = remember(size, radius) {
+-        runCatching { CapsuleRefraction33.effect(size, radius) }.getOrElse {
++    val effect = remember(size, radii) {
++        runCatching { CapsuleRefraction33.effect(size, radii) }.getOrElse {
+             Log.w("NavigationCapsule", "Refraction unavailable; retaining the blurred glass surface", it)
+             null
+         }
+@@ -35,41 +35,78 @@ internal object CapsuleRefraction33 {
+     const val SOURCE = """
+         uniform shader backdrop;
+         uniform float2 resolution;
+-        uniform float cornerRadius;
++        uniform float4 cornerRadii;
+ 
+         half4 main(float2 xy) {
++            float2 center = float2(0.0);
++            float radius = 0.0;
++            if (xy.x < cornerRadii.x && xy.y < cornerRadii.x) {
++                radius = cornerRadii.x;
++                center = float2(radius, radius);
++            } else if (xy.x > resolution.x - cornerRadii.y && xy.y < cornerRadii.y) {
++                radius = cornerRadii.y;
++                center = float2(resolution.x - radius, radius);
++            } else if (xy.x > resolution.x - cornerRadii.z && xy.y > resolution.y - cornerRadii.z) {
++                radius = cornerRadii.z;
++                center = resolution - float2(radius);
++            } else if (xy.x < cornerRadii.w && xy.y > resolution.y - cornerRadii.w) {
++                radius = cornerRadii.w;
++                center = float2(radius, resolution.y - radius);
++            }
++            float edgeDistance = -xy.x;
++            float2 normal = float2(-1.0, 0.0);
++            if (radius > 0.0) {
++                float2 delta = xy - center;
++                float distance = max(length(delta), 0.001);
++                edgeDistance = distance - radius;
++                normal = delta / distance;
++            } else {
++                if (xy.y < -edgeDistance) {
++                    edgeDistance = -xy.y;
++                    normal = float2(0.0, -1.0);
++                }
++                if (resolution.x - xy.x < -edgeDistance) {
++                    edgeDistance = xy.x - resolution.x;
++                    normal = float2(1.0, 0.0);
++                }
++                if (resolution.y - xy.y < -edgeDistance) {
++                    edgeDistance = xy.y - resolution.y;
++                    normal = float2(0.0, 1.0);
++                }
++            }
++            float edge = 1.0 - smoothstep(0.0, max(4.0, resolution.y * 0.30), -edgeDistance);
++            float bend = resolution.y * 0.12 * edge * edge;
+             float2 halfSize = resolution * 0.5;
+-            float radius = clamp(cornerRadius, 1.0, halfSize.y);
+-            float2 p = xy - halfSize;
+-            float2 q = abs(p) - (halfSize - float2(radius));
+-            float edgeDistance = length(max(q, float2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+-            float2 normal = normalize(max(q, float2(0.001))) * sign(p);
+-            float edge = 1.0 - smoothstep(0.0, max(3.0, resolution.y * 0.24), -edgeDistance);
+-            float bend = resolution.y * 0.10 * edge * edge;
+-            float2 samplePoint = halfSize + p * 0.985 - normal * bend;
++            float2 samplePoint = halfSize + (xy - halfSize) * 0.99 - normal * bend;
+             samplePoint = clamp(samplePoint, float2(0.5), resolution - float2(0.5));
+             half4 color = backdrop.eval(samplePoint);
+             float direction = dot(normal, normalize(float2(-0.55, -0.83)));
+-            float shine = 0.14 * edge * edge * (0.4 + 0.6 * max(direction, 0.0));
++            float shine = 0.18 * edge * edge * (0.4 + 0.6 * max(direction, 0.0));
+             color.rgb = mix(color.rgb, half3(1.0), half(shine));
+-            color.rgb *= half(1.0 - 0.05 * edge * max(-direction, 0.0));
++            color.rgb *= half(1.0 - 0.07 * edge * max(-direction, 0.0));
+             return color;
+         }
+     """
+ 
+-    fun shader(size: IntSize, radius: Float): RuntimeShader {
++    fun shader(size: IntSize, radius: Float): RuntimeShader =
++        shader(size, CapsuleCornerRadii(radius, radius, radius, radius))
++
++    fun shader(size: IntSize, radii: CapsuleCornerRadii): RuntimeShader {
+         // Older Skia implementations expose child sampling as sample(shader, xy), not shader.eval(xy).
+         val shader = runCatching { RuntimeShader(SOURCE) }.getOrElse {
+             RuntimeShader(SOURCE.replace("backdrop.eval(samplePoint)", "sample(backdrop, samplePoint)"))
+         }
+         // Array uniforms work in both platform and older Skia adapters; some primitive adapters are no-ops.
+         shader.setFloatUniform("resolution", floatArrayOf(size.width.toFloat(), size.height.toFloat()))
+-        shader.setFloatUniform("cornerRadius", floatArrayOf(radius))
++        shader.setFloatUniform(
++            "cornerRadii",
++            floatArrayOf(radii.topLeft, radii.topRight, radii.bottomRight, radii.bottomLeft),
++        )
+         return shader
+     }
+ 
+-    fun effect(size: IntSize, radius: Float): RenderEffect {
+-        val input = shader(size, radius)
++    fun effect(size: IntSize, radii: CapsuleCornerRadii): RenderEffect {
++        val input = shader(size, radii)
+         return android.graphics.RenderEffect.createRuntimeShaderEffect(input, "backdrop").asComposeRenderEffect()
+     }
+ }
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+index a275cbbba..b6c8ec1d1 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+@@ -8,7 +8,6 @@ import androidx.compose.animation.core.spring
+ import androidx.compose.animation.core.tween
+ import androidx.compose.foundation.gestures.awaitEachGesture
+ import androidx.compose.foundation.gestures.awaitFirstDown
+-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.WindowInsets
+ import androidx.compose.foundation.layout.WindowInsetsSides
+@@ -16,7 +15,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.navigationBars
+ import androidx.compose.foundation.layout.only
+ import androidx.compose.foundation.layout.padding
+-import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.layout.tappableElement
++import androidx.compose.foundation.shape.AbsoluteRoundedCornerShape
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.CompositionLocalProvider
+@@ -35,9 +35,10 @@ import androidx.compose.ui.draw.drawWithContent
+ import androidx.compose.ui.draw.shadow
+ import androidx.compose.ui.geometry.CornerRadius
+ import androidx.compose.ui.geometry.Offset
+-import androidx.compose.ui.geometry.Size
++import androidx.compose.ui.geometry.RoundRect
+ import androidx.compose.ui.graphics.Brush
+ import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.Path
+ import androidx.compose.ui.graphics.drawscope.Stroke
+ import androidx.compose.ui.graphics.graphicsLayer
+ import androidx.compose.ui.input.pointer.PointerEventPass
+@@ -52,6 +53,7 @@ import androidx.compose.ui.unit.IntSize
+ import androidx.compose.ui.unit.LayoutDirection
+ import androidx.compose.ui.unit.dp
+ import kotlinx.coroutines.launch
++import kotlin.math.abs
+ import kotlin.math.roundToInt
+ 
+ internal val LocalNavigationCapsule = staticCompositionLocalOf { false }
+@@ -82,16 +84,37 @@ fun NavigationCapsule(
+     val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
+     val view = LocalView.current
+     val config = LocalConfiguration.current
+-    var screenRadius by remember(view, config.screenWidthDp, config.screenHeightDp) { mutableStateOf<Float?>(null) }
+-    // Android exposes the reserved navigation area, not the visible gesture handle's bounds.
+-    // Use its midpoint as an optical estimate, with room for hosts reporting a small/zero inset.
+-    // Relative to that estimate, leave one gap above the handle and one below; sides match one gap.
+-    val bottomInset = with(density) { windowInsets.getBottom(density).toDp() }
+-    val gap = maxOf(12.dp, bottomInset / 2)
+-    val gapPx = with(density) { gap.toPx() }
+-    val halfHeight = if (surfaceSize.height > 0) surfaceSize.height / 2f else with(density) { 24.dp.toPx() }
+-    val radius = screenRadius?.minus(gapPx)?.takeIf { it > 0f }?.coerceAtMost(halfHeight) ?: halfHeight
+-    val shape = RoundedCornerShape(with(density) { radius.toDp() })
++    var screenCorners by remember(view, config.screenWidthDp, config.screenHeightDp) {
++        mutableStateOf<Pair<Float?, Float?>>(null to null)
++    }
++    val fallbackScreenRadius = remember(view, config.screenWidthDp, config.screenHeightDp, density.density) {
++        // Some containers omit RoundedCorner metadata but retain the platform's corner resources.
++        listOf("rounded_corner_radius_bottom", "rounded_corner_radius").firstNotNullOfOrNull { name ->
++            val id = view.resources.getIdentifier(name, "dimen", "android")
++            if (id != 0) view.resources.getDimension(id).takeIf { it > 0f } else null
++        } ?: with(density) { 40.dp.toPx() }
++    }
++    val gapPx = navigationCapsuleGap(
++        windowInsets.getBottom(density).toFloat(),
++        WindowInsets.tappableElement.getBottom(density).toFloat(),
++        density.density,
++    )
++    val gap = with(density) { gapPx.toDp() }
++    val height = surfaceSize.height.takeIf { it > 0 }?.toFloat() ?: with(density) { 48.dp.toPx() }
++    val radii = navigationCapsuleCorners(
++        height,
++        gapPx,
++        screenCorners.first ?: fallbackScreenRadius,
++        screenCorners.second ?: fallbackScreenRadius,
++    )
++    val shape = with(density) {
++        AbsoluteRoundedCornerShape(
++            topLeft = radii.topLeft.toDp(),
++            topRight = radii.topRight.toDp(),
++            bottomRight = radii.bottomRight.toDp(),
++            bottomLeft = radii.bottomLeft.toDp(),
++        )
++    }
+     val outline = MaterialTheme.colorScheme.outline
+     val motion = spring<Float>(dampingRatio = 0.86f, stiffness = 420f)
+     LaunchedEffect(selected, itemCount) {
+@@ -113,7 +136,7 @@ fun NavigationCapsule(
+         }
+     }
+     Box(
+-        modifier = modifier.fillMaxWidth().padding(start = gap, top = 2.dp, end = gap, bottom = gap * 2),
++        modifier = modifier.fillMaxWidth().padding(start = gap, top = 2.dp, end = gap, bottom = gap),
+         contentAlignment = Alignment.Center,
+     ) {
+         Box(
+@@ -121,88 +144,145 @@ fun NavigationCapsule(
+                 .onSizeChanged { surfaceSize = it }
+                 .onGloballyPositioned {
+                     if (Build.VERSION.SDK_INT >= 31) {
+-                        screenRadius = listOfNotNull(
+-                            view.rootWindowInsets?.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_LEFT)?.radius,
+-                            view.rootWindowInsets?.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_RIGHT)?.radius,
+-                        ).filter { it > 0 }.minOrNull()?.toFloat()
++                        screenCorners =
++                            view.rootWindowInsets?.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_LEFT)?.radius
++                                ?.takeIf { it > 0 }?.toFloat() to
++                            view.rootWindowInsets?.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_RIGHT)?.radius
++                                ?.takeIf { it > 0 }?.toFloat()
+                     }
+                 }
+                 .graphicsLayer {
+                     scaleX = 1f + 0.003f * pressure
+                     scaleY = 1f - 0.018f * pressure
+                 }
+-                .shadow(4.dp, shape, clip = false)
++                .shadow(3.dp, shape, clip = false)
+                 .clip(shape)
+-                .pointerInput(itemCount) {
++                .pointerInput(itemCount, rtl, surfaceSize.width) {
++                    fun indexAt(x: Float): Float {
++                        val inset = 6.dp.toPx()
++                        val width = (size.width - 2 * inset).coerceAtLeast(1f)
++                        val fraction = ((x - inset) / width).coerceIn(0f, 1f)
++                        return ((if (rtl) 1f - fraction else fraction) * itemCount - 0.5f)
++                            .coerceIn(0f, (itemCount - 1).toFloat())
++                    }
++                    // Own the whole glass surface from DOWN to UP. Empty end padding and seams
++                    // must not send taps to a cover underneath. Child tab semantics still work
++                    // for accessibility/keyboard; physical taps and drags use this single router.
+                     awaitEachGesture {
+                         val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
++                        down.consume()
+                         pressed = true
+                         touchX = down.position.x
++                        var last = down.position
++                        var axis = 0
++                        var cancelled = false
++                        var finished = false
+                         try {
+                             do {
+                                 val event = awaitPointerEvent(PointerEventPass.Initial)
+-                                event.changes.firstOrNull { it.id == down.id }?.let { touchX = it.position.x }
++                                if (event.changes.any { it.isConsumed }) cancelled = true
++                                if (event.changes.any { it.id != down.id && it.pressed }) cancelled = true
++                                val change = event.changes.firstOrNull { it.id == down.id }
++                                if (change == null) {
++                                    cancelled = true
++                                } else {
++                                    last = change.position
++                                    touchX = last.x
++                                    val distance = last - down.position
++                                    if (axis == 0) {
++                                        if (abs(distance.x) > viewConfiguration.touchSlop &&
++                                            abs(distance.x) >= abs(distance.y)
++                                        ) {
++                                            axis = 1
++                                        } else if (abs(distance.y) > viewConfiguration.touchSlop) {
++                                            axis = -1
++                                        }
++                                    }
++                                    if (axis == 1 && !cancelled) dragPosition = indexAt(last.x)
++                                }
++                                event.changes.forEach { it.consume() }
+                             } while (event.changes.any { it.pressed })
++                            val inside = last.x in 0f..size.width.toFloat() && last.y in 0f..size.height.toFloat()
++                            if (!cancelled && axis != -1 && inside) {
++                                settle(indexAt(last.x).roundToInt(), true)
++                            } else {
++                                settle(latestSelected, false)
++                            }
++                            finished = true
+                         } finally {
+                             pressed = false
++                            if (!finished) settle(latestSelected, false)
+                         }
+                     }
+-                }
+-                .pointerInput(itemCount, rtl, surfaceSize.width) {
+-                    fun indexAt(x: Float): Float {
+-                        val inset = 6.dp.toPx()
+-                        val availableWidth = (surfaceSize.width - 2 * inset).coerceAtLeast(1f)
+-                        val fraction = ((x - inset) / availableWidth).coerceIn(0f, 1f)
+-                        return ((if (rtl) 1f - fraction else fraction) * itemCount - 0.5f)
+-                            .coerceIn(0f, (itemCount - 1).toFloat())
+-                    }
+-                    detectHorizontalDragGestures(
+-                        onDragStart = { dragPosition = indexAt(it.x) },
+-                        onHorizontalDrag = { change, _ ->
+-                            change.consume()
+-                            dragPosition = indexAt(change.position.x)
+-                        },
+-                        onDragEnd = { settle((dragPosition ?: latestSelected.toFloat()).roundToInt(), true) },
+-                        onDragCancel = { settle(latestSelected, false) },
+-                    )
+                 },
+         ) {
+             Box(
+                 Modifier.matchParentSize()
+                     .drawWithContent {
+                         drawContent()
+-                        val inset = 0.5.dp.toPx()
+-                        val rimSize =
+-                            Size(
+-                                (size.width - 2 * inset).coerceAtLeast(0f),
+-                                (size.height - 2 * inset).coerceAtLeast(0f),
++                        // Broad transmitted sheen and two soft reflections convey thickness without a metal ring.
++                        drawRect(
++                            Brush.verticalGradient(
++                                listOf(
++                                    Color.White.copy(alpha = 0.10f),
++                                    Color.White.copy(alpha = 0.018f),
++                                    Color.Black.copy(alpha = 0.035f),
++                                ),
++                            ),
++                        )
++                        fun rim(inset: Float): Path = Path().apply {
++                            addRoundRect(
++                                RoundRect(
++                                    left = inset,
++                                    top = inset,
++                                    right = size.width - inset,
++                                    bottom = size.height - inset,
++                                    topLeftCornerRadius = CornerRadius((radii.topLeft - inset).coerceAtLeast(0f)),
++                                    topRightCornerRadius = CornerRadius((radii.topRight - inset).coerceAtLeast(0f)),
++                                    bottomRightCornerRadius = CornerRadius(
++                                        (radii.bottomRight - inset).coerceAtLeast(0f),
++                                    ),
++                                    bottomLeftCornerRadius = CornerRadius((radii.bottomLeft - inset).coerceAtLeast(0f)),
++                                ),
+                             )
+-                        drawRoundRect(
++                        }
++                        drawPath(
++                            path = rim(0.5.dp.toPx()),
+                             brush = Brush.linearGradient(
+                                 listOf(
+-                                    Color.White.copy(alpha = 0.65f),
+-                                    outline.copy(alpha = 0.14f),
+-                                    Color.White.copy(alpha = 0.28f),
++                                    Color.White.copy(alpha = 0.38f),
++                                    outline.copy(alpha = 0.07f),
++                                    Color.White.copy(alpha = 0.20f),
+                                 ),
+                                 start = Offset.Zero,
+                                 end = Offset(size.width, size.height),
+                             ),
+-                            topLeft = Offset(inset, inset),
+-                            size = rimSize,
+-                            cornerRadius = CornerRadius((radius - inset).coerceAtLeast(0f)),
+-                            style = Stroke(0.85.dp.toPx()),
++                            style = Stroke(0.65.dp.toPx()),
++                        )
++                        drawPath(
++                            path = rim(1.7.dp.toPx()),
++                            brush = Brush.linearGradient(
++                                listOf(
++                                    Color.White.copy(alpha = 0.16f),
++                                    Color.Transparent,
++                                    Color.White.copy(alpha = 0.07f),
++                                ),
++                                start = Offset.Zero,
++                                end = Offset(size.width * 0.7f, size.height),
++                            ),
++                            style = Stroke(1.dp.toPx()),
+                         )
+                         val fraction = (position.value + 0.5f) / itemCount
+                         val x = if (pressed) touchX else size.width * (if (rtl) 1f - fraction else fraction)
+                         drawRect(
+                             Brush.radialGradient(
+-                                listOf(Color.White.copy(alpha = 0.12f * light), Color.Transparent),
++                                listOf(Color.White.copy(alpha = 0.20f * light), Color.Transparent),
+                                 center = Offset(x, size.height * 0.25f),
+                                 radius = (size.height * 2.8f).coerceAtLeast(1f),
+                             ),
+                         )
+                     }
+-                    .capsuleRefraction(surfaceSize, radius)
++                    .capsuleRefraction(surfaceSize, radii)
+                     .browsingGlassBackground(state, thin = true),
+             )
+             CompositionLocalProvider(
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsuleGeometry.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsuleGeometry.kt
+new file mode 100644
+index 000000000..36d394d28
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsuleGeometry.kt
+@@ -0,0 +1,34 @@
++package tachiyomi.presentation.core.components.material
++
++/** One distance to the physical left, right and bottom edges, not two distances at the bottom. */
++internal fun navigationCapsuleGap(bottomInset: Float, tappableInset: Float, density: Float): Float {
++    // Gesture insets describe a reserved band, not the visible handle. A bounded optical adjustment
++    // keeps the capsule above the handle without reproducing the whole band's decorative whitespace.
++    // Button navigation is interactive throughout its band and keeps the complete inset.
++    val reserved = if (tappableInset > 0f) maxOf(bottomInset, tappableInset) else (bottomInset - 4f * density)
++    return maxOf(20f * density, reserved)
++}
++
++internal data class CapsuleCornerRadii(
++    val topLeft: Float,
++    val topRight: Float,
++    val bottomRight: Float,
++    val bottomLeft: Float,
++)
++
++/** Offset each screen corner by the same margin; do not force both lower corners to half-height. */
++internal fun navigationCapsuleCorners(
++    height: Float,
++    gap: Float,
++    screenLeftRadius: Float,
++    screenRightRadius: Float,
++): CapsuleCornerRadii {
++    val left = (screenLeftRadius - gap).coerceIn(0f, height)
++    val right = (screenRightRadius - gap).coerceIn(0f, height)
++    return CapsuleCornerRadii(
++        topLeft = minOf(height / 2f, height - left),
++        topRight = minOf(height / 2f, height - right),
++        bottomRight = right,
++        bottomLeft = left,
++    )
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleGeometryTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleGeometryTest.kt
+new file mode 100644
+index 000000000..5d4c9c185
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleGeometryTest.kt
+@@ -0,0 +1,38 @@
++package tachiyomi.presentation.core.components.material
++
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++
++class NavigationChromeCapsuleGeometryTest {
++    @Test
++    fun `Pura sized screenshot profile uses equal 55px margins instead of 33px sides and 66px bottom`() {
++        val density = 2.75f
++        val gap = navigationCapsuleGap(66f, 0f, density)
++        assertEquals(55f, gap)
++        assertTrue(gap < 66f)
++        val corners = navigationCapsuleCorners(132f, gap, 110f, 110f)
++        assertEquals(110f, gap + corners.bottomLeft)
++        assertEquals(110f, gap + corners.bottomRight)
++        assertTrue(corners.topLeft + corners.bottomLeft <= 132f)
++    }
++
++    @Test
++    fun `reported asymmetric lower screen corners remain concentric and fit the capsule height`() {
++        val corners = navigationCapsuleCorners(48f, 20f, 56f, 32f)
++        assertEquals(56f, 20f + corners.bottomLeft)
++        assertEquals(32f, 20f + corners.bottomRight)
++        assertTrue(corners.topLeft + corners.bottomLeft <= 48f)
++        assertTrue(corners.topRight + corners.bottomRight <= 48f)
++    }
++
++    @Test
++    fun `button navigation retains its full interactive band and zero inset hosts get a bounded margin`() {
++        assertEquals(48f, navigationCapsuleGap(48f, 48f, 1f))
++        assertEquals(20f, navigationCapsuleGap(0f, 0f, 1f))
++        assertEquals(36f, navigationCapsuleGap(40f, 0f, 1f))
++        val corners = navigationCapsuleCorners(48f, 20f, 100f, 8f)
++        assertTrue(corners.topLeft + corners.bottomLeft <= 48f)
++        assertEquals(0f, corners.bottomRight)
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
+index 88b6e80c5..4c6038d01 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
+@@ -1,5 +1,6 @@
+ package tachiyomi.presentation.core.components.material
+ 
++import androidx.compose.foundation.clickable
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.WindowInsets
+ import androidx.compose.foundation.layout.fillMaxSize
+@@ -17,14 +18,19 @@ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.geometry.Offset
+ import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.luminance
+ import androidx.compose.ui.platform.LocalDensity
+ import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.semantics.SemanticsActions
+ import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.click
+ import androidx.compose.ui.test.onNodeWithTag
+ import androidx.compose.ui.test.onNodeWithText
+ import androidx.compose.ui.test.performClick
++import androidx.compose.ui.test.performSemanticsAction
+ import androidx.compose.ui.test.performTouchInput
+ import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.text.TextLayoutResult
+ import androidx.compose.ui.unit.dp
+ import org.junit.Test
+ import org.junit.jupiter.api.Assertions.assertEquals
+@@ -33,6 +39,7 @@ import org.junit.runner.RunWith
+ import org.robolectric.RobolectricTestRunner
+ import org.robolectric.annotation.Config
+ import org.robolectric.annotation.GraphicsMode
++import kotlin.math.abs
+ 
+ @OptIn(ExperimentalTestApi::class)
+ @RunWith(RobolectricTestRunner::class)
+@@ -40,7 +47,7 @@ import org.robolectric.annotation.GraphicsMode
+ @Config(sdk = [34], qualifiers = "w1000dp-h600dp")
+ class NavigationChromeCapsuleTest {
+     @Test
+-    fun `capsule keeps handle-relative spacing and centered text across window shapes`() = runComposeUiTest {
++    fun `capsule keeps equal screen margins and centered text across window shapes`() = runComposeUiTest {
+         var width by mutableIntStateOf(320)
+         var dark by mutableStateOf(false)
+         var density = 1f
+@@ -97,9 +104,9 @@ class NavigationChromeCapsuleTest {
+                 assertEquals(row.left - viewport.left, viewport.right - row.right, 1f)
+                 val sideGap = row.left - viewport.left
+                 val bottomGap = viewport.bottom - row.bottom
+-                assertEquals(sideGap * 2, bottomGap, 1f)
++                assertEquals(sideGap, bottomGap, 1f)
+                 assertTrue(bottomGap >= 20f, "The reserved system area is only counted once")
+-                assertTrue(sideGap >= 12f * density)
++                assertTrue(sideGap >= 20f * density)
+                 for (index in 0..4) {
+                     onNodeWithTag("icon-$index", useUnmergedTree = true).assertDoesNotExist()
+                     val word = onNodeWithText("Tab $index", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+@@ -112,6 +119,120 @@ class NavigationChromeCapsuleTest {
+         }
+     }
+ 
++    @Test
++    fun `every visible part of the glass owns its taps while the outer margin remains content`() = runComposeUiTest {
++        var selected by mutableIntStateOf(0)
++        var selections = 0
++        var backgroundTaps = 0
++        setContent {
++            MaterialTheme {
++                Box(Modifier.size(360.dp, 240.dp).testTag("tap-viewport")) {
++                    Box(Modifier.fillMaxSize().clickable { backgroundTaps++ })
++                    NavigationCapsule(
++                        state = BrowsingNavigationBarState { true },
++                        selectedIndex = selected,
++                        itemCount = 5,
++                        onSelect = {
++                            selected = it
++                            selections++
++                        },
++                        modifier = Modifier.align(Alignment.BottomCenter),
++                        windowInsets = WindowInsets(0),
++                    ) {
++                        CompactNavigationBar(
++                            modifier = Modifier.testTag("touch-row"),
++                            height = 48.dp,
++                            containerColor = Color.Transparent,
++                            windowInsets = WindowInsets(0),
++                        ) {
++                            repeat(5) { index ->
++                                CompactNavigationBarItem(
++                                    selected = selected == index,
++                                    onClick = {
++                                        selected = index
++                                        selections++
++                                    },
++                                    icon = {},
++                                    label = "Tab $index",
++                                    index = index,
++                                    showLabel = true,
++                                )
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        val row = onNodeWithTag("touch-row")
++        for ((x, expected) in listOf(0.006f to 0, 0.30f to 1, 0.50f to 2, 0.70f to 3, 0.994f to 4)) {
++            val before = selections
++            row.performTouchInput { click(Offset(width * x, center.y)) }
++            waitForIdle()
++            runOnIdle {
++                assertEquals(0, backgroundTaps, "End padding and label seams must not click the cover below")
++                assertEquals(expected, selected)
++                assertEquals(before + 1, selections, "A physical tap selects exactly once")
++            }
++        }
++        val before = selections
++        row.performTouchInput {
++            down(center)
++            moveBy(Offset(0f, -20f), delayMillis = 100)
++            up()
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(before, selections, "A vertical drag on glass is not a tab selection")
++            assertEquals(0, backgroundTaps)
++        }
++        val bounds = row.fetchSemanticsNode().boundsInRoot
++        onNodeWithTag("tap-viewport").performTouchInput { click(Offset(1f, bounds.center.y)) }
++        runOnIdle { assertEquals(1, backgroundTaps, "The outside margin still belongs to content") }
++    }
++
++    @Test
++    fun `selected words have a clear solid color and weight difference in both themes`() = runComposeUiTest {
++        var dark by mutableStateOf(false)
++        setContent {
++            MaterialTheme(colorScheme = if (dark) darkColorScheme() else lightColorScheme()) {
++                NavigationCapsule(
++                    state = BrowsingNavigationBarState { true },
++                    selectedIndex = 0,
++                    itemCount = 5,
++                    onSelect = {},
++                    windowInsets = WindowInsets(0),
++                ) {
++                    CompactNavigationBar(containerColor = Color.Transparent, windowInsets = WindowInsets(0)) {
++                        repeat(5) { index ->
++                            CompactNavigationBarItem(
++                                selected = index == 0,
++                                onClick = {},
++                                icon = {},
++                                label = "Tab $index",
++                                index = index,
++                                showLabel = true,
++                            )
++                        }
++                    }
++                }
++            }
++        }
++        for (nextDark in listOf(false, true)) {
++            runOnIdle { dark = nextDark }
++            waitForIdle()
++            val active = mutableListOf<TextLayoutResult>()
++            val inactive = mutableListOf<TextLayoutResult>()
++            onNodeWithText("Tab 0", useUnmergedTree = true).performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(active) }
++            onNodeWithText("Tab 1", useUnmergedTree = true).performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(inactive) }
++            val selected = active.single().layoutInput.style
++            val other = inactive.single().layoutInput.style
++            assertEquals(1f, selected.color.alpha)
++            assertEquals(1f, other.color.alpha)
++            assertTrue(abs(selected.color.luminance() - other.color.luminance()) > 0.08f)
++            assertTrue(selected.fontWeight!!.weight > other.fontWeight!!.weight)
++        }
++    }
++
+     @Test
+     fun `tabs remain clickable and horizontal lens drag only commits a destination at release`() = runComposeUiTest {
+         var selected by mutableIntStateOf(0)
