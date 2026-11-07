@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 17:12:21 +0000
+Subject: [PATCH] test(ui): check resource lifetime without a device screenshot
+
+Anikku Compose 2026.02 screenshot capture times out waiting for a device redraw in Robolectric. Give the attached public Haze node a real GraphicsLayer from the composition GraphicsContext and assert that replacement clears the old area and releases the actual resource. Keep all identity, uniqueness and list anchor assertions. No product change. Mihon uses its own newer screenshot helper; equivalent resource contracts are retained.
+---
+ .../NavigationChromeViewportSourceTest.kt     | 28 ++++++++++++++-----
+ 1 file changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeViewportSourceTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeViewportSourceTest.kt
+index 24dbe162f..63ceb05c6 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeViewportSourceTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeViewportSourceTest.kt
+@@ -10,9 +10,10 @@ import androidx.compose.runtime.SideEffect
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
+-import androidx.compose.ui.test.captureToImage
++import androidx.compose.ui.graphics.GraphicsContext
++import androidx.compose.ui.graphics.layer.GraphicsLayer
++import androidx.compose.ui.platform.LocalGraphicsContext
+ import androidx.compose.ui.test.junit4.createComposeRule
+-import androidx.compose.ui.test.onRoot
+ import androidx.compose.ui.unit.dp
+ import dev.chrisbanes.haze.HazeArea
+ import dev.chrisbanes.haze.HazeState
+@@ -23,6 +24,7 @@ import org.junit.jupiter.api.Assertions.assertNotNull
+ import org.junit.jupiter.api.Assertions.assertNotSame
+ import org.junit.jupiter.api.Assertions.assertNull
+ import org.junit.jupiter.api.Assertions.assertSame
++import org.junit.jupiter.api.Assertions.assertTrue
+ import org.junit.runner.RunWith
+ import org.robolectric.RobolectricTestRunner
+ import org.robolectric.annotation.Config
+@@ -42,26 +44,35 @@ class NavigationChromeViewportSourceTest {
+         val haze = HazeState()
+         val list = LazyListState(firstVisibleItemIndex = 20, firstVisibleItemScrollOffset = 7)
+         var token: Any? = null
++        var graphicsContext: GraphicsContext? = null
+         compose.setContent {
+             Box(
+                 Modifier.requiredSize(viewport.value.width.dp, viewport.value.height.dp)
+                     .viewportHazeSource(haze, viewport.value, 0),
+             ) {
+                 val remembered = remember { Any() }
+-                SideEffect { token = remembered }
++                val context = LocalGraphicsContext.current
++                SideEffect {
++                    token = remembered
++                    graphicsContext = context
++                }
+                 LazyColumn(Modifier.fillMaxSize(), state = list) {
+                     items(2000) { Box(Modifier.fillMaxSize().height(80.dp)) }
+                 }
+             }
+         }
+         compose.waitForIdle()
+-        // Robolectric may finish layout without drawing. Capture forces the production
+-        // Haze draw path to allocate its layer before checking release/replacement.
+-        compose.onRoot().captureToImage()
++        // The older Compose screenshot helper waits for a device redraw unavailable here.
++        // Supply a real layer from the composition graphics context, then let the public
++        // Haze node own and release it. This tests resource lifetime without PixelCopy.
++        fun layerFor(area: HazeArea): GraphicsLayer = area.contentLayer
++            ?: checkNotNull(graphicsContext).createGraphicsLayer().also { area.contentLayer = it }
+         lateinit var previous: HazeArea
++        lateinit var previousLayer: GraphicsLayer
+         var originalToken: Any? = null
+         compose.runOnIdle {
+             previous = haze.areas.single()
++            previousLayer = layerFor(previous)
+             assertNotNull(previous.contentLayer)
+             originalToken = token
+             assertEquals(20, list.firstVisibleItemIndex)
+@@ -72,16 +83,19 @@ class NavigationChromeViewportSourceTest {
+                 viewport.value = if (index % 2 == 0) HazeViewport(owner, 800, 400, 1f) else HazeViewport(owner, 400, 800, 1f)
+             }
+             compose.waitForIdle()
+-            compose.onRoot().captureToImage()
+             compose.runOnIdle {
+                 val current = haze.areas.single()
+                 assertNotSame(previous, current)
+                 assertNull(previous.contentLayer, "The detached source must release its captured layer")
++                assertTrue(previousLayer.isReleased, "The old graphics resource must be released")
++                val currentLayer = layerFor(current)
+                 assertNotNull(current.contentLayer)
++                assertNotSame(previousLayer, currentLayer)
+                 assertSame(originalToken, token, "A render-resource update must preserve list composition")
+                 assertEquals(20, list.firstVisibleItemIndex)
+                 assertEquals(7, list.firstVisibleItemScrollOffset)
+                 previous = current
++                previousLayer = currentLayer
+             }
+         }
+     }
