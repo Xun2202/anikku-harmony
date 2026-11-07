@@ -158,7 +158,8 @@ jobs:
             --tests '*PanoramaMasonryLayoutTest' --tests '*PanoramaMasonryFlingTest.a coast from the content survives and a coast from the thumb does not' --tests '*PanoramaAutoColumnsTest' --tests '*NavigationChrome*' --tests '*Timeline*Test' \
             :app:testPreviewUnitTest \
             --tests '*PanoramaCoverShapesTest' --tests '*PanoramaShapeModeTest' --tests '*PanoramaLayoutPolicyTest' \
-            assemblePreview -Penable-updater --stacktrace
+            -Penable-updater --stacktrace
+          ./gradlew assemblePreview -Penable-updater --stacktrace
 
       - name: Print navigation regression failures
         if: failure()
@@ -169,7 +170,7 @@ jobs:
           import os
           from pathlib import Path
           import xml.etree.ElementTree as ET
-          for report in Path(os.environ['TEST_RESULTS']).glob('TEST-*NavigationChrome*.xml'):
+          for report in Path(os.environ['TEST_RESULTS']).glob('TEST-*.xml'):
               for case in ET.parse(report).getroot().findall('testcase'):
                   for failure in case.findall('failure'):
                       print(case.attrib.get('name'), failure.attrib.get('message'))

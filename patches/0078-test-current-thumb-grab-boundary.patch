@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 15:31:08 +0000
+Subject: [PATCH] test(ui): cover the current thumb grab and flick boundaries
+
+Shared intent with Mihon 0075. The desired grab target is already 28dp wide; a 20dp down must grab, while a quick flick in the outer 28..32dp hold-only band must keep content inertia. Preserve strict inertia assertions on 30dp/40dp/center and zero-coast on 20dp/6dp. This updates the old test to current user-requested hit geometry without shrinking production touch targets.
+---
+ .../core/components/PanoramaMasonryFlingTest.kt          | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt
+index 118e249a1..3f6cae04c 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/PanoramaMasonryFlingTest.kt
+@@ -49,17 +49,20 @@ class PanoramaMasonryFlingTest {
+     fun `a coast from the content survives and a coast from the thumb does not`() {
+         val center = coast(xFromEnd = null)
+         val from40 = coast(xFromEnd = 40.dp)
+-        val from20 = coast(xFromEnd = 20.dp)
++        // The current 28dp immediate-grab band includes 20dp. Its outer 28..32dp band permits flicks.
++        val from30 = coast(xFromEnd = 30.dp)
++        val grabbed20 = coast(xFromEnd = 20.dp)
+         val onThumb = coast(xFromEnd = 6.dp)
+         println(
+             "FLING_UI center=${center.inertia} drag=${center.drag} frames=${center.frames} " +
+                 "dp40=${from40.inertia} drag=${from40.drag} frames=${from40.frames} " +
+-                "dp20=${from20.inertia} drag=${from20.drag} frames=${from20.frames} " +
++                "dp30=${from30.inertia} drag=${from30.drag} frames=${from30.frames} grab20=${grabbed20.inertia} " +
+                 "thumb=${onThumb.inertia} drag=${onThumb.drag} frames=${onThumb.frames}",
+         )
+         assertTrue(center.inertia > 300f, "baseline ${center.inertia}")
+         assertTrue(from40.inertia > center.inertia * 0.6f, "40dp ${from40.inertia} vs ${center.inertia}")
+-        assertTrue(from20.inertia > center.inertia * 0.6f, "20dp ${from20.inertia} vs ${center.inertia}")
++        assertTrue(from30.inertia > center.inertia * 0.6f, "30dp ${from30.inertia} vs ${center.inertia}")
++        assertTrue(grabbed20.inertia < center.inertia * 0.25f, "grab20 ${grabbed20.inertia} vs ${center.inertia}")
+         assertTrue(onThumb.inertia < center.inertia * 0.25f, "thumb ${onThumb.inertia} vs ${center.inertia}")
+     }
+ 
