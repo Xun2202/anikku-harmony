@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 07:44:18 +0000
+Subject: [PATCH] fix: support legacy shader sampling and clear completed fling
+ speed
+
+Try standard childShader.eval first, with the equivalent sample(shader, point) form for older Skia implementations. The native pixel test still renders the real production shader. Clear release speed when a fling completes unless another touch already owns it. Compare label centers to their actual integer-sized weighted cells rather than ideal fractional columns. Shared with the other Harmony Tachiyomi fork.
+---
+ .../core/components/material/CapsuleRefraction.kt     | 11 ++++++++---
+ .../core/components/material/NavigationChrome.kt      |  3 +++
+ .../material/NavigationChromeScrollTracker.kt         |  1 +
+ .../material/NavigationChromeCapsuleTest.kt           |  4 ++--
+ 4 files changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt
+index ca5d2a0d9..03ab473a0 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt
+@@ -57,9 +57,14 @@ internal object CapsuleRefraction33 {
+         }
+     """
+ 
+-    fun shader(size: IntSize, radius: Float): RuntimeShader = RuntimeShader(SOURCE).apply {
+-        setFloatUniform("resolution", size.width.toFloat(), size.height.toFloat())
+-        setFloatUniform("cornerRadius", radius)
++    fun shader(size: IntSize, radius: Float): RuntimeShader {
++        // Older Skia implementations expose child sampling as sample(shader, xy), not shader.eval(xy).
++        val shader = runCatching { RuntimeShader(SOURCE) }.getOrElse {
++            RuntimeShader(SOURCE.replace("backdrop.eval(samplePoint)", "sample(backdrop, samplePoint)"))
++        }
++        shader.setFloatUniform("resolution", size.width.toFloat(), size.height.toFloat())
++        shader.setFloatUniform("cornerRadius", radius)
++        return shader
+     }
+ 
+     fun effect(size: IntSize, radius: Float): RenderEffect {
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+index e4b2e0df0..ae39cf85c 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+@@ -254,6 +254,9 @@ class BrowsingNavigationBarState internal constructor(
+ 
+         override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+             tracker.endFling()
++            // A completed fling must not leave fast speed behind for wheel/keyboard input.
++            // A cancelled old fling must also not clear the speed of a new pressed gesture.
++            if (!tracker.isGestureActive) gestureSpeedDpPerSecond = 0f
+             return Velocity.Zero
+         }
+     }
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
+index 0d05ecadc..fc2ad61c3 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
+@@ -11,6 +11,7 @@ internal class NavigationChromeScrollTracker(
+     var visible = initialVisible
+         private set
+     private var gestureActive = false
++    val isGestureActive: Boolean get() = gestureActive
+     private var switchedThisGesture = false
+     private var pendingDistance = 0f
+     private var consumedVerticalScroll = false
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
+index c746fa2a1..19565fbf5 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
+@@ -102,8 +102,8 @@ class NavigationChromeCapsuleTest {
+                     onNodeWithTag("icon-$index", useUnmergedTree = true).assertDoesNotExist()
+                     val word = onNodeWithText("Tab $index", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+                     assertEquals(row.center.y, word.center.y, 1f)
+-                    val centerX = row.left + 6f * density + (row.width - 12f * density) * (index + 0.5f) / 5
+-                    assertEquals(centerX, word.center.x, 1f)
++                    val item = onNodeWithText("Tab $index").fetchSemanticsNode().boundsInRoot
++                    assertEquals(item.center.x, word.center.x, 1f)
+                 }
+                 assertTrue(badge.top >= row.top - 1f && badge.bottom <= row.bottom + 1f)
+             }

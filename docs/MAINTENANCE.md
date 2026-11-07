@@ -720,3 +720,5 @@ gh release list --repo Xun2202/anikku-harmony
 - 快甩两个方向都优先收起：Initial读取瞬时位移速度并结合VelocityTracker，避免首个样本0速度误展开；Post仅在真实纵向消费后快移收起，Pre抑制快速回翻的错误展开，释放时双向快甩同样收起。普通慢拖仍可恢复，同一按住内一旦切换仍锁定；明确快释放时手指已松开可收起。首尾跟随、顶部刷新、短列表、横滑、搜索/选择/触摸探索/更多/投屏保护及0消费保留。
 - 检查：15项真实tracker JVM和格式通过；更新真实LazyColumn触摸用例覆盖双向快甩/慢拖，新增实际PanoramaMasonry快甩；胶囊两主题/三宽度三边等距、纯文字/居中/无图标、角标/点击拖拽取消回归；Native Skia编译并执行实际AGSL，验证边缘背景采样偏移而中心内容保留。最终结果/版本/签名/索引见归档现状；设备光学观感仍需安装反馈。
 - 官方参考：https://developer.huawei.com/consumer/cn/doc/HarmonyOS-Guides/arkts-immersive-light-sense-common-capability/ ；https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/arkts-immersive-light-sense-faq/ 。Animeko为独立导航/渲染架构，本轮不直接移植。
+
+- 首次CI实际抓到3处：Native Skia只认旧sample(shader, point)写法；中心测试误把整数权重分配当成理想小数网格（1.4px差异）；惯性完成后速度残留使直接UserInput恢复被当成快滑。后续兼容补丁优先标准.eval并尝试等价旧语法，Native像素验证不跳过；文字以真实可点击cell中心核验；完成fling只在没有新按住手势时清速度，避免旧惯性取消覆盖新手势速度。未发布失败候选。
