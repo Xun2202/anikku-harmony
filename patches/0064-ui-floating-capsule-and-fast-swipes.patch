@@ -1,0 +1,910 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 06:50:21 +0000
+Subject: [PATCH] ui: float glass navigation and stabilize repeated fast upward
+ swipes
+
+Share navigation behavior with the other Harmony Tachiyomi fork. Complete short upward intents with density-scaled release velocity without overriding a touch reveal. Protect a touch that catches an upward fling from a small reverse wobble; preserve deliberate reverse, boundary reveal, pinning and all content velocity. Add one rounded, inset glass capsule with a spring selection lens, drag-to-preview and release-to-select. Keep badges and labels, measured bottom clearance, static More behavior and Anikku cast/tab preferences. Regression tests cover release/cancellation sequences, touch scrolling, capsule geometry and drag/click routing.
+---
+ .../eu/kanade/tachiyomi/ui/home/HomeScreen.kt |  41 +++--
+ .../material/CompactNavigationBar.kt          |  10 +-
+ .../components/material/NavigationCapsule.kt  | 173 ++++++++++++++++++
+ .../components/material/NavigationChrome.kt   |  33 +++-
+ .../material/NavigationChromeScrollTracker.kt |  44 ++++-
+ .../material/NavigationChromeCapsuleTest.kt   | 171 +++++++++++++++++
+ .../NavigationChromeConnectionTest.kt         |  65 +++++++
+ .../material/NavigationChromeLayoutTest.kt    |  42 ++++-
+ .../NavigationChromeScrollTrackerTest.kt      |  93 ++++++++++
+ 9 files changed, 648 insertions(+), 24 deletions(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
+index 9a880bcec..221f1c670 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
+@@ -81,6 +81,7 @@ import tachiyomi.presentation.core.components.material.CompactNavigationBar
+ import tachiyomi.presentation.core.components.material.CompactNavigationBarItem
+ import tachiyomi.presentation.core.components.material.LocalBrowsingBottomPadding
+ import tachiyomi.presentation.core.components.material.LocalBrowsingNavigationBarState
++import tachiyomi.presentation.core.components.material.NavigationCapsule
+ import tachiyomi.presentation.core.components.material.NavigationRail
+ import tachiyomi.presentation.core.components.material.Scaffold
+ import tachiyomi.presentation.core.components.material.isCompactBrowsingWindow
+@@ -148,6 +149,7 @@ object HomeScreen : Screen() {
+                     enabled = bottomNavVisible && !isConnected && tabNavigator.current != MoreTab,
+                     resetKey = tabNavigator.current.key,
+                 )
++                val navigationTabs = TABS.fastFilter { it.isEnabled() }
+                 val compactBar = isCompactBrowsingWindow()
+                 val density = LocalDensity.current
+                 var measuredBarHeight by remember { mutableStateOf(0.dp) }
+@@ -202,22 +204,35 @@ object HomeScreen : Screen() {
+                                             )
+                                         }
+                                         if (bottomNavVisible) {
+-                                            Box(
+-                                                Modifier.onSizeChanged {
++                                            NavigationCapsule(
++                                                state = navigationScroll,
++                                                selectedIndex = navigationTabs.indexOfFirst {
++                                                    it::class == tabNavigator.current::class
++                                                },
++                                                itemCount = navigationTabs.size,
++                                                onSelect = { index ->
++                                                    val tab = navigationTabs[index]
++                                                    if (tab::class != tabNavigator.current::class) {
++                                                        tabNavigator.current = tab
++                                                    } else {
++                                                        scope.launch { tab.onReselect(navigator) }
++                                                    }
++                                                },
++                                                modifier = Modifier.onSizeChanged {
+                                                     measuredBarHeight = with(density) { it.height.toDp() }
+                                                 },
+                                             ) {
+-                                                if (compactBar) {
+-                                                    CompactNavigationBar(containerColor = Color.Transparent) {
+-                                                        TABS.fastFilter { it.isEnabled() }.fastForEach {
+-                                                            CompactNavigationItem(it, alwaysShowLabel)
+-                                                        }
+-                                                    }
+-                                                } else {
+-                                                    ShortNavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
+-                                                        TABS.fastFilter { it.isEnabled() }.fastForEach {
+-                                                            NavigationBarItem(it, alwaysShowLabel)
+-                                                        }
++                                                CompactNavigationBar(
++                                                    containerColor = Color.Transparent,
++                                                    height = when {
++                                                        density.fontScale > 1.3f -> 72.dp
++                                                        compactBar -> 56.dp
++                                                        else -> 64.dp
++                                                    },
++                                                    windowInsets = WindowInsets(0),
++                                                ) {
++                                                    navigationTabs.fastForEach {
++                                                        CompactNavigationItem(it, alwaysShowLabel)
+                                                     }
+                                                 }
+                                             }
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CompactNavigationBar.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CompactNavigationBar.kt
+index 7e6666adc..d954dfc37 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CompactNavigationBar.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CompactNavigationBar.kt
+@@ -29,6 +29,7 @@ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.layout.Layout
+ import androidx.compose.ui.semantics.Role
+ import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.Dp
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+ 
+@@ -37,6 +38,7 @@ import androidx.compose.ui.unit.sp
+ fun CompactNavigationBar(
+     modifier: Modifier = Modifier,
+     containerColor: Color = MaterialTheme.colorScheme.surface,
++    height: Dp = 56.dp,
+     windowInsets: WindowInsets = NavigationBarDefaults.windowInsets.only(WindowInsetsSides.Bottom),
+     content: @Composable RowScope.() -> Unit,
+ ) {
+@@ -45,7 +47,7 @@ fun CompactNavigationBar(
+             .fillMaxWidth()
+             .background(containerColor)
+             .windowInsetsPadding(windowInsets)
+-            .height(56.dp)
++            .height(height)
+             .selectableGroup(),
+         verticalAlignment = Alignment.CenterVertically,
+         content = content,
+@@ -70,7 +72,11 @@ fun RowScope.CompactNavigationBarItem(
+             .selectable(selected = selected, role = Role.Tab, onClick = onClick)
+             .padding(start = 4.dp, top = 8.dp, end = 4.dp)
+             .background(
+-                if (selected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
++                if (selected && !LocalNavigationCapsule.current) {
++                    MaterialTheme.colorScheme.secondaryContainer
++                } else {
++                    Color.Transparent
++                },
+                 RoundedCornerShape(16.dp),
+             ),
+         horizontalAlignment = Alignment.CenterHorizontally,
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+new file mode 100644
+index 000000000..34b78eda8
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+@@ -0,0 +1,173 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.animation.core.Animatable
++import androidx.compose.animation.core.animateFloatAsState
++import androidx.compose.animation.core.spring
++import androidx.compose.animation.core.tween
++import androidx.compose.foundation.BorderStroke
++import androidx.compose.foundation.border
++import androidx.compose.foundation.gestures.detectHorizontalDragGestures
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.WindowInsetsSides
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.navigationBars
++import androidx.compose.foundation.layout.only
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.widthIn
++import androidx.compose.foundation.layout.windowInsetsPadding
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.rememberUpdatedState
++import androidx.compose.runtime.setValue
++import androidx.compose.runtime.staticCompositionLocalOf
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.draw.drawWithContent
++import androidx.compose.ui.draw.shadow
++import androidx.compose.ui.geometry.CornerRadius
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.geometry.Size
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.drawscope.Stroke
++import androidx.compose.ui.input.pointer.pointerInput
++import androidx.compose.ui.layout.onSizeChanged
++import androidx.compose.ui.platform.LocalLayoutDirection
++import androidx.compose.ui.unit.LayoutDirection
++import androidx.compose.ui.unit.dp
++import kotlinx.coroutines.launch
++import kotlin.math.abs
++import kotlin.math.roundToInt
++
++internal val LocalNavigationCapsule = staticCompositionLocalOf { false }
++
++/** One glass surface; the selection lens and its brief light are drawn without another blur pass. */
++@Composable
++fun NavigationCapsule(
++    state: BrowsingNavigationBarState,
++    selectedIndex: Int,
++    itemCount: Int,
++    onSelect: (Int) -> Unit,
++    modifier: Modifier = Modifier,
++    windowInsets: WindowInsets = WindowInsets.navigationBars.only(WindowInsetsSides.Bottom),
++    content: @Composable () -> Unit,
++) {
++    if (itemCount <= 0) return
++    val selected = selectedIndex.coerceIn(0, itemCount - 1)
++    val position = remember { Animatable(selected.toFloat()) }
++    var dragPosition by remember { mutableStateOf<Float?>(null) }
++    var width by remember { mutableIntStateOf(0) }
++    val latestSelected by rememberUpdatedState(selected)
++    val latestOnSelect by rememberUpdatedState(onSelect)
++    val scope = rememberCoroutineScope()
++    val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
++    val shape = RoundedCornerShape(50)
++    val colors = MaterialTheme.colorScheme
++    val motion = spring<Float>(dampingRatio = 0.86f, stiffness = 420f)
++    LaunchedEffect(selected, itemCount) {
++        if (dragPosition == null) position.animateTo(selected.toFloat(), motion)
++    }
++    val light by animateFloatAsState(
++        targetValue = if (dragPosition != null || position.isRunning) 1f else 0f,
++        animationSpec = tween(160),
++        label = "capsuleLight",
++    )
++    fun settle(index: Int, commit: Boolean) {
++        val from = dragPosition ?: position.value
++        scope.launch {
++            position.snapTo(from)
++            dragPosition = null
++            if (commit) latestOnSelect(index)
++            position.animateTo(index.toFloat(), motion)
++        }
++    }
++    Box(
++        modifier = modifier.fillMaxWidth().windowInsetsPadding(windowInsets)
++            .padding(start = 16.dp, top = 4.dp, end = 16.dp, bottom = 8.dp),
++        contentAlignment = Alignment.Center,
++    ) {
++        Box(
++            Modifier.widthIn(max = 640.dp).fillMaxWidth()
++                .shadow(6.dp, shape)
++                .clip(shape)
++                .browsingGlassBackground(state)
++                .border(
++                    BorderStroke(
++                        0.75.dp,
++                        Brush.verticalGradient(
++                            listOf(Color.White.copy(alpha = 0.45f), colors.outlineVariant.copy(alpha = 0.3f)),
++                        ),
++                    ),
++                    shape,
++                )
++                .padding(horizontal = 6.dp)
++                .onSizeChanged { width = it.width }
++                .pointerInput(itemCount, rtl, width) {
++                    fun indexAt(x: Float): Float {
++                        val fraction = (x / width.coerceAtLeast(1)).coerceIn(0f, 1f)
++                        return ((if (rtl) 1f - fraction else fraction) * itemCount - 0.5f)
++                            .coerceIn(0f, (itemCount - 1).toFloat())
++                    }
++                    detectHorizontalDragGestures(
++                        onDragStart = { dragPosition = indexAt(it.x) },
++                        onHorizontalDrag = { change, _ ->
++                            change.consume()
++                            dragPosition = indexAt(change.position.x)
++                        },
++                        onDragEnd = { settle((dragPosition ?: latestSelected.toFloat()).roundToInt(), true) },
++                        onDragCancel = { settle(latestSelected, false) },
++                    )
++                }
++                .drawWithContent {
++                    val index = (dragPosition ?: position.value).coerceIn(0f, (itemCount - 1).toFloat())
++                    val lane = size.width / itemCount
++                    val moving = (1f - abs(index - index.roundToInt()) * 2f).coerceIn(0f, 1f)
++                    val stretch = lane * (1f - moving) * 0.08f
++                    val lensWidth = (lane - 8.dp.toPx() + stretch).coerceAtLeast(0f)
++                    val lensHeight = (size.height - 8.dp.toPx()).coerceAtLeast(0f)
++                    val start = ((index + 0.5f) * lane - lensWidth / 2)
++                        .coerceIn(0f, (size.width - lensWidth).coerceAtLeast(0f))
++                    val x = if (rtl) size.width - start - lensWidth else start
++                    val offset = Offset(x, 4.dp.toPx())
++                    val lensSize = Size(lensWidth, lensHeight)
++                    val radius = CornerRadius(lensHeight / 2)
++                    drawRoundRect(
++                        brush = Brush.linearGradient(
++                            listOf(
++                                colors.primary.copy(alpha = 0.12f + light * 0.08f),
++                                colors.surface.copy(alpha = 0.24f),
++                                colors.primary.copy(alpha = 0.09f),
++                            ),
++                            start = offset,
++                            end = offset + Offset(lensWidth, lensHeight),
++                        ),
++                        topLeft = offset,
++                        size = lensSize,
++                        cornerRadius = radius,
++                    )
++                    drawRoundRect(
++                        brush = Brush.verticalGradient(
++                            listOf(Color.White.copy(alpha = 0.25f + light * 0.25f), Color.Transparent),
++                        ),
++                        topLeft = offset,
++                        size = lensSize,
++                        cornerRadius = radius,
++                        style = Stroke(0.75.dp.toPx()),
++                    )
++                    drawContent()
++                },
++        ) {
++            CompositionLocalProvider(LocalNavigationCapsule provides true) { content() }
++        }
++    }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+index b4ead8298..256d92085 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+@@ -39,6 +39,7 @@ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.platform.LocalDensity
+ import androidx.compose.ui.unit.Constraints
+ import androidx.compose.ui.unit.Dp
++import androidx.compose.ui.unit.Velocity
+ import androidx.compose.ui.unit.dp
+ import dev.chrisbanes.haze.HazeState
+ import kotlin.math.abs
+@@ -109,7 +110,7 @@ fun BrowsingChromeOverlay(
+     content: @Composable () -> Unit,
+ ) {
+     Layout(modifier = modifier.clipToBounds(), content = {
+-        Box(Modifier.browsingGlassBackground(state)) { content() }
++        Box(if (atBottom) Modifier else Modifier.browsingGlassBackground(state)) { content() }
+     }) { measurables, constraints ->
+         val child = measurables.single().measure(constraints.copy(minHeight = 0, maxHeight = Constraints.Infinity))
+         if (atBottom) state.bottomHeightPx = child.height.toFloat() else state.headerHeightPx = child.height.toFloat()
+@@ -124,9 +125,15 @@ fun BrowsingChromeOverlay(
+ class BrowsingNavigationBarState internal constructor(
+     intentDistance: Float = 6f,
+     initialVisible: Boolean = true,
++    private val density: Float = 1f,
+     private val enabled: () -> Boolean,
+ ) {
+-    private val tracker = NavigationChromeScrollTracker(intentDistance, initialVisible)
++    private val tracker = NavigationChromeScrollTracker(
++        intentDistance,
++        initialVisible,
++        fastFlingVelocity =
++        600f * density,
++    )
+     private val pinnedOwners = mutableSetOf<Any>()
+     internal var animation: State<Float>? = null
+     internal val glassState = HazeState()
+@@ -222,6 +229,23 @@ class BrowsingNavigationBarState internal constructor(
+             // Never consume drag or velocity, or move the content on behalf of the controls.
+             return Offset.Zero
+         }
++
++        override suspend fun onPreFling(available: Velocity): Velocity {
++            if (canHide()) {
++                if (atEnd()) {
++                    revealAtEnd()
++                } else {
++                    gestureSpeedDpPerSecond = abs(available.y) / density
++                    updateVisibility(tracker.onPreFling(available.x, available.y))
++                }
++            }
++            return Velocity.Zero
++        }
++
++        override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
++            tracker.endFling()
++            return Velocity.Zero
++        }
+     }
+ }
+ 
+@@ -257,10 +281,11 @@ internal fun Modifier.observeBrowsingChromeGestures(
+ fun rememberBrowsingNavigationBarState(enabled: Boolean, resetKey: Any?): BrowsingNavigationBarState {
+     val canHide = enabled && !rememberTouchExplorationEnabled()
+     val currentEnabled by rememberUpdatedState(canHide)
+-    val intentDistance = with(LocalDensity.current) { 6.dp.toPx() }
++    val density = LocalDensity.current
++    val intentDistance = with(density) { 6.dp.toPx() }
+     var savedVisible by rememberSaveable { mutableStateOf(true) }
+     val state = remember(intentDistance) {
+-        BrowsingNavigationBarState(intentDistance, savedVisible) { currentEnabled }
++        BrowsingNavigationBarState(intentDistance, savedVisible, density.density) { currentEnabled }
+     }
+     SideEffect { savedVisible = state.visible }
+     val configuration = LocalConfiguration.current
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
+index 5dff174a6..058e21a69 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
+@@ -3,23 +3,33 @@ package tachiyomi.presentation.core.components.material
+ import kotlin.math.abs
+ 
+ /** One deliberate state change per touch, so reversing an ongoing drag cannot flash the controls. */
+-internal class NavigationChromeScrollTracker(private val intentDistance: Float = 6f, initialVisible: Boolean = true) {
++internal class NavigationChromeScrollTracker(
++    private val intentDistance: Float = 6f,
++    initialVisible: Boolean = true,
++    private val fastFlingVelocity: Float = 600f,
++) {
+     var visible = initialVisible
+         private set
+     private var gestureActive = false
+     private var switchedThisGesture = false
+     private var pendingDistance = 0f
++    private var consumedUpwardScroll = false
++    private var upwardFling = false
++    private var continuingFling = false
+ 
+     fun beginGesture() {
+         gestureActive = true
+         switchedThisGesture = false
+         pendingDistance = 0f
++        consumedUpwardScroll = false
++        // Snapshot before the new touch cancels the old fling and dispatches onPostFling.
++        continuingFling = upwardFling
+     }
+ 
+     fun endGesture() {
+         gestureActive = false
+-        switchedThisGesture = false
+         pendingDistance = 0f
++        // Keep the last touch's decision until its release velocity is delivered.
+     }
+ 
+     fun reset() {
+@@ -27,6 +37,9 @@ internal class NavigationChromeScrollTracker(private val intentDistance: Float =
+         // Do not unlock a finger that is still down when selection/search pins the controls.
+         switchedThisGesture = gestureActive
+         pendingDistance = 0f
++        consumedUpwardScroll = false
++        upwardFling = false
++        continuingFling = false
+     }
+ 
+     fun revealAtEnd() {
+@@ -34,6 +47,9 @@ internal class NavigationChromeScrollTracker(private val intentDistance: Float =
+         pendingDistance = 0f
+         // Reaching the boundary overrides a hide, but does not unlock the pressed finger.
+         switchedThisGesture = gestureActive
++        consumedUpwardScroll = false
++        upwardFling = false
++        continuingFling = false
+     }
+ 
+     fun onPreScroll(x: Float, y: Float, userInput: Boolean): Boolean {
+@@ -42,10 +58,28 @@ internal class NavigationChromeScrollTracker(private val intentDistance: Float =
+     }
+ 
+     fun onPostScroll(x: Float, y: Float, userInput: Boolean): Boolean {
+-        if (userInput && -y > abs(x)) observe(y)
++        if (userInput && -y > abs(x)) {
++            consumedUpwardScroll = true
++            observe(y)
++        }
+         return visible
+     }
+ 
++    fun onPreFling(x: Float, y: Float): Boolean {
++        upwardFling = consumedUpwardScroll && -y > abs(x) && -y >= fastFlingVelocity
++        // Fling can finish a short upward intent, but must not undo an intentional reveal.
++        if (upwardFling && !switchedThisGesture) {
++            visible = false
++            pendingDistance = 0f
++            switchedThisGesture = true
++        }
++        return visible
++    }
++
++    fun endFling() {
++        upwardFling = false
++    }
++
+     private fun observe(y: Float) {
+         if (gestureActive && switchedThisGesture) return
+         val reveal = y > 0f
+@@ -54,7 +88,9 @@ internal class NavigationChromeScrollTracker(private val intentDistance: Float =
+             return
+         }
+         pendingDistance += abs(y)
+-        if (pendingDistance < intentDistance) return
++        // Catching a moving list often adds a small downward wobble before the next upward swipe.
++        val threshold = if (reveal && continuingFling) intentDistance * 2 else intentDistance
++        if (pendingDistance < threshold) return
+         visible = reveal
+         pendingDistance = 0f
+         switchedThisGesture = gestureActive
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
+new file mode 100644
+index 000000000..10692ed81
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
+@@ -0,0 +1,171 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.size
++import androidx.compose.material3.Badge
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.material3.darkColorScheme
++import androidx.compose.material3.lightColorScheme
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.onNodeWithTag
++import androidx.compose.ui.test.onNodeWithText
++import androidx.compose.ui.test.performClick
++import androidx.compose.ui.test.performTouchInput
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.unit.dp
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.robolectric.annotation.GraphicsMode
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@GraphicsMode(GraphicsMode.Mode.LEGACY)
++@Config(sdk = [34], qualifiers = "w1000dp-h600dp")
++class NavigationChromeCapsuleTest {
++    @Test
++    fun `capsule keeps balanced margins and gesture clearance across themes and widths`() = runComposeUiTest {
++        var width by mutableIntStateOf(320)
++        var dark by mutableStateOf(false)
++        var density = 1f
++        setContent {
++            MaterialTheme(colorScheme = if (dark) darkColorScheme() else lightColorScheme()) {
++                density = LocalDensity.current.density
++                Box(Modifier.fillMaxSize()) {
++                    Box(Modifier.size(width.dp, 240.dp).testTag("viewport")) {
++                        NavigationCapsule(
++                            state = BrowsingNavigationBarState { true },
++                            selectedIndex = 0,
++                            itemCount = 5,
++                            onSelect = {},
++                            modifier = Modifier.align(Alignment.BottomCenter),
++                            windowInsets = WindowInsets(0, 0, 0, 20),
++                        ) {
++                            CompactNavigationBar(
++                                modifier = Modifier.testTag("capsule-row"),
++                                containerColor = Color.Transparent,
++                                windowInsets = WindowInsets(0),
++                            ) {
++                                repeat(5) { index ->
++                                    CompactNavigationBarItem(
++                                        selected = index == 0,
++                                        onClick = {},
++                                        icon = { Box(Modifier.size(24.dp)) },
++                                        label = "Tab $index",
++                                        showLabel = true,
++                                        badge = if (index == 3) {
++                                            { Badge(Modifier.testTag("counter")) { Text("108") } }
++                                        } else {
++                                            null
++                                        },
++                                    )
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        for (nextDark in listOf(false, true)) {
++            for (nextWidth in listOf(320, 432, 939)) {
++                runOnIdle {
++                    dark = nextDark
++                    width = nextWidth
++                }
++                waitForIdle()
++                val viewport = onNodeWithTag("viewport").fetchSemanticsNode().boundsInRoot
++                val row = onNodeWithTag("capsule-row").fetchSemanticsNode().boundsInRoot
++                val badge = onNodeWithTag("counter").fetchSemanticsNode().boundsInRoot
++                assertEquals(row.left - viewport.left, viewport.right - row.right, 1f)
++                assertTrue(row.left - viewport.left >= 16f * density)
++                assertTrue(row.width <= 640f * density)
++                assertTrue(row.bottom <= viewport.bottom - 20f - 8f * density + 1f)
++                assertTrue(badge.top >= row.top - 1f && badge.bottom <= row.bottom + 1f)
++            }
++        }
++    }
++
++    @Test
++    fun `tabs remain clickable and horizontal lens drag only commits a destination at release`() = runComposeUiTest {
++        var selected by mutableIntStateOf(0)
++        var selections = 0
++        setContent {
++            MaterialTheme {
++                NavigationCapsule(
++                    state = BrowsingNavigationBarState { true },
++                    selectedIndex = selected,
++                    itemCount = 5,
++                    onSelect = {
++                        selected = it
++                        selections++
++                    },
++                    modifier = Modifier.size(360.dp, 100.dp),
++                    windowInsets = WindowInsets(0),
++                ) {
++                    CompactNavigationBar(
++                        modifier = Modifier.testTag("tabs"),
++                        containerColor = Color.Transparent,
++                        windowInsets = WindowInsets(0),
++                    ) {
++                        repeat(5) { index ->
++                            CompactNavigationBarItem(
++                                selected = index == selected,
++                                onClick = { selected = index },
++                                icon = { Box(Modifier.size(24.dp)) },
++                                label = "Tab $index",
++                                showLabel = true,
++                            )
++                        }
++                    }
++                }
++            }
++        }
++        onNodeWithText("Tab 2").performClick()
++        waitForIdle()
++        runOnIdle { assertEquals(2, selected) }
++        val tabs = onNodeWithTag("tabs")
++        tabs.performTouchInput {
++            down(center)
++            moveTo(Offset(width * 0.9f, center.y), delayMillis = 120)
++        }
++        runOnIdle {
++            assertEquals(2, selected, "Do not open intermediate pages while the lens is being dragged")
++            assertEquals(0, selections)
++        }
++        tabs.performTouchInput { up() }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(4, selected)
++            assertEquals(1, selections)
++        }
++        tabs.performTouchInput {
++            down(Offset(width * 0.9f, center.y))
++            moveTo(Offset(width * 0.1f, center.y), delayMillis = 120)
++            cancel()
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(4, selected)
++            assertEquals(1, selections)
++        }
++        onNodeWithText("Tab 0").performClick()
++        waitForIdle()
++        runOnIdle { assertEquals(0, selected) }
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
+index a2d74918d..0a5748578 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
+@@ -71,4 +71,69 @@ class NavigationChromeConnectionTest {
+         state.nestedScrollConnection.onPostScroll(Offset(0f, -500f), Offset.Zero, NestedScrollSource.UserInput)
+         assertTrue(state.visible)
+     }
++
++    @Test
++    fun `fast release hides a short upward drag and passes all velocity to content`() = runBlocking {
++        val state = BrowsingNavigationBarState { true }
++        val connection = state.nestedScrollConnection
++        state.beginGesture()
++        connection.onPostScroll(Offset(0f, -2f), Offset.Zero, NestedScrollSource.UserInput)
++        assertTrue(state.visible)
++        state.endGesture()
++        assertEquals(Velocity.Zero, connection.onPreFling(Velocity(0f, -2400f)))
++        assertFalse(state.visible)
++        assertEquals(100, state.animationDurationMillis)
++        connection.onPreScroll(Offset(0f, 40f), NestedScrollSource.SideEffect)
++        assertFalse(state.visible)
++        assertEquals(Velocity.Zero, connection.onPostFling(Velocity(0f, -2400f), Velocity.Zero))
++    }
++
++    @Test
++    fun `catching consecutive flings keeps bars hidden until a deliberate reverse drag`() = runBlocking {
++        val state = BrowsingNavigationBarState { true }
++        val connection = state.nestedScrollConnection
++        state.beginGesture()
++        connection.onPostScroll(Offset(0f, -40f), Offset.Zero, NestedScrollSource.UserInput)
++        state.endGesture()
++        connection.onPreFling(Velocity(0f, -2400f))
++        repeat(3) {
++            state.beginGesture()
++            connection.onPostFling(Velocity(0f, -300f), Velocity.Zero)
++            connection.onPreScroll(Offset(0f, 8f), NestedScrollSource.UserInput)
++            assertFalse(state.visible)
++            connection.onPostScroll(Offset(0f, -40f), Offset.Zero, NestedScrollSource.UserInput)
++            state.endGesture()
++            connection.onPreFling(Velocity(0f, -2400f))
++            assertFalse(state.visible)
++        }
++        state.beginGesture()
++        connection.onPostFling(Velocity.Zero, Velocity.Zero)
++        connection.onPreScroll(Offset(0f, 12f), NestedScrollSource.UserInput)
++        assertTrue(state.visible)
++        connection.onPostScroll(Offset(0f, -40f), Offset.Zero, NestedScrollSource.UserInput)
++        state.endGesture()
++        connection.onPreFling(Velocity(0f, -2400f))
++        assertTrue(state.visible, "Release velocity must keep the touch's reveal decision")
++    }
++
++    @Test
++    fun `fling speed is density scaled and pinned disabled or terminal lists remain visible`() = runBlocking {
++        val scaled = BrowsingNavigationBarState(density = 3f) { true }
++        scaled.beginGesture()
++        scaled.nestedScrollConnection.onPostScroll(Offset(0f, -2f), Offset.Zero, NestedScrollSource.UserInput)
++        scaled.endGesture()
++        scaled.nestedScrollConnection.onPreFling(Velocity(0f, -1200f))
++        assertTrue(scaled.visible, "400dp per second is below the fast-fling threshold")
++        val owner = Any()
++        val pinned = BrowsingNavigationBarState { true }.apply { setPinned(owner, true) }
++        val disabled = BrowsingNavigationBarState { false }
++        val terminal = BrowsingNavigationBarState { true }.apply { trailingRemaining = { 0f } }
++        for (state in listOf(pinned, disabled, terminal)) {
++            state.beginGesture()
++            state.nestedScrollConnection.onPostScroll(Offset(0f, -40f), Offset.Zero, NestedScrollSource.UserInput)
++            state.endGesture()
++            assertEquals(Velocity.Zero, state.nestedScrollConnection.onPreFling(Velocity(0f, -2400f)))
++            assertTrue(state.visible)
++        }
++    }
+ }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
+index f4a62c5f6..705cfd8e6 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
+@@ -36,6 +36,7 @@ import androidx.compose.ui.test.performClick
+ import androidx.compose.ui.test.performScrollToIndex
+ import androidx.compose.ui.test.performTouchInput
+ import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.test.swipeUp
+ import androidx.compose.ui.unit.dp
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.launch
+@@ -207,6 +208,42 @@ class NavigationChromeLayoutTest {
+         runOnIdle { assertFalse(chrome.visible, "A fresh swipe can hide navigation") }
+     }
+ 
++    @Test
++    fun `repeated fast upward touch swipes keep navigation hidden and the list moving`() = runComposeUiTest {
++        lateinit var chrome: BrowsingNavigationBarState
++        lateinit var scroll: LazyListState
++        setContent {
++            MaterialTheme {
++                chrome = rememberBrowsingNavigationBarState(enabled = true, resetKey = Unit)
++                CompositionLocalProvider(LocalBrowsingNavigationBarState provides chrome) {
++                    Scaffold(topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior()) { padding ->
++                        scroll = rememberLazyListState(initialFirstVisibleItemIndex = 20)
++                        LazyColumn(
++                            modifier = Modifier.fillMaxSize().testTag("fling-list"),
++                            state = scroll,
++                            contentPadding = padding,
++                        ) {
++                            items(1000) { Box(Modifier.fillMaxWidth().height(80.dp)) }
++                        }
++                    }
++                }
++            }
++        }
++        waitForIdle()
++        repeat(3) {
++            val before = scroll.firstVisibleItemIndex * 10000 + scroll.firstVisibleItemScrollOffset
++            onNodeWithTag("fling-list").performTouchInput {
++                swipeUp(durationMillis = 60)
++            }
++            waitForIdle()
++            runOnIdle {
++                assertFalse(chrome.visible)
++                val after = scroll.firstVisibleItemIndex * 10000 + scroll.firstVisibleItemScrollOffset
++                assertTrue(after > before, "Navigation observation must keep list scrolling")
++            }
++        }
++    }
++
+     @Test
+     fun `shared animation completes both direction changes`() = runComposeUiTest {
+         lateinit var chrome: BrowsingNavigationBarState
+@@ -407,7 +444,10 @@ class NavigationChromeLayoutTest {
+         runOnIdle {
+             val registeredLeading = chrome.leadingOffset
+             val registeredTail = chrome.trailingRemaining
+-            assertTrue(registeredLeading != null && registeredTail != null, "Initial effects must retain the visible scroll source")
++            assertTrue(
++                registeredLeading != null && registeredTail != null,
++                "Initial effects must retain the visible scroll source",
++            )
+             chrome.reset()
+             assertTrue(chrome.leadingOffset === registeredLeading && chrome.trailingRemaining === registeredTail)
+             chrome.beginGesture()
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
+index 627a425d9..9b442064a 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
+@@ -72,6 +72,99 @@ class NavigationChromeScrollTrackerTest {
+         assertTrue(tracker.onPreScroll(0f, 20f, true))
+     }
+ 
++    @Test
++    fun `release velocity completes an upward swipe shorter than the drag threshold`() {
++        val tracker = NavigationChromeScrollTracker()
++        tracker.beginGesture()
++        assertTrue(tracker.onPostScroll(0f, -2f, true))
++        tracker.endGesture()
++        assertFalse(tracker.onPreFling(0f, -2400f))
++        assertFalse(tracker.onPreScroll(0f, 80f, false))
++        tracker.endFling()
++        assertFalse(tracker.visible)
++    }
++
++    @Test
++    fun `fling requires upward consumption and sufficient vertical release speed`() {
++        val tracker = NavigationChromeScrollTracker()
++        tracker.beginGesture()
++        tracker.onPreScroll(0f, -30f, true)
++        tracker.endGesture()
++        assertTrue(tracker.onPreFling(0f, -2400f), "An unscrollable short list stays visible")
++        for ((x, y) in listOf(0f to -300f, -4000f to -2400f, 0f to 2400f)) {
++            tracker.beginGesture()
++            tracker.onPostScroll(0f, -2f, true)
++            tracker.endGesture()
++            assertTrue(tracker.onPreFling(x, y))
++            tracker.endFling()
++        }
++    }
++
++    @Test
++    fun `release velocity cannot undo a reveal made by the same pressed finger`() {
++        val tracker = NavigationChromeScrollTracker(initialVisible = false)
++        tracker.beginGesture()
++        assertTrue(tracker.onPreScroll(0f, 20f, true))
++        tracker.onPostScroll(0f, -100f, true)
++        tracker.endGesture()
++        assertTrue(tracker.onPreFling(0f, -2400f))
++        tracker.endFling()
++        tracker.beginGesture()
++        assertFalse(tracker.onPostScroll(0f, -20f, true))
++    }
++
++    @Test
++    fun `successive upward flings ignore small catch wobbles even after fling cancellation`() {
++        val tracker = NavigationChromeScrollTracker()
++        tracker.beginGesture()
++        tracker.onPostScroll(0f, -20f, true)
++        tracker.endGesture()
++        tracker.onPreFling(0f, -2400f)
++        repeat(4) {
++            tracker.beginGesture()
++            // A new touch cancels the old fling after Initial-pass gesture observation.
++            tracker.endFling()
++            assertFalse(tracker.onPreScroll(0f, 8f, true))
++            assertFalse(tracker.onPostScroll(0f, -40f, true))
++            tracker.endGesture()
++            assertFalse(tracker.onPreFling(0f, -2400f))
++        }
++    }
++
++    @Test
++    fun `intentional reverse drag still reveals during a fling and normal tolerance returns at rest`() {
++        val tracker = NavigationChromeScrollTracker()
++        tracker.beginGesture()
++        tracker.onPostScroll(0f, -20f, true)
++        tracker.endGesture()
++        tracker.onPreFling(0f, -2400f)
++        tracker.beginGesture()
++        tracker.endFling()
++        assertFalse(tracker.onPreScroll(0f, 8f, true))
++        assertTrue(tracker.onPreScroll(0f, 4f, true))
++        assertTrue(tracker.onPostScroll(0f, -40f, true))
++        tracker.endGesture()
++        assertTrue(tracker.onPreFling(0f, -2400f))
++        tracker.endFling()
++        tracker.beginGesture()
++        tracker.onPostScroll(0f, -20f, true)
++        tracker.endGesture()
++        tracker.beginGesture()
++        assertTrue(tracker.onPreScroll(0f, 6f, true))
++    }
++
++    @Test
++    fun `boundary and pin reset discard a pending fast flick`() {
++        val tracker = NavigationChromeScrollTracker()
++        for (reveal in listOf(tracker::reset, tracker::revealAtEnd)) {
++            tracker.beginGesture()
++            tracker.onPostScroll(0f, -2f, true)
++            reveal()
++            tracker.endGesture()
++            assertTrue(tracker.onPreFling(0f, -2400f))
++        }
++    }
++
+     @Test
+     fun `fast swipes hide faster while reveal remains gentle`() {
+         assertEquals(175, browsingChromeAnimationDuration(false, 0f))

@@ -700,3 +700,12 @@ gh release list --repo Xun2202/anikku-harmony
 - 浏览Scaffold默认正文insets统一为vertical safe区域 + horizontal navigationBars；图片可延伸至侧边摄像头区域，侧面真实系统导航按钮仍留空间。标题/工具栏使用自身安全区，普通详情及显式传入insets不改。Mihon/Anikku分别保留material3包装与自定义Scaffold的实现。新增回归覆盖竖→左横→右横→竖、底部安全区、侧边导航按钮和普通详情显式边距。此为代码几何验证，Pura真机效果待安装反馈。
 - 分类选中条从每个tab条件创建，改为单一绘制的2dp选中条；250ms FastOutSlowIn动画穿过各tab真实位置/宽度，滚动偏移直接读取，保留RTL、边缘渐隐和系统动画缩放。新增中途位置/宽度、滚动偏移和未测量lazy tab回归。
 - Anikku首次候选编译发现Shaped缺少Mihon已有的minLane参数，补齐可选可读宽度下限，默认104dp保持旧书架行为。先前候选未发布，已将上述修复一并纳入本版；版本/构建结果见归档现状。
+
+## 2026-11-07：快速上滑与悬浮光感胶囊导航
+
+- 用户确认前版总体不错，新增要求快速上滑也可收起、连续快甩不意外弹出，保留此前同一次按住最多切换一次。原tracker只看手指拖动，短促上滑消费不足6dp后进入fling会漏收起；endGesture还会丢掉该手势的选择结果。现在松手仍保留选择结果，onPreFling仅在实际向上消费过且纵向速度≥600dp/s时补齐收起，禁止惯性推翻本手势已做的显示选择；所有位移和速度仍返回0消费。
+- 新手势在Initial阶段接住尚未结束的上行fling时，仅这次手势的反向恢复容差6→12dp，抵抗接触抖动；正常静止状态仍6dp，刻意下拉仍能恢复，完成切换后同手势反向仍锁定。搜索/选择/触摸探索/更多/投屏保护及首末尾随内容带出规则保留。
+- 用户给小红书深浅色截图并要求胶囊、边距、光效和动态拖拽。新增共享NavigationCapsule：左右16dp，内容内侧6dp、顶部4dp、系统手势区上方8dp，宽屏上限640dp居中；56dp紧凑/64dp常规/大字72dp行。只在胶囊采样一次原有Haze玻璃，透明区域不再铺整片底色，图标/标签/徽标原样保留；更新计数仍有独立8dp空间，底部实际测量高度进入列表尾padding。
+- 选中透镜弹簧位移、途经时轻微延展、切换时局部高光；横拖跟手预览、松手仅提交最终tab，取消回弹；点击/重复点当前页仍走原导航操作。支持RTL、深浅色与系统动画倍率，无常驻循环动画。Anikku保留启用tab筛选/标签偏好/投屏mini controller；Mihon保留侧栏，横屏黑条及分类动画既有修复继续生效。
+- 参考华为官方沉浸光感组件适配与功耗建议，采用局部悬浮材质和短暂交互反馈：本项目是Android Compose APK实现，并非直接调用ArkUI系统材质。官方：https://developer.huawei.com/consumer/cn/doc/HarmonyOS-Guides/arkts-immersive-light-sense-component-adaptation/ ；https://developer.huawei.com/consumer/cn/doc/HarmonyOS-Guides/arkts-immersive-light-sense-constraints/ 。Animeko使用独立AniTopAppBar，未运行本tracker/胶囊，不直接移植。
+- 检查：真实tracker的13项JVM回归通过；正式CI继续跑NavigationChrome系列，新增短上滑/密度/连续快甩/取消/触底与锁定、真实快速触摸、深浅色及320/432/939dp边距与徽标、点击/拖拽提交/取消。最终构建、签名和版本索引以归档现状为准，Pura真机观感由用户安装反馈。
