@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 07:59:12 +0000
+Subject: [PATCH] fix: bind glass shader dimensions through array uniforms
+
+Robolectric native Skia implements the array float-uniform overload, while its primitive overload is a documented no-op. Use the equivalent array overload in production so native pixel validation receives real dimensions and corner radius. Give the test texture a solid center to distinguish preserved content from interpolation at a stripe boundary; keep strict center and displaced rim checks. Shared with the other Harmony Tachiyomi fork.
+---
+ .../core/components/material/CapsuleRefraction.kt         | 5 +++--
+ .../material/NavigationChromeGlassShaderTest.kt           | 8 ++++++--
+ 2 files changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt
+index 03ab473a0..fb1bc426f 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt
+@@ -62,8 +62,9 @@ internal object CapsuleRefraction33 {
+         val shader = runCatching { RuntimeShader(SOURCE) }.getOrElse {
+             RuntimeShader(SOURCE.replace("backdrop.eval(samplePoint)", "sample(backdrop, samplePoint)"))
+         }
+-        shader.setFloatUniform("resolution", size.width.toFloat(), size.height.toFloat())
+-        shader.setFloatUniform("cornerRadius", radius)
++        // Array uniforms work in both platform and older Skia adapters; some primitive adapters are no-ops.
++        shader.setFloatUniform("resolution", floatArrayOf(size.width.toFloat(), size.height.toFloat()))
++        shader.setFloatUniform("cornerRadius", floatArrayOf(radius))
+         return shader
+     }
+ 
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGlassShaderTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGlassShaderTest.kt
+index 8a36f3b4d..cf2d940af 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGlassShaderTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGlassShaderTest.kt
+@@ -24,7 +24,8 @@ class NavigationChromeGlassShaderTest {
+     fun `glass bends backdrop stripes at its rim while retaining the center content`() {
+         val source = Bitmap.createBitmap(320, 48, Bitmap.Config.ARGB_8888)
+         for (y in 0 until source.height) {
+-            for (x in 0 until source.width) source.setPixel(x, y, if (y / 4 % 2 == 0) Color.RED else Color.BLUE)
++            val color = if (y in 16 until 32 || y / 4 % 2 == 0) Color.RED else Color.BLUE
++            for (x in 0 until source.width) source.setPixel(x, y, color)
+         }
+         val shader = CapsuleRefraction33.shader(IntSize(320, 48), 24f).apply {
+             setInputShader("backdrop", BitmapShader(source, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP))
+@@ -34,7 +35,10 @@ class NavigationChromeGlassShaderTest {
+         // Test-only opt-in: execute the Skia kernel on a raster bitmap. Production requires HW.
+         canvas.javaClass.getMethod("setHwFeaturesInSwModeEnabled", java.lang.Boolean.TYPE).invoke(canvas, true)
+         canvas.drawRect(0f, 0f, 320f, 48f, Paint().apply { this.shader = shader })
+-        assertEquals(source.getPixel(160, 24), output.getPixel(160, 24))
++        val center = output.getPixel(160, 24)
++        // A solid center avoids confusing texture-boundary interpolation with the optical edge behavior.
++        assertEquals(Color.RED, center)
++        assertEquals(255, Color.alpha(center))
+         val rim = output.getPixel(160, 1)
+         assertTrue(Color.blue(rim) > Color.red(rim), "The rim must sample a displaced blue stripe, not merely tint red")
+         assertEquals(255, Color.alpha(rim))
