@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 06:59:45 +0000
+Subject: [PATCH] test: locate capsule badge in unmerged semantics tree
+
+---
+ .../core/components/material/NavigationChromeCapsuleTest.kt     | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
+index 10692ed81..6a7bb3822 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
+@@ -91,7 +91,7 @@ class NavigationChromeCapsuleTest {
+                 waitForIdle()
+                 val viewport = onNodeWithTag("viewport").fetchSemanticsNode().boundsInRoot
+                 val row = onNodeWithTag("capsule-row").fetchSemanticsNode().boundsInRoot
+-                val badge = onNodeWithTag("counter").fetchSemanticsNode().boundsInRoot
++                val badge = onNodeWithTag("counter", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+                 assertEquals(row.left - viewport.left, viewport.right - row.right, 1f)
+                 assertTrue(row.left - viewport.left >= 16f * density)
+                 assertTrue(row.width <= 640f * density)
