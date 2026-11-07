@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 17:15:48 +0000
+Subject: [PATCH] test(ui): use the public Haze compatibility setter
+
+Haze 1.7.2 exposes area.contentLayer as a public getter with an internal setter; its legacy single-area state.contentLayer setter is public. Use that documented public compatibility API in the fixture instead of an inaccessible area setter. No reflection, no production change, all resource release assertions retained.
+---
+ .../core/components/NavigationChromeViewportSourceTest.kt      | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeViewportSourceTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeViewportSourceTest.kt
+index 63ceb05c6..b040ac882 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeViewportSourceTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeViewportSourceTest.kt
+@@ -65,8 +65,9 @@ class NavigationChromeViewportSourceTest {
+         // The older Compose screenshot helper waits for a device redraw unavailable here.
+         // Supply a real layer from the composition graphics context, then let the public
+         // Haze node own and release it. This tests resource lifetime without PixelCopy.
++        @Suppress("DEPRECATION") // Haze 1.7.2 exposes the compatible setter on its single-area state.
+         fun layerFor(area: HazeArea): GraphicsLayer = area.contentLayer
+-            ?: checkNotNull(graphicsContext).createGraphicsLayer().also { area.contentLayer = it }
++            ?: checkNotNull(graphicsContext).createGraphicsLayer().also { haze.contentLayer = it }
+         lateinit var previous: HazeArea
+         lateinit var previousLayer: GraphicsLayer
+         var originalToken: Any? = null

@@ -784,3 +784,5 @@ gh release list --repo Xun2202/anikku-harmony
 - 0080只补真实绘制测试步骤：Robolectric的layout idle不保证draw，首次contentLayer仍null。每次先capture实际root再断言分配/释放，保留全部旧layer清理、新area唯一、内容身份与滚动位置检查；生产代码不变。首次候选止于此测试，未发布。
 
 - 0081仅修Anikku旧Compose在Robolectric等待屏幕重绘的截图超时：从当前composition的真实GraphicsContext创建GraphicsLayer交给Haze节点，验证更新时旧area清空且旧layer.isReleased，继续检查新源唯一、内容和滚动锚点不变。无需PixelCopy；公共生产代码与DrawObserver测试仍和Mihon相同，窗口测试因框架差异采用等价资源合同，不再声称两测试文件全相同。第二候选未发布。
+
+- 0082仅改夹具API：Haze 1.7.2 area.contentLayer是public getter/internal setter，改用其公开的单area兼容state.contentLayer setter；不用反射，保留真实GraphicsLayer释放断言。第三候选39秒止于测试编译，未发布。

@@ -79,3 +79,4 @@
 0079-ui-window-capture-lifetime-and-light-recorder.patch
 0080-test-render-before-layer-lifetime-assertions.patch
 0081-test-layer-lifetime-without-pixelcopy.patch
+0082-test-public-haze-state-setter.patch
