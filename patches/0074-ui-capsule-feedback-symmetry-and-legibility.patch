@@ -1,0 +1,468 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 09:46:49 +0000
+Subject: [PATCH] fix(ui): balance capsule touch feedback symmetry and
+ legibility
+
+Shared with Mihon 0072. Keep a diffuse wide halo but brighten the contact core, track both finger coordinates and retain the release location. Give short taps a real peak and a slower same-family fade; deformation follows the same value. Make upper and lower corners symmetric within height bounds. Strengthen background blur, filled label contrast and soft shadow. Current-tab taps, accessibility activation and drags back to that tab have no reselect shortcut; leave legacy handlers outside the capsule intact. Add clock-driven feedback and repeat-tap regression checks.
+---
+ .../eu/kanade/tachiyomi/ui/home/HomeScreen.kt |  2 -
+ .../core/components/material/BrowsingGlass.kt |  4 +-
+ .../material/CapsuleNavigationLabel.kt        | 14 +++-
+ .../material/CapsuleTouchFeedback.kt          | 33 +++++++++
+ .../components/material/NavigationCapsule.kt  | 72 ++++++++++---------
+ .../material/NavigationCapsuleGeometry.kt     | 10 +--
+ .../components/material/NavigationChrome.kt   |  9 ++-
+ .../NavigationChromeCapsuleFeedbackTest.kt    | 70 ++++++++++++++++++
+ .../NavigationChromeCapsuleGeometryTest.kt    | 10 ++-
+ .../material/NavigationChromeCapsuleTest.kt   |  6 +-
+ 10 files changed, 180 insertions(+), 50 deletions(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleTouchFeedback.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleFeedbackTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
+index 538c0a7f8..a333f33ff 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
+@@ -215,8 +215,6 @@ object HomeScreen : Screen() {
+                                                     val tab = navigationTabs[index]
+                                                     if (tab::class != tabNavigator.current::class) {
+                                                         tabNavigator.current = tab
+-                                                    } else {
+-                                                        scope.launch { tab.onReselect(navigator) }
+                                                     }
+                                                 },
+                                                 modifier = Modifier.onSizeChanged {
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
+index f19c6c48d..b65b83d6e 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
+@@ -21,7 +21,7 @@ internal fun Modifier.browsingGlassBackground(state: BrowsingNavigationBarState,
+     val surface = MaterialTheme.colorScheme.surface
+     val dark = surface.luminance() < 0.5f
+     val tint = if (thin) {
+-        0.10f
++        if (dark) 0.18f else 0.22f
+     } else {
+         if (dark) 0.72f else 0.64f
+     }
+@@ -34,7 +34,7 @@ internal fun Modifier.browsingGlassBackground(state: BrowsingNavigationBarState,
+         style = HazeStyle(
+             backgroundColor = surface,
+             tint = HazeTint(surface.copy(alpha = tint)),
+-            blurRadius = if (thin) 4.dp else 18.dp,
++            blurRadius = if (thin) 10.dp else 18.dp,
+             noiseFactor = if (thin) 0.005f else 0.03f,
+             fallbackTint = HazeTint(surface.copy(alpha = fallback)),
+         ),
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt
+index f9f78302d..daaf3074c 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt
+@@ -13,8 +13,12 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.graphics.Shadow
+ import androidx.compose.ui.graphics.compositeOver
++import androidx.compose.ui.graphics.luminance
+ import androidx.compose.ui.layout.Layout
++import androidx.compose.ui.platform.LocalDensity
+ import androidx.compose.ui.semantics.Role
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.text.style.TextOverflow
+@@ -31,13 +35,16 @@ internal fun RowScope.CapsuleNavigationLabel(
+     modifier: Modifier,
+     badge: (@Composable () -> Unit)?,
+ ) {
++    val density = LocalDensity.current
++    val surface = MaterialTheme.colorScheme.surface
++    val dark = surface.luminance() < 0.5f
+     val preview = LocalCapsulePreview.current
+     val active = if (index != null && preview != null) index == preview else selected
+     val ink by animateColorAsState(
+         if (active) {
+             MaterialTheme.colorScheme.primary
+         } else {
+-            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f).compositeOver(MaterialTheme.colorScheme.surface)
++            MaterialTheme.colorScheme.onSurface.copy(alpha = if (dark) 0.72f else 0.55f).compositeOver(surface)
+         },
+         tween(160),
+         label = "capsuleWord",
+@@ -46,6 +53,9 @@ internal fun RowScope.CapsuleNavigationLabel(
+         fontSize = 14.sp,
+         lineHeight = 18.sp,
+         fontWeight = if (active) FontWeight.Bold else FontWeight.Medium,
++        shadow = with(density) {
++            Shadow(surface.copy(alpha = 0.85f), Offset(0f, 0.5.dp.toPx()), 2.dp.toPx())
++        },
+     )
+     Layout(
+         modifier = modifier.weight(1f).fillMaxHeight().selectable(
+@@ -53,7 +63,7 @@ internal fun RowScope.CapsuleNavigationLabel(
+             interactionSource = remember { MutableInteractionSource() },
+             indication = null,
+             role = Role.Tab,
+-            onClick = onClick,
++            onClick = { if (!selected) onClick() },
+         ),
+         content = {
+             Text(text = label, color = ink, style = style, overflow = TextOverflow.Ellipsis, maxLines = 1)
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleTouchFeedback.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleTouchFeedback.kt
+new file mode 100644
+index 000000000..a9dbee030
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleTouchFeedback.kt
+@@ -0,0 +1,33 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.animation.core.Animatable
++import androidx.compose.animation.core.FastOutSlowInEasing
++import androidx.compose.animation.core.tween
++import androidx.compose.runtime.Stable
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.launch
++
++/** Quick taps still reach a visible peak; the held and released material follows one easing family. */
++@Stable
++internal class CapsuleTouchFeedback {
++    private val strength = Animatable(0f)
++    private var motion: Job? = null
++    val value: Float get() = strength.value
++
++    fun press(scope: CoroutineScope) {
++        motion?.cancel()
++        motion = scope.launch { strength.animateTo(1f, tween(80, easing = FastOutSlowInEasing)) }
++    }
++
++    fun release(scope: CoroutineScope, completePulse: Boolean) {
++        motion?.cancel()
++        motion = scope.launch {
++            if (completePulse) {
++                if (strength.value < 1f) strength.animateTo(1f, tween(70, easing = FastOutSlowInEasing))
++                strength.animateTo(1f, tween(40, easing = FastOutSlowInEasing))
++            }
++            strength.animateTo(0f, tween(320, easing = FastOutSlowInEasing))
++        }
++    }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+index b6c8ec1d1..f4f85da2a 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+@@ -3,9 +3,7 @@ package tachiyomi.presentation.core.components.material
+ import android.os.Build
+ import android.view.RoundedCorner
+ import androidx.compose.animation.core.Animatable
+-import androidx.compose.animation.core.animateFloatAsState
+ import androidx.compose.animation.core.spring
+-import androidx.compose.animation.core.tween
+ import androidx.compose.foundation.gestures.awaitEachGesture
+ import androidx.compose.foundation.gestures.awaitFirstDown
+ import androidx.compose.foundation.layout.Box
+@@ -75,9 +73,10 @@ fun NavigationCapsule(
+     val position = remember { Animatable(selected.toFloat()) }
+     var dragPosition by remember { mutableStateOf<Float?>(null) }
+     var surfaceSize by remember { mutableStateOf(IntSize.Zero) }
+-    var pressed by remember { mutableStateOf(false) }
+-    var touchX by remember { mutableStateOf(0f) }
++    val feedback = remember { CapsuleTouchFeedback() }
++    var touchPosition by remember { mutableStateOf(Offset.Zero) }
+     val latestSelected by rememberUpdatedState(selected)
++    val latestActualSelected by rememberUpdatedState(selectedIndex)
+     val latestOnSelect by rememberUpdatedState(onSelect)
+     val scope = rememberCoroutineScope()
+     val density = LocalDensity.current
+@@ -120,18 +119,12 @@ fun NavigationCapsule(
+     LaunchedEffect(selected, itemCount) {
+         if (dragPosition == null) position.animateTo(selected.toFloat(), motion)
+     }
+-    val light by animateFloatAsState(
+-        if (pressed || dragPosition != null || position.isRunning) 1f else 0f,
+-        tween(160),
+-        label = "capsuleLight",
+-    )
+-    val pressure by animateFloatAsState(if (pressed) 1f else 0f, spring(), label = "capsulePressure")
+     fun settle(index: Int, commit: Boolean) {
+         val from = dragPosition ?: position.value
+         scope.launch {
+             position.snapTo(from)
+             dragPosition = null
+-            if (commit) latestOnSelect(index)
++            if (commit && index != latestActualSelected) latestOnSelect(index)
+             position.animateTo(index.toFloat(), motion)
+         }
+     }
+@@ -152,8 +145,8 @@ fun NavigationCapsule(
+                     }
+                 }
+                 .graphicsLayer {
+-                    scaleX = 1f + 0.003f * pressure
+-                    scaleY = 1f - 0.018f * pressure
++                    scaleX = 1f + 0.004f * feedback.value
++                    scaleY = 1f - 0.035f * feedback.value
+                 }
+                 .shadow(3.dp, shape, clip = false)
+                 .clip(shape)
+@@ -171,8 +164,8 @@ fun NavigationCapsule(
+                     awaitEachGesture {
+                         val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                         down.consume()
+-                        pressed = true
+-                        touchX = down.position.x
++                        touchPosition = down.position
++                        feedback.press(scope)
+                         var last = down.position
+                         var axis = 0
+                         var cancelled = false
+@@ -187,7 +180,7 @@ fun NavigationCapsule(
+                                     cancelled = true
+                                 } else {
+                                     last = change.position
+-                                    touchX = last.x
++                                    touchPosition = last
+                                     val distance = last - down.position
+                                     if (axis == 0) {
+                                         if (abs(distance.x) > viewConfiguration.touchSlop &&
+@@ -203,15 +196,15 @@ fun NavigationCapsule(
+                                 event.changes.forEach { it.consume() }
+                             } while (event.changes.any { it.pressed })
+                             val inside = last.x in 0f..size.width.toFloat() && last.y in 0f..size.height.toFloat()
+-                            if (!cancelled && axis != -1 && inside) {
+-                                settle(indexAt(last.x).roundToInt(), true)
+-                            } else {
+-                                settle(latestSelected, false)
+-                            }
++                            val commit = !cancelled && axis != -1 && inside
++                            if (commit) settle(indexAt(last.x).roundToInt(), true) else settle(latestSelected, false)
++                            feedback.release(scope, completePulse = commit)
+                             finished = true
+                         } finally {
+-                            pressed = false
+-                            if (!finished) settle(latestSelected, false)
++                            if (!finished) {
++                                settle(latestSelected, false)
++                                feedback.release(scope, completePulse = false)
++                            }
+                         }
+                     }
+                 },
+@@ -272,15 +265,30 @@ fun NavigationCapsule(
+                             ),
+                             style = Stroke(1.dp.toPx()),
+                         )
+-                        val fraction = (position.value + 0.5f) / itemCount
+-                        val x = if (pressed) touchX else size.width * (if (rtl) 1f - fraction else fraction)
+-                        drawRect(
+-                            Brush.radialGradient(
+-                                listOf(Color.White.copy(alpha = 0.20f * light), Color.Transparent),
+-                                center = Offset(x, size.height * 0.25f),
+-                                radius = (size.height * 2.8f).coerceAtLeast(1f),
+-                            ),
+-                        )
++                        val strength = feedback.value
++                        if (strength > 0f) {
++                            // A bright contact core sits exactly under the finger. The wide halo remains faint.
++                            drawRect(
++                                Brush.radialGradient(
++                                    0f to Color.White.copy(alpha = 0.42f * strength),
++                                    0.10f to Color.White.copy(alpha = 0.26f * strength),
++                                    0.35f to Color.White.copy(alpha = 0.065f * strength),
++                                    0.70f to Color.White.copy(alpha = 0.012f * strength),
++                                    1f to Color.Transparent,
++                                    center = touchPosition,
++                                    radius = (size.height * 2.8f).coerceAtLeast(1f),
++                                ),
++                            )
++                            val fraction = (position.value + 0.5f) / itemCount
++                            val x = size.width * (if (rtl) 1f - fraction else fraction)
++                            drawRect(
++                                Brush.radialGradient(
++                                    listOf(Color.White.copy(alpha = 0.045f * strength), Color.Transparent),
++                                    center = Offset(x, size.height * 0.5f),
++                                    radius = (size.height * 1.4f).coerceAtLeast(1f),
++                                ),
++                            )
++                        }
+                     }
+                     .capsuleRefraction(surfaceSize, radii)
+                     .browsingGlassBackground(state, thin = true),
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsuleGeometry.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsuleGeometry.kt
+index 36d394d28..a22ae403c 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsuleGeometry.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsuleGeometry.kt
+@@ -16,18 +16,18 @@ internal data class CapsuleCornerRadii(
+     val bottomLeft: Float,
+ )
+ 
+-/** Offset each screen corner by the same margin; do not force both lower corners to half-height. */
++/** Keep top and bottom symmetric on each side, within the height available for both arcs. */
+ internal fun navigationCapsuleCorners(
+     height: Float,
+     gap: Float,
+     screenLeftRadius: Float,
+     screenRightRadius: Float,
+ ): CapsuleCornerRadii {
+-    val left = (screenLeftRadius - gap).coerceIn(0f, height)
+-    val right = (screenRightRadius - gap).coerceIn(0f, height)
++    val left = (screenLeftRadius - gap).coerceIn(0f, height / 2f)
++    val right = (screenRightRadius - gap).coerceIn(0f, height / 2f)
+     return CapsuleCornerRadii(
+-        topLeft = minOf(height / 2f, height - left),
+-        topRight = minOf(height / 2f, height - right),
++        topLeft = left,
++        topRight = right,
+         bottomRight = right,
+         bottomLeft = left,
+     )
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+index 6669e1d02..fb80b5a20 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+@@ -149,9 +149,12 @@ class BrowsingNavigationBarState internal constructor(
+         )
+     var visible by mutableStateOf(initialVisible)
+         private set
+-    // HazeSource records a full content layer even when every effect is clipped offscreen.
+-    // Observe the boolean boundary, not every animation/scroll position in composition.
+-    private val glassVisibility = derivedStateOf { visible || hiddenFraction < 1f }
++
++    private val glassVisibility = derivedStateOf {
++        // HazeSource records the full content layer even with every effect clipped offscreen.
++        // A boolean boundary avoids recomposing for each animation/scroll position.
++        visible || hiddenFraction < 1f
++    }
+     internal val glassVisible: Boolean get() = glassVisibility.value
+     internal var animationDurationMillis by mutableIntStateOf(225)
+         private set
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleFeedbackTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleFeedbackTest.kt
+new file mode 100644
+index 000000000..2aa0a664a
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleFeedbackTest.kt
+@@ -0,0 +1,70 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.size
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.unit.dp
++import kotlinx.coroutines.CoroutineScope
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.robolectric.annotation.GraphicsMode
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@GraphicsMode(GraphicsMode.Mode.LEGACY)
++@Config(sdk = [34])
++class NavigationChromeCapsuleFeedbackTest {
++    @Test
++    fun `a very short tap reaches a visible peak and fades gradually`() = runComposeUiTest {
++        val feedback = CapsuleTouchFeedback()
++        lateinit var scope: CoroutineScope
++        setContent {
++            scope = rememberCoroutineScope()
++            Box(Modifier.size(100.dp))
++        }
++        mainClock.autoAdvance = false
++        runOnIdle {
++            feedback.press(scope)
++            feedback.release(scope, completePulse = true)
++        }
++        mainClock.advanceTimeBy(112)
++        runOnIdle { assertTrue(feedback.value > 0.9f, "A tap released before the attack finishes still has a visible pulse") }
++        mainClock.advanceTimeBy(80)
++        runOnIdle { assertTrue(feedback.value > 0.25f, "The release must not disappear immediately") }
++        mainClock.advanceTimeBy(400)
++        runOnIdle { assertEquals(0f, feedback.value, 0.001f) }
++    }
++
++    @Test
++    fun `a new press cancels the old fading tail and stays bright while held`() = runComposeUiTest {
++        val feedback = CapsuleTouchFeedback()
++        lateinit var scope: CoroutineScope
++        setContent {
++            scope = rememberCoroutineScope()
++            Box(Modifier.size(100.dp))
++        }
++        mainClock.autoAdvance = false
++        runOnIdle { feedback.press(scope) }
++        mainClock.advanceTimeBy(112)
++        runOnIdle { feedback.release(scope, completePulse = false) }
++        mainClock.advanceTimeBy(64)
++        runOnIdle {
++            assertTrue(feedback.value > 0.6f)
++            feedback.press(scope)
++        }
++        mainClock.advanceTimeBy(500)
++        runOnIdle {
++            assertEquals(1f, feedback.value, 0.001f)
++            feedback.release(scope, completePulse = false)
++        }
++        mainClock.advanceTimeBy(400)
++        runOnIdle { assertEquals(0f, feedback.value, 0.001f) }
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleGeometryTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleGeometryTest.kt
+index 5d4c9c185..bc0e17a22 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleGeometryTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleGeometryTest.kt
+@@ -18,10 +18,12 @@ class NavigationChromeCapsuleGeometryTest {
+     }
+ 
+     @Test
+-    fun `reported asymmetric lower screen corners remain concentric and fit the capsule height`() {
+-        val corners = navigationCapsuleCorners(48f, 20f, 56f, 32f)
+-        assertEquals(56f, 20f + corners.bottomLeft)
++    fun `top and bottom corners are symmetric and fit reported screen corners when the height allows`() {
++        val corners = navigationCapsuleCorners(48f, 20f, 40f, 32f)
++        assertEquals(40f, 20f + corners.bottomLeft)
+         assertEquals(32f, 20f + corners.bottomRight)
++        assertEquals(corners.topLeft, corners.bottomLeft)
++        assertEquals(corners.topRight, corners.bottomRight)
+         assertTrue(corners.topLeft + corners.bottomLeft <= 48f)
+         assertTrue(corners.topRight + corners.bottomRight <= 48f)
+     }
+@@ -34,5 +36,7 @@ class NavigationChromeCapsuleGeometryTest {
+         val corners = navigationCapsuleCorners(48f, 20f, 100f, 8f)
+         assertTrue(corners.topLeft + corners.bottomLeft <= 48f)
+         assertEquals(0f, corners.bottomRight)
++        assertEquals(corners.topLeft, corners.bottomLeft)
++        assertEquals(corners.topRight, corners.bottomRight)
+     }
+ }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
+index 0fa6a83b8..89a1c68b5 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
+@@ -166,15 +166,19 @@ class NavigationChromeCapsuleTest {
+         val row = onNodeWithTag("touch-row")
+         for ((x, expected) in listOf(0.006f to 0, 0.30f to 1, 0.50f to 2, 0.70f to 3, 0.994f to 4)) {
+             val before = selections
++            val wasSelected = selected == expected
+             row.performTouchInput { click(Offset(width * x, center.y)) }
+             waitForIdle()
+             runOnIdle {
+                 assertEquals(0, backgroundTaps, "End padding and label seams must not click the cover below")
+                 assertEquals(expected, selected)
+-                assertEquals(before + 1, selections, "A physical tap selects exactly once")
++                assertEquals(before + if (wasSelected) 0 else 1, selections, "Only a different tab switches, exactly once")
+             }
+         }
+         val before = selections
++        row.performTouchInput { click(Offset(width * 0.994f, center.y)) }
++        onNodeWithText("Tab 4").performSemanticsAction(SemanticsActions.OnClick) { it() }
++        runOnIdle { assertEquals(before, selections, "Current-tab tap and accessibility activation have no shortcut") }
+         row.performTouchInput {
+             down(center)
+             moveBy(Offset(0f, -20f), delayMillis = 100)

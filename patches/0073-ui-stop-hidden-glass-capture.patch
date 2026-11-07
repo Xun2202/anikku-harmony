@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 09:36:13 +0000
+Subject: [PATCH] perf(ui): stop glass backdrop capture while navigation is
+ fully hidden
+
+Shared with Mihon 0071. User preview.24 traces show long draw/layout frames and renderer work during browsing. Haze 1.7.2 records the full source graphics layer even with all effects clipped out. Gate both source and effects on a derived actual visibility boundary, keeping capture through hide animation, at list ends and before reveal. Do not recompose for every scroll/animation fraction. Device frame improvement still needs a comparable new trace.
+---
+ .../core/components/material/BrowsingGlass.kt |  3 ++-
+ .../components/material/NavigationChrome.kt   |  5 +++++
+ .../NavigationChromeConnectionTest.kt         | 21 +++++++++++++++++++
+ 3 files changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
+index 33a712a21..f19c6c48d 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
+@@ -17,6 +17,7 @@ import dev.chrisbanes.haze.hazeSource
+ /** Blur only the content behind the controls, leaving icons, labels and badges sharp. */
+ @Composable
+ internal fun Modifier.browsingGlassBackground(state: BrowsingNavigationBarState, thin: Boolean = false): Modifier {
++    if (!state.glassVisible) return this
+     val surface = MaterialTheme.colorScheme.surface
+     val dark = surface.luminance() < 0.5f
+     val tint = if (thin) {
+@@ -43,7 +44,7 @@ internal fun Modifier.browsingGlassBackground(state: BrowsingNavigationBarState,
+ @Composable
+ internal fun Modifier.browsingGlassSource(state: BrowsingNavigationBarState?): Modifier =
+     if (state == null || Build.VERSION.SDK_INT < 31 ||
+-        !LocalView.current.isHardwareAccelerated
++        !LocalView.current.isHardwareAccelerated || !state.glassVisible
+     ) {
+         this
+     } else {
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+index c236320cc..6669e1d02 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+@@ -16,6 +16,7 @@ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.SideEffect
+ import androidx.compose.runtime.Stable
+ import androidx.compose.runtime.State
++import androidx.compose.runtime.derivedStateOf
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableFloatStateOf
+ import androidx.compose.runtime.mutableIntStateOf
+@@ -148,6 +149,10 @@ class BrowsingNavigationBarState internal constructor(
+         )
+     var visible by mutableStateOf(initialVisible)
+         private set
++    // HazeSource records a full content layer even when every effect is clipped offscreen.
++    // Observe the boolean boundary, not every animation/scroll position in composition.
++    private val glassVisibility = derivedStateOf { visible || hiddenFraction < 1f }
++    internal val glassVisible: Boolean get() = glassVisibility.value
+     internal var animationDurationMillis by mutableIntStateOf(225)
+         private set
+     internal var gestureSpeedDpPerSecond = 0f
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
+index c6eb81f6e..cda27b66a 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
+@@ -1,5 +1,6 @@
+ package tachiyomi.presentation.core.components.material
+ 
++import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.ui.geometry.Offset
+ import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+ import androidx.compose.ui.unit.Velocity
+@@ -10,6 +11,26 @@ import org.junit.jupiter.api.Assertions.assertTrue
+ import org.junit.jupiter.api.Test
+ 
+ class NavigationChromeConnectionTest {
++    @Test
++    fun `glass capture stops only when both controls are fully hidden and resumes before reveal`() {
++        val state = BrowsingNavigationBarState { true }
++        val animation = mutableStateOf(0f)
++        state.animation = animation
++        assertTrue(state.glassVisible)
++        state.nestedScrollConnection.onPostScroll(Offset(0f, -40f), Offset.Zero, NestedScrollSource.UserInput)
++        assertFalse(state.visible)
++        animation.value = 0.8f
++        assertTrue(state.glassVisible, "The last visible part still needs its real glass")
++        animation.value = 1f
++        assertFalse(state.glassVisible, "A fully clipped bar must not capture the scrolling page")
++        state.nestedScrollConnection.onPreScroll(Offset(0f, 20f), NestedScrollSource.UserInput)
++        assertTrue(state.glassVisible, "Capture returns before the first reveal animation frame")
++        state.nestedScrollConnection.onPostScroll(Offset(0f, -40f), Offset.Zero, NestedScrollSource.UserInput)
++        state.bottomHeightPx = 80f
++        state.trailingRemaining = { 20f }
++        assertTrue(state.glassVisible, "The list end may pull a bar back before the visible flag changes")
++    }
++
+     @Test
+     fun `observing navigation changes never consumes content drag or fling`() = runBlocking {
+         val state = BrowsingNavigationBarState { true }
