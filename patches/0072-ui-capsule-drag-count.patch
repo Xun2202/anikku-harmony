@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 09:09:44 +0000
+Subject: [PATCH] test(ui): count the initial capsule tap before drag
+ assertions
+
+The unified glass surface routes the first physical label click through onSelect too. Measure the existing count before dragging instead of assuming that click was omitted. Keep assertions for zero extra selection while pressed, one commit on release, and no extra selection on cancel. Actual edge/seam click-through, solid selected-color and native refraction checks already pass in both forks.
+---
+ .../components/material/NavigationChromeCapsuleTest.kt    | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
+index 4c6038d01..0fa6a83b8 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
+@@ -271,6 +271,8 @@ class NavigationChromeCapsuleTest {
+         onNodeWithText("Tab 2").performClick()
+         waitForIdle()
+         runOnIdle { assertEquals(2, selected) }
++        // The unified surface router counts the initial physical click as a selection too.
++        val beforeDrag = selections
+         val tabs = onNodeWithTag("tabs")
+         tabs.performTouchInput {
+             down(center)
+@@ -278,13 +280,13 @@ class NavigationChromeCapsuleTest {
+         }
+         runOnIdle {
+             assertEquals(2, selected, "Do not open intermediate pages while the lens is being dragged")
+-            assertEquals(0, selections)
++            assertEquals(beforeDrag, selections)
+         }
+         tabs.performTouchInput { up() }
+         waitForIdle()
+         runOnIdle {
+             assertEquals(4, selected)
+-            assertEquals(1, selections)
++            assertEquals(beforeDrag + 1, selections)
+         }
+         tabs.performTouchInput {
+             down(Offset(width * 0.9f, center.y))
+@@ -294,7 +296,7 @@ class NavigationChromeCapsuleTest {
+         waitForIdle()
+         runOnIdle {
+             assertEquals(4, selected)
+-            assertEquals(1, selections)
++            assertEquals(beforeDrag + 1, selections)
+         }
+         onNodeWithText("Tab 0").performClick()
+         waitForIdle()
