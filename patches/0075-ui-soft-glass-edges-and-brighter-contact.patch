@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 13:55:29 +0000
+Subject: [PATCH] fix(ui): soften glass edges and brighten the touch core
+
+Shared with Mihon 0073. Compare against the user-provided Xiaohongshu capsule references: remove both closed perimeter strokes and the shader's all-direction rim lift, use local soft reflections, and reduce thin-glass blur from 10dp to 7dp. Slightly reduce filled type to 13.5sp and its shadow radius to 1.5dp. Raise the contact peak from 0.42 to 0.62 and the inner shoulder to 0.34 while keeping the wide faint halo and existing gesture timing. No layout, hit-target, reselect or hidden-capture policy changes.
+---
+ .../core/components/material/BrowsingGlass.kt |  2 +-
+ .../material/CapsuleNavigationLabel.kt        |  4 +-
+ .../components/material/CapsuleRefraction.kt  |  2 +-
+ .../components/material/NavigationCapsule.kt  | 66 +++++--------------
+ 4 files changed, 20 insertions(+), 54 deletions(-)
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
+index b65b83d6e..50af7bd5b 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
+@@ -34,7 +34,7 @@ internal fun Modifier.browsingGlassBackground(state: BrowsingNavigationBarState,
+         style = HazeStyle(
+             backgroundColor = surface,
+             tint = HazeTint(surface.copy(alpha = tint)),
+-            blurRadius = if (thin) 10.dp else 18.dp,
++            blurRadius = if (thin) 7.dp else 18.dp,
+             noiseFactor = if (thin) 0.005f else 0.03f,
+             fallbackTint = HazeTint(surface.copy(alpha = fallback)),
+         ),
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt
+index daaf3074c..cdd573320 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt
+@@ -50,11 +50,11 @@ internal fun RowScope.CapsuleNavigationLabel(
+         label = "capsuleWord",
+     )
+     val style = MaterialTheme.typography.labelLarge.copy(
+-        fontSize = 14.sp,
++        fontSize = 13.5.sp,
+         lineHeight = 18.sp,
+         fontWeight = if (active) FontWeight.Bold else FontWeight.Medium,
+         shadow = with(density) {
+-            Shadow(surface.copy(alpha = 0.85f), Offset(0f, 0.5.dp.toPx()), 2.dp.toPx())
++            Shadow(surface.copy(alpha = 0.85f), Offset(0f, 0.5.dp.toPx()), 1.5.dp.toPx())
+         },
+     )
+     Layout(
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt
+index 396e65747..f27c350c7 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt
+@@ -81,7 +81,7 @@ internal object CapsuleRefraction33 {
+             samplePoint = clamp(samplePoint, float2(0.5), resolution - float2(0.5));
+             half4 color = backdrop.eval(samplePoint);
+             float direction = dot(normal, normalize(float2(-0.55, -0.83)));
+-            float shine = 0.18 * edge * edge * (0.4 + 0.6 * max(direction, 0.0));
++            float shine = 0.16 * edge * edge * max(direction, 0.0);
+             color.rgb = mix(color.rgb, half3(1.0), half(shine));
+             color.rgb *= half(1.0 - 0.07 * edge * max(-direction, 0.0));
+             return color;
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+index f4f85da2a..f96860468 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+@@ -15,7 +15,6 @@ import androidx.compose.foundation.layout.only
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.tappableElement
+ import androidx.compose.foundation.shape.AbsoluteRoundedCornerShape
+-import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.runtime.LaunchedEffect
+@@ -31,13 +30,9 @@ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clip
+ import androidx.compose.ui.draw.drawWithContent
+ import androidx.compose.ui.draw.shadow
+-import androidx.compose.ui.geometry.CornerRadius
+ import androidx.compose.ui.geometry.Offset
+-import androidx.compose.ui.geometry.RoundRect
+ import androidx.compose.ui.graphics.Brush
+ import androidx.compose.ui.graphics.Color
+-import androidx.compose.ui.graphics.Path
+-import androidx.compose.ui.graphics.drawscope.Stroke
+ import androidx.compose.ui.graphics.graphicsLayer
+ import androidx.compose.ui.input.pointer.PointerEventPass
+ import androidx.compose.ui.input.pointer.pointerInput
+@@ -114,7 +109,6 @@ fun NavigationCapsule(
+             bottomLeft = radii.bottomLeft.toDp(),
+         )
+     }
+-    val outline = MaterialTheme.colorScheme.outline
+     val motion = spring<Float>(dampingRatio = 0.86f, stiffness = 420f)
+     LaunchedEffect(selected, itemCount) {
+         if (dragPosition == null) position.animateTo(selected.toFloat(), motion)
+@@ -213,65 +207,37 @@ fun NavigationCapsule(
+                 Modifier.matchParentSize()
+                     .drawWithContent {
+                         drawContent()
+-                        // Broad transmitted sheen and two soft reflections convey thickness without a metal ring.
++                        // Use soft directional reflections, never a closed perimeter stroke.
+                         drawRect(
+                             Brush.verticalGradient(
+                                 listOf(
+-                                    Color.White.copy(alpha = 0.10f),
+-                                    Color.White.copy(alpha = 0.018f),
+-                                    Color.Black.copy(alpha = 0.035f),
++                                    Color.White.copy(alpha = 0.06f),
++                                    Color.White.copy(alpha = 0.012f),
++                                    Color.Black.copy(alpha = 0.025f),
+                                 ),
+                             ),
+                         )
+-                        fun rim(inset: Float): Path = Path().apply {
+-                            addRoundRect(
+-                                RoundRect(
+-                                    left = inset,
+-                                    top = inset,
+-                                    right = size.width - inset,
+-                                    bottom = size.height - inset,
+-                                    topLeftCornerRadius = CornerRadius((radii.topLeft - inset).coerceAtLeast(0f)),
+-                                    topRightCornerRadius = CornerRadius((radii.topRight - inset).coerceAtLeast(0f)),
+-                                    bottomRightCornerRadius = CornerRadius(
+-                                        (radii.bottomRight - inset).coerceAtLeast(0f),
+-                                    ),
+-                                    bottomLeftCornerRadius = CornerRadius((radii.bottomLeft - inset).coerceAtLeast(0f)),
+-                                ),
+-                            )
+-                        }
+-                        drawPath(
+-                            path = rim(0.5.dp.toPx()),
+-                            brush = Brush.linearGradient(
+-                                listOf(
+-                                    Color.White.copy(alpha = 0.38f),
+-                                    outline.copy(alpha = 0.07f),
+-                                    Color.White.copy(alpha = 0.20f),
+-                                ),
+-                                start = Offset.Zero,
+-                                end = Offset(size.width, size.height),
++                        drawRect(
++                            Brush.radialGradient(
++                                listOf(Color.White.copy(alpha = 0.08f), Color.Transparent),
++                                center = Offset(size.width * 0.22f, -size.height * 0.25f),
++                                radius = (size.height * 1.8f).coerceAtLeast(1f),
+                             ),
+-                            style = Stroke(0.65.dp.toPx()),
+                         )
+-                        drawPath(
+-                            path = rim(1.7.dp.toPx()),
+-                            brush = Brush.linearGradient(
+-                                listOf(
+-                                    Color.White.copy(alpha = 0.16f),
+-                                    Color.Transparent,
+-                                    Color.White.copy(alpha = 0.07f),
+-                                ),
+-                                start = Offset.Zero,
+-                                end = Offset(size.width * 0.7f, size.height),
++                        drawRect(
++                            Brush.radialGradient(
++                                listOf(Color.White.copy(alpha = 0.04f), Color.Transparent),
++                                center = Offset(size.width * 0.82f, size.height * 1.35f),
++                                radius = (size.height * 1.8f).coerceAtLeast(1f),
+                             ),
+-                            style = Stroke(1.dp.toPx()),
+                         )
+                         val strength = feedback.value
+                         if (strength > 0f) {
+                             // A bright contact core sits exactly under the finger. The wide halo remains faint.
+                             drawRect(
+                                 Brush.radialGradient(
+-                                    0f to Color.White.copy(alpha = 0.42f * strength),
+-                                    0.10f to Color.White.copy(alpha = 0.26f * strength),
++                                    0f to Color.White.copy(alpha = 0.62f * strength),
++                                    0.10f to Color.White.copy(alpha = 0.34f * strength),
+                                     0.35f to Color.White.copy(alpha = 0.065f * strength),
+                                     0.70f to Color.White.copy(alpha = 0.012f * strength),
+                                     1f to Color.Transparent,
