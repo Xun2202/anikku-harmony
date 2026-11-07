@@ -1,0 +1,315 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 08:25:06 +0000
+Subject: [PATCH] fix(ui): soften navigation hiding and use solid compact
+ capsule labels
+
+Shared with Mihon 0068. Raise the fast-throw threshold to 1400dp/s, require 18dp of normal upward travel, and accelerate only true fast hides. Keep slow reveal and one decision per pressed gesture. Replace difference/stroked canvas words with solid 14sp themed Text. Use handle-relative optical spacing with a 12dp floor; Android does not expose the visible handle rectangle, so real-device equality remains to be confirmed. Preserve glass shaders and interaction routing.
+---
+ .../material/CapsuleNavigationLabel.kt        | 73 +++++--------------
+ .../components/material/NavigationCapsule.kt  |  9 ++-
+ .../components/material/NavigationChrome.kt   |  3 +-
+ .../material/NavigationChromeScrollTracker.kt | 17 ++++-
+ .../material/NavigationChromeCapsuleTest.kt   | 10 ++-
+ .../NavigationChromeConnectionTest.kt         |  2 +-
+ .../NavigationChromeScrollTrackerTest.kt      | 27 ++++++-
+ 7 files changed, 70 insertions(+), 71 deletions(-)
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt
+index 236a5b9a8..fa04dcd80 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt
+@@ -1,43 +1,26 @@
+ package tachiyomi.presentation.core.components.material
+ 
+-import android.os.Build
+-import androidx.compose.animation.core.animateFloatAsState
++import androidx.compose.animation.animateColorAsState
+ import androidx.compose.animation.core.tween
+-import androidx.compose.foundation.Canvas
+ import androidx.compose.foundation.interaction.MutableInteractionSource
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.RowScope
+ import androidx.compose.foundation.layout.fillMaxHeight
+ import androidx.compose.foundation.selection.selectable
+ import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
+-import androidx.compose.ui.geometry.Offset
+-import androidx.compose.ui.graphics.BlendMode
+-import androidx.compose.ui.graphics.Color
+-import androidx.compose.ui.graphics.drawscope.Stroke
+-import androidx.compose.ui.graphics.graphicsLayer
+ import androidx.compose.ui.layout.Layout
+ import androidx.compose.ui.semantics.Role
+-import androidx.compose.ui.semantics.semantics
+-import androidx.compose.ui.semantics.text
+-import androidx.compose.ui.text.AnnotatedString
+-import androidx.compose.ui.text.TextLayoutResult
+-import androidx.compose.ui.text.drawText
+ import androidx.compose.ui.text.font.FontWeight
+-import androidx.compose.ui.text.rememberTextMeasurer
+ import androidx.compose.ui.text.style.TextOverflow
+-import androidx.compose.ui.unit.Constraints
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+ 
+-private class CapsuleTextLayout {
+-    var result: TextLayoutResult? = null
+-}
+-
+-/** Center each word independently of its counter; Difference ink responds to the actual glass below. */
++/** Solid, centered words; the glass and its lighting stay entirely behind the text. */
+ @Composable
+ internal fun RowScope.CapsuleNavigationLabel(
+     selected: Boolean,
+@@ -49,17 +32,16 @@ internal fun RowScope.CapsuleNavigationLabel(
+ ) {
+     val preview = LocalCapsulePreview.current
+     val active = if (index != null && preview != null) index == preview else selected
+-    val emphasis by animateFloatAsState(if (active) 1f else 0f, tween(160), label = "capsuleWord")
++    val ink by animateColorAsState(
++        if (active) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
++        tween(160),
++        label = "capsuleWord",
++    )
+     val style = MaterialTheme.typography.labelLarge.copy(
+-        fontSize = 16.sp,
+-        lineHeight = 20.sp,
++        fontSize = 14.sp,
++        lineHeight = 18.sp,
+         fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+     )
+-    val measurer = rememberTextMeasurer()
+-    val savedLayout = remember { CapsuleTextLayout() }
+-    val ink = MaterialTheme.colorScheme.onSurface
+-    val outline = MaterialTheme.colorScheme.surface.copy(alpha = 0.35f)
+-    val inverse = Build.VERSION.SDK_INT >= 29
+     Layout(
+         modifier = modifier.weight(1f).fillMaxHeight().selectable(
+             selected = selected,
+@@ -69,38 +51,17 @@ internal fun RowScope.CapsuleNavigationLabel(
+             onClick = onClick,
+         ),
+         content = {
+-            Canvas(
+-                Modifier.semantics { text = AnnotatedString(label) }
+-                    .graphicsLayer {
+-                        scaleX = 1f + 0.025f * emphasis
+-                        scaleY = scaleX
+-                    },
+-            ) {
+-                savedLayout.result?.let {
+-                    drawText(it, color = outline, drawStyle = Stroke(1.dp.toPx()))
+-                    drawText(
+-                        it,
+-                        color = (if (inverse) Color.White else ink).copy(alpha = 0.62f + 0.38f * emphasis),
+-                        blendMode = if (inverse) BlendMode.Difference else BlendMode.SrcOver,
+-                    )
+-                    if (inverse) {
+-                        // Keep the contrast response neutral rather than tinting words with a complementary hue.
+-                        drawText(it, color = Color.Gray, blendMode = BlendMode.Saturation)
+-                    }
+-                }
+-            }
++            Text(text = label, color = ink, style = style, overflow = TextOverflow.Ellipsis, maxLines = 1)
+             Box { badge?.invoke() }
+         },
+     ) { measurables, constraints ->
+-        val text = measurer.measure(
+-            label,
+-            style,
+-            overflow = TextOverflow.Ellipsis,
+-            maxLines = 1,
+-            constraints = Constraints(maxWidth = (constraints.maxWidth - 8.dp.roundToPx()).coerceAtLeast(0)),
++        val word = measurables[0].measure(
++            constraints.copy(
++                minWidth = 0,
++                minHeight = 0,
++                maxWidth = (constraints.maxWidth - 8.dp.roundToPx()).coerceAtLeast(0),
++            ),
+         )
+-        savedLayout.result = text
+-        val word = measurables[0].measure(Constraints.fixed(text.size.width, text.size.height))
+         val counter = measurables[1].measure(constraints.copy(minWidth = 0, minHeight = 0))
+         val width = constraints.maxWidth
+         val height = constraints.maxHeight
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+index 01f6bb230..a275cbbba 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+@@ -83,8 +83,11 @@ fun NavigationCapsule(
+     val view = LocalView.current
+     val config = LocalConfiguration.current
+     var screenRadius by remember(view, config.screenWidthDp, config.screenHeightDp) { mutableStateOf<Float?>(null) }
+-    // The safe inset is the total bottom gap, not another band added below it.
+-    val gap = maxOf(8.dp, with(density) { windowInsets.getBottom(density).toDp() })
++    // Android exposes the reserved navigation area, not the visible gesture handle's bounds.
++    // Use its midpoint as an optical estimate, with room for hosts reporting a small/zero inset.
++    // Relative to that estimate, leave one gap above the handle and one below; sides match one gap.
++    val bottomInset = with(density) { windowInsets.getBottom(density).toDp() }
++    val gap = maxOf(12.dp, bottomInset / 2)
+     val gapPx = with(density) { gap.toPx() }
+     val halfHeight = if (surfaceSize.height > 0) surfaceSize.height / 2f else with(density) { 24.dp.toPx() }
+     val radius = screenRadius?.minus(gapPx)?.takeIf { it > 0f }?.coerceAtMost(halfHeight) ?: halfHeight
+@@ -110,7 +113,7 @@ fun NavigationCapsule(
+         }
+     }
+     Box(
+-        modifier = modifier.fillMaxWidth().padding(start = gap, top = 2.dp, end = gap, bottom = gap),
++        modifier = modifier.fillMaxWidth().padding(start = gap, top = 2.dp, end = gap, bottom = gap * 2),
+         contentAlignment = Alignment.Center,
+     ) {
+         Box(
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+index ae39cf85c..c236320cc 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+@@ -131,8 +131,7 @@ class BrowsingNavigationBarState internal constructor(
+     private val tracker = NavigationChromeScrollTracker(
+         intentDistance,
+         initialVisible,
+-        fastFlingVelocity =
+-        600f * density,
++        fastFlingVelocity = NAVIGATION_CHROME_FAST_FLING_VELOCITY * density,
+     )
+     private val pinnedOwners = mutableSetOf<Any>()
+     internal var animation: State<Float>? = null
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
+index fc2ad61c3..f29e73c74 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
+@@ -2,11 +2,13 @@ package tachiyomi.presentation.core.components.material
+ 
+ import kotlin.math.abs
+ 
++internal const val NAVIGATION_CHROME_FAST_FLING_VELOCITY = 1400f
++
+ /** One deliberate state change per touch, so reversing an ongoing drag cannot flash the controls. */
+ internal class NavigationChromeScrollTracker(
+     private val intentDistance: Float = 6f,
+     initialVisible: Boolean = true,
+-    private val fastFlingVelocity: Float = 600f,
++    private val fastFlingVelocity: Float = NAVIGATION_CHROME_FAST_FLING_VELOCITY,
+ ) {
+     var visible = initialVisible
+         private set
+@@ -99,7 +101,11 @@ internal class NavigationChromeScrollTracker(
+         }
+         pendingDistance += abs(y)
+         // Catching a moving list often adds a small downward wobble before the next swipe.
+-        val threshold = if (reveal && continuingFling) intentDistance * 2 else intentDistance
++        val threshold = when {
++            !reveal -> intentDistance * 3
++            continuingFling -> intentDistance * 2
++            else -> intentDistance
++        }
+         if (pendingDistance < threshold) return
+         visible = reveal
+         pendingDistance = 0f
+@@ -109,7 +115,12 @@ internal class NavigationChromeScrollTracker(
+ 
+ /** Reveal gently; a fast swipe can dismiss controls more quickly without changing the list motion. */
+ internal fun browsingChromeAnimationDuration(visible: Boolean, speedDpPerSecond: Float): Int =
+-    if (visible) 225 else (175 - 75 * (speedDpPerSecond / 1600f).coerceIn(0f, 1f)).toInt()
++    if (visible) {
++        225
++    } else {
++        val fastFraction = ((speedDpPerSecond - NAVIGATION_CHROME_FAST_FLING_VELOCITY) / 1600f).coerceIn(0f, 1f)
++        (175 - 75 * fastFraction).toInt()
++    }
+ 
+ /** Window shape, not device model or orientation; short windows and wide foldables need less chrome. */
+ internal fun compactBrowsingWindow(widthDp: Int, heightDp: Int, fontScale: Float): Boolean =
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
+index 19565fbf5..88b6e80c5 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
+@@ -40,7 +40,7 @@ import org.robolectric.annotation.GraphicsMode
+ @Config(sdk = [34], qualifiers = "w1000dp-h600dp")
+ class NavigationChromeCapsuleTest {
+     @Test
+-    fun `capsule keeps three equal gaps and centered text across window shapes`() = runComposeUiTest {
++    fun `capsule keeps handle-relative spacing and centered text across window shapes`() = runComposeUiTest {
+         var width by mutableIntStateOf(320)
+         var dark by mutableStateOf(false)
+         var density = 1f
+@@ -95,9 +95,11 @@ class NavigationChromeCapsuleTest {
+                 val row = onNodeWithTag("capsule-row").fetchSemanticsNode().boundsInRoot
+                 val badge = onNodeWithTag("counter", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+                 assertEquals(row.left - viewport.left, viewport.right - row.right, 1f)
+-                assertEquals(row.left - viewport.left, viewport.bottom - row.bottom, 1f)
+-                assertTrue(viewport.bottom - row.bottom >= 20f)
+-                assertTrue(viewport.bottom - row.bottom >= 8f * density)
++                val sideGap = row.left - viewport.left
++                val bottomGap = viewport.bottom - row.bottom
++                assertEquals(sideGap * 2, bottomGap, 1f)
++                assertTrue(bottomGap >= 20f, "The reserved system area is only counted once")
++                assertTrue(sideGap >= 12f * density)
+                 for (index in 0..4) {
+                     onNodeWithTag("icon-$index", useUnmergedTree = true).assertDoesNotExist()
+                     val word = onNodeWithText("Tab $index", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
+index 14e151abf..c6eb81f6e 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
+@@ -82,7 +82,7 @@ class NavigationChromeConnectionTest {
+         state.endGesture()
+         assertEquals(Velocity.Zero, connection.onPreFling(Velocity(0f, -2400f)))
+         assertFalse(state.visible)
+-        assertEquals(100, state.animationDurationMillis)
++        assertTrue(state.animationDurationMillis in 100 until 175, "A genuine fast throw gets the quicker hide animation")
+         connection.onPreScroll(Offset(0f, 40f), NestedScrollSource.SideEffect)
+         assertFalse(state.visible)
+         assertEquals(Velocity.Zero, connection.onPostFling(Velocity(0f, -2400f), Velocity.Zero))
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
+index f05e06cb1..150a8c3c0 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
+@@ -35,7 +35,7 @@ class NavigationChromeScrollTrackerTest {
+         assertTrue(tracker.onPostScroll(0f, -3f, true))
+         tracker.endGesture()
+         tracker.beginGesture()
+-        assertTrue(tracker.onPostScroll(0f, -3f, true))
++        repeat(5) { assertTrue(tracker.onPostScroll(0f, -3f, true)) }
+         assertFalse(tracker.onPostScroll(0f, -3f, true))
+     }
+ 
+@@ -197,10 +197,33 @@ class NavigationChromeScrollTrackerTest {
+         }
+     }
+ 
++    @Test
++    fun `ordinary short swipes and moderate release speeds do not count as a fast throw`() {
++        for (direction in listOf(-1f, 1f)) {
++            for (speed in listOf(600f, 1000f, 1300f)) {
++                val tracker = NavigationChromeScrollTracker()
++                tracker.beginGesture()
++                assertTrue(tracker.onPreScroll(0f, direction * 10f, true, speed))
++                assertTrue(tracker.onPostScroll(0f, direction * 10f, true, speed))
++                tracker.endGesture()
++                assertTrue(tracker.onPreFling(0f, direction * speed))
++            }
++            val tracker = NavigationChromeScrollTracker()
++            tracker.beginGesture()
++            assertTrue(tracker.onPreScroll(0f, direction * 2f, true, 1600f))
++            assertFalse(tracker.onPostScroll(0f, direction * 2f, true, 1600f))
++        }
++        val tracker = NavigationChromeScrollTracker()
++        tracker.beginGesture()
++        assertTrue(tracker.onPostScroll(0f, -12f, true, 400f))
++        assertFalse(tracker.onPostScroll(0f, -6f, true, 400f), "A deliberate normal scroll still hides after enough travel")
++    }
++
+     @Test
+     fun `fast swipes hide faster while reveal remains gentle`() {
+         assertEquals(175, browsingChromeAnimationDuration(false, 0f))
+-        assertTrue(browsingChromeAnimationDuration(false, 800f) < 175)
++        assertEquals(175, browsingChromeAnimationDuration(false, 800f))
++        assertTrue(browsingChromeAnimationDuration(false, 2400f) < 175)
+         assertEquals(100, browsingChromeAnimationDuration(false, 4000f))
+         assertEquals(225, browsingChromeAnimationDuration(true, 4000f))
+     }
