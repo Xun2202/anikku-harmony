@@ -1,0 +1,819 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 17:50:09 +0000
+Subject: [PATCH] fix(ui): retain adaptive main windows and soften press light
+
+Shared window continuity, passive commit sampling and glow with Mihon 0078. User preview.29 traces show two Activity recreations, a 116ms transition frame dominated by scheduling delay, and near-89Hz flings despite persistent perceived stutter. Let MainActivity handle size/orientation configurations, feed live Configuration into Compose and reapply the existing tablet policy; restrict its resource override to the tablet breakpoint instead of freezing the whole configuration. Other restart causes and reader/player Activity policies remain unchanged. Default light recording passively samples at most one outstanding frame-commit callback, no faster than 2Hz, and logs 2s summaries; stop unregisters, stale delivery is inert and views are weakly held. Submission is not GPU completion or visible presentation. Mihon exports format6 with its explicit detailed mode retained; Anikku compact format3 keeps its own adapter and DI/TV policy. Press/release use equal-speed 260ms progress with smoothstep brightness, no forced peak, and a cached wide Gaussian halo without a bright plateau edge. Phone validation remains required; no definitive single-root-cause or FPS gain claim.
+---
+ app/src/main/AndroidManifest.xml              |   1 +
+ .../kanade/tachiyomi/ui/main/MainActivity.kt  |   6 +-
+ .../util/system/DisplayExtensions.kt          |   6 +-
+ .../tachiyomi/util/system/HarmonyFramePerf.kt |  16 ++-
+ .../util/system/HarmonyWindowInsets.kt        |  20 ++-
+ .../tachiyomi/util/view/HarmonyMainContent.kt |  34 +++++
+ .../util/system/HarmonyFramePerfTest.kt       |   2 +-
+ .../core/components/FrameCommitProbe.kt       | 128 ++++++++++++++++++
+ .../core/components/material/CapsuleGlow.kt   |  14 ++
+ .../material/CapsuleTouchFeedback.kt          |  30 ++--
+ .../components/material/NavigationCapsule.kt  |  94 ++++++-------
+ .../NavigationChromeFrameCommitTest.kt        |  75 ++++++++++
+ .../NavigationChromeCapsuleFeedbackTest.kt    |  80 ++++++++---
+ 13 files changed, 414 insertions(+), 92 deletions(-)
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/util/view/HarmonyMainContent.kt
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/FrameCommitProbe.kt
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleGlow.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFrameCommitTest.kt
+
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 496851fa4..b73b6b372 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -71,6 +71,7 @@
+ 
+         <activity
+             android:name=".ui.main.MainActivity"
++            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout"
+             android:exported="true"
+             android:launchMode="singleTop"
+             android:windowSoftInputMode="adjustResize"
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/main/MainActivity.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/main/MainActivity.kt
+index 2187b3b8e..28fa9cc73 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/main/MainActivity.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/main/MainActivity.kt
+@@ -97,7 +97,7 @@ import eu.kanade.tachiyomi.util.system.dpToPx
+ import eu.kanade.tachiyomi.util.system.installHarmonyWindowInsets
+ import eu.kanade.tachiyomi.util.system.toast
+ import eu.kanade.tachiyomi.util.system.updaterEnabled
+-import eu.kanade.tachiyomi.util.view.setComposeContent
++import eu.kanade.tachiyomi.util.view.setHarmonyMainContent
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.channels.awaitClose
+ import kotlinx.coroutines.flow.callbackFlow
+@@ -164,7 +164,7 @@ class MainActivity : BaseActivity() {
+         val splashScreen = if (isLaunch) installSplashScreen() else null
+ 
+         super.onCreate(savedInstanceState)
+-        installHarmonyWindowInsets()
++        val windowConfiguration = installHarmonyWindowInsets()
+ 
+         if (isLaunch) {
+             Migrator.awaitAndRelease()
+@@ -180,7 +180,7 @@ class MainActivity : BaseActivity() {
+         HarmonyFramePerf.bind(this, preferences.scrollPerfRecorder().changes())
+         // Harmony <--
+ 
+-        setComposeContent {
++        setHarmonyMainContent(windowConfiguration) {
+             val context = LocalContext.current
+ 
+             var incognito by remember { mutableStateOf(getIncognitoState.await(null)) }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/util/system/DisplayExtensions.kt b/app/src/main/java/eu/kanade/tachiyomi/util/system/DisplayExtensions.kt
+index 01832fc88..5d49d2cf9 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/util/system/DisplayExtensions.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/util/system/DisplayExtensions.kt
+@@ -41,11 +41,11 @@ fun Context.prepareTabletUiContext(): Context {
+     }
+     if (configuration.isTabletUi() != expected) {
+         val overrideConf = Configuration()
+-        overrideConf.setTo(configuration)
++        // Override only the tablet breakpoint; other window resources must keep updating.
+         overrideConf.smallestScreenWidthDp = if (expected) {
+-            overrideConf.smallestScreenWidthDp.coerceAtLeast(TABLET_UI_REQUIRED_SCREEN_WIDTH_DP)
++            configuration.smallestScreenWidthDp.coerceAtLeast(TABLET_UI_REQUIRED_SCREEN_WIDTH_DP)
+         } else {
+-            overrideConf.smallestScreenWidthDp.coerceAtMost(TABLET_UI_REQUIRED_SCREEN_WIDTH_DP - 1)
++            configuration.smallestScreenWidthDp.coerceAtMost(TABLET_UI_REQUIRED_SCREEN_WIDTH_DP - 1)
+         }
+         return createConfigurationContext(overrideConf)
+     }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerf.kt b/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerf.kt
+index f84850001..2141fd0e7 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerf.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerf.kt
+@@ -52,6 +52,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+ import tachiyomi.presentation.core.components.DrawPerfObserver
++import tachiyomi.presentation.core.components.FrameCommitProbe
+ import tachiyomi.presentation.core.components.PanoramaFrameCounters
+ import tachiyomi.presentation.core.components.PanoramaScrollTrace
+ import java.text.SimpleDateFormat
+@@ -94,6 +95,7 @@ object HarmonyFramePerf {
+     private var window: Window? = null
+     private var thread: HandlerThread? = null
+     private var drawObserver: DrawPerfObserver? = null
++    private var commitProbe: FrameCommitProbe? = null
+ 
+     @Volatile private var generation = 0L
+     private var binding: Job? = null
+@@ -153,6 +155,9 @@ object HarmonyFramePerf {
+         val epoch = generation
+         val context = activity.applicationContext
+         val currentDisplay = displayOf(activity)
++        val ownerId = System.identityHashCode(activity)
++        val probe = FrameCommitProbe(activity.window.decorView)
++        commitProbe = probe
+         val samplerThread = HandlerThread("HarmonyPerfLight").also { it.start() }
+         val samplerHandler = Handler(samplerThread.looper)
+         thread = samplerThread
+@@ -170,6 +175,7 @@ object HarmonyFramePerf {
+                 lastGcCount = gc
+                 lastCpuMs = cpu
+                 runCatching { sample(owner, epoch, context, currentDisplay, gcDelta, cpuDelta) }
++                if (generation == epoch) PanoramaScrollTrace.log(0, "window submit owner=$ownerId ${probe.summary()}")
+                 if (generation == epoch) samplerHandler.postDelayed(this, SAMPLE_INTERVAL_MS)
+             }
+         })
+@@ -178,7 +184,10 @@ object HarmonyFramePerf {
+         PanoramaFrameCounters.reset()
+         ticking = true
+         drawObserver = DrawPerfObserver(activity.window.decorView) { arrival ->
+-            if (generation == epoch) onTick(arrival, owner)
++            if (generation == epoch) {
++                onTick(arrival, owner)
++                probe.onDraw(arrival)
++            }
+         }.also { it.start() }
+         activity.window.decorView.invalidate()
+         recordingState.value = true
+@@ -187,6 +196,8 @@ object HarmonyFramePerf {
+     private fun detach() {
+         generation++
+         ticking = false
++        commitProbe?.stop()
++        commitProbe = null
+         drawObserver?.stop()
+         drawObserver = null
+         window = null
+@@ -712,11 +723,12 @@ object PerfReport {
+         val haveFrames = frames.rows > 0
+ 
+         out.appendLine("# ${header.appLabel} scroll performance log")
+-        out.appendLine("format: harmony-scroll-perf 2")
++        out.appendLine("format: harmony-scroll-perf 3")
+         out.appendLine("producer: ${header.producer}")
+         if (header.producer == "view_draw") {
+             out.appendLine("# Actual ViewTreeObserver draw intervals; callback rate is not presented FPS.")
+             out.appendLine("# Callback gaps include idle pauses and do not prove displayed jank; samples every 2 s.")
++            out.appendLine("# window submit trace: passive commit samples at most 2 Hz; not GPU completion or display presentation.")
+         }
+         out.appendLine("app_id: ${header.appId}")
+         out.appendLine("version: ${header.versionName} (${header.versionCode})")
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyWindowInsets.kt b/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyWindowInsets.kt
+index 35dce4965..b3b7a5f7a 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyWindowInsets.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyWindowInsets.kt
+@@ -1,11 +1,15 @@
+ package eu.kanade.tachiyomi.util.system
+ 
++import android.content.res.Configuration
+ import android.graphics.Color
+ import android.os.Build
+ import android.view.View
+ import android.view.ViewTreeObserver
+ import android.view.WindowManager
+ import androidx.activity.ComponentActivity
++import androidx.compose.runtime.State
++import androidx.compose.runtime.mutableStateOf
++import androidx.core.util.Consumer
+ import androidx.core.view.ViewCompat
+ import androidx.core.view.WindowCompat
+ import androidx.lifecycle.DefaultLifecycleObserver
+@@ -13,7 +17,8 @@ import androidx.lifecycle.LifecycleOwner
+ import tachiyomi.presentation.core.components.PanoramaScrollTrace
+ 
+ /** Reconcile edge-to-edge geometry after rotation/folding, once the new window bounds are laid out. */
+-fun ComponentActivity.installHarmonyWindowInsets() {
++fun ComponentActivity.installHarmonyWindowInsets(): State<Configuration> {
++    val liveConfiguration = mutableStateOf(Configuration(resources.configuration))
+     val decor = window.decorView
+     val ownerId = System.identityHashCode(this)
+     var closed = false
+@@ -31,6 +36,16 @@ fun ComponentActivity.installHarmonyWindowInsets() {
+         decor.removeCallbacks(refresh)
+         decor.post(refresh)
+     }
++    val configurationListener = Consumer<Configuration> { config ->
++        liveConfiguration.value = Configuration(config)
++        PanoramaScrollTrace.log(
++            0,
++            "window configuration owner=$ownerId dp=${config.screenWidthDp}x${config.screenHeightDp} " +
++                "orientation=${config.orientation} density=${config.densityDpi}",
++        )
++        scheduleRefresh()
++    }
++    addOnConfigurationChangedListener(configurationListener)
+     val boundsListener = View.OnLayoutChangeListener {
+             _,
+             left,
+@@ -70,6 +85,7 @@ fun ComponentActivity.installHarmonyWindowInsets() {
+             // Floating observers merge into the live tree. Remove any migrated copy before
+             // registering, and retain the live owner for cleanup after a later detach.
+             attachFocusListener()
++            PanoramaScrollTrace.log(0, "window attach owner=$ownerId display=${decor.display?.displayId ?: -1}")
+             scheduleRefresh()
+         }
+         override fun onViewDetachedFromWindow(v: View) = removeFocusListener()
+@@ -85,6 +101,7 @@ fun ComponentActivity.installHarmonyWindowInsets() {
+         override fun onDestroy(owner: LifecycleOwner) {
+             closed = true
+             decor.removeCallbacks(refresh)
++            removeOnConfigurationChangedListener(configurationListener)
+             decor.removeOnLayoutChangeListener(boundsListener)
+             decor.removeOnAttachStateChangeListener(attachment)
+             removeFocusListener()
+@@ -92,6 +109,7 @@ fun ComponentActivity.installHarmonyWindowInsets() {
+             owner.lifecycle.removeObserver(this)
+         }
+     })
++    return liveConfiguration
+ }
+ 
+ /** Run after AndroidX edge-to-edge too, since it owns the same Window attributes. */
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/util/view/HarmonyMainContent.kt b/app/src/main/java/eu/kanade/tachiyomi/util/view/HarmonyMainContent.kt
+new file mode 100644
+index 000000000..3edaae5bc
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/util/view/HarmonyMainContent.kt
+@@ -0,0 +1,34 @@
++package eu.kanade.tachiyomi.util.view
++
++import android.content.res.Configuration
++import androidx.activity.ComponentActivity
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.State
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.remember
++import androidx.compose.ui.platform.LocalConfiguration
++import eu.kanade.domain.ui.UiPreferences
++import eu.kanade.tachiyomi.util.system.prepareTabletUiContext
++import tachiyomi.presentation.core.util.collectAsState
++import uy.kohesive.injekt.Injekt
++import uy.kohesive.injekt.api.get
++
++/** Apply the existing tablet policy to each live window config, without replacing the Activity. */
++fun ComponentActivity.setHarmonyMainContent(
++    windowConfiguration: State<Configuration>,
++    content: @Composable () -> Unit,
++) {
++    val uiPreferences = Injekt.get<UiPreferences>()
++    setComposeContent {
++        val tabletMode by uiPreferences.tabletUiMode().collectAsState()
++        val physical = windowConfiguration.value
++        val adapted = remember(physical, tabletMode) {
++            Configuration(
++                applicationContext.createConfigurationContext(physical)
++                    .prepareTabletUiContext().resources.configuration,
++            )
++        }
++        CompositionLocalProvider(LocalConfiguration provides adapted) { content() }
++    }
++}
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerfTest.kt b/app/src/test/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerfTest.kt
+index dfded79ca..1c1368d0b 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerfTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerfTest.kt
+@@ -145,7 +145,7 @@ class HarmonyFramePerfTest {
+             timeZone = full.timeZone,
+         )
+         val text = PerfReport.format(input)
+-        assertTrue(text.contains("format: harmony-scroll-perf 2"), text)
++        assertTrue(text.contains("format: harmony-scroll-perf 3"), text)
+         assertTrue(text.contains("producer: view_draw"), text)
+         assertTrue(text.contains("frame_metrics: disabled (light mode); TOTAL_DURATION / GPU unavailable"), text)
+         assertTrue(text.contains("source=view_draw"), text)
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/FrameCommitProbe.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/FrameCommitProbe.kt
+new file mode 100644
+index 000000000..8ab470c10
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/FrameCommitProbe.kt
+@@ -0,0 +1,128 @@
++package tachiyomi.presentation.core.components
++
++import android.annotation.TargetApi
++import android.os.Build
++import android.view.View
++import android.view.ViewTreeObserver
++import java.lang.ref.WeakReference
++import java.util.Locale
++
++internal interface FrameCommitTarget {
++    val available: Boolean
++    fun register(callback: Runnable)
++    fun unregister(callback: Runnable)
++}
++
++internal data class FrameCommitSnapshot(
++    val available: Boolean,
++    val requested: Long,
++    val committed: Long,
++    val lastNanos: Long,
++    val maxNanos: Long,
++    val pendingNanos: Long,
++    val errors: Long,
++)
++
++/** Passive, at most 2 Hz, single-outstanding submission callback. Never requests a frame. */
++class FrameCommitProbe internal constructor(
++    private val target: FrameCommitTarget,
++    private val clock: () -> Long,
++) {
++    constructor(view: View) : this(ViewCommitTarget(view), System::nanoTime)
++
++    private val lock = Any()
++
++    @Volatile private var closed = false
++
++    @Volatile private var pending: Runnable? = null
++    private var nextSample = 0L
++    private var requestedAt = 0L
++    private var available = false
++    private var requested = 0L
++    private var committed = 0L
++    private var lastNanos = -1L
++    private var maxNanos = -1L
++    private var errors = 0L
++
++    fun onDraw(nowNanos: Long) {
++        if (closed || pending != null || nowNanos < nextSample) return
++        synchronized(lock) {
++            if (closed || pending != null) return
++            nextSample = nowNanos + 500_000_000L
++            available = target.available
++            if (!available) return
++            requestedAt = nowNanos
++            requested++
++            val callback = object : Runnable {
++                override fun run() {
++                    val arrived = clock()
++                    synchronized(lock) {
++                        if (closed || pending !== this) return
++                        lastNanos = (arrived - requestedAt).coerceAtLeast(0L)
++                        maxNanos = maxOf(maxNanos, lastNanos)
++                        committed++
++                        pending = null
++                    }
++                }
++            }
++            pending = callback
++            try {
++                target.register(callback)
++            } catch (_: RuntimeException) {
++                if (pending === callback) pending = null
++                errors++
++            }
++        }
++    }
++
++    fun stop() {
++        val callback = synchronized(lock) {
++            closed = true
++            pending.also { pending = null }
++        }
++        if (callback != null) runCatching { target.unregister(callback) }
++    }
++
++    internal fun snapshot(): FrameCommitSnapshot = synchronized(lock) {
++        FrameCommitSnapshot(
++            available,
++            requested,
++            committed,
++            lastNanos,
++            maxNanos,
++            if (pending == null) -1L else (clock() - requestedAt).coerceAtLeast(0L),
++            errors,
++        )
++    }
++
++    /** Submission is not display presentation, GPU completion, or presented FPS. */
++    fun summary(): String {
++        val sample = snapshot()
++        fun ms(value: Long): String = if (value < 0L) "n/a" else String.format(Locale.US, "%.2f", value / 1_000_000.0)
++        return "available=${sample.available} requested=${sample.requested} committed=${sample.committed} " +
++            "draw_to_submit_callback_ms=${ms(sample.lastNanos)} max_ms=${ms(sample.maxNanos)} " +
++            "pending_ms=${ms(sample.pendingNanos)} errors=${sample.errors}"
++    }
++}
++
++private class ViewCommitTarget(view: View) : FrameCommitTarget {
++    private val view = WeakReference(view)
++    private var owner = WeakReference<ViewTreeObserver>(null)
++    override val available: Boolean get() = Build.VERSION.SDK_INT >= 29 && view.get()?.isHardwareAccelerated == true
++
++    @TargetApi(29)
++    override fun register(callback: Runnable) {
++        val observer = checkNotNull(view.get()).viewTreeObserver
++        owner = WeakReference(observer)
++        observer.registerFrameCommitCallback(callback)
++    }
++
++    @TargetApi(29)
++    override fun unregister(callback: Runnable) {
++        val original = owner.get()
++        if (original?.isAlive == true) original.unregisterFrameCommitCallback(callback)
++        val current = view.get()?.viewTreeObserver
++        if (current !== original && current?.isAlive == true) current.unregisterFrameCommitCallback(callback)
++        owner.clear()
++    }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleGlow.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleGlow.kt
+new file mode 100644
+index 000000000..ace9673e0
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleGlow.kt
+@@ -0,0 +1,14 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.ui.graphics.Color
++import kotlin.math.exp
++
++/** Shared sampled Gaussian mixture: bright contact, broad faint tail, no white plateau. */
++internal val capsuleGlowStops: Array<Pair<Float, Color>> = Array(65) { index ->
++    val radius = index / 64f
++    val squared = radius * radius
++    val edge = 0.78f * exp(-18f) + 0.10f * exp(-5f)
++    val alpha = (0.78f * exp(-18f * squared) + 0.10f * exp(-5f * squared) - edge)
++        .coerceAtLeast(0f)
++    radius to Color.White.copy(alpha = alpha)
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleTouchFeedback.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleTouchFeedback.kt
+index a9dbee030..fe9bf065b 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleTouchFeedback.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleTouchFeedback.kt
+@@ -1,33 +1,37 @@
+ package tachiyomi.presentation.core.components.material
+ 
+ import androidx.compose.animation.core.Animatable
+-import androidx.compose.animation.core.FastOutSlowInEasing
++import androidx.compose.animation.core.LinearEasing
+ import androidx.compose.animation.core.tween
+ import androidx.compose.runtime.Stable
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.launch
++import kotlin.math.abs
++import kotlin.math.roundToInt
+ 
+-/** Quick taps still reach a visible peak; the held and released material follows one easing family. */
++/** Constant-speed progress, with the same smooth brightness mapping in both directions. */
+ @Stable
+ internal class CapsuleTouchFeedback {
+-    private val strength = Animatable(0f)
++    private val progress = Animatable(0f)
+     private var motion: Job? = null
+-    val value: Float get() = strength.value
++    val value: Float
++        get() = progress.value.let { it * it * (3f - 2f * it) }
+ 
+-    fun press(scope: CoroutineScope) {
+-        motion?.cancel()
+-        motion = scope.launch { strength.animateTo(1f, tween(80, easing = FastOutSlowInEasing)) }
+-    }
++    fun press(scope: CoroutineScope) = move(scope, 1f)
++
++    fun release(scope: CoroutineScope) = move(scope, 0f)
+ 
+-    fun release(scope: CoroutineScope, completePulse: Boolean) {
++    private fun move(scope: CoroutineScope, target: Float) {
+         motion?.cancel()
+         motion = scope.launch {
+-            if (completePulse) {
+-                if (strength.value < 1f) strength.animateTo(1f, tween(70, easing = FastOutSlowInEasing))
+-                strength.animateTo(1f, tween(40, easing = FastOutSlowInEasing))
++            // A reversal continues at the same progress speed, without restarting a full easing.
++            val duration = (abs(target - progress.value) * 260f).roundToInt()
++            if (duration > 0) {
++                progress.animateTo(target, tween(duration, easing = LinearEasing))
++            } else {
++                progress.snapTo(target)
+             }
+-            strength.animateTo(0f, tween(320, easing = FastOutSlowInEasing))
+         }
+     }
+ }
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+index e5e9523fb..2fda0b094 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+@@ -28,11 +28,12 @@ import androidx.compose.runtime.staticCompositionLocalOf
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clip
+-import androidx.compose.ui.draw.drawWithContent
++import androidx.compose.ui.draw.drawWithCache
+ import androidx.compose.ui.draw.shadow
+ import androidx.compose.ui.geometry.Offset
+ import androidx.compose.ui.graphics.Brush
+ import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.drawscope.translate
+ import androidx.compose.ui.graphics.graphicsLayer
+ import androidx.compose.ui.input.pointer.PointerEventPass
+ import androidx.compose.ui.input.pointer.pointerInput
+@@ -192,12 +193,12 @@ fun NavigationCapsule(
+                             val inside = last.x in 0f..size.width.toFloat() && last.y in 0f..size.height.toFloat()
+                             val commit = !cancelled && axis != -1 && inside
+                             if (commit) settle(indexAt(last.x).roundToInt(), true) else settle(latestSelected, false)
+-                            feedback.release(scope, completePulse = commit)
++                            feedback.release(scope)
+                             finished = true
+                         } finally {
+                             if (!finished) {
+                                 settle(latestSelected, false)
+-                                feedback.release(scope, completePulse = false)
++                                feedback.release(scope)
+                             }
+                         }
+                     }
+@@ -205,56 +206,51 @@ fun NavigationCapsule(
+         ) {
+             Box(
+                 Modifier.matchParentSize()
+-                    .drawWithContent {
+-                        drawContent()
+-                        // Use soft directional reflections, never a closed perimeter stroke.
+-                        drawRect(
+-                            Brush.verticalGradient(
+-                                listOf(
+-                                    Color.White.copy(alpha = 0.06f),
+-                                    Color.White.copy(alpha = 0.012f),
+-                                    Color.Black.copy(alpha = 0.025f),
+-                                ),
++                    .drawWithCache {
++                        val surfaceReflection = Brush.verticalGradient(
++                            listOf(
++                                Color.White.copy(alpha = 0.06f),
++                                Color.White.copy(alpha = 0.012f),
++                                Color.Black.copy(alpha = 0.025f),
+                             ),
+                         )
+-                        drawRect(
+-                            Brush.radialGradient(
+-                                listOf(Color.White.copy(alpha = 0.08f), Color.Transparent),
+-                                center = Offset(size.width * 0.22f, -size.height * 0.25f),
+-                                radius = (size.height * 1.8f).coerceAtLeast(1f),
+-                            ),
++                        val topReflection = Brush.radialGradient(
++                            listOf(Color.White.copy(alpha = 0.08f), Color.Transparent),
++                            center = Offset(size.width * 0.22f, -size.height * 0.25f),
++                            radius = (size.height * 1.8f).coerceAtLeast(1f),
+                         )
+-                        drawRect(
+-                            Brush.radialGradient(
+-                                listOf(Color.White.copy(alpha = 0.04f), Color.Transparent),
+-                                center = Offset(size.width * 0.82f, size.height * 1.35f),
+-                                radius = (size.height * 1.8f).coerceAtLeast(1f),
+-                            ),
++                        val bottomReflection = Brush.radialGradient(
++                            listOf(Color.White.copy(alpha = 0.04f), Color.Transparent),
++                            center = Offset(size.width * 0.82f, size.height * 1.35f),
++                            radius = (size.height * 1.8f).coerceAtLeast(1f),
++                        )
++                        val contactGlow = Brush.radialGradient(
++                            colorStops = capsuleGlowStops,
++                            center = touchPosition,
++                            radius = (size.height * 3.6f).coerceAtLeast(1f),
+                         )
+-                        val strength = feedback.value
+-                        if (strength > 0f) {
+-                            // A bright contact core sits exactly under the finger. The wide halo remains faint.
+-                            drawRect(
+-                                Brush.radialGradient(
+-                                    0f to Color.White.copy(alpha = 0.88f * strength),
+-                                    0.06f to Color.White.copy(alpha = 0.82f * strength),
+-                                    0.18f to Color.White.copy(alpha = 0.50f * strength),
+-                                    0.36f to Color.White.copy(alpha = 0.075f * strength),
+-                                    0.70f to Color.White.copy(alpha = 0.012f * strength),
+-                                    1f to Color.Transparent,
+-                                    center = touchPosition,
+-                                    radius = (size.height * 2.8f).coerceAtLeast(1f),
+-                                ),
+-                            )
+-                            val fraction = (position.value + 0.5f) / itemCount
+-                            val x = size.width * (if (rtl) 1f - fraction else fraction)
+-                            drawRect(
+-                                Brush.radialGradient(
+-                                    listOf(Color.White.copy(alpha = 0.045f * strength), Color.Transparent),
+-                                    center = Offset(x, size.height * 0.5f),
+-                                    radius = (size.height * 1.4f).coerceAtLeast(1f),
+-                                ),
+-                            )
++                        val selectedReflection = Brush.radialGradient(
++                            listOf(Color.White.copy(alpha = 0.045f), Color.Transparent),
++                            center = Offset.Zero,
++                            radius = (size.height * 1.4f).coerceAtLeast(1f),
++                        )
++                        onDrawWithContent {
++                            drawContent()
++                            drawRect(surfaceReflection)
++                            drawRect(topReflection)
++                            drawRect(bottomReflection)
++                            val strength = feedback.value
++                            if (strength > 0f) {
++                                // Animation changes only draw alpha; the Gaussian shader is cached.
++                                drawRect(contactGlow, alpha = strength)
++                                val fraction = (position.value + 0.5f) / itemCount
++                                val x = size.width * (if (rtl) 1f - fraction else fraction)
++                                val y = size.height * 0.5f
++                                val bounds = size
++                                translate(left = x, top = y) {
++                                    drawRect(selectedReflection, topLeft = Offset(-x, -y), size = bounds, alpha = strength)
++                                }
++                            }
+                         }
+                     }
+                     .capsuleRefraction(surfaceSize, radii)
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFrameCommitTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFrameCommitTest.kt
+new file mode 100644
+index 000000000..4b3938383
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFrameCommitTest.kt
+@@ -0,0 +1,75 @@
++package tachiyomi.presentation.core.components
++
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Test
++
++class NavigationChromeFrameCommitTest {
++    private class Target : FrameCommitTarget {
++        override var available = true
++        val callbacks = mutableListOf<Runnable>()
++        var removals = 0
++        override fun register(callback: Runnable) {
++            callbacks += callback
++        }
++        override fun unregister(callback: Runnable) {
++            removals++
++            callbacks.remove(callback)
++        }
++    }
++
++    @Test
++    fun `draw sampling is throttled and a missing commit cannot accumulate callbacks`() {
++        val target = Target()
++        var now = 1_000_000L
++        val probe = FrameCommitProbe(target) { now }
++        probe.onDraw(now)
++        repeat(200) { probe.onDraw(now + it * 11_000_000L) }
++        assertEquals(1, target.callbacks.size)
++        now += 2_000_000_000L
++        assertEquals(2_000_000_000L, probe.snapshot().pendingNanos)
++        now += 5_000_000L
++        target.callbacks.removeAt(0).run()
++        assertEquals(1L, probe.snapshot().committed)
++        assertEquals(2_005_000_000L, probe.snapshot().maxNanos)
++        probe.onDraw(now)
++        val second = target.callbacks.removeAt(0)
++        now += 4_000_000L
++        second.run()
++        probe.onDraw(now)
++        assertEquals(2L, probe.snapshot().requested, "No third sample inside the 500 ms interval")
++        assertEquals(4_000_000L, probe.snapshot().lastNanos)
++        assertEquals(2_005_000_000L, probe.snapshot().maxNanos)
++    }
++
++    @Test
++    fun `stop unregisters outstanding work and an already queued callback is inert`() {
++        val target = Target()
++        var now = 1_000_000L
++        val probe = FrameCommitProbe(target) { now }
++        probe.onDraw(now)
++        val queued = target.callbacks.single()
++        probe.stop()
++        probe.stop()
++        now += 10_000_000L
++        queued.run()
++        probe.onDraw(now + 2_000_000_000L)
++        assertEquals(1, target.removals)
++        assertEquals(0L, probe.snapshot().committed)
++        assertEquals(-1L, probe.snapshot().pendingNanos)
++        assertEquals(0, target.callbacks.size)
++    }
++
++    @Test
++    fun `unsupported hardware has no callback and does not force drawing`() {
++        val target = Target().apply { available = false }
++        val probe = FrameCommitProbe(target) { 1L }
++        probe.onDraw(1L)
++        probe.onDraw(1_000_000_001L)
++        assertFalse(probe.snapshot().available)
++        assertEquals(0L, probe.snapshot().requested)
++        assertEquals(0, target.callbacks.size)
++        probe.stop()
++        assertEquals(0, target.removals)
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleFeedbackTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleFeedbackTest.kt
+index 2aa0a664a..1c8b919e4 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleFeedbackTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleFeedbackTest.kt
+@@ -22,7 +22,7 @@ import org.robolectric.annotation.GraphicsMode
+ @Config(sdk = [34])
+ class NavigationChromeCapsuleFeedbackTest {
+     @Test
+-    fun `a very short tap reaches a visible peak and fades gradually`() = runComposeUiTest {
++    fun `brightness follows hold duration and release never completes a peak`() = runComposeUiTest {
+         val feedback = CapsuleTouchFeedback()
+         lateinit var scope: CoroutineScope
+         setContent {
+@@ -30,20 +30,34 @@ class NavigationChromeCapsuleFeedbackTest {
+             Box(Modifier.size(100.dp))
+         }
+         mainClock.autoAdvance = false
+-        runOnIdle {
+-            feedback.press(scope)
+-            feedback.release(scope, completePulse = true)
++        val peaks = ArrayList<Float>()
++        for (heldMillis in listOf(64L, 144L, 320L)) {
++            runOnIdle { feedback.press(scope) }
++            mainClock.advanceTimeBy(heldMillis)
++            var previous = 0f
++            runOnIdle {
++                previous = feedback.value
++                peaks += previous
++                feedback.release(scope)
++                assertEquals(previous, feedback.value, 0.001f)
++            }
++            repeat(12) {
++                mainClock.advanceTimeBy(32)
++                runOnIdle {
++                    assertTrue(feedback.value <= previous + 0.001f, "Released brightness must never rise")
++                    previous = feedback.value
++                }
++            }
++            runOnIdle { assertEquals(0f, feedback.value, 0.001f) }
+         }
+-        mainClock.advanceTimeBy(112)
+-        runOnIdle { assertTrue(feedback.value > 0.9f, "A tap released before the attack finishes still has a visible pulse") }
+-        mainClock.advanceTimeBy(80)
+-        runOnIdle { assertTrue(feedback.value > 0.25f, "The release must not disappear immediately") }
+-        mainClock.advanceTimeBy(400)
+-        runOnIdle { assertEquals(0f, feedback.value, 0.001f) }
++        assertTrue(peaks[0] > 0f && peaks[0] < peaks[1])
++        assertTrue(peaks[1] < peaks[2])
++        assertTrue(peaks[0] < 0.5f, "A short tap must not be promoted to full brightness")
++        assertEquals(1f, peaks[2], 0.001f)
+     }
+ 
+     @Test
+-    fun `a new press cancels the old fading tail and stays bright while held`() = runComposeUiTest {
++    fun `pressing again continues from the current fading brightness without a jump`() = runComposeUiTest {
+         val feedback = CapsuleTouchFeedback()
+         lateinit var scope: CoroutineScope
+         setContent {
+@@ -52,19 +66,45 @@ class NavigationChromeCapsuleFeedbackTest {
+         }
+         mainClock.autoAdvance = false
+         runOnIdle { feedback.press(scope) }
+-        mainClock.advanceTimeBy(112)
+-        runOnIdle { feedback.release(scope, completePulse = false) }
+-        mainClock.advanceTimeBy(64)
+-        runOnIdle {
+-            assertTrue(feedback.value > 0.6f)
+-            feedback.press(scope)
++        mainClock.advanceTimeBy(208)
++        repeat(3) {
++            runOnIdle { feedback.release(scope) }
++            mainClock.advanceTimeBy(64)
++            var fading = 0f
++            runOnIdle {
++                fading = feedback.value
++                assertTrue(fading > 0f && fading < 1f)
++                feedback.press(scope)
++                assertEquals(fading, feedback.value, 0.001f)
++            }
++            mainClock.advanceTimeBy(64)
++            runOnIdle {
++                assertTrue(feedback.value > fading, "Interrupted attack must resume, without restarting a slow easing")
++                assertTrue(feedback.value <= 1f)
++            }
+         }
+-        mainClock.advanceTimeBy(500)
++        mainClock.advanceTimeBy(320)
+         runOnIdle {
+             assertEquals(1f, feedback.value, 0.001f)
+-            feedback.release(scope, completePulse = false)
++            feedback.release(scope)
+         }
+-        mainClock.advanceTimeBy(400)
++        mainClock.advanceTimeBy(320)
+         runOnIdle { assertEquals(0f, feedback.value, 0.001f) }
+     }
++
++    @Test
++    fun `cached glow falls continuously through a broad faint tail`() {
++        val stops = capsuleGlowStops
++        assertTrue(stops.first().second.alpha > 0.8f)
++        assertEquals(0f, stops.last().second.alpha, 0.001f)
++        for (index in 1 until stops.size) {
++            val previous = stops[index - 1]
++            val current = stops[index]
++            assertTrue(current.first > previous.first)
++            assertTrue(current.second.alpha <= previous.second.alpha)
++            assertTrue(previous.second.alpha - current.second.alpha < 0.06f, "No abrupt bright plateau edge")
++        }
++        assertTrue(stops[32].second.alpha > 0.01f, "The wide tail should fade gradually")
++        assertTrue(stops[56].second.alpha < 0.003f, "The far edge should be almost invisible")
++    }
+ }

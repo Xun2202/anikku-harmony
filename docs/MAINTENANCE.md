@@ -786,3 +786,13 @@ gh release list --repo Xun2202/anikku-harmony
 - 0081仅修Anikku旧Compose在Robolectric等待屏幕重绘的截图超时：从当前composition的真实GraphicsContext创建GraphicsLayer交给Haze节点，验证更新时旧area清空且旧layer.isReleased，继续检查新源唯一、内容和滚动锚点不变。无需PixelCopy；公共生产代码与DrawObserver测试仍和Mihon相同，窗口测试因框架差异采用等价资源合同，不再声称两测试文件全相同。第二候选未发布。
 
 - 0082仅改夹具API：Haze 1.7.2 area.contentLayer是public getter/internal setter，改用其公开的单area兼容state.contentLayer setter；不用反射，保留真实GraphicsLayer释放断言。第三候选39秒止于测试编译，未发布。
+
+## 2026-11-08：折叠窗口连续性、提交诊断与按压光感
+
+- 用户29反馈开录冷重启仍丝滑，但展开/折回后持续变卡。011952轻量日志确认两次Activity销毁/重建，前后惯性draw回调约89Hz；013940详细日志22秒1277帧，切换首段116.28ms（delay95.65/GPU2.69ms），拖动/惯性deadline jank0。内部帧/回调稳定不能证明卓易通宿主呈现丝滑，未断言唯一根因。
+- 仅MainActivity处理orientation/screenSize/smallestScreenSize/screenLayout，避免尺寸切换整页重建。窗口监听发布live Configuration，Main Compose Provider每次重算原平板模式并跟随偏好，不硬编码Pura型号；prepareTabletUiContext仅覆盖smallest断点，不再复制整份尺寸/方向配置而冻结资源。语言/密度/夜间等未声明变更仍可系统重建；阅读/播放Activity策略不变。主界面重建/配置/attach/bounds低频事件可由日志区分。
+- 轻量模式在真实draw上最多每500ms注册一个frame commit callback，未回报只保留一个pending，既不自续vsync也不注册FrameMetrics；2秒汇总请求/提交数、draw到提交回调耗时/最大值、pending时长/错误数。停止解绑且迟到回调无效，持有View/VTO为弱引用，无新采样线程。提交不等于GPU完成或屏幕呈现；若仍卡，可进一步定位宿主链而非用回调率反驳体感。
+- 胶囊删除短按强行补峰和固定峰值停驻。进度260ms满程、升降按剩余距离同比计时，亮度smoothstep，松手从当前值退下、再按从当前续；无常驻帧。取消旧高亮平台/骤降，缓存65点Gaussian双尺度渐变，3.6h半径向外连续减弱。实际xy、选中反射、字/布局/边距/对称圆角/防点穿/无重选快捷保留，不增加模糊通道，动画只改draw alpha。
+- 更新真实组件时钟测试：按住长短对应不同峰值、松手不再上升、反复打断/最终归零及空间连续衰减；新增提交采样的单pending/节流、停止及迟到回调、无硬件三个状态测试。沿用两款原有NavigationChrome选择器，不加另一App构建变体。公共4份core生产文件、窗口工具及两份新测逐字节一致；应用入口/平板策略因DI和Anikku TV保留差异。
+- Anikku格式3轻量，保留Injekt/TV平板策略，不扩移Mihon详细模式/A-B；继续在已有app:testPreviewUnitTest检查报告模型。
+- 参考官方Android配置连续性与ViewTreeObserver提交回调文档、华为interactive/lightEffect原则；本地260ms/smoothstep/Gaussian是依用户需求选择，非声称原生SDK私有曲线。APK Manifest四个配置标记、版本/完整签名/hash/公开更新索引及真机反馈见归档。Animeko没有本Tachiyomi入口/胶囊/采集器，不直接移植。
