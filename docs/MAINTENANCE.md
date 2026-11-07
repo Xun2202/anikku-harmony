@@ -709,3 +709,14 @@ gh release list --repo Xun2202/anikku-harmony
 - 选中透镜弹簧位移、途经时轻微延展、切换时局部高光；横拖跟手预览、松手仅提交最终tab，取消回弹；点击/重复点当前页仍走原导航操作。支持RTL、深浅色与系统动画倍率，无常驻循环动画。Anikku保留启用tab筛选/标签偏好/投屏mini controller；Mihon保留侧栏，横屏黑条及分类动画既有修复继续生效。
 - 参考华为官方沉浸光感组件适配与功耗建议，采用局部悬浮材质和短暂交互反馈：本项目是Android Compose APK实现，并非直接调用ArkUI系统材质。官方：https://developer.huawei.com/consumer/cn/doc/HarmonyOS-Guides/arkts-immersive-light-sense-component-adaptation/ ；https://developer.huawei.com/consumer/cn/doc/HarmonyOS-Guides/arkts-immersive-light-sense-constraints/ 。Animeko使用独立AniTopAppBar，未运行本tracker/胶囊，不直接移植。
 - 检查：真实tracker的13项JVM回归通过；正式CI继续跑NavigationChrome系列，新增短上滑/密度/连续快甩/取消/触底与锁定、真实快速触摸、深浅色及320/432/939dp边距与徽标、点击/拖拽提交/取消。最终构建、签名和版本索引以归档现状为准，Pura真机观感由用户安装反馈。
+
+## 2026-11-07：纯文字玻璃胶囊、三边等距与双向快甩
+
+- 用户反馈22/35不够玻璃，强调要参考真实沉浸光感组件表现而非单调透明度；要求胶囊只有居中文字、无选中背景框，离屏幕底部更近且左/右/下等距，底部弧线协调。继续追问后确认：往前、往后两个方向的快速甩动都要收起。前版只补负向释放是确切遗漏。
+- 参考华为官方沉浸材质视效和FAQ的薄材质折射/光感/反色说明；另读Haze1.7.2材质说明与Robolectric Native RuntimeShader实现。新胶囊背景单独使用API33+AGSL：对实际Haze采样背景按圆角距离场偏移采样形成边缘折射，带方向性Fresnel明暗；上层文字单独绘制、无折射。单次内容采样/模糊，不修改阅读器或播放器。31/32保留模糊与光边，低版本/无硬件加速只保留薄色罩，API/驱动不支持shader时安全回退并记录日志；这是Android视觉实现，不声称调用ArkUI系统材质。
+- 胶囊薄材质：8dp模糊、dark0.18/light0.14色罩、fallback0.24，按应用surface亮度判断主题；旧非胶囊顶栏参数保留。外轮廓渐变高光、触摸点宽域光斑与轻微按压形变，停止操作后回落。完全去掉内部选中框/透镜/默认选中底色；不再用每项背景承载状态。
+- 胶囊内纯16sp文字：各项严格水平/垂直居中，选中靠字重、轻微缩放和明暗变化，角标不挤偏标题；API29+Difference字色响应实际玻璃底色，保留a11y文字/选中语义及徽标计数。Floating模式始终显示标签；Anikku原标签偏好仍作用于其他导航形态。48dp紧凑/52dp常规/64dp大字触区，点击/重选/横拖预览/松手提交/取消保留。
+- 外边距统一gap=max(8dp,真实底部系统inset)，左/右/下只应用这一个gap，移除640dp宽度上限和inset外再叠8dp的旧做法。API31+若报告屏幕底角半径，使用扣除gap后的内轮廓半径并限制到胶囊半高；未报告则对称半高圆角，不硬编码Pura参数。安全区只计一次，实测总高度仍进入列表尾部留白，横屏cutout和更多固定规则保留。
+- 快甩两个方向都优先收起：Initial读取瞬时位移速度并结合VelocityTracker，避免首个样本0速度误展开；Post仅在真实纵向消费后快移收起，Pre抑制快速回翻的错误展开，释放时双向快甩同样收起。普通慢拖仍可恢复，同一按住内一旦切换仍锁定；明确快释放时手指已松开可收起。首尾跟随、顶部刷新、短列表、横滑、搜索/选择/触摸探索/更多/投屏保护及0消费保留。
+- 检查：15项真实tracker JVM和格式通过；更新真实LazyColumn触摸用例覆盖双向快甩/慢拖，新增实际PanoramaMasonry快甩；胶囊两主题/三宽度三边等距、纯文字/居中/无图标、角标/点击拖拽取消回归；Native Skia编译并执行实际AGSL，验证边缘背景采样偏移而中心内容保留。最终结果/版本/签名/索引见归档现状；设备光学观感仍需安装反馈。
+- 官方参考：https://developer.huawei.com/consumer/cn/doc/HarmonyOS-Guides/arkts-immersive-light-sense-common-capability/ ；https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/arkts-immersive-light-sense-faq/ 。Animeko为独立导航/渲染架构，本轮不直接移植。

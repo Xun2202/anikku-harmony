@@ -1,0 +1,1108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 07:36:45 +0000
+Subject: [PATCH] ui: rebuild text-only refractive glass navigation and hide on
+ fast return swipes
+
+Shared with the other Harmony Tachiyomi fork. Use one background-only AGSL refraction layer on API 33+, a thinner Haze backdrop and directional rim/press light; keep text sharp with contrast-aware Difference ink. Remove per-tab lens, icons and selection frame; retain centered labels, counters, semantics and drag-to-select. Give left/right/bottom one total safe gap and match reported screen corner curvature when possible. User clarified fast throws in either direction must hide: classify from instantaneous and tracked movement as well as release velocity, while preserving slow reveal, pressed touch latch and boundary/refresh guards. Cover the actual panorama scrollable, bidirectional flings, text centering and native Skia shader pixels.
+---
+ .../eu/kanade/tachiyomi/ui/home/HomeScreen.kt |  13 +-
+ .../core/components/material/BrowsingGlass.kt |  21 ++-
+ .../material/CapsuleNavigationLabel.kt        | 112 +++++++++++
+ .../components/material/CapsuleRefraction.kt  |  69 +++++++
+ .../material/CompactNavigationBar.kt          |   8 +-
+ .../components/material/NavigationCapsule.kt  | 176 +++++++++++-------
+ .../components/material/NavigationChrome.kt   |  16 +-
+ .../material/NavigationChromeScrollTracker.kt |  47 +++--
+ .../material/NavigationChromeCapsuleTest.kt   |  19 +-
+ .../NavigationChromeConnectionTest.kt         |  28 ++-
+ .../NavigationChromeGlassShaderTest.kt        |  41 ++++
+ .../material/NavigationChromeLayoutTest.kt    |  68 ++++++-
+ .../NavigationChromeScrollTrackerTest.kt      |  42 ++++-
+ 13 files changed, 541 insertions(+), 119 deletions(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGlassShaderTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
+index 221f1c670..538c0a7f8 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
+@@ -47,6 +47,7 @@ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.util.fastFilter
+ import androidx.compose.ui.util.fastForEach
++import androidx.compose.ui.util.fastForEachIndexed
+ import cafe.adriel.voyager.navigator.LocalNavigator
+ import cafe.adriel.voyager.navigator.currentOrThrow
+ import cafe.adriel.voyager.navigator.tab.LocalTabNavigator
+@@ -225,14 +226,14 @@ object HomeScreen : Screen() {
+                                                 CompactNavigationBar(
+                                                     containerColor = Color.Transparent,
+                                                     height = when {
+-                                                        density.fontScale > 1.3f -> 72.dp
+-                                                        compactBar -> 56.dp
+-                                                        else -> 64.dp
++                                                        density.fontScale > 1.3f -> 64.dp
++                                                        compactBar -> 48.dp
++                                                        else -> 52.dp
+                                                     },
+                                                     windowInsets = WindowInsets(0),
+                                                 ) {
+-                                                    navigationTabs.fastForEach {
+-                                                        CompactNavigationItem(it, alwaysShowLabel)
++                                                    navigationTabs.fastForEachIndexed { index, tab ->
++                                                        CompactNavigationItem(tab, alwaysShowLabel, index)
+                                                     }
+                                                 }
+                                             }
+@@ -349,6 +350,7 @@ object HomeScreen : Screen() {
+     private fun RowScope.CompactNavigationItem(
+         tab: eu.kanade.presentation.util.Tab,
+         alwaysShowLabel: Boolean,
++        index: Int,
+     ) {
+         val tabNavigator = LocalTabNavigator.current
+         val navigator = LocalNavigator.currentOrThrow
+@@ -356,6 +358,7 @@ object HomeScreen : Screen() {
+         val selected = tabNavigator.current::class == tab::class
+         CompactNavigationBarItem(
+             selected = selected,
++            index = index,
+             onClick = {
+                 if (!selected) tabNavigator.current = tab else scope.launch { tab.onReselect(navigator) }
+             },
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
+index d5aff5f9f..82932a489 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
+@@ -2,11 +2,11 @@ package tachiyomi.presentation.core.components.material
+ 
+ import android.os.Build
+ import androidx.compose.foundation.background
+-import androidx.compose.foundation.isSystemInDarkTheme
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.luminance
+ import androidx.compose.ui.platform.LocalView
+ import androidx.compose.ui.unit.dp
+ import dev.chrisbanes.haze.HazeStyle
+@@ -16,19 +16,26 @@ import dev.chrisbanes.haze.hazeSource
+ 
+ /** Blur only the content behind the controls, leaving icons, labels and badges sharp. */
+ @Composable
+-internal fun Modifier.browsingGlassBackground(state: BrowsingNavigationBarState): Modifier {
++internal fun Modifier.browsingGlassBackground(state: BrowsingNavigationBarState, thin: Boolean = false): Modifier {
+     val surface = MaterialTheme.colorScheme.surface
++    val dark = surface.luminance() < 0.5f
++    val tint = if (thin) {
++        if (dark) 0.18f else 0.14f
++    } else {
++        if (dark) 0.72f else 0.64f
++    }
++    val fallback = if (thin) 0.24f else 0.94f
+     if (Build.VERSION.SDK_INT < 31 || !LocalView.current.isHardwareAccelerated) {
+-        return background(surface.copy(alpha = 0.94f))
++        return background(surface.copy(alpha = fallback))
+     }
+     return hazeEffect(
+         state = state.glassState,
+         style = HazeStyle(
+             backgroundColor = surface,
+-            tint = HazeTint(surface.copy(alpha = if (isSystemInDarkTheme()) 0.72f else 0.64f)),
+-            blurRadius = 18.dp,
+-            noiseFactor = 0.03f,
+-            fallbackTint = HazeTint(surface.copy(alpha = 0.94f)),
++            tint = HazeTint(surface.copy(alpha = tint)),
++            blurRadius = if (thin) 8.dp else 18.dp,
++            noiseFactor = if (thin) 0.01f else 0.03f,
++            fallbackTint = HazeTint(surface.copy(alpha = fallback)),
+         ),
+     )
+ }
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt
+new file mode 100644
+index 000000000..7a480601a
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt
+@@ -0,0 +1,112 @@
++package tachiyomi.presentation.core.components.material
++
++import android.os.Build
++import androidx.compose.animation.core.animateFloatAsState
++import androidx.compose.animation.core.tween
++import androidx.compose.foundation.Canvas
++import androidx.compose.foundation.interaction.MutableInteractionSource
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.RowScope
++import androidx.compose.foundation.layout.fillMaxHeight
++import androidx.compose.foundation.selection.selectable
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.graphics.BlendMode
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.drawscope.Stroke
++import androidx.compose.ui.graphics.graphicsLayer
++import androidx.compose.ui.layout.Layout
++import androidx.compose.ui.semantics.Role
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.semantics.text
++import androidx.compose.ui.text.AnnotatedString
++import androidx.compose.ui.text.TextLayoutResult
++import androidx.compose.ui.text.drawText
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.rememberTextMeasurer
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.Constraints
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++
++private class CapsuleTextLayout {
++    var result: TextLayoutResult? = null
++}
++
++/** Center each word independently of its counter; Difference ink responds to the actual glass below. */
++@Composable
++internal fun RowScope.CapsuleNavigationLabel(
++    selected: Boolean,
++    onClick: () -> Unit,
++    label: String,
++    index: Int?,
++    modifier: Modifier,
++    badge: (@Composable () -> Unit)?,
++) {
++    val preview = LocalCapsulePreview.current
++    val active = if (index != null && preview != null) index == preview else selected
++    val emphasis by animateFloatAsState(if (active) 1f else 0f, tween(160), label = "capsuleWord")
++    val style = MaterialTheme.typography.labelLarge.copy(
++        fontSize = 16.sp,
++        lineHeight = 20.sp,
++        fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
++    )
++    val measurer = rememberTextMeasurer()
++    val savedLayout = remember { CapsuleTextLayout() }
++    val ink = MaterialTheme.colorScheme.onSurface
++    val outline = MaterialTheme.colorScheme.surface.copy(alpha = 0.35f)
++    val inverse = Build.VERSION.SDK_INT >= 29
++    Layout(
++        modifier = modifier.weight(1f).fillMaxHeight().selectable(
++            selected = selected,
++            interactionSource = remember { MutableInteractionSource() },
++            indication = null,
++            role = Role.Tab,
++            onClick = onClick,
++        ),
++        content = {
++            Canvas(
++                Modifier.semantics { text = AnnotatedString(label) }
++                    .graphicsLayer {
++                        scaleX = 1f + 0.025f * emphasis
++                        scaleY = scaleX
++                    },
++            ) {
++                savedLayout.result?.let {
++                    drawText(it, color = outline, drawStyle = Stroke(1.dp.toPx()))
++                    drawText(
++                        it,
++                        color = (if (inverse) Color.White else ink).copy(alpha = 0.62f + 0.38f * emphasis),
++                        blendMode = if (inverse) BlendMode.Difference else BlendMode.SrcOver,
++                    )
++                }
++            }
++            Box { badge?.invoke() }
++        },
++    ) { measurables, constraints ->
++        val text = measurer.measure(
++            label,
++            style,
++            overflow = TextOverflow.Ellipsis,
++            maxLines = 1,
++            constraints = Constraints(maxWidth = (constraints.maxWidth - 8.dp.roundToPx()).coerceAtLeast(0)),
++        )
++        savedLayout.result = text
++        val word = measurables[0].measure(Constraints.fixed(text.size.width, text.size.height))
++        val counter = measurables[1].measure(constraints.copy(minWidth = 0, minHeight = 0))
++        val width = constraints.maxWidth
++        val height = constraints.maxHeight
++        layout(width, height) {
++            val left = (width - word.width) / 2
++            word.placeRelative(left, (height - word.height) / 2)
++            counter.placeRelative(
++                (left + word.width + 2.dp.roundToPx()).coerceAtMost(width - counter.width).coerceAtLeast(0),
++                2.dp.roundToPx(),
++            )
++        }
++    }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt
+new file mode 100644
+index 000000000..ca5d2a0d9
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt
+@@ -0,0 +1,69 @@
++package tachiyomi.presentation.core.components.material
++
++import android.annotation.TargetApi
++import android.graphics.RuntimeShader
++import android.os.Build
++import android.util.Log
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.RenderEffect
++import androidx.compose.ui.graphics.asComposeRenderEffect
++import androidx.compose.ui.graphics.graphicsLayer
++import androidx.compose.ui.platform.LocalView
++import androidx.compose.ui.unit.IntSize
++
++/** Bend the already sampled backdrop only; labels are a separate, sharp sibling layer. */
++@Composable
++internal fun Modifier.capsuleRefraction(size: IntSize, radius: Float): Modifier {
++    if (Build.VERSION.SDK_INT < 33 || !LocalView.current.isHardwareAccelerated || size.width <= 0 || size.height <= 0) {
++        return this
++    }
++    val effect = remember(size, radius) {
++        runCatching { CapsuleRefraction33.effect(size, radius) }.getOrElse {
++            Log.w("NavigationCapsule", "Refraction unavailable; retaining the blurred glass surface", it)
++            null
++        }
++    }
++    return if (effect == null) this else graphicsLayer { renderEffect = effect }
++}
++
++@TargetApi(33)
++internal object CapsuleRefraction33 {
++    // A curved edge samples a displaced background, with directional Fresnel light at its rim.
++    // There is no per-tab shape, second background capture, or perpetual animation.
++    const val SOURCE = """
++        uniform shader backdrop;
++        uniform float2 resolution;
++        uniform float cornerRadius;
++
++        half4 main(float2 xy) {
++            float2 halfSize = resolution * 0.5;
++            float radius = clamp(cornerRadius, 1.0, halfSize.y);
++            float2 p = xy - halfSize;
++            float2 q = abs(p) - (halfSize - float2(radius));
++            float edgeDistance = length(max(q, float2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
++            float2 normal = normalize(max(q, float2(0.001))) * sign(p);
++            float edge = 1.0 - smoothstep(0.0, max(3.0, resolution.y * 0.24), -edgeDistance);
++            float bend = resolution.y * 0.10 * edge * edge;
++            float2 samplePoint = halfSize + p * 0.985 - normal * bend;
++            samplePoint = clamp(samplePoint, float2(0.5), resolution - float2(0.5));
++            half4 color = backdrop.eval(samplePoint);
++            float direction = dot(normal, normalize(float2(-0.55, -0.83)));
++            float shine = 0.14 * edge * edge * (0.4 + 0.6 * max(direction, 0.0));
++            color.rgb = mix(color.rgb, half3(1.0), half(shine));
++            color.rgb *= half(1.0 - 0.05 * edge * max(-direction, 0.0));
++            return color;
++        }
++    """
++
++    fun shader(size: IntSize, radius: Float): RuntimeShader = RuntimeShader(SOURCE).apply {
++        setFloatUniform("resolution", size.width.toFloat(), size.height.toFloat())
++        setFloatUniform("cornerRadius", radius)
++    }
++
++    fun effect(size: IntSize, radius: Float): RenderEffect {
++        val input = shader(size, radius)
++        return android.graphics.RenderEffect.createRuntimeShaderEffect(input, "backdrop").asComposeRenderEffect()
++    }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CompactNavigationBar.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CompactNavigationBar.kt
+index d954dfc37..7ffea499a 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CompactNavigationBar.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CompactNavigationBar.kt
+@@ -48,7 +48,8 @@ fun CompactNavigationBar(
+             .background(containerColor)
+             .windowInsetsPadding(windowInsets)
+             .height(height)
+-            .selectableGroup(),
++            .selectableGroup()
++            .padding(horizontal = if (LocalNavigationCapsule.current) 6.dp else 0.dp),
+         verticalAlignment = Alignment.CenterVertically,
+         content = content,
+     )
+@@ -61,9 +62,14 @@ fun RowScope.CompactNavigationBarItem(
+     icon: @Composable () -> Unit,
+     label: String,
+     showLabel: Boolean,
++    index: Int? = null,
+     modifier: Modifier = Modifier,
+     badge: (@Composable () -> Unit)? = null,
+ ) {
++    if (LocalNavigationCapsule.current) {
++        CapsuleNavigationLabel(selected, onClick, label, index, modifier, badge)
++        return
++    }
+     val color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+     Column(
+         modifier = modifier
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+index 34b78eda8..01f6bb230 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+@@ -1,11 +1,13 @@
+ package tachiyomi.presentation.core.components.material
+ 
++import android.os.Build
++import android.view.RoundedCorner
+ import androidx.compose.animation.core.Animatable
+ import androidx.compose.animation.core.animateFloatAsState
+ import androidx.compose.animation.core.spring
+ import androidx.compose.animation.core.tween
+-import androidx.compose.foundation.BorderStroke
+-import androidx.compose.foundation.border
++import androidx.compose.foundation.gestures.awaitEachGesture
++import androidx.compose.foundation.gestures.awaitFirstDown
+ import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.WindowInsets
+@@ -14,15 +16,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.navigationBars
+ import androidx.compose.foundation.layout.only
+ import androidx.compose.foundation.layout.padding
+-import androidx.compose.foundation.layout.widthIn
+-import androidx.compose.foundation.layout.windowInsetsPadding
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+-import androidx.compose.runtime.mutableIntStateOf
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.rememberCoroutineScope
+@@ -40,18 +39,25 @@ import androidx.compose.ui.geometry.Size
+ import androidx.compose.ui.graphics.Brush
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.graphics.drawscope.Stroke
++import androidx.compose.ui.graphics.graphicsLayer
++import androidx.compose.ui.input.pointer.PointerEventPass
+ import androidx.compose.ui.input.pointer.pointerInput
++import androidx.compose.ui.layout.onGloballyPositioned
+ import androidx.compose.ui.layout.onSizeChanged
++import androidx.compose.ui.platform.LocalConfiguration
++import androidx.compose.ui.platform.LocalDensity
+ import androidx.compose.ui.platform.LocalLayoutDirection
++import androidx.compose.ui.platform.LocalView
++import androidx.compose.ui.unit.IntSize
+ import androidx.compose.ui.unit.LayoutDirection
+ import androidx.compose.ui.unit.dp
+ import kotlinx.coroutines.launch
+-import kotlin.math.abs
+ import kotlin.math.roundToInt
+ 
+ internal val LocalNavigationCapsule = staticCompositionLocalOf { false }
++internal val LocalCapsulePreview = staticCompositionLocalOf<Int?> { null }
+ 
+-/** One glass surface; the selection lens and its brief light are drawn without another blur pass. */
++/** One refractive glass body. Selection is expressed by the words, never a second framed surface. */
+ @Composable
+ fun NavigationCapsule(
+     state: BrowsingNavigationBarState,
+@@ -66,22 +72,34 @@ fun NavigationCapsule(
+     val selected = selectedIndex.coerceIn(0, itemCount - 1)
+     val position = remember { Animatable(selected.toFloat()) }
+     var dragPosition by remember { mutableStateOf<Float?>(null) }
+-    var width by remember { mutableIntStateOf(0) }
++    var surfaceSize by remember { mutableStateOf(IntSize.Zero) }
++    var pressed by remember { mutableStateOf(false) }
++    var touchX by remember { mutableStateOf(0f) }
+     val latestSelected by rememberUpdatedState(selected)
+     val latestOnSelect by rememberUpdatedState(onSelect)
+     val scope = rememberCoroutineScope()
++    val density = LocalDensity.current
+     val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
+-    val shape = RoundedCornerShape(50)
+-    val colors = MaterialTheme.colorScheme
++    val view = LocalView.current
++    val config = LocalConfiguration.current
++    var screenRadius by remember(view, config.screenWidthDp, config.screenHeightDp) { mutableStateOf<Float?>(null) }
++    // The safe inset is the total bottom gap, not another band added below it.
++    val gap = maxOf(8.dp, with(density) { windowInsets.getBottom(density).toDp() })
++    val gapPx = with(density) { gap.toPx() }
++    val halfHeight = if (surfaceSize.height > 0) surfaceSize.height / 2f else with(density) { 24.dp.toPx() }
++    val radius = screenRadius?.minus(gapPx)?.takeIf { it > 0f }?.coerceAtMost(halfHeight) ?: halfHeight
++    val shape = RoundedCornerShape(with(density) { radius.toDp() })
++    val outline = MaterialTheme.colorScheme.outline
+     val motion = spring<Float>(dampingRatio = 0.86f, stiffness = 420f)
+     LaunchedEffect(selected, itemCount) {
+         if (dragPosition == null) position.animateTo(selected.toFloat(), motion)
+     }
+     val light by animateFloatAsState(
+-        targetValue = if (dragPosition != null || position.isRunning) 1f else 0f,
+-        animationSpec = tween(160),
++        if (pressed || dragPosition != null || position.isRunning) 1f else 0f,
++        tween(160),
+         label = "capsuleLight",
+     )
++    val pressure by animateFloatAsState(if (pressed) 1f else 0f, spring(), label = "capsulePressure")
+     fun settle(index: Int, commit: Boolean) {
+         val from = dragPosition ?: position.value
+         scope.launch {
+@@ -92,29 +110,46 @@ fun NavigationCapsule(
+         }
+     }
+     Box(
+-        modifier = modifier.fillMaxWidth().windowInsetsPadding(windowInsets)
+-            .padding(start = 16.dp, top = 4.dp, end = 16.dp, bottom = 8.dp),
++        modifier = modifier.fillMaxWidth().padding(start = gap, top = 2.dp, end = gap, bottom = gap),
+         contentAlignment = Alignment.Center,
+     ) {
+         Box(
+-            Modifier.widthIn(max = 640.dp).fillMaxWidth()
+-                .shadow(6.dp, shape)
++            Modifier.fillMaxWidth()
++                .onSizeChanged { surfaceSize = it }
++                .onGloballyPositioned {
++                    if (Build.VERSION.SDK_INT >= 31) {
++                        screenRadius = listOfNotNull(
++                            view.rootWindowInsets?.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_LEFT)?.radius,
++                            view.rootWindowInsets?.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_RIGHT)?.radius,
++                        ).filter { it > 0 }.minOrNull()?.toFloat()
++                    }
++                }
++                .graphicsLayer {
++                    scaleX = 1f + 0.003f * pressure
++                    scaleY = 1f - 0.018f * pressure
++                }
++                .shadow(4.dp, shape, clip = false)
+                 .clip(shape)
+-                .browsingGlassBackground(state)
+-                .border(
+-                    BorderStroke(
+-                        0.75.dp,
+-                        Brush.verticalGradient(
+-                            listOf(Color.White.copy(alpha = 0.45f), colors.outlineVariant.copy(alpha = 0.3f)),
+-                        ),
+-                    ),
+-                    shape,
+-                )
+-                .padding(horizontal = 6.dp)
+-                .onSizeChanged { width = it.width }
+-                .pointerInput(itemCount, rtl, width) {
++                .pointerInput(itemCount) {
++                    awaitEachGesture {
++                        val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
++                        pressed = true
++                        touchX = down.position.x
++                        try {
++                            do {
++                                val event = awaitPointerEvent(PointerEventPass.Initial)
++                                event.changes.firstOrNull { it.id == down.id }?.let { touchX = it.position.x }
++                            } while (event.changes.any { it.pressed })
++                        } finally {
++                            pressed = false
++                        }
++                    }
++                }
++                .pointerInput(itemCount, rtl, surfaceSize.width) {
+                     fun indexAt(x: Float): Float {
+-                        val fraction = (x / width.coerceAtLeast(1)).coerceIn(0f, 1f)
++                        val inset = 6.dp.toPx()
++                        val availableWidth = (surfaceSize.width - 2 * inset).coerceAtLeast(1f)
++                        val fraction = ((x - inset) / availableWidth).coerceIn(0f, 1f)
+                         return ((if (rtl) 1f - fraction else fraction) * itemCount - 0.5f)
+                             .coerceIn(0f, (itemCount - 1).toFloat())
+                     }
+@@ -127,47 +162,50 @@ fun NavigationCapsule(
+                         onDragEnd = { settle((dragPosition ?: latestSelected.toFloat()).roundToInt(), true) },
+                         onDragCancel = { settle(latestSelected, false) },
+                     )
+-                }
+-                .drawWithContent {
+-                    val index = (dragPosition ?: position.value).coerceIn(0f, (itemCount - 1).toFloat())
+-                    val lane = size.width / itemCount
+-                    val moving = (1f - abs(index - index.roundToInt()) * 2f).coerceIn(0f, 1f)
+-                    val stretch = lane * (1f - moving) * 0.08f
+-                    val lensWidth = (lane - 8.dp.toPx() + stretch).coerceAtLeast(0f)
+-                    val lensHeight = (size.height - 8.dp.toPx()).coerceAtLeast(0f)
+-                    val start = ((index + 0.5f) * lane - lensWidth / 2)
+-                        .coerceIn(0f, (size.width - lensWidth).coerceAtLeast(0f))
+-                    val x = if (rtl) size.width - start - lensWidth else start
+-                    val offset = Offset(x, 4.dp.toPx())
+-                    val lensSize = Size(lensWidth, lensHeight)
+-                    val radius = CornerRadius(lensHeight / 2)
+-                    drawRoundRect(
+-                        brush = Brush.linearGradient(
+-                            listOf(
+-                                colors.primary.copy(alpha = 0.12f + light * 0.08f),
+-                                colors.surface.copy(alpha = 0.24f),
+-                                colors.primary.copy(alpha = 0.09f),
+-                            ),
+-                            start = offset,
+-                            end = offset + Offset(lensWidth, lensHeight),
+-                        ),
+-                        topLeft = offset,
+-                        size = lensSize,
+-                        cornerRadius = radius,
+-                    )
+-                    drawRoundRect(
+-                        brush = Brush.verticalGradient(
+-                            listOf(Color.White.copy(alpha = 0.25f + light * 0.25f), Color.Transparent),
+-                        ),
+-                        topLeft = offset,
+-                        size = lensSize,
+-                        cornerRadius = radius,
+-                        style = Stroke(0.75.dp.toPx()),
+-                    )
+-                    drawContent()
+                 },
+         ) {
+-            CompositionLocalProvider(LocalNavigationCapsule provides true) { content() }
++            Box(
++                Modifier.matchParentSize()
++                    .drawWithContent {
++                        drawContent()
++                        val inset = 0.5.dp.toPx()
++                        val rimSize =
++                            Size(
++                                (size.width - 2 * inset).coerceAtLeast(0f),
++                                (size.height - 2 * inset).coerceAtLeast(0f),
++                            )
++                        drawRoundRect(
++                            brush = Brush.linearGradient(
++                                listOf(
++                                    Color.White.copy(alpha = 0.65f),
++                                    outline.copy(alpha = 0.14f),
++                                    Color.White.copy(alpha = 0.28f),
++                                ),
++                                start = Offset.Zero,
++                                end = Offset(size.width, size.height),
++                            ),
++                            topLeft = Offset(inset, inset),
++                            size = rimSize,
++                            cornerRadius = CornerRadius((radius - inset).coerceAtLeast(0f)),
++                            style = Stroke(0.85.dp.toPx()),
++                        )
++                        val fraction = (position.value + 0.5f) / itemCount
++                        val x = if (pressed) touchX else size.width * (if (rtl) 1f - fraction else fraction)
++                        drawRect(
++                            Brush.radialGradient(
++                                listOf(Color.White.copy(alpha = 0.12f * light), Color.Transparent),
++                                center = Offset(x, size.height * 0.25f),
++                                radius = (size.height * 2.8f).coerceAtLeast(1f),
++                            ),
++                        )
++                    }
++                    .capsuleRefraction(surfaceSize, radius)
++                    .browsingGlassBackground(state, thin = true),
++            )
++            CompositionLocalProvider(
++                LocalNavigationCapsule provides true,
++                LocalCapsulePreview provides (dragPosition?.roundToInt() ?: selected),
++            ) { content() }
+         }
+     }
+ }
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+index 256d92085..e4b2e0df0 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+@@ -196,6 +196,8 @@ class BrowsingNavigationBarState internal constructor(
+ 
+     private fun atEnd() = trailingRemaining?.invoke()?.let { it <= 0.5f } == true
+ 
++    private fun atStart() = leadingOffset?.invoke()?.let { it <= 0.5f } == true
++
+     private fun canHide() = enabled() && pinnedOwners.isEmpty()
+ 
+     val nestedScrollConnection = object : NestedScrollConnection {
+@@ -209,6 +211,7 @@ class BrowsingNavigationBarState internal constructor(
+                             available.x,
+                             available.y,
+                             source == NestedScrollSource.UserInput,
++                            if (available.y > 0f && atStart()) 0f else gestureSpeedDpPerSecond * density,
+                         ),
+                     )
+                 }
+@@ -222,7 +225,12 @@ class BrowsingNavigationBarState internal constructor(
+                     revealAtEnd()
+                 } else {
+                     updateVisibility(
+-                        tracker.onPostScroll(consumed.x, consumed.y, source == NestedScrollSource.UserInput),
++                        tracker.onPostScroll(
++                            consumed.x,
++                            consumed.y,
++                            source == NestedScrollSource.UserInput,
++                            if (consumed.y > 0f && atStart()) 0f else gestureSpeedDpPerSecond * density,
++                        ),
+                     )
+                 }
+             }
+@@ -234,6 +242,8 @@ class BrowsingNavigationBarState internal constructor(
+             if (canHide()) {
+                 if (atEnd()) {
+                     revealAtEnd()
++                } else if (available.y > 0f && atStart()) {
++                    reset()
+                 } else {
+                     gestureSpeedDpPerSecond = abs(available.y) / density
+                     updateVisibility(tracker.onPreFling(available.x, available.y))
+@@ -267,7 +277,9 @@ internal fun Modifier.observeBrowsingChromeGestures(
+                     val event = awaitPointerEvent(PointerEventPass.Initial)
+                     event.changes.firstOrNull { it.id == down.id }?.let { change ->
+                         velocity.addPosition(change.uptimeMillis, change.position)
+-                        state.gestureSpeedDpPerSecond = abs(velocity.calculateVelocity().y) / density
++                        val elapsed = (change.uptimeMillis - change.previousUptimeMillis).coerceAtLeast(1)
++                        val instant = abs(change.position.y - change.previousPosition.y) * 1000f / elapsed
++                        state.gestureSpeedDpPerSecond = maxOf(instant, abs(velocity.calculateVelocity().y)) / density
+                     }
+                 } while (event.changes.any { it.pressed })
+             } finally {
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
+index 058e21a69..0d05ecadc 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTracker.kt
+@@ -13,17 +13,17 @@ internal class NavigationChromeScrollTracker(
+     private var gestureActive = false
+     private var switchedThisGesture = false
+     private var pendingDistance = 0f
+-    private var consumedUpwardScroll = false
+-    private var upwardFling = false
++    private var consumedVerticalScroll = false
++    private var fastFling = false
+     private var continuingFling = false
+ 
+     fun beginGesture() {
+         gestureActive = true
+         switchedThisGesture = false
+         pendingDistance = 0f
+-        consumedUpwardScroll = false
++        consumedVerticalScroll = false
+         // Snapshot before the new touch cancels the old fling and dispatches onPostFling.
+-        continuingFling = upwardFling
++        continuingFling = fastFling
+     }
+ 
+     fun endGesture() {
+@@ -37,8 +37,8 @@ internal class NavigationChromeScrollTracker(
+         // Do not unlock a finger that is still down when selection/search pins the controls.
+         switchedThisGesture = gestureActive
+         pendingDistance = 0f
+-        consumedUpwardScroll = false
+-        upwardFling = false
++        consumedVerticalScroll = false
++        fastFling = false
+         continuingFling = false
+     }
+ 
+@@ -47,28 +47,37 @@ internal class NavigationChromeScrollTracker(
+         pendingDistance = 0f
+         // Reaching the boundary overrides a hide, but does not unlock the pressed finger.
+         switchedThisGesture = gestureActive
+-        consumedUpwardScroll = false
+-        upwardFling = false
++        consumedVerticalScroll = false
++        fastFling = false
+         continuingFling = false
+     }
+ 
+-    fun onPreScroll(x: Float, y: Float, userInput: Boolean): Boolean {
+-        if (userInput && y > abs(x)) observe(y)
++    fun onPreScroll(x: Float, y: Float, userInput: Boolean, speed: Float = 0f): Boolean {
++        // A fast return swipe is browsing intent, not a request to reveal the controls.
++        if (userInput && y > abs(x) && speed < fastFlingVelocity) observe(y)
+         return visible
+     }
+ 
+-    fun onPostScroll(x: Float, y: Float, userInput: Boolean): Boolean {
+-        if (userInput && -y > abs(x)) {
+-            consumedUpwardScroll = true
+-            observe(y)
++    fun onPostScroll(x: Float, y: Float, userInput: Boolean, speed: Float = 0f): Boolean {
++        if (userInput && abs(y) > abs(x)) {
++            consumedVerticalScroll = true
++            if (speed >= fastFlingVelocity) {
++                if (!gestureActive || !switchedThisGesture) {
++                    visible = false
++                    pendingDistance = 0f
++                    switchedThisGesture = gestureActive
++                }
++            } else if (y < 0f) {
++                observe(y)
++            }
+         }
+         return visible
+     }
+ 
+     fun onPreFling(x: Float, y: Float): Boolean {
+-        upwardFling = consumedUpwardScroll && -y > abs(x) && -y >= fastFlingVelocity
+-        // Fling can finish a short upward intent, but must not undo an intentional reveal.
+-        if (upwardFling && !switchedThisGesture) {
++        fastFling = consumedVerticalScroll && abs(y) > abs(x) && abs(y) >= fastFlingVelocity
++        // Release ends the pressed-finger latch: a deliberate fast throw in either direction hides.
++        if (fastFling) {
+             visible = false
+             pendingDistance = 0f
+             switchedThisGesture = true
+@@ -77,7 +86,7 @@ internal class NavigationChromeScrollTracker(
+     }
+ 
+     fun endFling() {
+-        upwardFling = false
++        fastFling = false
+     }
+ 
+     private fun observe(y: Float) {
+@@ -88,7 +97,7 @@ internal class NavigationChromeScrollTracker(
+             return
+         }
+         pendingDistance += abs(y)
+-        // Catching a moving list often adds a small downward wobble before the next upward swipe.
++        // Catching a moving list often adds a small downward wobble before the next swipe.
+         val threshold = if (reveal && continuingFling) intentDistance * 2 else intentDistance
+         if (pendingDistance < threshold) return
+         visible = reveal
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
+index 6a7bb3822..c746fa2a1 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleTest.kt
+@@ -40,7 +40,7 @@ import org.robolectric.annotation.GraphicsMode
+ @Config(sdk = [34], qualifiers = "w1000dp-h600dp")
+ class NavigationChromeCapsuleTest {
+     @Test
+-    fun `capsule keeps balanced margins and gesture clearance across themes and widths`() = runComposeUiTest {
++    fun `capsule keeps three equal gaps and centered text across window shapes`() = runComposeUiTest {
+         var width by mutableIntStateOf(320)
+         var dark by mutableStateOf(false)
+         var density = 1f
+@@ -60,13 +60,15 @@ class NavigationChromeCapsuleTest {
+                             CompactNavigationBar(
+                                 modifier = Modifier.testTag("capsule-row"),
+                                 containerColor = Color.Transparent,
++                                height = 48.dp,
+                                 windowInsets = WindowInsets(0),
+                             ) {
+                                 repeat(5) { index ->
+                                     CompactNavigationBarItem(
+                                         selected = index == 0,
+                                         onClick = {},
+-                                        icon = { Box(Modifier.size(24.dp)) },
++                                        icon = { Box(Modifier.size(24.dp).testTag("icon-$index")) },
++                                        index = index,
+                                         label = "Tab $index",
+                                         showLabel = true,
+                                         badge = if (index == 3) {
+@@ -93,9 +95,16 @@ class NavigationChromeCapsuleTest {
+                 val row = onNodeWithTag("capsule-row").fetchSemanticsNode().boundsInRoot
+                 val badge = onNodeWithTag("counter", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+                 assertEquals(row.left - viewport.left, viewport.right - row.right, 1f)
+-                assertTrue(row.left - viewport.left >= 16f * density)
+-                assertTrue(row.width <= 640f * density)
+-                assertTrue(row.bottom <= viewport.bottom - 20f - 8f * density + 1f)
++                assertEquals(row.left - viewport.left, viewport.bottom - row.bottom, 1f)
++                assertTrue(viewport.bottom - row.bottom >= 20f)
++                assertTrue(viewport.bottom - row.bottom >= 8f * density)
++                for (index in 0..4) {
++                    onNodeWithTag("icon-$index", useUnmergedTree = true).assertDoesNotExist()
++                    val word = onNodeWithText("Tab $index", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
++                    assertEquals(row.center.y, word.center.y, 1f)
++                    val centerX = row.left + 6f * density + (row.width - 12f * density) * (index + 0.5f) / 5
++                    assertEquals(centerX, word.center.x, 1f)
++                }
+                 assertTrue(badge.top >= row.top - 1f && badge.bottom <= row.bottom + 1f)
+             }
+         }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
+index 0a5748578..14e151abf 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConnectionTest.kt
+@@ -112,8 +112,8 @@ class NavigationChromeConnectionTest {
+         assertTrue(state.visible)
+         connection.onPostScroll(Offset(0f, -40f), Offset.Zero, NestedScrollSource.UserInput)
+         state.endGesture()
+-        connection.onPreFling(Velocity(0f, -2400f))
+-        assertTrue(state.visible, "Release velocity must keep the touch's reveal decision")
++        connection.onPreFling(Velocity(0f, -300f))
++        assertTrue(state.visible, "A slow release keeps the pressed touch's reveal decision")
+     }
+ 
+     @Test
+@@ -136,4 +136,28 @@ class NavigationChromeConnectionTest {
+             assertTrue(state.visible)
+         }
+     }
++
++    @Test
++    fun `fast browsing hides in both directions but fast pull to refresh at the top stays visible`() = runBlocking {
++        for (direction in listOf(-1f, 1f)) {
++            val state = BrowsingNavigationBarState { true }.apply { leadingOffset = { 1000f } }
++            state.beginGesture()
++            state.gestureSpeedDpPerSecond = 1600f
++            val scroll = Offset(0f, direction * 40f)
++            assertEquals(Offset.Zero, state.nestedScrollConnection.onPreScroll(scroll, NestedScrollSource.UserInput))
++            assertEquals(Offset.Zero, state.nestedScrollConnection.onPostScroll(scroll, Offset.Zero, NestedScrollSource.UserInput))
++            assertFalse(state.visible)
++            state.endGesture()
++            assertEquals(Velocity.Zero, state.nestedScrollConnection.onPreFling(Velocity(0f, direction * 2400f)))
++            assertFalse(state.visible)
++        }
++        val top = BrowsingNavigationBarState { true }.apply { leadingOffset = { 0f } }
++        top.beginGesture()
++        top.gestureSpeedDpPerSecond = 1600f
++        top.nestedScrollConnection.onPreScroll(Offset(0f, 40f), NestedScrollSource.UserInput)
++        top.nestedScrollConnection.onPostScroll(Offset(0f, 40f), Offset.Zero, NestedScrollSource.UserInput)
++        top.endGesture()
++        top.nestedScrollConnection.onPreFling(Velocity(0f, 2400f))
++        assertTrue(top.visible)
++    }
+ }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGlassShaderTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGlassShaderTest.kt
+new file mode 100644
+index 000000000..e299f7540
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGlassShaderTest.kt
+@@ -0,0 +1,41 @@
++package tachiyomi.presentation.core.components.material
++
++import android.graphics.Bitmap
++import android.graphics.BitmapShader
++import android.graphics.Canvas
++import android.graphics.Color
++import android.graphics.Paint
++import android.graphics.Shader
++import androidx.compose.ui.unit.IntSize
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.robolectric.annotation.GraphicsMode
++
++/** Compile and execute the actual AGSL optics with native Skia, independently of a hardware View. */
++@RunWith(RobolectricTestRunner::class)
++@GraphicsMode(GraphicsMode.Mode.NATIVE)
++@Config(sdk = [34])
++class NavigationChromeGlassShaderTest {
++    @Test
++    fun `glass bends backdrop stripes at its rim while retaining the center content`() {
++        val source = Bitmap.createBitmap(320, 48, Bitmap.Config.ARGB_8888)
++        for (y in 0 until source.height) {
++            for (x in 0 until source.width) source.setPixel(x, y, if (y / 4 % 2 == 0) Color.RED else Color.BLUE)
++        }
++        val shader = CapsuleRefraction33.shader(IntSize(320, 48), 24f).apply {
++            setInputShader("backdrop", BitmapShader(source, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP))
++        }
++        val output = Bitmap.createBitmap(320, 48, Bitmap.Config.ARGB_8888)
++        Canvas(output).drawRect(0f, 0f, 320f, 48f, Paint().apply { this.shader = shader })
++        assertEquals(source.getPixel(160, 24), output.getPixel(160, 24))
++        val rim = output.getPixel(160, 1)
++        assertTrue(Color.blue(rim) > Color.red(rim), "The rim must sample a displaced blue stripe, not merely tint red")
++        assertEquals(255, Color.alpha(rim))
++        source.recycle()
++        output.recycle()
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
+index 705cfd8e6..bee1e302c 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
+@@ -36,6 +36,7 @@ import androidx.compose.ui.test.performClick
+ import androidx.compose.ui.test.performScrollToIndex
+ import androidx.compose.ui.test.performTouchInput
+ import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.test.swipeDown
+ import androidx.compose.ui.test.swipeUp
+ import androidx.compose.ui.unit.dp
+ import kotlinx.coroutines.CoroutineScope
+@@ -49,6 +50,11 @@ import org.robolectric.RobolectricTestRunner
+ import org.robolectric.annotation.Config
+ import org.robolectric.annotation.GraphicsMode
+ import tachiyomi.presentation.core.components.FastScrollLazyColumn
++import tachiyomi.presentation.core.components.FastScrollPanoramaMasonry
++import tachiyomi.presentation.core.components.PanoramaCellHeight
++import tachiyomi.presentation.core.components.PanoramaColumns
++import tachiyomi.presentation.core.components.PanoramaMasonryState
++import tachiyomi.presentation.core.components.rememberPanoramaMasonryState
+ 
+ @OptIn(ExperimentalTestApi::class)
+ @RunWith(RobolectricTestRunner::class)
+@@ -193,7 +199,7 @@ class NavigationChromeLayoutTest {
+         waitForIdle()
+         list.performTouchInput {
+             down(center)
+-            moveBy(Offset(0f, 100f), delayMillis = 80)
++            moveBy(Offset(0f, 100f), delayMillis = 250)
+         }
+         runOnIdle { assertTrue(chrome.visible) }
+         list.performTouchInput { moveBy(Offset(0f, -150f), delayMillis = 100) }
+@@ -209,7 +215,7 @@ class NavigationChromeLayoutTest {
+     }
+ 
+     @Test
+-    fun `repeated fast upward touch swipes keep navigation hidden and the list moving`() = runComposeUiTest {
++    fun `fast touch swipes in either direction keep navigation hidden and the list moving`() = runComposeUiTest {
+         lateinit var chrome: BrowsingNavigationBarState
+         lateinit var scroll: LazyListState
+         setContent {
+@@ -217,13 +223,13 @@ class NavigationChromeLayoutTest {
+                 chrome = rememberBrowsingNavigationBarState(enabled = true, resetKey = Unit)
+                 CompositionLocalProvider(LocalBrowsingNavigationBarState provides chrome) {
+                     Scaffold(topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior()) { padding ->
+-                        scroll = rememberLazyListState(initialFirstVisibleItemIndex = 20)
++                        scroll = rememberLazyListState(initialFirstVisibleItemIndex = 500)
+                         LazyColumn(
+                             modifier = Modifier.fillMaxSize().testTag("fling-list"),
+                             state = scroll,
+                             contentPadding = padding,
+                         ) {
+-                            items(1000) { Box(Modifier.fillMaxWidth().height(80.dp)) }
++                            items(10000) { Box(Modifier.fillMaxWidth().height(80.dp)) }
+                         }
+                     }
+                 }
+@@ -241,6 +247,60 @@ class NavigationChromeLayoutTest {
+                 val after = scroll.firstVisibleItemIndex * 10000 + scroll.firstVisibleItemScrollOffset
+                 assertTrue(after > before, "Navigation observation must keep list scrolling")
+             }
++            val beforeReturn = scroll.firstVisibleItemIndex * 10000 + scroll.firstVisibleItemScrollOffset
++            onNodeWithTag("fling-list").performTouchInput { swipeDown(durationMillis = 60) }
++            waitForIdle()
++            runOnIdle {
++                assertFalse(chrome.visible, "A fast return swipe also hides the controls")
++                val afterReturn = scroll.firstVisibleItemIndex * 10000 + scroll.firstVisibleItemScrollOffset
++                assertTrue(afterReturn < beforeReturn, "Return scrolling must keep its momentum")
++            }
++        }
++    }
++
++    @Test
++    fun `real panorama masonry fast swipes hide navigation in both directions`() = runComposeUiTest {
++        lateinit var chrome: BrowsingNavigationBarState
++        lateinit var grid: PanoramaMasonryState
++        lateinit var scope: CoroutineScope
++        setContent {
++            MaterialTheme {
++                chrome = rememberBrowsingNavigationBarState(enabled = true, resetKey = Unit)
++                scope = rememberCoroutineScope()
++                CompositionLocalProvider(LocalBrowsingNavigationBarState provides chrome) {
++                    Scaffold(topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior()) { padding ->
++                        grid = rememberPanoramaMasonryState()
++                        FastScrollPanoramaMasonry(
++                            columns = PanoramaColumns.Fixed(3),
++                            state = grid,
++                            modifier = Modifier.fillMaxSize().testTag("fling-masonry"),
++                            contentPadding = padding,
++                        ) {
++                            items(6000, key = { it }, height = { PanoramaCellHeight.Fixed(100.dp) }) {
++                                Box(Modifier.fillMaxWidth().height(100.dp))
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        runOnIdle { scope.launch { grid.scrollToItem(1500) } }
++        waitForIdle()
++        repeat(2) {
++            val before = grid.scrollOffset
++            onNodeWithTag("fling-masonry").performTouchInput { swipeUp(durationMillis = 60) }
++            waitForIdle()
++            runOnIdle {
++                assertFalse(chrome.visible)
++                assertTrue(grid.scrollOffset > before)
++            }
++            val beforeReturn = grid.scrollOffset
++            onNodeWithTag("fling-masonry").performTouchInput { swipeDown(durationMillis = 60) }
++            waitForIdle()
++            runOnIdle {
++                assertFalse(chrome.visible)
++                assertTrue(grid.scrollOffset < beforeReturn)
++            }
+         }
+     }
+ 
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
+index 9b442064a..f05e06cb1 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
+@@ -85,13 +85,13 @@ class NavigationChromeScrollTrackerTest {
+     }
+ 
+     @Test
+-    fun `fling requires upward consumption and sufficient vertical release speed`() {
++    fun `fling requires real consumption and sufficient vertical release speed`() {
+         val tracker = NavigationChromeScrollTracker()
+         tracker.beginGesture()
+         tracker.onPreScroll(0f, -30f, true)
+         tracker.endGesture()
+         assertTrue(tracker.onPreFling(0f, -2400f), "An unscrollable short list stays visible")
+-        for ((x, y) in listOf(0f to -300f, -4000f to -2400f, 0f to 2400f)) {
++        for ((x, y) in listOf(0f to -300f, -4000f to -2400f, 0f to 300f)) {
+             tracker.beginGesture()
+             tracker.onPostScroll(0f, -2f, true)
+             tracker.endGesture()
+@@ -101,13 +101,14 @@ class NavigationChromeScrollTrackerTest {
+     }
+ 
+     @Test
+-    fun `release velocity cannot undo a reveal made by the same pressed finger`() {
++    fun `pressed finger keeps its reveal but an explicit fast release finishes with hidden navigation`() {
+         val tracker = NavigationChromeScrollTracker(initialVisible = false)
+         tracker.beginGesture()
+         assertTrue(tracker.onPreScroll(0f, 20f, true))
+         tracker.onPostScroll(0f, -100f, true)
++        assertTrue(tracker.visible)
+         tracker.endGesture()
+-        assertTrue(tracker.onPreFling(0f, -2400f))
++        assertFalse(tracker.onPreFling(0f, -2400f))
+         tracker.endFling()
+         tracker.beginGesture()
+         assertFalse(tracker.onPostScroll(0f, -20f, true))
+@@ -144,7 +145,7 @@ class NavigationChromeScrollTrackerTest {
+         assertTrue(tracker.onPreScroll(0f, 4f, true))
+         assertTrue(tracker.onPostScroll(0f, -40f, true))
+         tracker.endGesture()
+-        assertTrue(tracker.onPreFling(0f, -2400f))
++        assertTrue(tracker.onPreFling(0f, -300f))
+         tracker.endFling()
+         tracker.beginGesture()
+         tracker.onPostScroll(0f, -20f, true)
+@@ -165,6 +166,37 @@ class NavigationChromeScrollTrackerTest {
+         }
+     }
+ 
++    @Test
++    fun `fast drags in both directions hide while slow return still reveals`() {
++        for (direction in listOf(-1f, 1f)) {
++            val tracker = NavigationChromeScrollTracker()
++            tracker.beginGesture()
++            tracker.onPreScroll(0f, direction * 20f, true, 1600f)
++            assertFalse(tracker.onPostScroll(0f, direction * 20f, true, 1600f))
++            tracker.endGesture()
++            assertFalse(tracker.onPreFling(0f, direction * 2400f))
++            tracker.endFling()
++            tracker.beginGesture()
++            assertTrue(tracker.onPreScroll(0f, 12f, true, 200f))
++            assertTrue(tracker.onPostScroll(0f, -40f, true, 1600f), "An already switched pressed finger stays latched")
++            tracker.endGesture()
++            assertTrue(tracker.onPreFling(0f, 200f))
++        }
++    }
++
++    @Test
++    fun `a fast reverse gesture does not briefly reveal hidden controls`() {
++        val tracker = NavigationChromeScrollTracker(initialVisible = false)
++        repeat(3) {
++            tracker.beginGesture()
++            tracker.endFling()
++            assertFalse(tracker.onPreScroll(0f, 20f, true, 1600f))
++            assertFalse(tracker.onPostScroll(0f, 20f, true, 1600f))
++            tracker.endGesture()
++            assertFalse(tracker.onPreFling(0f, 2400f))
++        }
++    }
++
+     @Test
+     fun `fast swipes hide faster while reveal remains gentle`() {
+         assertEquals(175, browsingChromeAnimationDuration(false, 0f))
