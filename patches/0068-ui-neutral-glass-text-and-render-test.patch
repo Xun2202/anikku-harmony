@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 07:51:38 +0000
+Subject: [PATCH] ui: keep glass text neutral and enable native kernel pixel
+ validation
+
+Desaturate the contrast-reactive glyph result so colored covers do not give words a complementary hue. On the test canvas only, enable Android BaseCanvas hardware-feature raster support to execute the real Skia shader kernel; production retains its hardware View and SDK guards. Same change in both Harmony Tachiyomi forks.
+---
+ .../core/components/material/CapsuleNavigationLabel.kt       | 4 ++++
+ .../components/material/NavigationChromeGlassShaderTest.kt   | 5 ++++-
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt
+index 7a480601a..236a5b9a8 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleNavigationLabel.kt
+@@ -83,6 +83,10 @@ internal fun RowScope.CapsuleNavigationLabel(
+                         color = (if (inverse) Color.White else ink).copy(alpha = 0.62f + 0.38f * emphasis),
+                         blendMode = if (inverse) BlendMode.Difference else BlendMode.SrcOver,
+                     )
++                    if (inverse) {
++                        // Keep the contrast response neutral rather than tinting words with a complementary hue.
++                        drawText(it, color = Color.Gray, blendMode = BlendMode.Saturation)
++                    }
+                 }
+             }
+             Box { badge?.invoke() }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGlassShaderTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGlassShaderTest.kt
+index e299f7540..8a36f3b4d 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGlassShaderTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGlassShaderTest.kt
+@@ -30,7 +30,10 @@ class NavigationChromeGlassShaderTest {
+             setInputShader("backdrop", BitmapShader(source, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP))
+         }
+         val output = Bitmap.createBitmap(320, 48, Bitmap.Config.ARGB_8888)
+-        Canvas(output).drawRect(0f, 0f, 320f, 48f, Paint().apply { this.shader = shader })
++        val canvas = Canvas(output)
++        // Test-only opt-in: execute the Skia kernel on a raster bitmap. Production requires HW.
++        canvas.javaClass.getMethod("setHwFeaturesInSwModeEnabled", java.lang.Boolean.TYPE).invoke(canvas, true)
++        canvas.drawRect(0f, 0f, 320f, 48f, Paint().apply { this.shader = shader })
+         assertEquals(source.getPixel(160, 24), output.getPixel(160, 24))
+         val rim = output.getPixel(160, 1)
+         assertTrue(Color.blue(rim) > Color.red(rim), "The rim must sample a displaced blue stripe, not merely tint red")

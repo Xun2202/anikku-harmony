@@ -722,3 +722,5 @@ gh release list --repo Xun2202/anikku-harmony
 - 官方参考：https://developer.huawei.com/consumer/cn/doc/HarmonyOS-Guides/arkts-immersive-light-sense-common-capability/ ；https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/arkts-immersive-light-sense-faq/ 。Animeko为独立导航/渲染架构，本轮不直接移植。
 
 - 首次CI实际抓到3处：Native Skia只认旧sample(shader, point)写法；中心测试误把整数权重分配当成理想小数网格（1.4px差异）；惯性完成后速度残留使直接UserInput恢复被当成快滑。后续兼容补丁优先标准.eval并尝试等价旧语法，Native像素验证不跳过；文字以真实可点击cell中心核验；完成fling只在没有新按住手势时清速度，避免旧惯性取消覆盖新手势速度。未发布失败候选。
+
+- 第二轮手势/居中/三边等距全部通过，Native着色器已编译，但Android BaseCanvas默认拒绝在位图画布使用RuntimeShader；仅测试Canvas显式启用其硬件特性光栅许可以执行真实Skia内核像素检查，生产的SDK/硬件判断不改。文字反差绘制后再去饱和，保持中性黑白灰而非封面补色。
