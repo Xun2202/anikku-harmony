@@ -1,0 +1,744 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 15:11:13 +0000
+Subject: [PATCH] perf(ui): defer panorama prefetch and gate scroller capture
+
+Shared core optimization with Mihon 0074. User preview.27 traces still show 40.68ms re-entry / 19.77ms masonry measurement and a 21.52ms fling frame. Measure/place only viewport cells and submit one approaching row to Compose frame-budgeted prefetch, cancelling stale requests. Stop the independent fast-scroller Haze source/effect when its thumb is hidden or disallowed. Record inclusive source and layout stages only when diagnostics are enabled. Preserve existing scrolling, anchors, corners, touch handling and glass defaults. Mihon additionally exports format4 arrival timestamps and bounded worst/recent work samples, retains phase consensus for repeated frame times, and provides an in-memory glass A/B switch restored when recording is disabled. Anikku retains its existing format1 recorder; no unrelated diagnostics or image toggles are ported.
+---
+ .../core/components/FastScrollerGlass.kt      |   9 +-
+ .../core/components/PanoramaFrameCounters.kt  |  63 ++++++++++
+ .../core/components/PanoramaMasonry.kt        |  34 +++++-
+ .../components/PanoramaMasonryPrefetch.kt     |  71 +++++++++++
+ .../components/ScrollSourceDiagnostics.kt     |  35 ++++++
+ .../core/components/VerticalFastScroller.kt   |  81 +++++++++----
+ .../core/components/material/BrowsingGlass.kt |   9 +-
+ .../components/material/CapsuleRefraction.kt  |   2 +
+ .../NavigationChromeMasonryWorkTest.kt        | 110 ++++++++++++++++++
+ 9 files changed, 385 insertions(+), 29 deletions(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryPrefetch.kt
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/ScrollSourceDiagnostics.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeMasonryWorkTest.kt
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/FastScrollerGlass.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/FastScrollerGlass.kt
+index c3c253a7d..03a78388e 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/FastScrollerGlass.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/FastScrollerGlass.kt
+@@ -27,8 +27,13 @@ internal fun rememberFastScrollerGlass(): HazeState? {
+ 
+ // Capture only the list sibling. Capturing an ancestor that also contains the thumb cannot
+ // supply its backdrop: Haze deliberately excludes that area to prevent drawing itself.
++@Composable
+ internal fun Modifier.fastScrollerGlassSource(state: HazeState?): Modifier =
+-    if (state == null) this else hazeSource(state)
++    if (state == null || !ScrollGlassDiagnostics.enabled) {
++        this
++    } else {
++        recordScrollSource(PanoramaFrameCounters.SCROLLER_SOURCE).hazeSource(state)
++    }
+ 
+ @Composable
+ internal fun Modifier.fastScrollerGlass(
+@@ -39,7 +44,7 @@ internal fun Modifier.fastScrollerGlass(
+     val surface = MaterialTheme.colorScheme.surface
+     val shape = RoundedCornerShape(8.dp)
+     val tint = accent.copy(alpha = if (pressed) 0.3f else 0.18f)
+-    val base = if (state == null) {
++    val base = if (state == null || !ScrollGlassDiagnostics.enabled) {
+         Modifier.background(surface.copy(alpha = 0.78f)).background(tint)
+     } else {
+         Modifier.hazeEffect(
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaFrameCounters.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaFrameCounters.kt
+index aad6f5ead..0ce363fdb 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaFrameCounters.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaFrameCounters.kt
+@@ -9,6 +9,62 @@ package tachiyomi.presentation.core.components
+  */
+ object PanoramaFrameCounters {
+ 
++    var enabled: Boolean = false
++    const val NAVIGATION_SOURCE = 0
++    const val SCROLLER_SOURCE = 1
++
++    var navigationSources: Int = 0
++        private set
++    var scrollerSources: Int = 0
++        private set
++    var navigationDrawNanos: Long = 0L
++        private set
++    var scrollerDrawNanos: Long = 0L
++        private set
++    var planNanos: Long = 0L
++        private set
++    var cellsNanos: Long = 0L
++        private set
++    var visibleCells: Int = 0
++        private set
++    var prefetchCells: Int = 0
++        private set
++    var scannedRects: Int = 0
++        private set
++
++    // Attachment lifetime is independent of the recorder lifetime.
++    fun sourceAttached(kind: Int) {
++        when (kind) {
++            NAVIGATION_SOURCE -> navigationSources++
++            SCROLLER_SOURCE -> scrollerSources++
++        }
++    }
++
++    fun sourceDetached(kind: Int) {
++        when (kind) {
++            NAVIGATION_SOURCE -> navigationSources = (navigationSources - 1).coerceAtLeast(0)
++            SCROLLER_SOURCE -> scrollerSources = (scrollerSources - 1).coerceAtLeast(0)
++        }
++    }
++
++    /** Inclusive durations: these can overlap measure and must not be added together. */
++    fun sourceDraw(kind: Int, nanos: Long) {
++        if (!enabled) return
++        when (kind) {
++            NAVIGATION_SOURCE -> navigationDrawNanos += nanos
++            SCROLLER_SOURCE -> scrollerDrawNanos += nanos
++        }
++    }
++
++    fun masonryWork(planNanos: Long, cellsNanos: Long, visibleCells: Int, prefetchCells: Int, scannedRects: Int) {
++        if (!enabled) return
++        this.planNanos += planNanos
++        this.cellsNanos += cellsNanos
++        this.visibleCells += visibleCells
++        this.prefetchCells += prefetchCells
++        this.scannedRects += scannedRects
++    }
++
+     /** [PanoramaMasonry] measure passes since the last [reset]. */
+     var measureCount: Int = 0
+         private set
+@@ -37,5 +93,12 @@ object PanoramaFrameCounters {
+         measureCount = 0
+         measureNanos = 0L
+         composedCells = 0
++        navigationDrawNanos = 0L
++        scrollerDrawNanos = 0L
++        planNanos = 0L
++        cellsNanos = 0L
++        visibleCells = 0
++        prefetchCells = 0
++        scannedRects = 0
+     }
+ }
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+index a88fd060f..91d233fea 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+@@ -501,6 +501,10 @@ fun PanoramaMasonry(
+     userScrollEnabled: Boolean = true,
+     content: PanoramaMasonryScope.() -> Unit,
+ ) {
++    val prefetcher = remember(state) { PanoramaMasonryPrefetch() }
++    DisposableEffect(prefetcher) {
++        onDispose { prefetcher.clear() }
++    }
+     val latestContent = rememberUpdatedState(content)
+     val defaultFling = ScrollableDefaults.flingBehavior()
+     val flingBehavior = remember(defaultFling, state) { TracedFlingBehavior(defaultFling, state.traceId, state) }
+@@ -538,6 +542,7 @@ fun PanoramaMasonry(
+                 enabled = userScrollEnabled,
+                 flingBehavior = flingBehavior,
+             ),
++        prefetchState = prefetcher.state,
+         itemProvider = {
+             PanoramaItemProvider(PanoramaIntervalContent(latestContent.value))
+         },
+@@ -548,6 +553,7 @@ fun PanoramaMasonry(
+             state = state,
+             args = args.value,
+             content = latestContent.value,
++            prefetcher = prefetcher,
+         ).also { PanoramaFrameCounters.onMeasure(System.nanoTime() - measureStart) }
+     }
+ }
+@@ -612,7 +618,10 @@ private fun LazyLayoutMeasureScope.measureMasonry(
+     state: PanoramaMasonryState,
+     args: MasonryMeasureArgs,
+     content: PanoramaMasonryScope.() -> Unit,
++    prefetcher: PanoramaMasonryPrefetch,
+ ): MeasureResult {
++    val profiling = PanoramaFrameCounters.enabled
++    val planStart = if (profiling) System.nanoTime() else 0L
+     // Subscribes this measure to scroll-to-item requests.
+     state.scrollRequest
+ 
+@@ -753,14 +762,20 @@ private fun LazyLayoutMeasureScope.measureMasonry(
+     )
+     val scrollPx = state.scrollOffset.roundToInt()
+ 
+-    val prefetch = viewport / 2
+-    val windowStart = scrollPx - prefetch
+-    val windowEnd = scrollPx + viewport + prefetch
++    val planEnd = if (profiling) System.nanoTime() else 0L
++    val windowStart = scrollPx
++    val windowEnd = scrollPx + viewport
++    var visibleCells = 0
++    prefetcher.begin(masonry, keys, scrollPx)
+     val placed = ArrayList<Pair<PanoramaMasonryRect, List<Placeable>>>(16)
+     for (rect in masonry.rects) {
+         val top = topPad + rect.y
+         val bottom = top + rect.height
+-        if (bottom <= windowStart || top >= windowEnd) continue
++        if (bottom <= windowStart || top >= windowEnd) {
++            prefetcher.offer(rect, top, bottom, windowStart, windowEnd, masonry.laneCount)
++            continue
++        }
++        visibleCells++
+         val placeables = measuredPlaceables[rect.index] ?: compose(rect.index).map { measurable ->
+             measurable.measure(
+                 Constraints(
+@@ -774,6 +789,17 @@ private fun LazyLayoutMeasureScope.measureMasonry(
+         placed.add(rect to placeables)
+     }
+ 
++    prefetcher.submit()
++    if (profiling) {
++        PanoramaFrameCounters.masonryWork(
++            planNanos = planEnd - planStart,
++            cellsNanos = System.nanoTime() - planEnd,
++            visibleCells = visibleCells,
++            prefetchCells = 0,
++            scannedRects = masonry.rects.size,
++        )
++    }
++
+     val layoutWidth = if (constraints.hasBoundedWidth) constraints.maxWidth else available + left + right
+     val layoutHeight = if (constraints.hasBoundedHeight) constraints.maxHeight else total.coerceAtLeast(0)
+     return layout(layoutWidth, layoutHeight) {
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryPrefetch.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryPrefetch.kt
+new file mode 100644
+index 000000000..70468f639
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonryPrefetch.kt
+@@ -0,0 +1,71 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.lazy.layout.LazyLayoutPrefetchState
++import androidx.compose.ui.unit.Constraints
++
++/** Offscreen composition runs in Compose's frame-budgeted scheduler, never in visible measure. */
++internal class PanoramaMasonryPrefetch {
++    val state = LazyLayoutPrefetchState()
++    private var previousLayout: PanoramaMasonryLayout? = null
++    private var previousKeys: List<Any>? = null
++    private var previousScroll = 0
++    private var forward = true
++    private val candidates = ArrayList<PanoramaMasonryRect>()
++    private val requests = HashMap<Int, Request>()
++
++    private class Request(
++        val width: Int,
++        val height: Int,
++        val handle: LazyLayoutPrefetchState.PrefetchHandle,
++    )
++
++    fun begin(layout: PanoramaMasonryLayout, keys: List<Any>, scroll: Int) {
++        if (layout !== previousLayout || keys !== previousKeys) clear()
++        previousLayout = layout
++        previousKeys = keys
++        if (scroll != previousScroll) forward = scroll > previousScroll
++        previousScroll = scroll
++        candidates.clear()
++    }
++
++    fun offer(rect: PanoramaMasonryRect, top: Int, bottom: Int, start: Int, end: Int, lanes: Int) {
++        // Keep at most one nearby row, on the side the user is approaching.
++        val distance = if (forward) top - end else start - bottom
++        if (distance < 0 || distance > (end - start) / 2 || lanes <= 0) return
++        if (candidates.size < lanes) {
++            candidates.add(rect)
++        } else {
++            val farthest = candidates.indices.maxByOrNull { index ->
++                if (forward) candidates[index].y else -candidates[index].y
++            } ?: return
++            val old = candidates[farthest]
++            if (if (forward) rect.y < old.y else rect.y > old.y) candidates[farthest] = rect
++        }
++    }
++
++    fun submit() {
++        val iterator = requests.iterator()
++        while (iterator.hasNext()) {
++            val (index, request) = iterator.next()
++            val next = candidates.firstOrNull { it.index == index }
++            if (next == null || request.width != next.width || request.height != next.height) {
++                request.handle.cancel()
++                iterator.remove()
++            }
++        }
++        for (rect in candidates) {
++            if (requests.containsKey(rect.index)) continue
++            val handle = state.schedulePrecompositionAndPremeasure(
++                rect.index,
++                Constraints.fixed(rect.width, rect.height),
++            )
++            PanoramaFrameCounters.masonryWork(0L, 0L, 0, 1, 0)
++            requests[rect.index] = Request(rect.width, rect.height, handle)
++        }
++    }
++
++    fun clear() {
++        requests.values.forEach { it.handle.cancel() }
++        requests.clear()
++    }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/ScrollSourceDiagnostics.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/ScrollSourceDiagnostics.kt
+new file mode 100644
+index 000000000..ffabc9720
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/ScrollSourceDiagnostics.kt
+@@ -0,0 +1,35 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.drawWithContent
++
++/** In-memory A/B switch; the recorder restores it when recording is disabled. */
++object ScrollGlassDiagnostics {
++    var enabled by mutableStateOf(true)
++}
++
++/** Inclusive CPU draw time, not GPU blur time. No clock reads when recording is disabled. */
++@Composable
++internal fun Modifier.recordScrollSource(kind: Int): Modifier {
++    DisposableEffect(kind) {
++        PanoramaFrameCounters.sourceAttached(kind)
++        onDispose { PanoramaFrameCounters.sourceDetached(kind) }
++    }
++    return drawWithContent {
++        if (PanoramaFrameCounters.enabled) {
++            val start = System.nanoTime()
++            try {
++                drawContent()
++            } finally {
++                PanoramaFrameCounters.sourceDraw(kind, System.nanoTime() - start)
++            }
++        } else {
++            drawContent()
++        }
++    }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+index 3d6a2a8ce..b5d999678 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+@@ -32,6 +32,7 @@ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.State
++import androidx.compose.runtime.derivedStateOf
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableFloatStateOf
+ import androidx.compose.runtime.mutableStateMapOf
+@@ -102,9 +103,15 @@ fun VerticalFastScroller(
+     content: @Composable () -> Unit,
+ ) {
+     val thumbGlass = rememberFastScrollerGlass()
++    val alpha = remember { Animatable(0f) }
++    val glassVisible = remember(alpha, thumbAllowed, listState) {
++        derivedStateOf {
++            alpha.value > 0f && thumbAllowed() && (listState.canScrollBackward || listState.canScrollForward)
++        }
++    }
+     SubcomposeLayout(modifier = modifier) { constraints ->
+         val contentPlaceable = subcompose("content") {
+-            Box(Modifier.fastScrollerGlassSource(thumbGlass), propagateMinConstraints = true) { content() }
++            Box(Modifier.fastScrollerGlassSource(thumbGlass.takeIf { glassVisible.value }), propagateMinConstraints = true) { content() }
+         }.map { it.measure(constraints) }
+         val contentHeight = contentPlaceable.fastMaxBy { it.height }?.height ?: 0
+         val contentWidth = contentPlaceable.fastMaxBy { it.width }?.width ?: 0
+@@ -150,7 +157,10 @@ fun VerticalFastScroller(
+             val heightPx = contentHeight.toFloat() - thumbTopPadding - thumbBottomPadding
+             val thumbHeightPx = with(LocalDensity.current) { ThumbLength.toPx() }
+             val trackHeightPx = heightPx - thumbHeightPx
+-            if (trackHeightPx <= 0f) return@subcompose
++            if (trackHeightPx <= 0f) {
++                LaunchedEffect(alpha) { alpha.snapTo(0f) }
++                return@subcompose
++            }
+             val scrollHeightPx = contentHeight.toFloat() -
+                 listState.layoutInfo.beforeContentPadding -
+                 listState.layoutInfo.afterContentPadding
+@@ -223,7 +233,6 @@ fun VerticalFastScroller(
+             }
+ 
+             // Thumb alpha
+-            val alpha = remember { Animatable(0f) }
+             val isThumbVisible = alpha.value > 0f
+             LaunchedEffect(scrolled, alpha) {
+                 scrolled
+@@ -249,7 +258,7 @@ fun VerticalFastScroller(
+                 offsetY = thumbOffsetY,
+                 alpha = alpha.value,
+                 thumbColor = thumbColor,
+-                glassState = thumbGlass,
++                glassState = thumbGlass.takeIf { glassVisible.value },
+                 endInset = 8.dp + endContentPadding,
+                 touchEnabled = isThumbVisible || thumbPressed.pressed || isThumbDragged,
+                 pressState = thumbPressed,
+@@ -337,9 +346,15 @@ fun VerticalGridFastScroller(
+     )
+ 
+     val thumbGlass = rememberFastScrollerGlass()
++    val alpha = remember { Animatable(0f) }
++    val glassVisible = remember(alpha, thumbAllowed, state) {
++        derivedStateOf {
++            alpha.value > 0f && thumbAllowed() && (state.canScrollBackward || state.canScrollForward)
++        }
++    }
+     SubcomposeLayout(modifier = modifier) { constraints ->
+         val contentPlaceable = subcompose("content") {
+-            Box(Modifier.fastScrollerGlassSource(thumbGlass), propagateMinConstraints = true) { content() }
++            Box(Modifier.fastScrollerGlassSource(thumbGlass.takeIf { glassVisible.value }), propagateMinConstraints = true) { content() }
+         }.map { it.measure(constraints) }
+         val contentHeight = contentPlaceable.fastMaxBy { it.height }?.height ?: 0
+         val contentWidth = contentPlaceable.fastMaxBy { it.width }?.width ?: 0
+@@ -382,7 +397,10 @@ fun VerticalGridFastScroller(
+             val heightPx = contentHeight.toFloat() - thumbTopPadding - thumbBottomPadding
+             val thumbHeightPx = with(LocalDensity.current) { ThumbLength.toPx() }
+             val trackHeightPx = heightPx - thumbHeightPx
+-            if (trackHeightPx <= 0f) return@subcompose
++            if (trackHeightPx <= 0f) {
++                LaunchedEffect(alpha) { alpha.snapTo(0f) }
++                return@subcompose
++            }
+             val scrollViewportHeightPx = contentHeight.toFloat() -
+                 state.layoutInfo.beforeContentPadding - state.layoutInfo.afterContentPadding
+ 
+@@ -441,7 +459,6 @@ fun VerticalGridFastScroller(
+             }
+ 
+             // Thumb alpha
+-            val alpha = remember { Animatable(0f) }
+             val isThumbVisible = alpha.value > 0f
+             LaunchedEffect(scrolled, alpha) {
+                 scrolled
+@@ -465,7 +482,7 @@ fun VerticalGridFastScroller(
+                 offsetY = thumbOffsetY,
+                 alpha = alpha.value,
+                 thumbColor = thumbColor,
+-                glassState = thumbGlass,
++                glassState = thumbGlass.takeIf { glassVisible.value },
+                 endInset = endContentPadding,
+                 touchEnabled = isThumbVisible || thumbPressed.pressed || isThumbDragged,
+                 pressState = thumbPressed,
+@@ -564,9 +581,15 @@ fun IrregularVerticalGridFastScroller(
+     var cachedGridItemHeight by remember { mutableFloatStateOf(0f) }
+ 
+     val thumbGlass = rememberFastScrollerGlass()
++    val alpha = remember { Animatable(0f) }
++    val glassVisible = remember(alpha, thumbAllowed, state) {
++        derivedStateOf {
++            alpha.value > 0f && thumbAllowed() && (state.canScrollBackward || state.canScrollForward)
++        }
++    }
+     SubcomposeLayout(modifier = modifier) { constraints ->
+         val contentPlaceable = subcompose("content") {
+-            Box(Modifier.fastScrollerGlassSource(thumbGlass), propagateMinConstraints = true) { content() }
++            Box(Modifier.fastScrollerGlassSource(thumbGlass.takeIf { glassVisible.value }), propagateMinConstraints = true) { content() }
+         }.map { it.measure(constraints) }
+         val contentHeight = contentPlaceable.fastMaxBy { it.height }?.height ?: 0
+         val contentWidth = contentPlaceable.fastMaxBy { it.width }?.width ?: 0
+@@ -640,7 +663,10 @@ fun IrregularVerticalGridFastScroller(
+             val heightPx = contentHeight.toFloat() - thumbTopPadding - thumbBottomPadding
+             val thumbHeightPx = with(LocalDensity.current) { ThumbLength.toPx() }
+             val trackHeightPx = heightPx - thumbHeightPx
+-            if (trackHeightPx <= 0f) return@subcompose
++            if (trackHeightPx <= 0f) {
++                LaunchedEffect(alpha) { alpha.snapTo(0f) }
++                return@subcompose
++            }
+             val scrollViewportHeightPx = contentHeight.toFloat() -
+                 state.layoutInfo.beforeContentPadding - state.layoutInfo.afterContentPadding
+ 
+@@ -739,7 +765,6 @@ fun IrregularVerticalGridFastScroller(
+             // <-- Harmony
+ 
+             // Thumb alpha
+-            val alpha = remember { Animatable(0f) }
+             val isThumbVisible = alpha.value > 0f
+             LaunchedEffect(scrolled, alpha) {
+                 scrolled
+@@ -763,7 +788,7 @@ fun IrregularVerticalGridFastScroller(
+                 offsetY = thumbOffsetY,
+                 alpha = alpha.value,
+                 thumbColor = thumbColor,
+-                glassState = thumbGlass,
++                glassState = thumbGlass.takeIf { glassVisible.value },
+                 endInset = endContentPadding,
+                 touchEnabled = isThumbVisible || thumbPressed.pressed || isThumbDragged,
+                 pressState = thumbPressed,
+@@ -853,9 +878,15 @@ fun VerticalMasonryFastScroller(
+     content: @Composable () -> Unit,
+ ) {
+     val thumbGlass = rememberFastScrollerGlass()
++    val alpha = remember { Animatable(0f) }
++    val glassVisible = remember(alpha, thumbAllowed, state) {
++        derivedStateOf {
++            alpha.value > 0f && thumbAllowed() && (state.canScrollBackward || state.canScrollForward)
++        }
++    }
+     SubcomposeLayout(modifier = modifier) { constraints ->
+         val contentPlaceable = subcompose("content") {
+-            Box(Modifier.fastScrollerGlassSource(thumbGlass), propagateMinConstraints = true) { content() }
++            Box(Modifier.fastScrollerGlassSource(thumbGlass.takeIf { glassVisible.value }), propagateMinConstraints = true) { content() }
+         }.map { it.measure(constraints) }
+         val contentHeight = contentPlaceable.fastMaxBy { it.height }?.height ?: 0
+         val contentWidth = contentPlaceable.fastMaxBy { it.width }?.width ?: 0
+@@ -890,7 +921,10 @@ fun VerticalMasonryFastScroller(
+             val heightPx = contentHeight.toFloat() - thumbTopPadding - thumbBottomPadding
+             val thumbHeightPx = with(LocalDensity.current) { ThumbLength.toPx() }
+             val trackHeightPx = heightPx - thumbHeightPx
+-            if (trackHeightPx <= 0f) return@subcompose
++            if (trackHeightPx <= 0f) {
++                LaunchedEffect(alpha) { alpha.snapTo(0f) }
++                return@subcompose
++            }
+ 
+             LaunchedEffect(thumbOffsetY) {
+                 if (!isThumbDragged) return@LaunchedEffect
+@@ -921,7 +955,6 @@ fun VerticalMasonryFastScroller(
+                 }
+             }
+ 
+-            val alpha = remember { Animatable(0f) }
+             val isThumbVisible = alpha.value > 0f
+             LaunchedEffect(scrolled, alpha) {
+                 scrolled
+@@ -943,7 +976,7 @@ fun VerticalMasonryFastScroller(
+                 offsetY = thumbOffsetY,
+                 alpha = alpha.value,
+                 thumbColor = thumbColor,
+-                glassState = thumbGlass,
++                glassState = thumbGlass.takeIf { glassVisible.value },
+                 endInset = endContentPadding,
+                 touchEnabled = isThumbVisible || thumbPressed.pressed || isThumbDragged,
+                 pressState = thumbPressed,
+@@ -987,9 +1020,15 @@ internal fun VerticalTimelineFastScroller(
+     content: @Composable () -> Unit,
+ ) {
+     val thumbGlass = rememberFastScrollerGlass()
++    val alpha = remember { Animatable(0f) }
++    val glassVisible = remember(alpha, thumbAllowed, state) {
++        derivedStateOf {
++            alpha.value > 0f && thumbAllowed() && (state.canScrollBackward || state.canScrollForward)
++        }
++    }
+     SubcomposeLayout(modifier = modifier) { constraints ->
+         val contentPlaceable = subcompose("content") {
+-            Box(Modifier.fastScrollerGlassSource(thumbGlass), propagateMinConstraints = true) { content() }
++            Box(Modifier.fastScrollerGlassSource(thumbGlass.takeIf { glassVisible.value }), propagateMinConstraints = true) { content() }
+         }.map { it.measure(constraints) }
+         val contentHeight = contentPlaceable.fastMaxBy { it.height }?.height ?: 0
+         val contentWidth = contentPlaceable.fastMaxBy { it.width }?.width ?: 0
+@@ -1024,7 +1063,10 @@ internal fun VerticalTimelineFastScroller(
+             val heightPx = contentHeight.toFloat() - thumbTopPadding - thumbBottomPadding
+             val thumbHeightPx = with(LocalDensity.current) { ThumbLength.toPx() }
+             val trackHeightPx = heightPx - thumbHeightPx
+-            if (trackHeightPx <= 0f) return@subcompose
++            if (trackHeightPx <= 0f) {
++                LaunchedEffect(alpha) { alpha.snapTo(0f) }
++                return@subcompose
++            }
+ 
+             LaunchedEffect(thumbOffsetY) {
+                 if (!isThumbDragged) return@LaunchedEffect
+@@ -1055,7 +1097,6 @@ internal fun VerticalTimelineFastScroller(
+                 }
+             }
+ 
+-            val alpha = remember { Animatable(0f) }
+             val isThumbVisible = alpha.value > 0f
+             LaunchedEffect(scrolled, alpha) {
+                 scrolled
+@@ -1077,7 +1118,7 @@ internal fun VerticalTimelineFastScroller(
+                 offsetY = thumbOffsetY,
+                 alpha = alpha.value,
+                 thumbColor = thumbColor,
+-                glassState = thumbGlass,
++                glassState = thumbGlass.takeIf { glassVisible.value },
+                 endInset = endContentPadding,
+                 touchEnabled = isThumbVisible || thumbPressed.pressed || isThumbDragged,
+                 pressState = thumbPressed,
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
+index 50af7bd5b..f71499aa5 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingGlass.kt
+@@ -13,6 +13,9 @@ import dev.chrisbanes.haze.HazeStyle
+ import dev.chrisbanes.haze.HazeTint
+ import dev.chrisbanes.haze.hazeEffect
+ import dev.chrisbanes.haze.hazeSource
++import tachiyomi.presentation.core.components.PanoramaFrameCounters
++import tachiyomi.presentation.core.components.ScrollGlassDiagnostics
++import tachiyomi.presentation.core.components.recordScrollSource
+ 
+ /** Blur only the content behind the controls, leaving icons, labels and badges sharp. */
+ @Composable
+@@ -26,7 +29,7 @@ internal fun Modifier.browsingGlassBackground(state: BrowsingNavigationBarState,
+         if (dark) 0.72f else 0.64f
+     }
+     val fallback = if (thin) 0.18f else 0.94f
+-    if (Build.VERSION.SDK_INT < 31 || !LocalView.current.isHardwareAccelerated) {
++    if (Build.VERSION.SDK_INT < 31 || !LocalView.current.isHardwareAccelerated || !ScrollGlassDiagnostics.enabled) {
+         return background(surface.copy(alpha = fallback))
+     }
+     return hazeEffect(
+@@ -44,11 +47,11 @@ internal fun Modifier.browsingGlassBackground(state: BrowsingNavigationBarState,
+ @Composable
+ internal fun Modifier.browsingGlassSource(state: BrowsingNavigationBarState?): Modifier =
+     if (state == null || Build.VERSION.SDK_INT < 31 ||
+-        !LocalView.current.isHardwareAccelerated || !state.glassVisible
++        !LocalView.current.isHardwareAccelerated || !state.glassVisible || !ScrollGlassDiagnostics.enabled
+     ) {
+         this
+     } else {
+-        hazeSource(state.glassState)
++        recordScrollSource(PanoramaFrameCounters.NAVIGATION_SOURCE).hazeSource(state.glassState)
+     }
+ 
+ @Composable
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt
+index f27c350c7..e17363f13 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleRefraction.kt
+@@ -12,10 +12,12 @@ import androidx.compose.ui.graphics.asComposeRenderEffect
+ import androidx.compose.ui.graphics.graphicsLayer
+ import androidx.compose.ui.platform.LocalView
+ import androidx.compose.ui.unit.IntSize
++import tachiyomi.presentation.core.components.ScrollGlassDiagnostics
+ 
+ /** Bend the already sampled backdrop only; labels are a separate, sharp sibling layer. */
+ @Composable
+ internal fun Modifier.capsuleRefraction(size: IntSize, radii: CapsuleCornerRadii): Modifier {
++    if (!ScrollGlassDiagnostics.enabled) return this
+     if (Build.VERSION.SDK_INT < 33 || !LocalView.current.isHardwareAccelerated || size.width <= 0 || size.height <= 0) {
+         return this
+     }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeMasonryWorkTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeMasonryWorkTest.kt
+new file mode 100644
+index 000000000..bdcb90a89
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeMasonryWorkTest.kt
+@@ -0,0 +1,110 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.requiredSize
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.layout.onPlaced
++import androidx.compose.ui.layout.positionInParent
++import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.assertIsDisplayed
++import androidx.compose.ui.test.onNodeWithTag
++import androidx.compose.ui.test.v2.runComposeUiTest
++import androidx.compose.ui.unit.dp
++import dev.chrisbanes.haze.HazeState
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.launch
++import org.junit.After
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.robolectric.annotation.GraphicsMode
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@GraphicsMode(GraphicsMode.Mode.NATIVE)
++@Config(sdk = [34])
++class NavigationChromeMasonryWorkTest {
++    @After
++    fun restoreDiagnostics() {
++        ScrollGlassDiagnostics.enabled = true
++        PanoramaFrameCounters.enabled = false
++        PanoramaFrameCounters.reset()
++    }
++
++    @Test
++    fun `cold viewport places only visible cells and jumps still reveal complete rows`() {
++        val placed = mutableSetOf<Int>()
++        val state = PanoramaMasonryState()
++        lateinit var scope: CoroutineScope
++        var rowHeight = 0f
++        runComposeUiTest {
++            setContent {
++                scope = rememberCoroutineScope()
++                PanoramaMasonry(
++                    columns = PanoramaColumns.Fixed(2),
++                    modifier = Modifier.requiredSize(360.dp, 640.dp),
++                    state = state,
++                ) {
++                    items(count = 2000, key = { it }, height = { PanoramaCellHeight.Fixed(150.dp) }) { index ->
++                        Box(
++                            Modifier.fillMaxSize().testTag("cell$index").onPlaced {
++                                rowHeight = it.size.height.toFloat()
++                                if (it.positionInParent().y >= 0) placed.add(index)
++                            },
++                        )
++                    }
++                }
++            }
++            runOnIdle {
++                assertEquals((0..9).toSet(), placed, "Offscreen rows must not be placed by the visible measure pass")
++                scope.launch { state.scrollToOffset(rowHeight * 10) }
++            }
++            waitForIdle()
++            onNodeWithTag("cell20").assertIsDisplayed()
++            onNodeWithTag("cell21").assertIsDisplayed()
++            runOnIdle { scope.launch { state.scrollToOffset(0f) } }
++            waitForIdle()
++            onNodeWithTag("cell0").assertIsDisplayed()
++            onNodeWithTag("cell1").assertIsDisplayed()
++        }
++    }
++
++    @Test
++    fun `scroller source detaches when hidden and recording off skips source timing`() {
++        val show = mutableStateOf(true)
++        val haze = HazeState()
++        val baseline = PanoramaFrameCounters.scrollerSources
++        PanoramaFrameCounters.enabled = false
++        PanoramaFrameCounters.reset()
++        runComposeUiTest {
++            setContent {
++                Box(Modifier.requiredSize(40.dp, 40.dp).fastScrollerGlassSource(haze.takeIf { show.value }))
++            }
++            runOnIdle {
++                assertEquals(baseline + 1, PanoramaFrameCounters.scrollerSources)
++                assertEquals(0L, PanoramaFrameCounters.scrollerDrawNanos)
++                show.value = false
++            }
++            waitForIdle()
++            runOnIdle {
++                assertEquals(baseline, PanoramaFrameCounters.scrollerSources)
++                show.value = true
++            }
++            waitForIdle()
++            runOnIdle {
++                assertTrue(PanoramaFrameCounters.scrollerSources > baseline)
++                ScrollGlassDiagnostics.enabled = false
++            }
++            waitForIdle()
++            runOnIdle { assertEquals(baseline, PanoramaFrameCounters.scrollerSources) }
++        }
++        assertEquals(baseline, PanoramaFrameCounters.scrollerSources, "Disposal releases the active-source counter")
++    }
++}
