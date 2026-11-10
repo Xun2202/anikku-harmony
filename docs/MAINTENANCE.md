@@ -873,3 +873,9 @@ gh release list --repo Xun2202/anikku-harmony
 - 紧凑窗口原热门/最新/筛选/An保存搜索横条并入主栏中间，来源名最大80dp，控件横滑可达，An批量模式以数量替代来源名。使用BrowsingToolbarTitle/FilterRow共用主栏高度和触摸空间；搜索保留完整输入，额外筛选行走AnimatedNavigationRow，长屏保留第二行。滚动位置提升、不删操作。去掉source/global-search在浏览chrome下的实色覆盖；非该上下文保持原实色fallback，不改玻璃shader。
 - 普通source列表/网格切已有FastScrollLazyColumn/VerticalGrid，和全景/书架同边缘观察、滚动条与惯性保护；An entries高度/metadata/selection及分页访问保留。顶部与底部实测边界共同提交visible和动画终值，列表回首/程序跳回之后离开padding也不会还原旧hidden目标，继续不消费滚动。
 - 首轮两款编译通过，新面板生命周期/高低持指/选择栏用例通过，3个内容拖动测试因Surface合并semantics而找不到body，尚未注入手势；仅定位加useUnmergedTree，保留全部断言。该失败包未发布。新增紧凑header40dp且末项可横滑点击、列表/网格回首离开spacer不回弹3项真实Compose回归；新交互总10项。
+
+### 回归揭示的零速度收起与测试几何修正（0095）
+
+- 第二轮内容慢拖失败是实际策略缺口：官方AnchoredDraggable computeTarget在velocity==0时直接closestAnchor，完全不读取positionalThreshold，因此静止松手仍需半屏。共用SheetFlingBehavior仅该分支按min(56dp,25%height)选目标并在原ScrollScope动画；直接/嵌套共用，非零速度仍原生判断，帧时间保护不变。
+- 手势测试先越过实际平台LocalViewConfiguration.touchSlop，再验证80px慢拖/40px快甩/24px慢拖，距离断言保留。列表回首用例原Box仅height导致列表宽0、owner不激活，改实际卡片fillMaxWidth，并加入真实来源的零高prepend-loading slot；list/grid exact-start通过canScrollBackward确认0，避免首槽零高时漏边界。
+- Anikku编译补原enableSwipeDismiss flag引用和溢出菜单Alignment导入；不删fork功能或改宽度。首两轮失败产物均未发布，保留全部10项交互回归和旧测试。

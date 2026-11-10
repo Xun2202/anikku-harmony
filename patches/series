@@ -92,3 +92,4 @@
 0092-fix-shared-toolbar-imports-and-sheet-test.patch
 0093-ui-shared-sheet-motion-and-selection-actions.patch
 0094-browse-unify-header-glass-and-scroll-boundaries.patch
+0095-fix-sheet-zero-velocity-distance-and-fork-adapters.patch
