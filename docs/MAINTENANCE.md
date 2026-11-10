@@ -852,3 +852,5 @@ gh release list --repo Xun2202/anikku-harmony
 - 新回归实际渲染普通/多选/搜索主栏、分类行中间值/展开收回、面板贴底且底部24px仅一次、72dp主胶囊不继承、管理pin释放、手指仍按住时宽窄变化、原手势不续拖、新手势可用、高度变化不打断以及初始半页还原。机器几何不等于Pura X Max实拍，效果仍由安装反馈。
 - 参考官方Compose搜索/布局动画/Insets资料：https://developer.android.com/develop/ui/compose/components/search-bar ，https://developer.android.com/develop/ui/compose/animation/quick-guide ，https://developer.android.com/develop/ui/compose/system/material-insets 。采用分层布局和尺寸+透明度过渡，保留本项目已验证的动画时间保护，并非直接替换成全屏SearchBar。
 - Animeko没有本自定义胶囊占位/Toolbar分支；实查有独立Dialog系统栏处理和KMP collection/details Pager。其视口归整可用纯Compose方式独立评估（该helper不依赖JVM），NestedScrollable/窗口切换还需专项确认；不要将本项归整误写成因System.nanoTime不能移植。本轮不扩第三款构建。
+
+- 0092首轮编译差异修复：移除已不使用的菜单图标导入（Mihon core不带该依赖）；共用面板测试改位置参数，兼容Anikku原enableSwipeDismiss命名，横拖测试位移按视口缩放。首轮两款未进入APK组装/发布，保留全部几何与拖动断言；生产布局/归整策略不变。
