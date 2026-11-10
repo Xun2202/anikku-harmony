@@ -88,3 +88,4 @@
 0088-test-render-protected-indicator-state.patch
 0089-ui-protect-scroll-modes-and-preference-observers.patch
 0090-test-retain-empty-staggered-grid-anchor.patch
+0091-ui-consistent-navigation-and-pager-viewport.patch

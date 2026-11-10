@@ -841,3 +841,14 @@ gh release list --repo Xun2202/anikku-harmony
 - Animeko commonMain也有原生滚动与分页，但依赖独立Paging/KMP状态，既有JVM保护不可直拷；其Android时钟适用性仍待专项证据，Tachiyomi PreferenceMutableState监听缺口不直接套用。本轮不扩构建第三款。
 
 - 0090修正新增回归对原生时间网格空态的假设：空数据时可保留内部恢复锚点，检查实际layoutInfo空/单项输出，恢复后必须继续推进滚动。不改生产位置、不去掉恢复断言；第一轮其余5项新测试通过，仅此断言失败，未组装或发布。
+
+## 2026-11-10：统一导航状态、面板安全区与折叠分页
+
+- 用户对35反馈“舒服很多”，本轮改UI。补充偏好：多选沿普通书架，左取消/数量、中分类、右紧凑操作；搜索可加分类第二行，但相同组件高度固定、额外行用动画过渡。0091与Mihon 0086共用核心组件与6项Compose回归。
+- NavigationTopAppBar统一紧凑窗口40dp、普通56dp、大字号64dp；操作容器随主栏40/48dp统一。搜索单行去掉正文式内边距；多选复用中间分类条并提升LazyRow state，保留选中指示和条内位置。搜索的分类行沿用同一40dp分类组件，以220ms尺寸/位移/透明度展开收回，不挤窄输入框；使用既有帧时间保护。普通长屏原两层栏不强制压成一行。搜索空查询也保留分类布局，非当前标签的残留查询不影响当前管理页高度。
+- 图源/插件/迁移管理页通过原共享chrome owner固定导航，具体来源作品列表继续收起；Anikku feed仍可收起，feed批量选择保留中部分类与fork动作。未改已获正向反馈的惯性时钟内核/物理曲线或玻璃着色。
+- AdaptiveSheet Dialog按自身窗口edge-to-edge处理，NavigationOverlayScope清主页面胶囊占位、滚动owner与旧窗口刷新坐标。手机面板背景贴底、下角归零，只在内容内加一次系统导航栏/IME联合安全区；保留顶部安全区、平板居中及两款原有BackHandler差异。消除decorFits+面板安全区重复留白及嵌套Scaffold继承主导航空间。
+- 新用户复现：横拖分类不松手时折叠，外屏停半页。PagerViewportAlignment覆盖Mi3/An5个原生Pager，宽度变化用PreventUserInput取消旧拖动并更新最近有效整页，初次还原的半页也归整；只改高度（如搜索分类行/键盘）不取消横拖，空页数保护。不会重写惯性/触摸速度或依赖机型比例。
+- 新回归实际渲染普通/多选/搜索主栏、分类行中间值/展开收回、面板贴底且底部24px仅一次、72dp主胶囊不继承、管理pin释放、手指仍按住时宽窄变化、原手势不续拖、新手势可用、高度变化不打断以及初始半页还原。机器几何不等于Pura X Max实拍，效果仍由安装反馈。
+- 参考官方Compose搜索/布局动画/Insets资料：https://developer.android.com/develop/ui/compose/components/search-bar ，https://developer.android.com/develop/ui/compose/animation/quick-guide ，https://developer.android.com/develop/ui/compose/system/material-insets 。采用分层布局和尺寸+透明度过渡，保留本项目已验证的动画时间保护，并非直接替换成全屏SearchBar。
+- Animeko没有本自定义胶囊占位/Toolbar分支；实查有独立Dialog系统栏处理和KMP collection/details Pager。其视口归整可用纯Compose方式独立评估（该helper不依赖JVM），NestedScrollable/窗口切换还需专项确认；不要将本项归整误写成因System.nanoTime不能移植。本轮不扩第三款构建。

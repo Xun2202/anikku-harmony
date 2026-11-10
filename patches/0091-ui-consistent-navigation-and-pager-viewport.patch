@@ -1,0 +1,1270 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 14:10:42 +0000
+Subject: [PATCH] fix(ui): align toolbar modes sheets and resized pager
+ gestures
+
+Shared navigation components and regression with Mihon 0086. User reports preview.35 feels much better and requests consistent regular/selection/search toolbar geometry. Keep selection cancel/count on the left, categories in the middle and compact actions on the right, retaining category scroll state. Use one compact toolbar height and icon allocation across contexts, remove search field body padding, and animate only the separate equal-height search category row with the existing protected animation clock. Detect actual active search rather than an inactive tab retained query. Pin source/extension/migration management navigation, preserving actual source browsing and the Anikku feed behavior. Isolate dialog navigation locals, draw bottom sheet backgrounds to the window edge and apply system/IME bottom insets once inside the content; retain centered tablet sheets and fork dismissal behavior. On pager width changes cancel the previous user mutation with PreventUserInput and snap the nearest valid page, also aligning restored partial pages; height-only changes keep ordinary gestures. Cover all native pagers in the two apps. Add real Compose toolbar/animated-row/window-inset/pin ownership and held-drag resize/height-only/restoration regressions. No device visual acceptance or quantitative FPS gain is claimed.
+---
+ .../presentation/components/AdaptiveSheet.kt  |  19 +-
+ .../kanade/presentation/components/AppBar.kt  |  11 +-
+ .../components/BulkSelectionToolbar.kt        |   3 +-
+ .../presentation/components/TabbedDialog.kt   |   3 +-
+ .../presentation/components/TabbedScreen.kt   |  63 ++++--
+ .../library/components/LibraryPager.kt        |   3 +-
+ .../library/components/LibraryToolbar.kt      | 134 ++++++-----
+ .../manga/components/MangaCoverDialog.kt      |   2 +
+ .../kanade/tachiyomi/ui/browse/BrowseTab.kt   |   1 +
+ .../kanade/tachiyomi/ui/library/LibraryTab.kt |  34 ++-
+ .../panels/components/MultiCardPanel.kt       |   2 +
+ .../core/components/AdaptiveSheet.kt          |  13 +-
+ .../core/components/PagerViewportAlignment.kt |  35 +++
+ .../material/AnimatedNavigationRow.kt         |  38 ++++
+ .../material/BrowsingTabSelector.kt           |  19 +-
+ .../components/material/NavigationChrome.kt   |   3 +-
+ .../components/material/NavigationOverlay.kt  |  17 ++
+ .../components/material/NavigationToolbar.kt  |  60 +++++
+ .../NavigationChromePagerViewportTest.kt      | 128 +++++++++++
+ .../NavigationChromeConsistentToolbarTest.kt  | 208 ++++++++++++++++++
+ 20 files changed, 669 insertions(+), 127 deletions(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/PagerViewportAlignment.kt
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/AnimatedNavigationRow.kt
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationOverlay.kt
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationToolbar.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromePagerViewportTest.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConsistentToolbarTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/components/AdaptiveSheet.kt b/app/src/main/java/eu/kanade/presentation/components/AdaptiveSheet.kt
+index 15d05a6ec..694ed53c9 100644
+--- a/app/src/main/java/eu/kanade/presentation/components/AdaptiveSheet.kt
++++ b/app/src/main/java/eu/kanade/presentation/components/AdaptiveSheet.kt
+@@ -15,6 +15,7 @@ import cafe.adriel.voyager.core.screen.Screen
+ import cafe.adriel.voyager.navigator.Navigator
+ import eu.kanade.presentation.util.ScreenTransition
+ import eu.kanade.presentation.util.isTabletUi
++import tachiyomi.presentation.core.components.material.NavigationOverlayScope
+ import tachiyomi.presentation.core.components.AdaptiveSheet as AdaptiveSheetImpl
+ 
+ @OptIn(InternalVoyagerApi::class)
+@@ -78,18 +79,20 @@ fun AdaptiveSheet(
+         onDismissRequest = onDismissRequest,
+         properties = dialogProperties,
+     ) {
+-        AdaptiveSheetImpl(
+-            modifier = modifier,
+-            isTabletUi = isTabletUi,
+-            enableSwipeDismiss = enableSwipeDismiss,
+-            onDismissRequest = onDismissRequest,
+-        ) {
+-            content()
++        NavigationOverlayScope {
++            AdaptiveSheetImpl(
++                modifier = modifier,
++                isTabletUi = isTabletUi,
++                enableSwipeDismiss = enableSwipeDismiss,
++                onDismissRequest = onDismissRequest,
++            ) {
++                content()
++            }
+         }
+     }
+ }
+ 
+ private val dialogProperties = DialogProperties(
+     usePlatformDefaultWidth = false,
+-    decorFitsSystemWindows = true,
++    decorFitsSystemWindows = false,
+ )
+diff --git a/app/src/main/java/eu/kanade/presentation/components/AppBar.kt b/app/src/main/java/eu/kanade/presentation/components/AppBar.kt
+index f05544786..bb919fb3c 100644
+--- a/app/src/main/java/eu/kanade/presentation/components/AppBar.kt
++++ b/app/src/main/java/eu/kanade/presentation/components/AppBar.kt
+@@ -4,6 +4,7 @@ import androidx.compose.foundation.basicMarquee
+ import androidx.compose.foundation.interaction.MutableInteractionSource
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.RowScope
+ import androidx.compose.foundation.layout.fillMaxWidth
+@@ -28,7 +29,6 @@ import androidx.compose.material3.TextFieldDefaults
+ import androidx.compose.material3.TooltipAnchorPosition
+ import androidx.compose.material3.TooltipBox
+ import androidx.compose.material3.TooltipDefaults.rememberTooltipPositionProvider
+-import androidx.compose.material3.TopAppBar
+ import androidx.compose.material3.TopAppBarDefaults
+ import androidx.compose.material3.TopAppBarScrollBehavior
+ import androidx.compose.material3.minimumInteractiveComponentSize
+@@ -59,9 +59,8 @@ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+ import kotlinx.collections.immutable.ImmutableList
+ import tachiyomi.i18n.MR
++import tachiyomi.presentation.core.components.material.NavigationTopAppBar
+ import tachiyomi.presentation.core.components.material.browsingChromeContainerColor
+-import tachiyomi.presentation.core.components.material.navigationToolbarHeight
+-import tachiyomi.presentation.core.components.material.toolbarScrollBehavior
+ import tachiyomi.presentation.core.i18n.stringResource
+ import tachiyomi.presentation.core.util.clearFocusOnSoftKeyboardHide
+ import tachiyomi.presentation.core.util.runOnEnterKeyPressed
+@@ -144,8 +143,7 @@ fun AppBar(
+     Column(
+         modifier = modifier,
+     ) {
+-        TopAppBar(
+-            expandedHeight = navigationToolbarHeight(),
++        NavigationTopAppBar(
+             navigationIcon = {
+                 if (isActionMode) {
+                     IconButton(onClick = onCancelActionMode) {
+@@ -179,7 +177,7 @@ fun AppBar(
+                 containerColor = backgroundColor ?: browsingChromeContainerColor(),
+                 scrolledContainerColor = backgroundColor ?: browsingChromeContainerColor(),
+             ),
+-            scrollBehavior = scrollBehavior.toolbarScrollBehavior(),
++            scrollBehavior = scrollBehavior,
+         )
+     }
+ }
+@@ -383,6 +381,7 @@ fun SearchToolbar(
+                                 ),
+                             )
+                         },
++                        contentPadding = PaddingValues(0.dp),
+                         container = {},
+                     )
+                 },
+diff --git a/app/src/main/java/eu/kanade/presentation/components/BulkSelectionToolbar.kt b/app/src/main/java/eu/kanade/presentation/components/BulkSelectionToolbar.kt
+index c6689ebda..96d3407ce 100644
+--- a/app/src/main/java/eu/kanade/presentation/components/BulkSelectionToolbar.kt
++++ b/app/src/main/java/eu/kanade/presentation/components/BulkSelectionToolbar.kt
+@@ -20,6 +20,7 @@ import tachiyomi.presentation.core.i18n.stringResource
+ @Composable
+ fun BulkSelectionToolbar(
+     selectedCount: Int,
++    titleContent: (@Composable () -> Unit)? = null,
+     isRunning: Boolean,
+     onClickClearSelection: () -> Unit,
+     onChangeCategoryClick: () -> Unit,
+@@ -27,7 +28,7 @@ fun BulkSelectionToolbar(
+     onReverseSelection: (() -> Unit)? = null,
+ ) {
+     AppBar(
+-        titleContent = { Text(text = "$selectedCount") },
++        titleContent = titleContent ?: { Text(text = "$selectedCount") },
+         actions = {
+             AppBarActions(
+                 actions = persistentListOf<AppBar.AppBarAction>()
+diff --git a/app/src/main/java/eu/kanade/presentation/components/TabbedDialog.kt b/app/src/main/java/eu/kanade/presentation/components/TabbedDialog.kt
+index 8c276de95..602b54ec5 100644
+--- a/app/src/main/java/eu/kanade/presentation/components/TabbedDialog.kt
++++ b/app/src/main/java/eu/kanade/presentation/components/TabbedDialog.kt
+@@ -32,6 +32,7 @@ import kotlinx.coroutines.launch
+ import tachiyomi.i18n.MR
+ import tachiyomi.presentation.core.components.material.TabText
+ import tachiyomi.presentation.core.components.rememberFrameTimeProtectedPagerFlingBehavior
++import tachiyomi.presentation.core.components.settlePagerOnWidthChange
+ import tachiyomi.presentation.core.components.withFrameTimeProtection
+ import tachiyomi.presentation.core.i18n.stringResource
+ 
+@@ -78,7 +79,7 @@ fun TabbedDialog(
+             HorizontalDivider()
+ 
+             HorizontalPager(
+-                modifier = Modifier.animateContentSize(),
++                modifier = Modifier.settlePagerOnWidthChange(pagerState).animateContentSize(),
+                 state = pagerState,
+                 flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(pagerState),
+                 verticalAlignment = Alignment.Top,
+diff --git a/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt b/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
+index 31db81a52..2cddf906f 100644
+--- a/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
+@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.calculateEndPadding
+ import androidx.compose.foundation.layout.calculateStartPadding
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.rememberLazyListState
+ import androidx.compose.foundation.pager.HorizontalPager
+ import androidx.compose.foundation.pager.PagerState
+ import androidx.compose.foundation.pager.rememberPagerState
+@@ -29,6 +30,7 @@ import eu.kanade.tachiyomi.ui.browse.feed.FeedScreenModel
+ import kotlinx.collections.immutable.ImmutableList
+ import kotlinx.collections.immutable.persistentListOf
+ import kotlinx.coroutines.launch
++import tachiyomi.presentation.core.components.material.AnimatedNavigationRow
+ import tachiyomi.presentation.core.components.material.BrowsingTabSelector
+ import tachiyomi.presentation.core.components.material.Scaffold
+ import tachiyomi.presentation.core.components.material.TabText
+@@ -36,6 +38,7 @@ import tachiyomi.presentation.core.components.material.browsingChromeContainerCo
+ import tachiyomi.presentation.core.components.material.isCompactBrowsingWindow
+ import tachiyomi.presentation.core.components.material.rememberBrowsingTopAppBarScrollBehavior
+ import tachiyomi.presentation.core.components.rememberFrameTimeProtectedPagerFlingBehavior
++import tachiyomi.presentation.core.components.settlePagerOnWidthChange
+ import tachiyomi.presentation.core.components.withFrameTimeProtection
+ import tachiyomi.presentation.core.i18n.stringResource
+ 
+@@ -46,6 +49,7 @@ fun TabbedScreen(
+     state: PagerState = rememberPagerState { tabs.size },
+     searchQuery: String? = null,
+     onChangeSearchQuery: (String?) -> Unit = {},
++    collapseNavigation: Boolean = true,
+     // KMK -->
+     feedScreenModel: FeedScreenModel,
+     bulkFavoriteScreenModel: BulkFavoriteScreenModel,
+@@ -53,17 +57,19 @@ fun TabbedScreen(
+ ) {
+     val scope = rememberCoroutineScope()
+     val snackbarHostState = remember { SnackbarHostState() }
++    val categoryTabState = rememberLazyListState(initialFirstVisibleItemIndex = state.currentPage)
+ 
+     // KMK -->
+     val feedState by feedScreenModel.state.collectAsState()
+     val bulkFavoriteState by bulkFavoriteScreenModel.state.collectAsState()
+     // KMK <--
+ 
+-    val compactTabs = isCompactBrowsingWindow() && searchQuery == null && !bulkFavoriteState.selectionMode
++    val searching = tabs[state.currentPage].searchEnabled && searchQuery != null
++    val compactTabs = isCompactBrowsingWindow() && (!searching || bulkFavoriteState.selectionMode)
+ 
+     Scaffold(
+         topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior(
+-            enabled = searchQuery == null && !bulkFavoriteState.selectionMode,
++            enabled = collapseNavigation && !searching && !bulkFavoriteState.selectionMode,
+             resetKey = state.currentPage,
+         ),
+         topBar = { scrollBehavior ->
+@@ -74,6 +80,20 @@ fun TabbedScreen(
+                 if (bulkFavoriteState.selectionMode) {
+                     BulkSelectionToolbar(
+                         selectedCount = bulkFavoriteState.selection.size,
++                        titleContent = if (compactTabs) {
++                            {
++                                BrowsingTabSelector(
++                                    state = categoryTabState,
++                                    title = bulkFavoriteState.selection.size.toString(),
++                                    labels = tabs.map { stringResource(it.titleRes) },
++                                    selectedIndex = state.currentPage,
++                                    badges = tabs.map { it.badgeNumber },
++                                    onSelect = { scope.launch { withFrameTimeProtection { state.animateScrollToPage(it) } } },
++                                )
++                            }
++                        } else {
++                            null
++                        },
+                         isRunning = bulkFavoriteState.isRunning,
+                         onClickClearSelection = bulkFavoriteScreenModel::toggleSelectionMode,
+                         onChangeCategoryClick = bulkFavoriteScreenModel::addFavorite,
+@@ -99,6 +119,7 @@ fun TabbedScreen(
+                         titleContent = {
+                             if (compactTabs) {
+                                 BrowsingTabSelector(
++                                    state = categoryTabState,
+                                     title = stringResource(titleRes),
+                                     labels = tabs.map { stringResource(it.titleRes) },
+                                     selectedIndex = state.currentPage,
+@@ -116,19 +137,29 @@ fun TabbedScreen(
+                     )
+                 }
+ 
+-                if (!compactTabs) {
+-                    PrimaryTabRow(
+-                        selectedTabIndex = state.currentPage,
+-                        containerColor = browsingChromeContainerColor(),
+-                        modifier = Modifier.zIndex(1f),
+-                    ) {
+-                        tabs.forEachIndexed { index, tab ->
+-                            Tab(
+-                                selected = state.currentPage == index,
+-                                onClick = { scope.launch { withFrameTimeProtection { state.animateScrollToPage(index) } } },
+-                                text = { TabText(text = stringResource(tab.titleRes), badgeCount = tab.badgeNumber) },
+-                                unselectedContentColor = MaterialTheme.colorScheme.onSurface,
+-                            )
++                AnimatedNavigationRow(visible = !compactTabs) {
++                    if (isCompactBrowsingWindow()) {
++                        BrowsingTabSelector(
++                            title = "",
++                            labels = tabs.map { stringResource(it.titleRes) },
++                            selectedIndex = state.currentPage,
++                            badges = tabs.map { it.badgeNumber },
++                            onSelect = { scope.launch { withFrameTimeProtection { state.animateScrollToPage(it) } } },
++                        )
++                    } else {
++                        PrimaryTabRow(
++                            selectedTabIndex = state.currentPage,
++                            containerColor = browsingChromeContainerColor(),
++                            modifier = Modifier.zIndex(1f),
++                        ) {
++                            tabs.forEachIndexed { index, tab ->
++                                Tab(
++                                    selected = state.currentPage == index,
++                                    onClick = { scope.launch { withFrameTimeProtection { state.animateScrollToPage(index) } } },
++                                    text = { TabText(text = stringResource(tab.titleRes), badgeCount = tab.badgeNumber) },
++                                    unselectedContentColor = MaterialTheme.colorScheme.onSurface,
++                                )
++                            }
+                         }
+                     }
+                 }
+@@ -143,7 +174,7 @@ fun TabbedScreen(
+             ),
+         ) {
+             HorizontalPager(
+-                modifier = Modifier.fillMaxSize(),
++                modifier = Modifier.settlePagerOnWidthChange(state).fillMaxSize(),
+                 state = state,
+                 flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(state),
+                 verticalAlignment = Alignment.Top,
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LibraryPager.kt b/app/src/main/java/eu/kanade/presentation/library/components/LibraryPager.kt
+index 5162c0fc0..b2f7ee918 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LibraryPager.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LibraryPager.kt
+@@ -28,6 +28,7 @@ import tachiyomi.i18n.MR
+ import tachiyomi.presentation.core.components.material.browsingContentVerticalPadding
+ import tachiyomi.presentation.core.components.rememberFrameTimeProtectedFlingBehavior
+ import tachiyomi.presentation.core.components.rememberFrameTimeProtectedPagerFlingBehavior
++import tachiyomi.presentation.core.components.settlePagerOnWidthChange
+ import tachiyomi.presentation.core.screens.EmptyScreen
+ import tachiyomi.presentation.core.util.plus
+ 
+@@ -54,7 +55,7 @@ fun LibraryPager(
+         // <-- AY
+ 
+         HorizontalPager(
+-            modifier = Modifier.fillMaxSize(),
++            modifier = Modifier.settlePagerOnWidthChange(state).fillMaxSize(),
+             state = state,
+             flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(state),
+             verticalAlignment = Alignment.Top,
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LibraryToolbar.kt b/app/src/main/java/eu/kanade/presentation/library/components/LibraryToolbar.kt
+index df8127a1a..f031e78b2 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LibraryToolbar.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LibraryToolbar.kt
+@@ -56,6 +56,7 @@ fun LibraryToolbar(
+ ) = when {
+     selectedCount > 0 -> LibrarySelectionToolbar(
+         selectedCount = selectedCount,
++        titleContent = titleContent,
+         onClickUnselectAll = onClickUnselectAll,
+         onClickSelectAll = onClickSelectAll,
+         onClickInvertSelection = onClickInvertSelection,
+@@ -99,89 +100,82 @@ private fun LibraryRegularToolbar(
+ ) {
+     val context = LocalContext.current
+     val pillAlpha = if (isSystemInDarkTheme()) 0.12f else 0.08f
+-    val actionMinimumSize = if (isCompactBrowsingWindow() && searchQuery == null) {
+-        40.dp
+-    } else {
+-        LocalMinimumInteractiveComponentSize.current
+-    }
+-    // Scope the tighter 40dp icon containers to this shelf's three regular actions only.
+-    CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides actionMinimumSize) {
+-        SearchToolbar(
+-            titleContent = titleContent ?: {
+-                Row(verticalAlignment = Alignment.CenterVertically) {
+-                    Text(
+-                        text = title.text,
+-                        maxLines = 1,
+-                        modifier = Modifier.weight(1f, false),
+-                        overflow = TextOverflow.Ellipsis,
++    SearchToolbar(
++        titleContent = titleContent ?: {
++            Row(verticalAlignment = Alignment.CenterVertically) {
++                Text(
++                    text = title.text,
++                    maxLines = 1,
++                    modifier = Modifier.weight(1f, false),
++                    overflow = TextOverflow.Ellipsis,
++                )
++                if (title.numberOfManga != null) {
++                    Pill(
++                        text = "${title.numberOfManga}",
++                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = pillAlpha),
++                        fontSize = 14.sp,
+                     )
+-                    if (title.numberOfManga != null) {
+-                        Pill(
+-                            text = "${title.numberOfManga}",
+-                            color = MaterialTheme.colorScheme.onBackground.copy(alpha = pillAlpha),
+-                            fontSize = 14.sp,
++                }
++            }
++        },
++        searchQuery = searchQuery,
++        onChangeSearchQuery = onSearchQueryChange,
++        actions = {
++            val filterTint = if (hasFilters) MaterialTheme.colorScheme.active else LocalContentColor.current
++            AppBarActions(
++                persistentListOf(
++                    AppBar.Action(
++                        title = stringResource(MR.strings.action_filter),
++                        icon = Icons.Outlined.FilterList,
++                        iconTint = filterTint,
++                        onClick = onClickFilter,
++                    ),
++                    AppBar.OverflowAction(
++                        title = stringResource(MR.strings.action_update_library),
++                        onClick = onClickGlobalUpdate,
++                    ),
++                    AppBar.OverflowAction(
++                        title = stringResource(MR.strings.action_update_category),
++                        onClick = onClickRefresh,
++                    ),
++                    AppBar.OverflowAction(
++                        title = stringResource(MR.strings.action_open_random_manga),
++                        onClick = onClickOpenRandomManga,
++                    ),
++                    AppBar.OverflowAction(
++                        title = stringResource(MR.strings.pref_invalidate_download_cache),
++                        onClick = {
++                            onInvalidateDownloadCache(context)
++                        },
++                    ),
++                ).builder().apply {
++                    // SY -->
++                    if (isSyncEnabled) {
++                        add(
++                            AppBar.OverflowAction(
++                                title = stringResource(SYMR.strings.sync_library),
++                                onClick = onClickSyncNow,
++                            ),
+                         )
+                     }
+-                }
+-            },
+-            searchQuery = searchQuery,
+-            onChangeSearchQuery = onSearchQueryChange,
+-            actions = {
+-                val filterTint = if (hasFilters) MaterialTheme.colorScheme.active else LocalContentColor.current
+-                AppBarActions(
+-                    persistentListOf(
+-                        AppBar.Action(
+-                            title = stringResource(MR.strings.action_filter),
+-                            icon = Icons.Outlined.FilterList,
+-                            iconTint = filterTint,
+-                            onClick = onClickFilter,
+-                        ),
+-                        AppBar.OverflowAction(
+-                            title = stringResource(MR.strings.action_update_library),
+-                            onClick = onClickGlobalUpdate,
+-                        ),
+-                        AppBar.OverflowAction(
+-                            title = stringResource(MR.strings.action_update_category),
+-                            onClick = onClickRefresh,
+-                        ),
+-                        AppBar.OverflowAction(
+-                            title = stringResource(MR.strings.action_open_random_manga),
+-                            onClick = onClickOpenRandomManga,
+-                        ),
+-                        AppBar.OverflowAction(
+-                            title = stringResource(MR.strings.pref_invalidate_download_cache),
+-                            onClick = {
+-                                onInvalidateDownloadCache(context)
+-                            },
+-                        ),
+-                    ).builder().apply {
+-                        // SY -->
+-                        if (isSyncEnabled) {
+-                            add(
+-                                AppBar.OverflowAction(
+-                                    title = stringResource(SYMR.strings.sync_library),
+-                                    onClick = onClickSyncNow,
+-                                ),
+-                            )
+-                        }
+-                        // SY <--
+-                    }.build(),
+-                )
+-            },
+-            scrollBehavior = scrollBehavior,
+-        )
+-    }
++                    // SY <--
++                }.build(),
++            )
++        },
++        scrollBehavior = scrollBehavior,
++    )
+ }
+ 
+ @Composable
+ private fun LibrarySelectionToolbar(
+     selectedCount: Int,
++    titleContent: (@Composable () -> Unit)? = null,
+     onClickUnselectAll: () -> Unit,
+     onClickSelectAll: () -> Unit,
+     onClickInvertSelection: () -> Unit,
+ ) {
+     AppBar(
+-        titleContent = { Text(text = "$selectedCount") },
++        titleContent = titleContent ?: { Text(text = "$selectedCount") },
+         actions = {
+             AppBarActions(
+                 persistentListOf(
+diff --git a/app/src/main/java/eu/kanade/presentation/manga/components/MangaCoverDialog.kt b/app/src/main/java/eu/kanade/presentation/manga/components/MangaCoverDialog.kt
+index 80108f547..194de937c 100644
+--- a/app/src/main/java/eu/kanade/presentation/manga/components/MangaCoverDialog.kt
++++ b/app/src/main/java/eu/kanade/presentation/manga/components/MangaCoverDialog.kt
+@@ -63,6 +63,7 @@ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.aniyomi.AYMR
+ import tachiyomi.presentation.core.components.material.Scaffold
+ import tachiyomi.presentation.core.components.rememberFrameTimeProtectedPagerFlingBehavior
++import tachiyomi.presentation.core.components.settlePagerOnWidthChange
+ import tachiyomi.presentation.core.components.withFrameTimeProtection
+ import tachiyomi.presentation.core.i18n.stringResource
+ import tachiyomi.presentation.core.util.clickableNoIndication
+@@ -246,6 +247,7 @@ fun MangaCoverDialog(
+             ) {
+                 // AY -->
+                 HorizontalPager(
++                    modifier = Modifier.settlePagerOnWidthChange(pagerState),
+                     state = pagerState,
+                     flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(pagerState),
+                 ) { page ->
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/BrowseTab.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/BrowseTab.kt
+index 6f5f827d7..68071e9e9 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/BrowseTab.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/BrowseTab.kt
+@@ -127,6 +127,7 @@ data object BrowseTab : Tab {
+             titleRes = MR.strings.browse,
+             tabs = tabs,
+             state = state,
++            collapseNavigation = !hideFeedTab && state.currentPage == (if (feedTabInFront) 0 else 1),
+             searchQuery = extensionsState.searchQuery,
+             onChangeSearchQuery = extensionsScreenModel::search,
+             // KMK -->
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt
+index 74610f51d..70b00e5dc 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt
+@@ -7,6 +7,7 @@ import androidx.compose.animation.graphics.res.rememberAnimatedVectorPainter
+ import androidx.compose.animation.graphics.vector.AnimatedImageVector
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.rememberLazyListState
+ import androidx.compose.foundation.pager.rememberPagerState
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.automirrored.outlined.HelpOutline
+@@ -79,6 +80,7 @@ import tachiyomi.domain.manga.model.Manga
+ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.kmk.KMR
+ import tachiyomi.i18n.sy.SYMR
++import tachiyomi.presentation.core.components.material.AnimatedNavigationRow
+ import tachiyomi.presentation.core.components.material.BrowsingTabSelector
+ import tachiyomi.presentation.core.components.material.Scaffold
+ import tachiyomi.presentation.core.components.material.isCompactBrowsingWindow
+@@ -152,8 +154,9 @@ data object LibraryTab : Tab {
+         }
+ 
+         val pagerState = rememberPagerState(state.coercedActiveCategoryIndex) { state.displayedCategories.size }
++        val categoryTabState = rememberLazyListState(initialFirstVisibleItemIndex = pagerState.currentPage)
+         val categories = state.displayedCategories
+-        val showPageTabs = (state.showCategoryTabs || !state.searchQuery.isNullOrEmpty()) &&
++        val showPageTabs = (state.showCategoryTabs || state.searchQuery != null) &&
+             categories.isNotEmpty() && (categories.size > 1 || !categories.first().isSystemCategory)
+         if (showPageTabs) {
+             LaunchedEffect(state.displayedCategories) {
+@@ -172,7 +175,7 @@ data object LibraryTab : Tab {
+         }
+ 
+         val compactCategories = isCompactBrowsingWindow() && showPageTabs &&
+-            !state.isLoading && !state.selectionMode && state.searchQuery == null
++            !state.isLoading && (state.selectionMode || state.searchQuery == null)
+ 
+         Scaffold(
+             topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior(
+@@ -193,7 +196,8 @@ data object LibraryTab : Tab {
+                         titleContent = if (compactCategories) {
+                             {
+                                 BrowsingTabSelector(
+-                                    title = stringResource(MR.strings.label_library),
++                                    state = categoryTabState,
++                                    title = if (state.selectionMode) state.selection.size.toString() else stringResource(MR.strings.label_library),
+                                     labels = categories.map { it.visualName },
+                                     selectedIndex = pagerState.currentPage,
+                                     badges = categories.map { state.getItemCountForCategory(it) },
+@@ -240,13 +244,23 @@ data object LibraryTab : Tab {
+                         scrollBehavior = scrollBehavior,
+                     )
+ 
+-                    if (showPageTabs && !state.isLoading && !compactCategories) {
+-                        LibraryTabs(
+-                            categories = categories,
+-                            pagerState = pagerState,
+-                            getItemCountForCategory = { state.getItemCountForCategory(it) },
+-                            onTabItemClick = { scope.launch { withFrameTimeProtection { pagerState.animateScrollToPage(it) } } },
+-                        )
++                    AnimatedNavigationRow(visible = showPageTabs && !state.isLoading && !compactCategories) {
++                        if (isCompactBrowsingWindow()) {
++                            BrowsingTabSelector(
++                                title = "",
++                                labels = categories.map { it.visualName },
++                                selectedIndex = pagerState.currentPage,
++                                badges = categories.map { state.getItemCountForCategory(it) },
++                                onSelect = { scope.launch { withFrameTimeProtection { pagerState.animateScrollToPage(it) } } },
++                            )
++                        } else {
++                            LibraryTabs(
++                                categories = categories,
++                                pagerState = pagerState,
++                                getItemCountForCategory = { state.getItemCountForCategory(it) },
++                                onTabItemClick = { scope.launch { withFrameTimeProtection { pagerState.animateScrollToPage(it) } } },
++                            )
++                        }
+                     }
+                 }
+             },
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/controls/components/panels/components/MultiCardPanel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/controls/components/panels/components/MultiCardPanel.kt
+index 1a43817a2..378fcb618 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/controls/components/panels/components/MultiCardPanel.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/controls/components/panels/components/MultiCardPanel.kt
+@@ -41,6 +41,7 @@ import eu.kanade.tachiyomi.ui.player.controls.CARDS_MAX_WIDTH
+ import tachiyomi.presentation.core.components.material.padding
+ import tachiyomi.presentation.core.components.rememberFrameTimeProtectedFlingBehavior
+ import tachiyomi.presentation.core.components.rememberFrameTimeProtectedPagerFlingBehavior
++import tachiyomi.presentation.core.components.settlePagerOnWidthChange
+ 
+ @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
+ @Composable
+@@ -82,6 +83,7 @@ fun MultiCardPanel(
+                     colors = TopAppBarDefaults.topAppBarColors().copy(containerColor = Color.Transparent),
+                 )
+                 HorizontalPager(
++                    modifier = Modifier.settlePagerOnWidthChange(pagerState),
+                     state = pagerState,
+                     flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(pagerState),
+                     pageSize = PageSize.Fixed(LocalConfiguration.current.screenWidthDp.dp * 0.9f),
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheet.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheet.kt
+index 1ec200452..8d9696d45 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheet.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheet.kt
+@@ -12,14 +12,19 @@ import androidx.compose.foundation.gestures.Orientation
+ import androidx.compose.foundation.gestures.anchoredDraggable
+ import androidx.compose.foundation.gestures.animateTo
+ import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.WindowInsets
+ import androidx.compose.foundation.layout.fillMaxSize
+-import androidx.compose.foundation.layout.navigationBarsPadding
++import androidx.compose.foundation.layout.ime
++import androidx.compose.foundation.layout.navigationBars
+ import androidx.compose.foundation.layout.offset
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.requiredWidthIn
+ import androidx.compose.foundation.layout.statusBarsPadding
+ import androidx.compose.foundation.layout.systemBarsPadding
++import androidx.compose.foundation.layout.union
+ import androidx.compose.foundation.layout.widthIn
++import androidx.compose.foundation.layout.windowInsetsPadding
++import androidx.compose.foundation.shape.CornerSize
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Surface
+ import androidx.compose.runtime.Composable
+@@ -57,6 +62,7 @@ fun AdaptiveSheet(
+     enableSwipeDismiss: Boolean,
+     onDismissRequest: () -> Unit,
+     modifier: Modifier = Modifier,
++    contentWindowInsets: WindowInsets = WindowInsets.navigationBars.union(WindowInsets.ime),
+     content: @Composable () -> Unit,
+ ) {
+     val density = LocalDensity.current
+@@ -183,16 +189,15 @@ fun AdaptiveSheet(
+                         orientation = Orientation.Vertical,
+                         enabled = enableSwipeDismiss,
+                     )
+-                    .navigationBarsPadding()
+                     .statusBarsPadding(),
+-                shape = MaterialTheme.shapes.extraLarge,
++                shape = MaterialTheme.shapes.extraLarge.copy(bottomStart = CornerSize(0.dp), bottomEnd = CornerSize(0.dp)),
+                 color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                 content = {
+                     BackHandler(
+                         enabled = anchoredDraggableState.targetValue == 0,
+                         onBack = internalOnDismissRequest,
+                     )
+-                    content()
++                    Box(Modifier.windowInsetsPadding(contentWindowInsets)) { content() }
+                 },
+             )
+ 
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PagerViewportAlignment.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PagerViewportAlignment.kt
+new file mode 100644
+index 000000000..3d227bbc4
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PagerViewportAlignment.kt
+@@ -0,0 +1,35 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.MutatePriority
++import androidx.compose.foundation.pager.PagerState
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.layout.onSizeChanged
++import kotlin.math.abs
++
++/** End an old-width drag before aligning its nearest page; height-only changes preserve gestures. */
++@Composable
++fun Modifier.settlePagerOnWidthChange(state: PagerState): Modifier {
++    var width by remember(state) { mutableIntStateOf(0) }
++    val previous = remember(state) { intArrayOf(0) }
++    LaunchedEffect(state, width) {
++        if (width == 0) return@LaunchedEffect
++        val resized = previous[0] != 0 && previous[0] != width
++        val restoredPartialPage = previous[0] == 0 && abs(state.currentPageOffsetFraction) > 0.001f
++        previous[0] = width
++        if ((!resized && !restoredPartialPage) || state.pageCount == 0) return@LaunchedEffect
++        with(state) {
++            // UserInput outranks default scrollToPage. Cancel that mutation before snapping.
++            scroll(MutatePriority.PreventUserInput) {
++                val count = pageCount
++                if (count > 0) updateCurrentPage(currentPage.coerceIn(0, count - 1), 0f)
++            }
++        }
++    }
++    return onSizeChanged { width = it.width }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/AnimatedNavigationRow.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/AnimatedNavigationRow.kt
+new file mode 100644
+index 000000000..725a3cc6a
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/AnimatedNavigationRow.kt
+@@ -0,0 +1,38 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.animation.core.FastOutSlowInEasing
++import androidx.compose.animation.core.tween
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clipToBounds
++import androidx.compose.ui.layout.Layout
++import androidx.compose.ui.unit.constrainHeight
++import androidx.compose.ui.unit.constrainWidth
++import tachiyomi.presentation.core.components.frameTimeProtectedFloatAsState
++import kotlin.math.roundToInt
++
++/** Expand the extra row without resizing its children or changing the primary toolbar height. */
++@Composable
++fun AnimatedNavigationRow(
++    visible: Boolean,
++    modifier: Modifier = Modifier,
++    content: @Composable () -> Unit,
++) {
++    val fraction = frameTimeProtectedFloatAsState(
++        targetValue = if (visible) 1f else 0f,
++        animationSpec = tween(220, easing = FastOutSlowInEasing),
++        label = "navigationExtraRow",
++    )
++    if (!visible && fraction.value == 0f) return
++    Layout(content = content, modifier = modifier.clipToBounds()) { measurables, constraints ->
++        val children = measurables.map { it.measure(constraints.copy(minHeight = 0)) }
++        val fullHeight = children.maxOfOrNull { it.height } ?: 0
++        val height = (fullHeight * fraction.value).roundToInt()
++        val width = constraints.constrainWidth(children.maxOfOrNull { it.width } ?: 0)
++        layout(width, constraints.constrainHeight(height)) {
++            children.forEach { child ->
++                child.placeRelativeWithLayer(0, height - fullHeight) { alpha = fraction.value }
++            }
++        }
++    }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt
+index b7b1d2ccf..41a4de093 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt
+@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.width
+ import androidx.compose.foundation.layout.widthIn
++import androidx.compose.foundation.lazy.LazyListState
+ import androidx.compose.foundation.lazy.LazyRow
+ import androidx.compose.foundation.lazy.itemsIndexed
+ import androidx.compose.foundation.lazy.rememberLazyListState
+@@ -53,10 +54,10 @@ fun BrowsingTabSelector(
+     badges: List<Int?> = emptyList(),
+     onSelect: (Int) -> Unit,
+     modifier: Modifier = Modifier,
++    state: LazyListState = rememberLazyListState(initialFirstVisibleItemIndex = selectedIndex.coerceAtLeast(0)),
+ ) {
+     if (labels.isEmpty()) return
+     val selected = selectedIndex.coerceIn(labels.indices)
+-    val state = rememberLazyListState(initialFirstVisibleItemIndex = selected)
+     val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
+     val indicatorColor = MaterialTheme.colorScheme.primary
+     val animatedSelection by frameTimeProtectedFloatAsState(
+@@ -77,13 +78,15 @@ fun BrowsingTabSelector(
+             verticalAlignment = Alignment.CenterVertically,
+             horizontalArrangement = Arrangement.spacedBy(6.dp),
+         ) {
+-            Text(
+-                text = title,
+-                modifier = Modifier.widthIn(max = titleMaxWidth),
+-                style = MaterialTheme.typography.titleLarge.copy(lineHeight = 28.sp),
+-                maxLines = 1,
+-                overflow = TextOverflow.Ellipsis,
+-            )
++            if (title.isNotEmpty()) {
++                Text(
++                    text = title,
++                    modifier = Modifier.widthIn(max = titleMaxWidth),
++                    style = MaterialTheme.typography.titleLarge.copy(lineHeight = 28.sp),
++                    maxLines = 1,
++                    overflow = TextOverflow.Ellipsis,
++                )
++            }
+             LazyRow(
+                 state = state,
+                 flingBehavior = rememberFrameTimeProtectedFlingBehavior(),
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+index f0f2dbd69..01804dd5a 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+@@ -55,8 +55,7 @@ fun isCompactBrowsingWindow(): Boolean {
+ @Composable
+ fun navigationToolbarHeight(): Dp = when {
+     LocalDensity.current.fontScale > 1.3f -> 64.dp
+-    isCompactBrowsingWindow() && LocalBrowsingChrome.current != null -> 40.dp
+-    isCompactBrowsingWindow() -> 48.dp
++    isCompactBrowsingWindow() -> 40.dp
+     else -> 56.dp
+ }
+ 
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationOverlay.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationOverlay.kt
+new file mode 100644
+index 000000000..02cd221ec
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationOverlay.kt
+@@ -0,0 +1,17 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.ui.unit.dp
++
++/** Dialogs have their own window insets and cannot reuse the home capsule's layout or scroll owner. */
++@Composable
++fun NavigationOverlayScope(content: @Composable () -> Unit) {
++    CompositionLocalProvider(
++        LocalBrowsingBottomPadding provides 0.dp,
++        LocalBrowsingNavigationBarState provides null,
++        LocalBrowsingChrome provides null,
++        LocalPullRefreshTopBoundary provides { 0f },
++        content = content,
++    )
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationToolbar.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationToolbar.kt
+new file mode 100644
+index 000000000..8b5007a43
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationToolbar.kt
+@@ -0,0 +1,60 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.layout.RowScope
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.widthIn
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.ArrowDropDown
++import androidx.compose.material3.DropdownMenu
++import androidx.compose.material3.DropdownMenuItem
++import androidx.compose.material3.Icon
++import androidx.compose.material3.LocalMinimumInteractiveComponentSize
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.material3.TopAppBar
++import androidx.compose.material3.TopAppBarColors
++import androidx.compose.material3.TopAppBarDefaults
++import androidx.compose.material3.TopAppBarScrollBehavior
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.selected
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++
++/** One height and icon allocation for regular, search and selection modes. */
++@Composable
++fun NavigationTopAppBar(
++    title: @Composable () -> Unit,
++    navigationIcon: @Composable () -> Unit,
++    actions: @Composable RowScope.() -> Unit,
++    colors: TopAppBarColors,
++    scrollBehavior: TopAppBarScrollBehavior?,
++    modifier: Modifier = Modifier,
++    windowInsets: WindowInsets = TopAppBarDefaults.windowInsets,
++) {
++    val height = navigationToolbarHeight()
++    CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides minOf(height, 48.dp)) {
++        TopAppBar(
++            title = title,
++            navigationIcon = navigationIcon,
++            actions = actions,
++            expandedHeight = height,
++            colors = colors,
++            scrollBehavior = scrollBehavior.toolbarScrollBehavior(),
++            modifier = modifier,
++            windowInsets = windowInsets,
++        )
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromePagerViewportTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromePagerViewportTest.kt
+new file mode 100644
+index 000000000..d961c00e7
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromePagerViewportTest.kt
+@@ -0,0 +1,128 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.requiredSize
++import androidx.compose.foundation.pager.HorizontalPager
++import androidx.compose.foundation.pager.PagerState
++import androidx.compose.foundation.pager.rememberPagerState
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.onNodeWithTag
++import androidx.compose.ui.test.performTouchInput
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.test.swipeLeft
++import androidx.compose.ui.unit.dp
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import kotlin.math.abs
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34])
++class NavigationChromePagerViewportTest {
++    @Test
++    fun `held drag is cancelled and aligned after width changes in either direction`() = runComposeUiTest {
++        val width = mutableIntStateOf(320)
++        lateinit var pager: PagerState
++        setContent {
++            pager = rememberPagerState(initialPage = 2) { 8 }
++            HorizontalPager(
++                state = pager,
++                flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(pager),
++                modifier = Modifier.requiredSize(width.intValue.dp, 500.dp)
++                    .settlePagerOnWidthChange(pager).testTag("pager"),
++            ) { Box(Modifier.fillMaxSize()) }
++        }
++        for (nextWidth in listOf(600, 320)) {
++            onNodeWithTag("pager").performTouchInput {
++                down(center)
++                moveBy(Offset(-80f, 0f))
++            }
++            runOnIdle {
++                assertTrue(abs(pager.currentPageOffsetFraction) > 0.03f)
++                width.intValue = nextWidth
++            }
++            waitForIdle()
++            runOnIdle {
++                assertFalse(pager.isScrollInProgress)
++                assertEquals(0f, pager.currentPageOffsetFraction, 0.001f)
++            }
++            // The old finger remains down across the resize and must not resume the cancelled drag.
++            onNodeWithTag("pager").performTouchInput {
++                moveBy(Offset(-20f, 0f))
++                up()
++            }
++            waitForIdle()
++            runOnIdle { assertEquals(0f, pager.currentPageOffsetFraction, 0.001f) }
++        }
++        val before = pager.currentPage
++        onNodeWithTag("pager").performTouchInput { swipeLeft(durationMillis = 180) }
++        waitForIdle()
++        runOnIdle {
++            assertTrue(pager.currentPage > before)
++            assertEquals(0f, pager.currentPageOffsetFraction, 0.001f)
++        }
++    }
++
++    @Test
++    fun `extra toolbar height does not cancel a normal horizontal gesture`() = runComposeUiTest {
++        val height = mutableIntStateOf(500)
++        lateinit var pager: PagerState
++        setContent {
++            pager = rememberPagerState(initialPage = 2) { 8 }
++            HorizontalPager(
++                state = pager,
++                flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(pager),
++                modifier = Modifier.requiredSize(400.dp, height.intValue.dp)
++                    .settlePagerOnWidthChange(pager).testTag("pager"),
++            ) { Box(Modifier.fillMaxSize()) }
++        }
++        onNodeWithTag("pager").performTouchInput {
++            down(center)
++            moveBy(Offset(-80f, 0f))
++        }
++        runOnIdle {
++            assertTrue(abs(pager.currentPageOffsetFraction) > 0.03f)
++            height.intValue = 460
++        }
++        waitForIdle()
++        runOnIdle {
++            assertTrue(pager.isScrollInProgress)
++            assertTrue(abs(pager.currentPageOffsetFraction) > 0.03f)
++        }
++        onNodeWithTag("pager").performTouchInput { up() }
++        waitForIdle()
++        runOnIdle {
++            assertFalse(pager.isScrollInProgress)
++            assertEquals(0f, pager.currentPageOffsetFraction, 0.001f)
++        }
++    }
++
++    @Test
++    fun `restored partial page is aligned on the first viewport`() = runComposeUiTest {
++        lateinit var pager: PagerState
++        setContent {
++            pager = rememberPagerState(initialPage = 2, initialPageOffsetFraction = 0.3f) { 8 }
++            HorizontalPager(
++                state = pager,
++                flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(pager),
++                modifier = Modifier.requiredSize(400.dp, 500.dp).settlePagerOnWidthChange(pager),
++            ) { Box(Modifier.fillMaxSize()) }
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(2, pager.currentPage)
++            assertEquals(0f, pager.currentPageOffsetFraction, 0.001f)
++            assertFalse(pager.isScrollInProgress)
++        }
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConsistentToolbarTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConsistentToolbarTest.kt
+new file mode 100644
+index 000000000..a24bacd56
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConsistentToolbarTest.kt
+@@ -0,0 +1,208 @@
++package tachiyomi.presentation.core.components.material
++
++import android.content.res.Configuration
++import androidx.compose.foundation.interaction.MutableInteractionSource
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.requiredSize
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.text.BasicTextField
++import androidx.compose.foundation.text.input.TextFieldLineLimits
++import androidx.compose.foundation.text.input.rememberTextFieldState
++import androidx.compose.material3.IconButton
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextFieldDefaults
++import androidx.compose.material3.TopAppBarDefaults
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.input.nestedscroll.NestedScrollSource
++import androidx.compose.ui.layout.onGloballyPositioned
++import androidx.compose.ui.layout.positionInRoot
++import androidx.compose.ui.platform.LocalConfiguration
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.unit.Density
++import androidx.compose.ui.unit.dp
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertNull
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import tachiyomi.presentation.core.components.AdaptiveSheet
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34])
++class NavigationChromeConsistentToolbarTest {
++    @Test
++    fun `regular selection and search keep one main height while only the extra row animates`() = runComposeUiTest {
++        val mode = mutableIntStateOf(0)
++        var mainHeight = 0
++        var headerHeight = 0
++        var childHeight = 0
++        setContent {
++            val config = Configuration(LocalConfiguration.current).apply {
++                screenWidthDp = 400
++                screenHeightDp = 600
++            }
++            CompositionLocalProvider(LocalConfiguration provides config, LocalDensity provides Density(1f)) {
++                MaterialTheme {
++                    val field = rememberTextFieldState("query")
++                    val interaction = remember { MutableInteractionSource() }
++                    Column(Modifier.requiredSize(400.dp, 600.dp)) {
++                        Column(Modifier.onGloballyPositioned { headerHeight = it.size.height }) {
++                            NavigationTopAppBar(
++                                title = {
++                                    if (mode.intValue == 2) {
++                                        BasicTextField(
++                                            state = field,
++                                            lineLimits = TextFieldLineLimits.SingleLine,
++                                            interactionSource = interaction,
++                                            decorator = TextFieldDefaults.decorator(
++                                                state = field,
++                                                enabled = true,
++                                                lineLimits = TextFieldLineLimits.SingleLine,
++                                                outputTransformation = null,
++                                                interactionSource = interaction,
++                                                contentPadding = PaddingValues(0.dp),
++                                                container = {},
++                                            ),
++                                        )
++                                    } else {
++                                        BrowsingTabSelector(
++                                            title = if (mode.intValue == 1) "2" else "Library",
++                                            labels = listOf("Default", "Reading", "Done"),
++                                            selectedIndex = 1,
++                                            onSelect = {},
++                                        )
++                                    }
++                                },
++                                navigationIcon = { if (mode.intValue != 0) IconButton(onClick = {}) { Box(Modifier.size(24.dp)) } },
++                                actions = { repeat(if (mode.intValue == 1) 2 else 3) { IconButton(onClick = {}) { Box(Modifier.size(24.dp)) } } },
++                                colors = TopAppBarDefaults.topAppBarColors(),
++                                scrollBehavior = null,
++                                windowInsets = WindowInsets(0),
++                                modifier = Modifier.onGloballyPositioned { mainHeight = it.size.height },
++                            )
++                            AnimatedNavigationRow(visible = mode.intValue == 2) {
++                                BrowsingTabSelector(
++                                    title = "",
++                                    labels = listOf("Default", "Reading", "Done"),
++                                    selectedIndex = 1,
++                                    onSelect = {},
++                                    modifier = Modifier.onGloballyPositioned { childHeight = it.size.height },
++                                )
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        mainClock.autoAdvance = false
++        runOnIdle {
++            assertEquals(40, mainHeight)
++            assertEquals(40, headerHeight)
++            mode.intValue = 1
++        }
++        mainClock.advanceTimeByFrame()
++        waitForIdle()
++        runOnIdle {
++            assertEquals(40, mainHeight)
++            assertEquals(40, headerHeight)
++            mode.intValue = 2
++        }
++        mainClock.advanceTimeByFrame()
++        waitForIdle()
++        mainClock.advanceTimeBy(96)
++        runOnIdle {
++            assertEquals(40, mainHeight)
++            assertEquals(40, childHeight)
++            assertTrue(headerHeight in 41..79, "height=$headerHeight")
++        }
++        mainClock.advanceTimeBy(500)
++        runOnIdle {
++            assertEquals(80, headerHeight)
++            mode.intValue = 0
++        }
++        mainClock.advanceTimeByFrame()
++        waitForIdle()
++        mainClock.advanceTimeBy(96)
++        runOnIdle {
++            assertEquals(40, mainHeight)
++            assertTrue(headerHeight in 41..79, "height=$headerHeight")
++        }
++        mainClock.advanceTimeBy(500)
++        runOnIdle { assertEquals(40, headerHeight) }
++    }
++
++    @Test
++    fun `bottom sheet fills its window and applies its own navigation inset exactly once`() = runComposeUiTest {
++        var viewportBottom = 0f
++        var sheetBottom = 0f
++        var contentBottom = 0f
++        var localPadding = 72.dp
++        val home = BrowsingNavigationBarState { true }
++        setContent {
++            CompositionLocalProvider(LocalDensity provides Density(1f), LocalBrowsingBottomPadding provides 72.dp, LocalBrowsingNavigationBarState provides home) {
++                MaterialTheme {
++                    Box(Modifier.requiredSize(400.dp, 600.dp).onGloballyPositioned { viewportBottom = it.positionInRoot().y + it.size.height }) {
++                        NavigationOverlayScope {
++                            localPadding = LocalBrowsingBottomPadding.current
++                            assertNull(LocalBrowsingNavigationBarState.current)
++                            AdaptiveSheet(
++                                isTabletUi = false,
++                                enableImplicitDismiss = true,
++                                onDismissRequest = {},
++                                contentWindowInsets = WindowInsets(0, 0, 0, 24),
++                                modifier = Modifier.onGloballyPositioned { sheetBottom = it.positionInRoot().y + it.size.height },
++                            ) {
++                                Box(Modifier.fillMaxWidth().height(80.dp).onGloballyPositioned { contentBottom = it.positionInRoot().y + it.size.height })
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(0.dp, localPadding)
++            assertEquals(viewportBottom, sheetBottom, 1f)
++            assertEquals(24f, viewportBottom - contentBottom, 1f)
++        }
++    }
++
++    @Test
++    fun `manager navigation stays pinned and resumes collapse when its owner is released`() = runComposeUiTest {
++        val pinned = mutableStateOf(true)
++        val chrome = BrowsingNavigationBarState { true }
++        setContent {
++            CompositionLocalProvider(LocalBrowsingNavigationBarState provides chrome) {
++                rememberBrowsingTopAppBarScrollBehavior(enabled = !pinned.value)
++                Text("management")
++            }
++        }
++        runOnIdle {
++            chrome.nestedScrollConnection.onPostScroll(Offset(0f, -60f), Offset.Zero, NestedScrollSource.UserInput)
++            assertTrue(chrome.visible)
++            pinned.value = false
++        }
++        waitForIdle()
++        runOnIdle {
++            chrome.nestedScrollConnection.onPostScroll(Offset(0f, -60f), Offset.Zero, NestedScrollSource.UserInput)
++            assertFalse(chrome.visible)
++        }
++    }
++}
