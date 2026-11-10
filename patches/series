@@ -86,3 +86,4 @@
 0086-scroll-recover-stalled-fling-frame-time.patch
 0087-ui-smooth-category-paging-and-shared-animations.patch
 0088-test-render-protected-indicator-state.patch
+0089-ui-protect-scroll-modes-and-preference-observers.patch
