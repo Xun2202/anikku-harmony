@@ -91,3 +91,4 @@
 0091-ui-consistent-navigation-and-pager-viewport.patch
 0092-fix-shared-toolbar-imports-and-sheet-test.patch
 0093-ui-shared-sheet-motion-and-selection-actions.patch
+0094-browse-unify-header-glass-and-scroll-boundaries.patch

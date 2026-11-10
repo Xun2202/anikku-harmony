@@ -866,3 +866,10 @@ gh release list --repo Xun2202/anikku-harmony
 - 新回归：手机/居中遮罩-进退-回调时序、80px慢拖关闭、40px快甩关闭、24px慢拖复位、高低双向持指分页中间高度、选择栏64ms内开始且最终48px（不再300ms等待）。已有导航/折叠/惯性用例继续作为必要检查，不改原FlingFrameClock内核或玻璃着色。
 - Animeko实查SubjectCommentsSheet/ViewAllSheet为Material3 ModalBottomSheet和独立KMP Dialog，不走本旧全窗口锚点/自绘dim/TabbedDialog最大页高路径，无相同自定义批量操作栏。纯Compose高度插值可按自身需求独立评估，不以JVM为由拒绝移植；其原生Sheet手势和窗口行为待专项复现，本轮不扩大第三款构建。
 - 共用UI规则固化在档案docs/rules/apk-shared-ui.md，并从档案与本仓AGENTS触发加载，后续对话可定位共用owner及有意差异。真机验证：面板开关遮罩同步、高低双向持指变化与小距离/快甩关闭、长按批量栏及时且紧凑；确认内容列表仍能正常滚动。
+
+### 同版补充：插件作品列表主栏与顶部恢复（0094）
+
+- 用户追加插件浏览栏高度/玻璃不一、从下方回到顶部不恢复。确认为源码列表顶层Column实色盖住共用玻璃，普通原生LazyColumn/LazyVerticalGrid缺少书架FastScroll的边缘owner，且原只提交底部边界状态、顶部仅瞬时几何封顶。
+- 紧凑窗口原热门/最新/筛选/An保存搜索横条并入主栏中间，来源名最大80dp，控件横滑可达，An批量模式以数量替代来源名。使用BrowsingToolbarTitle/FilterRow共用主栏高度和触摸空间；搜索保留完整输入，额外筛选行走AnimatedNavigationRow，长屏保留第二行。滚动位置提升、不删操作。去掉source/global-search在浏览chrome下的实色覆盖；非该上下文保持原实色fallback，不改玻璃shader。
+- 普通source列表/网格切已有FastScrollLazyColumn/VerticalGrid，和全景/书架同边缘观察、滚动条与惯性保护；An entries高度/metadata/selection及分页访问保留。顶部与底部实测边界共同提交visible和动画终值，列表回首/程序跳回之后离开padding也不会还原旧hidden目标，继续不消费滚动。
+- 首轮两款编译通过，新面板生命周期/高低持指/选择栏用例通过，3个内容拖动测试因Surface合并semantics而找不到body，尚未注入手势；仅定位加useUnmergedTree，保留全部断言。该失败包未发布。新增紧凑header40dp且末项可横滑点击、列表/网格回首离开spacer不回弹3项真实Compose回归；新交互总10项。
