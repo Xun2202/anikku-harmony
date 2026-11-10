@@ -796,3 +796,11 @@ gh release list --repo Xun2202/anikku-harmony
 - 更新真实组件时钟测试：按住长短对应不同峰值、松手不再上升、反复打断/最终归零及空间连续衰减；新增提交采样的单pending/节流、停止及迟到回调、无硬件三个状态测试。沿用两款原有NavigationChrome选择器，不加另一App构建变体。公共4份core生产文件、窗口工具及两份新测逐字节一致；应用入口/平板策略因DI和Anikku TV保留差异。
 - Anikku格式3轻量，保留Injekt/TV平板策略，不扩移Mihon详细模式/A-B；继续在已有app:testPreviewUnitTest检查报告模型。
 - 参考官方Android配置连续性与ViewTreeObserver提交回调文档、华为interactive/lightEffect原则；本地260ms/smoothstep/Gaussian是依用户需求选择，非声称原生SDK私有曲线。APK Manifest四个配置标记、版本/完整签名/hash/公开更新索引及真机反馈见归档。Animeko没有本Tachiyomi入口/胶囊/采集器，不直接移植。
+
+## 2026-11-10：自适应导航共用内容，保留折叠前后的列表实例
+
+- 用户提供Mihon30的11-09 11:12:39轻量24秒日志，未附本次体感说明。一个Activity owner贯穿两次配置变化，43次采样提交全部返回、错误0，说明上版窗口连续性生效；这不代表屏幕实际呈现已经通过。新证据是列表g1离开offset36038后g2从0进入，折回g2离开21254后g3也从0进入。
+- HomeScreen的侧栏和底部导航分别调用TabContent，切换分支仍会重建整个标签内容。新增共享rememberNavigationContent：按TabNavigator owner缓存一份movableContent，回调用rememberUpdatedState接收最新值；两个宿主移动同一份内容，不改变原导航样式、平板策略、手势或材质。不同导航owner仍创建新内容，避免跨导航实例保留旧状态。与Mihon 0079同源。
+- 新增真实Compose回归：普通Box与SubcomposeLayout导航宿主往返6次，内部remember的LazyListState/内容identity不变，滚动37项+9px、挂载1/销毁0；最新内容与LocalBrowsingBottomPadding同时更新。另验导航owner变化会重置并销毁旧内容。两份共享文件逐字节一致，沿用NavigationChrome CI选择器，无截图或额外App构建变体。
+- 正常滑动大段回调仍约89Hz；138.76ms是切换附近采样的draw到提交回调延迟，非GPU完成/屏幕呈现。冷启有46.22ms布局与171.62ms采样提交峰值；idle的1200ms空档不能直接当卡死。本轮修已证实的内容生命周期缺陷，持续体感卡仍等用户反馈，不追加无依据的低层渲染修改。日志格式/采样成本保持Mi6、An3。
+- Animeko使用独立导航、无本Voyager HomeScreen双分支，不直接移植此helper；没有据此排除其独立折叠性能问题。构建/签名/版本/hash/公开更新索引见私有归档现状。

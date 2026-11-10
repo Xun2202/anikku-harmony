@@ -81,3 +81,4 @@
 0081-test-layer-lifetime-without-pixelcopy.patch
 0082-test-public-haze-state-setter.patch
 0083-ui-adaptive-window-continuity-and-soft-press-light.patch
+0084-ui-preserve-content-across-adaptive-navigation.patch
