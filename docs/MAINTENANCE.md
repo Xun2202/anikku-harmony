@@ -839,3 +839,5 @@ gh release list --repo Xun2202/anikku-harmony
 - LibraryViewModel/LibraryScreenModel原getDisplayMode每次组合读取都构造PreferenceMutableState并启动model scope监听；列数getter在方向重建时同样累积。改3个惰性稳定实例，仍响应外部设置变更并随模型结束取消，不更改设置key/持久化。普通列表滚动条padding缓存补direction/density键，避免视口配置变化后用旧像素值。
 - 新真实Compose回归覆盖普通列表/快速列表/紧凑网格/时间网格/ScrollState在筛选缩量、双向甩动、宽窄视口、空与单项、恢复后继续滑动；另测通用代理重复时间戳保护、作用域/速度/消费和剩余速度透传。沿用必要CI选择器，原惯性时钟内核未变，不重复旧独立模型验证。
 - Animeko commonMain也有原生滚动与分页，但依赖独立Paging/KMP状态，既有JVM保护不可直拷；其Android时钟适用性仍待专项证据，Tachiyomi PreferenceMutableState监听缺口不直接套用。本轮不扩构建第三款。
+
+- 0090修正新增回归对原生时间网格空态的假设：空数据时可保留内部恢复锚点，检查实际layoutInfo空/单项输出，恢复后必须继续推进滚动。不改生产位置、不去掉恢复断言；第一轮其余5项新测试通过，仅此断言失败，未组装或发布。
