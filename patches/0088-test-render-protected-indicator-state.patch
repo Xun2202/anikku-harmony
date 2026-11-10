@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 12:00:32 +0000
+Subject: [PATCH] test(ui): render indicator and compare native animation state
+
+The indicator regression must exercise a rendered state consumer rather than a plain variable assigned inside an otherwise empty composition. Render protected/native state together, advance the recomposition frame before sampling, assert both intermediate values and the final conflated target. Existing pager swipe and settled-only persistence regressions remain intact; no production animation behavior is changed.
+---
+ .../NavigationChromePagerAnimationTest.kt     | 21 +++++++++++++++----
+ 1 file changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromePagerAnimationTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromePagerAnimationTest.kt
+index ca39294e1..f7e4c0c1b 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromePagerAnimationTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromePagerAnimationTest.kt
+@@ -1,5 +1,6 @@
+ package tachiyomi.presentation.core.components
+ 
++import androidx.compose.animation.core.animateFloatAsState
+ import androidx.compose.animation.core.tween
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.fillMaxSize
+@@ -7,6 +8,8 @@ import androidx.compose.foundation.layout.requiredSize
+ import androidx.compose.foundation.pager.HorizontalPager
+ import androidx.compose.foundation.pager.PagerState
+ import androidx.compose.foundation.pager.rememberPagerState
++import androidx.compose.material3.Text
++import androidx.compose.runtime.State
+ import androidx.compose.runtime.mutableFloatStateOf
+ import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.ui.Modifier
+@@ -96,20 +99,30 @@ class NavigationChromePagerAnimationTest {
+     @Test
+     fun `protected indicator keeps intermediate animation and conflates rapid target changes`() = runComposeUiTest {
+         val target = mutableFloatStateOf(0f)
+-        var value = 0f
++        lateinit var value: State<Float>
++        lateinit var reference: State<Float>
+         setContent {
+-            value = frameTimeProtectedFloatAsState(target.floatValue, tween(250), "indicator").value
++            value = frameTimeProtectedFloatAsState(target.floatValue, tween(250), "indicator")
++            reference = animateFloatAsState(target.floatValue, tween(250), label = "nativeIndicator")
++            Text("${value.value}/${reference.value}")
+         }
+         mainClock.autoAdvance = false
+         runOnIdle { target.floatValue = 1f }
++        mainClock.advanceTimeByFrame()
++        waitForIdle()
+         mainClock.advanceTimeBy(96)
+-        runOnIdle { assertTrue(value in 0.01f..0.99f) }
++        runOnIdle {
++            assertTrue(reference.value in 0.01f..0.99f, "native=${reference.value}")
++            assertTrue(value.value in 0.01f..0.99f, "protected=${value.value}, native=${reference.value}")
++            assertEquals(reference.value, value.value, 0.12f)
++        }
+         runOnIdle {
+             target.floatValue = 0f
+             target.floatValue = 0.4f
+             target.floatValue = 0.8f
+         }
++        mainClock.advanceTimeByFrame()
+         mainClock.advanceTimeBy(500)
+-        runOnIdle { assertEquals(0.8f, value, 0.001f) }
++        runOnIdle { assertEquals(0.8f, value.value, 0.001f) }
+     }
+ }

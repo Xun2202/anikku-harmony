@@ -828,3 +828,5 @@ gh release list --repo Xun2202/anikku-harmony
 - 自定义分类指示条保留250ms渐变与边缘遮罩，分类条自动/手动滚动、导航位移/按压和滑块渐隐共享保护；FloatAsState沿用conflated channel+Animatable互斥中断语义，保留中间值与快速重定向，不改布局/玻璃样式/手势阈值。
 - 新增真实Compose回归：正常分页、快速重定向及仅保存settled分类，左右手势原生吸附，指示条中间值/连续目标合并。原惯性/导航/光效回归继续；实际横滑流畅度需用户更新后确认，未编造FPS收益。
 - Animeko实查CollectionPage与详情/日程等也有KMP commonMain Pager，不能标不适用；它采用独立LazyPagingItems/状态和跨平台Coroutine，不能直接引入本JVM System.nanoTime helper。其同类时钟适用性待Android专项证据/平台实现评估，Tachiyomi分类数据改动不直接移植；本轮记录待确认，未额外构建第三款。
+
+- 0088补测试夹具：首轮UI回归的左右横滑/连续切换通过，指示条中间值失败，未进入APK组装/发布。改用真实渲染的State与原生动画并排对照，先推进重组帧再验中间值/最终目标；保留严格中间值断言，生产逻辑不改。
