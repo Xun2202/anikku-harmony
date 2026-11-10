@@ -1,0 +1,435 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 07:35:33 +0000
+Subject: [PATCH] perf(debug): capture fling tail timing and placement
+
+Shared tracing and tests with Mihon 0080. The user identifies stutter near the end of free decay after folding, even with stable whole-fling callback rates. Preserve the first four baseline flings and the latest twelve, with bounded primitive rings for the last 64 scroll steps and actual grid draw calls. Capture unmodified requested/consumed deltas, float scroll offset, placed integer position, viewport and inclusive CPU draw wall time. Formatting occurs only at export; there is no additional frame driver, per-frame text, snapshot read or change to decay physics. Stop clears buffers and generation-safe IDs reject old flings. The added report section is separately versioned; light mode and the existing report model remain unchanged. These are diagnostics, not proof that persistent perceived jank has been fixed.
+---
+ .../tachiyomi/util/system/HarmonyFramePerf.kt |   5 +-
+ .../core/components/FlingTailTrace.kt         | 148 ++++++++++++++++++
+ .../core/components/PanoramaMasonry.kt        |  25 +++
+ .../core/components/PanoramaScrollTrace.kt    |   4 +
+ .../NavigationChromeFlingTailTest.kt          | 133 ++++++++++++++++
+ 5 files changed, 314 insertions(+), 1 deletion(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/FlingTailTrace.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFlingTailTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerf.kt b/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerf.kt
+index 2141fd0e7..a25810383 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerf.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyFramePerf.kt
+@@ -52,6 +52,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+ import tachiyomi.presentation.core.components.DrawPerfObserver
++import tachiyomi.presentation.core.components.FlingTailTrace
+ import tachiyomi.presentation.core.components.FrameCommitProbe
+ import tachiyomi.presentation.core.components.PanoramaFrameCounters
+ import tachiyomi.presentation.core.components.PanoramaScrollTrace
+@@ -163,6 +164,7 @@ object HarmonyFramePerf {
+         thread = samplerThread
+         handler = samplerHandler
+         window = activity.window
++        FlingTailTrace.startRecording()
+         samplerHandler.post(object : Runnable {
+             private var lastGcCount = -1L
+             private var lastCpuMs = -1L
+@@ -194,6 +196,7 @@ object HarmonyFramePerf {
+     }
+ 
+     private fun detach() {
++        FlingTailTrace.stopRecording()
+         generation++
+         ticking = false
+         commitProbe?.stop()
+@@ -292,7 +295,7 @@ object HarmonyFramePerf {
+         )
+         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date(nowWallMs))
+         val file = context.createFileInCacheDir("${fileLabel(header)}_scroll_perf_$stamp.txt")
+-        file.writeText(PerfReport.format(input))
++        file.writeText(PerfReport.format(input) + FlingTailTrace.report(input.startedNanos))
+         return file
+     }
+ 
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/FlingTailTrace.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/FlingTailTrace.kt
+new file mode 100644
+index 000000000..ad63aeec0
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/FlingTailTrace.kt
+@@ -0,0 +1,148 @@
++package tachiyomi.presentation.core.components
++
++import java.util.Locale
++
++/** Passive tail diagnostics. No frame callbacks, snapshot reads, or per-frame text allocation. */
++object FlingTailTrace {
++    private const val FLINGS = 16
++    private const val BASELINE_FLINGS = 4
++    private const val ROWS = 64
++    private const val WIDTH = 5
++    private const val FINAL_DRAW_GRACE_NS = 100_000_000L
++    private val lock = Any()
++    private val sessions = ArrayDeque<Session>(FLINGS)
++    private var serial = 0L
++    private var current: Session? = null
++
++    @Volatile
++    var enabled: Boolean = false
++        private set
++
++    fun startRecording() = synchronized(lock) {
++        sessions.clear()
++        current = null
++        enabled = true
++    }
++
++    fun stopRecording() = synchronized(lock) {
++        enabled = false
++        current = null
++        sessions.clear()
++    }
++
++    internal fun begin(grid: Int, velocity: Float, now: Long): Long = synchronized(lock) {
++        if (!enabled) return@synchronized 0L
++        val session = Session(++serial, grid, velocity, now)
++        if (sessions.size == FLINGS) sessions.removeAt(BASELINE_FLINGS)
++        sessions.addLast(session)
++        current = session
++        session.id
++    }
++
++    internal fun step(id: Long, now: Long, asked: Float, consumed: Float, offset: Float) = synchronized(lock) {
++        val session = current
++        if (!enabled || session == null || session.id != id || session.ended != 0L) return@synchronized
++        session.steps.append(now, asked.toRawBits().toLong(), consumed.toRawBits().toLong(), offset.toRawBits().toLong(), 0L)
++    }
++
++    internal fun draw(grid: Int, now: Long, offset: Int, width: Int, height: Int, drawNanos: Long = 0L) = synchronized(lock) {
++        val session = current
++        if (!enabled || session == null || session.grid != grid) return@synchronized
++        if (session.ended != 0L && now - session.ended > FINAL_DRAW_GRACE_NS) return@synchronized
++        session.draws.append(now, offset.toLong(), width.toLong(), height.toLong(), drawNanos)
++    }
++
++    internal fun end(id: Long, now: Long, outcome: String) = synchronized(lock) {
++        val session = current
++        if (!enabled || session == null || session.id != id || session.ended != 0L) return@synchronized
++        session.ended = now
++        session.outcome = outcome
++    }
++
++    internal fun snapshot(): List<FlingTailSnapshot> = synchronized(lock) {
++        sessions.map {
++            FlingTailSnapshot(it.id, it.grid, it.velocity, it.started, it.ended, it.outcome, it.steps.count, it.draws.count, it.steps.snapshot(), it.draws.snapshot())
++        }
++    }
++
++    /** Called only at export, on the writer thread. Times share the report's monotonic origin. */
++    fun report(originNanos: Long): String = buildString {
++        val captured = snapshot()
++        appendLine()
++        appendLine("## Fling tail samples (format 1)")
++        appendLine("# Last 64 steps and grid draw calls per fling; first 4 and latest 12 flings. Earlier rows may be omitted.")
++        appendLine("# Step asked/consumed are scroll deltas in px; offset is the float state after scrollBy.")
++        appendLine("# Draw offset is the integer used to place cells; draw_wall_ms is inclusive CPU wall time, not GPU completion/presentation.")
++        appendLine("# dt is between adjacent retained calls of the same kind; first retained dt is n/a.")
++        appendLine("# step speed is inferred from asked/dt, not the decay model's instantaneous velocity.")
++        fun number(value: Double) = String.format(Locale.US, "%.3f", value)
++        for (session in captured) {
++            appendLine(
++                "tail_fling id=${session.id} grid=${session.grid} start_ms=${number((session.started - originNanos) / 1e6)} " +
++                    "end_ms=${if (session.ended == 0L) "n/a" else number((session.ended - originNanos) / 1e6)} " +
++                    "initial_px_s=${number(session.velocity.toDouble())} outcome=${session.outcome} " +
++                    "steps_total=${session.stepCount} draws_total=${session.drawCount}",
++            )
++            for ((kind, rows) in listOf("step" to session.steps, "draw" to session.draws)) {
++                for (row in rows.indices step WIDTH) {
++                    val time = rows[row]
++                    val dt = if (row == 0) 0L else time - rows[row - WIDTH]
++                    val timing = "at_ms=${number((time - originNanos) / 1e6)} elapsed_ms=${number((time - session.started) / 1e6)} " +
++                        "dt_ms=${if (dt <= 0L) "n/a" else number(dt / 1e6)}"
++                    if (kind == "step") {
++                        val asked = Float.fromBits(rows[row + 1].toInt())
++                        appendLine(
++                            "tail_step id=${session.id} $timing asked_px=${number(asked.toDouble())} " +
++                                "consumed_px=${number(Float.fromBits(rows[row + 2].toInt()).toDouble())} " +
++                                "offset_px=${number(Float.fromBits(rows[row + 3].toInt()).toDouble())} " +
++                                "speed_estimate_px_s=${if (dt <= 0L) "n/a" else number(asked * 1e9 / dt)}",
++                        )
++                    } else {
++                        appendLine("tail_draw id=${session.id} $timing placed_offset_px=${rows[row + 1]} viewport_px=${rows[row + 2]}x${rows[row + 3]} draw_wall_ms=${number(rows[row + 4] / 1e6)}")
++                    }
++                }
++            }
++        }
++    }
++
++    private class Session(val id: Long, val grid: Int, val velocity: Float, val started: Long) {
++        var ended = 0L
++        var outcome = "active"
++        val steps = TailRows()
++        val draws = TailRows()
++    }
++
++    private class TailRows {
++        private val values = LongArray(ROWS * WIDTH)
++        var count = 0
++            private set
++
++        fun append(a: Long, b: Long, c: Long, d: Long, e: Long) {
++            val row = (count++ % ROWS) * WIDTH
++            values[row] = a
++            values[row + 1] = b
++            values[row + 2] = c
++            values[row + 3] = d
++            values[row + 4] = e
++        }
++
++        fun snapshot(): LongArray {
++            val size = minOf(count, ROWS)
++            val first = count - size
++            return LongArray(size * WIDTH) { index -> values[((first + index / WIDTH) % ROWS) * WIDTH + index % WIDTH] }
++        }
++    }
++}
++
++internal data class FlingTailSnapshot(
++    val id: Long,
++    val grid: Int,
++    val velocity: Float,
++    val started: Long,
++    val ended: Long,
++    val outcome: String,
++    val stepCount: Int,
++    val drawCount: Int,
++    val steps: LongArray,
++    val draws: LongArray,
++)
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+index 91d233fea..d29c1a7b0 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+@@ -30,6 +30,7 @@ import androidx.compose.runtime.snapshots.Snapshot
+ import androidx.compose.runtime.withFrameNanos
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clipToBounds
++import androidx.compose.ui.draw.drawWithContent
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.layout.MeasureResult
+ import androidx.compose.ui.layout.Placeable
+@@ -116,6 +117,11 @@ sealed interface PanoramaCellHeight {
+ 
+ @Stable
+ class PanoramaMasonryState {
++    // Plain fields: diagnostics must not observe scroll state or schedule an extra draw.
++    internal var tracedPlacementOffset = 0
++    internal var tracedPlacementWidth = 0
++    internal var tracedPlacementHeight = 0
++
+     internal val scrollableState: ScrollableState = ScrollableState { delta ->
+         val max = maxScroll
+         val current = scrollOffset
+@@ -525,6 +531,20 @@ fun PanoramaMasonry(
+     )
+     LazyLayout(
+         modifier = modifier
++            .drawWithContent {
++                val started = if (FlingTailTrace.enabled) System.nanoTime() else 0L
++                drawContent()
++                if (started != 0L) {
++                    FlingTailTrace.draw(
++                        state.traceId,
++                        started,
++                        state.tracedPlacementOffset,
++                        state.tracedPlacementWidth,
++                        state.tracedPlacementHeight,
++                        System.nanoTime() - started,
++                    )
++                }
++            }
+             .panoramaTouchTrace(state.traceId)
+             .semantics {
+                 if (userScrollEnabled) {
+@@ -803,6 +823,11 @@ private fun LazyLayoutMeasureScope.measureMasonry(
+     val layoutWidth = if (constraints.hasBoundedWidth) constraints.maxWidth else available + left + right
+     val layoutHeight = if (constraints.hasBoundedHeight) constraints.maxHeight else total.coerceAtLeast(0)
+     return layout(layoutWidth, layoutHeight) {
++        if (FlingTailTrace.enabled) {
++            state.tracedPlacementOffset = scrollPx
++            state.tracedPlacementWidth = layoutWidth
++            state.tracedPlacementHeight = layoutHeight
++        }
+         for ((rect, placeables) in placed) {
+             val x = left + rect.x
+             val y = topPad + rect.y - scrollPx
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaScrollTrace.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaScrollTrace.kt
+index d812c8bba..487243aa4 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaScrollTrace.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaScrollTrace.kt
+@@ -147,6 +147,7 @@ internal class TracedFlingBehavior(
+         var maxGapNs = 0L
+         var frames = 0
+         var travelled = 0f
++        val tail = if (FlingTailTrace.enabled) FlingTailTrace.begin(gridId, initialVelocity, start) else 0L
+         val traced = object : ScrollScope {
+             override fun scrollBy(pixels: Float): Float {
+                 val now = System.nanoTime()
+@@ -156,6 +157,7 @@ internal class TracedFlingBehavior(
+                 val before = state.scrollOffset
+                 val consumed = outer.scrollBy(pixels)
+                 travelled += consumed
++                if (tail != 0L) FlingTailTrace.step(tail, now, pixels, consumed, state.scrollOffset)
+                 if (abs(pixels - consumed) > 0.5f) {
+                     PanoramaScrollTrace.log(
+                         gridId,
+@@ -178,9 +180,11 @@ internal class TracedFlingBehavior(
+             left = with(inner) { traced.performFling(initialVelocity) }
+             outcome = if (abs(left) > 1f) "stopped" else "done"
+         } catch (e: CancellationException) {
++            if (tail != 0L) FlingTailTrace.end(tail, System.nanoTime(), "cancelled")
+             logFlingEnd("cancelled", 0f, start, frames, travelled, maxGapNs)
+             throw e
+         }
++        if (tail != 0L) FlingTailTrace.end(tail, System.nanoTime(), outcome)
+         logFlingEnd(outcome, left, start, frames, travelled, maxGapNs)
+         return left
+     }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFlingTailTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFlingTailTest.kt
+new file mode 100644
+index 000000000..0b11ea346
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFlingTailTest.kt
+@@ -0,0 +1,133 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.gestures.FlingBehavior
++import androidx.compose.foundation.gestures.ScrollScope
++import kotlinx.coroutines.runBlocking
++import org.junit.jupiter.api.AfterEach
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++
++class NavigationChromeFlingTailTest {
++    @AfterEach
++    fun stop() = FlingTailTrace.stopRecording()
++
++    @Test
++    fun `disabled recorder retains no samples and old fling cannot write into a new recording`() {
++        FlingTailTrace.stopRecording()
++        assertEquals(0L, FlingTailTrace.begin(1, 500f, 1L))
++        assertTrue(FlingTailTrace.snapshot().isEmpty())
++        FlingTailTrace.startRecording()
++        val old = FlingTailTrace.begin(1, 500f, 10L)
++        FlingTailTrace.stopRecording()
++        assertFalse(FlingTailTrace.enabled)
++        assertTrue(FlingTailTrace.snapshot().isEmpty())
++        FlingTailTrace.startRecording()
++        val next = FlingTailTrace.begin(1, 500f, 20L)
++        FlingTailTrace.step(old, 21L, 3f, 3f, 3f)
++        FlingTailTrace.end(old, 22L, "cancelled")
++        FlingTailTrace.step(next, 23L, 2f, 2f, 2f)
++        assertEquals(1, FlingTailTrace.snapshot().single().stepCount)
++        assertEquals("active", FlingTailTrace.snapshot().single().outcome)
++    }
++
++    @Test
++    fun `tail wrap preserves chronological last 64 steps and draws with independent totals`() {
++        FlingTailTrace.startRecording()
++        val id = FlingTailTrace.begin(2, 500f, 1L)
++        repeat(200) { i ->
++            FlingTailTrace.step(id, 100L + i, 0.25f, 0.25f, i / 4f)
++            FlingTailTrace.draw(2, 1000L + i, i, 1264, 1848)
++        }
++        val captured = FlingTailTrace.snapshot().single()
++        assertEquals(200, captured.stepCount)
++        assertEquals(200, captured.drawCount)
++        assertEquals(64 * 5, captured.steps.size)
++        assertEquals(236L, captured.steps.first())
++        assertEquals(1136L, captured.draws.first())
++        assertEquals(1199L, captured.draws[captured.draws.size - 5])
++        assertTrue(FlingTailTrace.report(1L).contains("dt_ms=n/a"))
++    }
++
++    @Test
++    fun `final placement can draw after decay ends without charging an idle gap to the tail`() {
++        FlingTailTrace.startRecording()
++        val id = FlingTailTrace.begin(1, 100f, 1L)
++        FlingTailTrace.end(id, 1_000_000L, "done")
++        FlingTailTrace.draw(1, 11_000_000L, 17, 1264, 1848)
++        FlingTailTrace.draw(1, 2_000_000_000L, 17, 1264, 1848)
++        FlingTailTrace.step(id, 3_000_000_000L, 1f, 1f, 18f)
++        val captured = FlingTailTrace.snapshot().single()
++        assertEquals(1, captured.drawCount)
++        assertEquals(0, captured.stepCount)
++        assertEquals("done", captured.outcome)
++        assertEquals(17L, captured.draws[1])
++    }
++
++    @Test
++    fun `fractional scroll values and actual integer placement remain distinguishable`() {
++        FlingTailTrace.startRecording()
++        val id = FlingTailTrace.begin(1, 100f, 1_000_000L)
++        FlingTailTrace.step(id, 2_000_000L, 0.25f, 0.125f, 100_000.125f)
++        FlingTailTrace.draw(3, 3_000_000L, 5, 9, 9)
++        FlingTailTrace.draw(1, 4_000_000L, 100_000, 1264, 1848, 18_000_000L)
++        val captured = FlingTailTrace.snapshot().single()
++        assertEquals(0.25f, Float.fromBits(captured.steps[1].toInt()))
++        assertEquals(0.125f, Float.fromBits(captured.steps[2].toInt()))
++        assertEquals(100_000.125f, Float.fromBits(captured.steps[3].toInt()))
++        assertEquals(1, captured.drawCount)
++        val text = FlingTailTrace.report(1_000_000L)
++        assertTrue(text.contains("offset_px=100000.125"))
++        assertTrue(text.contains("placed_offset_px=100000 viewport_px=1264x1848"))
++        assertTrue(text.contains("speed_estimate_px_s=n/a"))
++        assertTrue(text.contains("draw_wall_ms=18.000"))
++    }
++
++    @Test
++    fun `recordings retain at most 16 flings and exported snapshots are detached`() {
++        FlingTailTrace.startRecording()
++        repeat(20) { i ->
++            val id = FlingTailTrace.begin(i, 100f, 1L + i)
++            FlingTailTrace.step(id, 30L + i, 1f, 1f, i.toFloat())
++        }
++        val captured = FlingTailTrace.snapshot()
++        assertEquals(16, captured.size)
++        assertEquals(listOf(0, 1, 2, 3), captured.take(4).map { it.grid })
++        assertEquals(8, captured[4].grid)
++        captured.last().steps[0] = -1L
++        assertEquals(49L, FlingTailTrace.snapshot().last().steps[0])
++    }
++
++    @Test
++    fun `tracing forwards the original fling velocity deltas consumption and remaining velocity`() = runBlocking {
++        FlingTailTrace.startRecording()
++        val state = PanoramaMasonryState()
++        state.scrollOffset = 10f
++        val requested = listOf(4f, -2f, 0.125f)
++        val observed = mutableListOf<Float>()
++        val consumed = mutableListOf<Float>()
++        val inner = object : FlingBehavior {
++            override suspend fun ScrollScope.performFling(initialVelocity: Float): Float {
++                assertEquals(123f, initialVelocity)
++                requested.forEach { consumed += scrollBy(it) }
++                return 3f
++            }
++        }
++        val scope = object : ScrollScope {
++            override fun scrollBy(pixels: Float): Float {
++                observed += pixels
++                val accepted = pixels / 2f
++                state.scrollOffset += accepted
++                return accepted
++            }
++        }
++        val remaining = with(TracedFlingBehavior(inner, state.traceId, state)) { scope.performFling(123f) }
++        assertEquals(3f, remaining)
++        assertEquals(requested, observed)
++        assertEquals(requested.map { it / 2f }, consumed)
++        assertEquals(11.0625f, state.scrollOffset)
++        assertEquals(3, FlingTailTrace.snapshot().single().stepCount)
++        assertEquals("stopped", FlingTailTrace.snapshot().single().outcome)
++    }
++}

@@ -804,3 +804,10 @@ gh release list --repo Xun2202/anikku-harmony
 - 新增真实Compose回归：普通Box与SubcomposeLayout导航宿主往返6次，内部remember的LazyListState/内容identity不变，滚动37项+9px、挂载1/销毁0；最新内容与LocalBrowsingBottomPadding同时更新。另验导航owner变化会重置并销毁旧内容。两份共享文件逐字节一致，沿用NavigationChrome CI选择器，无截图或额外App构建变体。
 - 正常滑动大段回调仍约89Hz；138.76ms是切换附近采样的draw到提交回调延迟，非GPU完成/屏幕呈现。冷启有46.22ms布局与171.62ms采样提交峰值；idle的1200ms空档不能直接当卡死。本轮修已证实的内容生命周期缺陷，持续体感卡仍等用户反馈，不追加无依据的低层渲染修改。日志格式/采样成本保持Mi6、An3。
 - Animeko使用独立导航、无本Voyager HomeScreen双分支，不直接移植此helper；没有据此排除其独立折叠性能问题。构建/签名/版本/hash/公开更新索引见私有归档现状。
+
+## 2026-11-10：惯性减速末段诊断
+
+- 用户明确卡感集中在松手后惯性快停下的阶段：冷启动两种屏幕均顺滑，折叠/展开后曾持续变卡；随后玻璃仍开着、不曾切开关就自行恢复，不能据此归因玻璃。31日志同一window/grid跨两次切换，最后提交119/119；整段惯性p90从外屏11.32–11.64ms变成展开11.76–12.01ms、折回11.79–11.96ms，但不能将回调率当实际呈现或18.75ms单点当所有慢尾原因。
+- 0085与Mihon 0080同源：轻量/详细记录均追加独立版本1尾段。保留前4次作为基线及最近12次，每次各64步与grid draw，记录原始请求/消费、小数offset、实际布局整数位置、视口与inclusive CPU draw wall time；速度只从delta/dt推算，非物理模型瞬时速度。grid draw可来自捕获层，不是屏幕呈现/GPU完成。
+- 固定容量原始数组，无逐帧字符串或新增帧驱动，不改变原fling的速度、消费和返回剩余速度。导出线程格式化；停止清空，旧session token不会写进新记录。原主报告Mi6/An3与默认轻量保留，新尾段独立version1。
+- 六个定向回归覆盖关闭/重开与旧回调、环形保留顺序、保留基线、结束后最后draw而不混静止空档、小数/整数/CPU耗时、快照隔离与实际FlingBehavior委托。仍需真机正常→展开→折回各两次快甩到自然停下，约20–30秒导出；此版用于定位尾段，未声称持续卡已修复。Animeko没有本自建PanoramaMasonry/TracedFlingBehavior，不直接移植。
