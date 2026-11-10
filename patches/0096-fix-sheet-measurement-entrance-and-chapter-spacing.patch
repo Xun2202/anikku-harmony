@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 16:46:08 +0000
+Subject: [PATCH] fix(ui): await sheet measurement without restarting entrance
+
+Handle user feedback that filter panels no longer appear after preview.37/50. Share the fix with Mihon 0092. Await valid measured anchors inside a single opening coroutine instead of keying it on measurement readiness. The old launch may start after layout has already supplied a height, then get cancelled by its false-to-true readiness key change; its finally marks entry complete while the sheet is still hidden, allowing the hidden-position observer to immediately dismiss it. Keep deliberate dismissal and drag interruption behavior, scrim synchronization and existing distance/velocity policies. Add actual Android Dialog-window tests that open through a button, assert visible settled content and no spontaneous dismissal, close and reopen three times for phone and centered presentations. Increase only chapter/episode selection action-bar top padding by 4dp, retaining lower padding, compact controls and immediate response. Library selection-bar dimensions and glass/navigation behavior remain unchanged.
+---
+ .../manga/components/MangaBottomActionMenu.kt |  3 +-
+ .../core/components/AdaptiveSheetLayout.kt    | 10 +-
+ .../NavigationChromeSheetWindowTest.kt        | 96 +++++++++++++++++++
+ 3 files changed, 105 insertions(+), 4 deletions(-)
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSheetWindowTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/manga/components/MangaBottomActionMenu.kt b/app/src/main/java/eu/kanade/presentation/manga/components/MangaBottomActionMenu.kt
+index b06e89046..c3b6a531a 100644
+--- a/app/src/main/java/eu/kanade/presentation/manga/components/MangaBottomActionMenu.kt
++++ b/app/src/main/java/eu/kanade/presentation/manga/components/MangaBottomActionMenu.kt
+@@ -130,7 +130,8 @@ fun MangaBottomActionMenu(
+                             .only(WindowInsetsSides.Bottom)
+                             .asPaddingValues(),
+                     )
+-                    .padding(horizontal = 8.dp, vertical = selectionActionBarVerticalPadding()),
++                    .padding(horizontal = 8.dp)
++                    .padding(top = selectionActionBarVerticalPadding() + 4.dp, bottom = selectionActionBarVerticalPadding()),
+             ) {
+                 if (onBookmarkClicked != null) {
+                     Button(
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheetLayout.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheetLayout.kt
+index e277cb90e..b79f573d5 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheetLayout.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheetLayout.kt
+@@ -64,6 +64,7 @@ import kotlinx.coroutines.awaitCancellation
+ import kotlinx.coroutines.cancelAndJoin
+ import kotlinx.coroutines.flow.collect
+ import kotlinx.coroutines.flow.filter
++import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.launch
+ import kotlin.math.abs
+ import kotlin.math.roundToInt
+@@ -138,11 +139,14 @@ internal fun AdaptiveSheetLayout(
+     SideEffect { nested.allowed = { allowImplicitDismiss && !state.isClosing } }
+     DisposableEffect(nested) { onDispose { nested.cancel() } }
+ 
+-    LaunchedEffect(drag, height > 0, state.isClosing) {
+-        if (height == 0) {
+-            if (state.isClosing) complete()
++    LaunchedEffect(drag, state.isClosing) {
++        if (state.isClosing && height == 0) {
++            complete()
+             return@LaunchedEffect
+         }
++        // Measurement can happen before this coroutine starts. Await it within one launch:
++        // keying the effect on readiness can cancel its own entrance and mark it as dismissed.
++        snapshotFlow { height > 0 && drag.offset.isFinite() }.first { it }
+         state.hasPresented = true
+         if (state.isClosing) {
+             withFrameTimeProtection {
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSheetWindowTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSheetWindowTest.kt
+new file mode 100644
+index 000000000..3cb4d011e
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSheetWindowTest.kt
+@@ -0,0 +1,96 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.material3.Button
++import androidx.compose.material3.Text
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.SideEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.platform.LocalView
++import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.assertIsDisplayed
++import androidx.compose.ui.test.onNodeWithTag
++import androidx.compose.ui.test.performClick
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.unit.Density
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.window.Dialog
++import androidx.compose.ui.window.DialogProperties
++import androidx.compose.ui.window.DialogWindowProvider
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import tachiyomi.presentation.core.components.material.NavigationOverlayScope
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34])
++class NavigationChromeSheetWindowTest {
++    @Test
++    fun `phone filter opens from its button in a real dialog and can reopen`() = assertWindowLifecycle(false)
++
++    @Test
++    fun `centered filter opens from its button in a real dialog and can reopen`() = assertWindowLifecycle(true)
++
++    private fun assertWindowLifecycle(tablet: Boolean) = runComposeUiTest {
++        lateinit var state: AdaptiveSheetState
++        var dismissed = 0
++        setContent {
++            CompositionLocalProvider(LocalDensity provides Density(1f)) {
++                var open by remember { mutableStateOf(false) }
++                Button(onClick = { open = true }, modifier = Modifier.testTag("open-filter")) { Text("筛选") }
++                if (open) {
++                    state = rememberAdaptiveSheetState()
++                    Dialog(
++                        onDismissRequest = state::dismiss,
++                        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
++                    ) {
++                        val window = (LocalView.current.parent as? DialogWindowProvider)?.window
++                        SideEffect {
++                            window?.setDimAmount(0f)
++                            window?.setWindowAnimations(0)
++                        }
++                        NavigationOverlayScope {
++                            AdaptiveSheet(tablet, true, {
++                                dismissed++
++                                open = false
++                            }, state = state) {
++                                Column(Modifier.fillMaxWidth().testTag("filter-panel")) {
++                                    Text("筛选面板")
++                                    Box(Modifier.fillMaxWidth().height(180.dp))
++                                    Button(onClick = state::dismiss, modifier = Modifier.testTag("close-filter")) { Text("关闭") }
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        repeat(3) { attempt ->
++            onNodeWithTag("open-filter").performClick()
++            waitForIdle()
++            onNodeWithTag("filter-panel", useUnmergedTree = true).assertIsDisplayed()
++            runOnIdle {
++                assertFalse(state.isClosing, "Opening must not be treated as a hidden/closed drag")
++                assertEquals(1f, state.visibleFraction, 0.01f)
++                assertEquals(attempt, dismissed)
++            }
++            onNodeWithTag("close-filter").performClick()
++            waitForIdle()
++            onNodeWithTag("filter-panel", useUnmergedTree = true).assertDoesNotExist()
++            runOnIdle { assertEquals(attempt + 1, dismissed) }
++        }
++    }
++}
