@@ -854,3 +854,15 @@ gh release list --repo Xun2202/anikku-harmony
 - Animeko没有本自定义胶囊占位/Toolbar分支；实查有独立Dialog系统栏处理和KMP collection/details Pager。其视口归整可用纯Compose方式独立评估（该helper不依赖JVM），NestedScrollable/窗口切换还需专项确认；不要将本项归整误写成因System.nanoTime不能移植。本轮不扩第三款构建。
 
 - 0092首轮编译差异修复：移除已不使用的菜单图标导入（Mihon core不带该依赖）；共用面板测试改位置参数，兼容Anikku原enableSwipeDismiss命名，横拖测试位移按视口缩放。首轮两款未进入APK组装/发布，保留全部几何与拖动断言；生产布局/归整策略不变。
+
+## 2026-11-10：共用面板进退、高低分页与批量操作栏
+
+- 用户反馈36/49筛选面板遮罩与弹出时机错位、高到低分页突然缩小、下拉关闭距离过大；追加书架长按后的底部操作栏过高且响应慢。0093与Mihon 0088共用核心与7项Compose回归，安装前不声称真机通过。
+- 根因：旧隐藏锚点用全窗口高度，短面板先在屏外走一段而原生dim已出现；嵌套列表release走不含距离/速度策略的旧settle路径；原Pager取可见页最大高度、外加animateContentSize只能在高页离场后缩小。新AdaptiveSheetState/Layout按实际面板高度移动，以可见比例同步遮罩，关闭完成才移除窗口；App Dialog关闭系统dim和窗口动画，返回/遮罩/内容按钮使用同一dismiss。平板保留居中淡入淡出，Anikku保留横屏600dp宽度和原API参数名，隐式关闭遵循App enableImplicitDismiss合同。
+- 直接拖面板与嵌套内容同用原生FlingBehavior距离/速度判断：位移门槛min(56dp,面板25%)，短快甩也可关闭，小幅慢拖复位；内容未触顶时不抢列表滚动。入口可被用户拖动中断；退场屏蔽旧操作。顶部安全区在宿主、底部系统/IME联合安全区只消费一次，沿用36/49面板贴底与NavigationOverlayScope隔离。
+- AdaptiveHeightPager在完整可用窗口约束下测自然高度，当前与目标页随手指位置插值并裁剪，不让测量依赖正在变化的可视高度；保留原保护惯性与宽度变化归整。TabbedDialog统一接入，覆盖筛选/排序/显示等所有调用。
+- SelectionActionBar替代书架和章节共用底部操作栏的分散动画：去掉书架显式300ms延迟，180ms过渡，紧凑窗口40dp按钮+上下各4dp，其它48dp+各8dp，大字号独立扩容。保留长按识别、确认标签、1秒触觉/确认含义和系统手势区；退场操作与关联菜单不接受点击。确认权重动画接原帧时间保护。
+- 复查全部AdaptiveSheet/TabbedDialog调用及别名；内容关闭回调转为动画请求，不把外部导航替换强行延后。补齐省略括号的原生LazyColumn/LazyRow保护（之前仅查带括号会漏），独立TrackerSearch/SettingsSearch主栏接共用尺寸。Anikku播放器MultiCardPanel的大标题与ExpandedControllerScreen双行标题有明确用途，保持专用设计；不是全部TopAppBar压成同一高度。
+- 新回归：手机/居中遮罩-进退-回调时序、80px慢拖关闭、40px快甩关闭、24px慢拖复位、高低双向持指分页中间高度、选择栏64ms内开始且最终48px（不再300ms等待）。已有导航/折叠/惯性用例继续作为必要检查，不改原FlingFrameClock内核或玻璃着色。
+- Animeko实查SubjectCommentsSheet/ViewAllSheet为Material3 ModalBottomSheet和独立KMP Dialog，不走本旧全窗口锚点/自绘dim/TabbedDialog最大页高路径，无相同自定义批量操作栏。纯Compose高度插值可按自身需求独立评估，不以JVM为由拒绝移植；其原生Sheet手势和窗口行为待专项复现，本轮不扩大第三款构建。
+- 共用UI规则固化在档案docs/rules/apk-shared-ui.md，并从档案与本仓AGENTS触发加载，后续对话可定位共用owner及有意差异。真机验证：面板开关遮罩同步、高低双向持指变化与小距离/快甩关闭、长按批量栏及时且紧凑；确认内容列表仍能正常滚动。

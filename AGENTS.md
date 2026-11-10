@@ -8,6 +8,8 @@
 2. 跨应用规则与用户偏好的事实源是 [Xun2202/project-archive](https://github.com/Xun2202/project-archive) 私有档案仓。在当前环境找到该 checkout（云端常见 `/workspace/project-archive`，路径不是约定常量），读取根 `AGENTS.md`、`memory/state/现状.md` 相关小节、`docs/rules/orchestration.md` 和 `docs/rules/harmony-cross-app.md`；发版时再读 `docs/runbooks/release-harmony.md`。
 3. 没有本地档案时，可用现有授权读取规范仓；不可访问时说明缺失，依照本入口和本仓文档继续可完成的工作，不声称已继承完整规则。同一会话已读且未变的内容直接复用。切换到独立源码仓或派子代理时，明确传递相关规则，不能假定跨仓自动继承。
 
+共享 UI/交互改动时，还需实际读取档案仓 `docs/rules/apk-shared-ui.md`。先定位共用组件及所有调用（含别名、`LazyColumn {}` 等省略参数形式），统一面板进退/关闭/安全区和批量栏，不仅修单个入口；播放器等有意差异明确记录。
+
 ## 默认执行方式
 
 - **速度与额度优先**：先做当前问题的最小改动与必要检查；输入未变的有效证据直接复用，不默认本地与 CI 双重全面验证、候选成功后重建同一产物，或扩展无关排查。纯文档修改不构建应用。

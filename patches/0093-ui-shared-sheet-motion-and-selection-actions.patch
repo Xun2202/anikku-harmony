@@ -1,0 +1,1550 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:57:11 +0000
+Subject: [PATCH] fix(ui): synchronize adaptive sheet motion and selection
+ actions
+
+Share adaptive sheet state, geometry and lifecycle with Mihon 0088. Measure hidden anchor from actual sheet height; draw the scrim from visible fraction and disable duplicate native dim/animations. Animate back, outside and content dismissals before removing the dialog. Use native distance/velocity fling policy consistently for direct and nested content drags, retain list scrolling, block retiring actions and retain tablet presentation and fork width adapters. Interpolate natural pager heights during held swipes in both directions. Remove the library action bar extra 300ms delay and use common compact button/padding metrics for book and chapter selection; retain confirmation and gesture insets. Cover remaining bare native LazyColumn/LazyRow calls with existing frame-time protection and align standalone tracker/settings search headers, retaining purpose-built player headers. Add seven Compose lifecycle, content distance/velocity, held-swipe height and immediate selection bar regressions. Device visual behavior remains pending user installation; existing fling clock kernel and capsule shaders are unchanged.
+---
+ .../browse/components/SourceFeedDialogs.kt    |   2 +-
+ .../presentation/components/AdaptiveSheet.kt  |  19 +-
+ .../presentation/components/TabbedDialog.kt   |  14 +-
+ .../manga/DuplicateMangaDialog.kt             |   2 +-
+ .../manga/components/MangaBottomActionMenu.kt |  29 +-
+ .../settings/screen/SettingsAdvancedScreen.kt |   3 +-
+ .../settings/screen/SettingsSearchScreen.kt   |   4 +-
+ .../settings/screen/SettingsSecurityScreen.kt |   3 +-
+ .../widget/MultiSelectListPreferenceWidget.kt |   3 +-
+ .../presentation/track/TrackerSearch.kt       |   4 +-
+ .../source/browse/SourceFilterDialog.kt       |   5 +-
+ .../cast/components/CastControlSheet.kt       |   4 +-
+ .../ui/player/cast/components/CastDialogs.kt  |   3 +-
+ .../components/ExpandedControllerScreen.kt    |   2 +-
+ .../components/sheets/GenericTracksSheet.kt   |   3 +-
+ .../core/components/AdaptiveHeightPager.kt    |  53 ++++
+ .../core/components/AdaptiveSheet.kt          | 257 +---------------
+ .../core/components/AdaptiveSheetLayout.kt    | 286 ++++++++++++++++++
+ .../core/components/AdaptiveSheetState.kt     |  34 +++
+ .../material/AnimatedNavigationRow.kt         |   4 +-
+ .../components/material/NavigationToolbar.kt  |   8 +-
+ .../components/material/SelectionActionBar.kt |  45 +++
+ .../NavigationChromeSheetMotionTest.kt        | 122 ++++++++
+ .../NavigationChromeSheetPagerHeightTest.kt   |  81 +++++
+ .../NavigationChromeSelectionBarTest.kt       |  63 ++++
+ 25 files changed, 757 insertions(+), 296 deletions(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveHeightPager.kt
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheetLayout.kt
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheetState.kt
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/SelectionActionBar.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSheetMotionTest.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSheetPagerHeightTest.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeSelectionBarTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/SourceFeedDialogs.kt b/app/src/main/java/eu/kanade/presentation/browse/components/SourceFeedDialogs.kt
+index e18d3eb20..74260fa79 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/SourceFeedDialogs.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/SourceFeedDialogs.kt
+@@ -104,7 +104,7 @@ fun FeedActionsDialog(
+     AdaptiveSheet(
+         modifier = modifier,
+         onDismissRequest = onDismissRequest,
+-    ) {
++    ) { onDismissRequest ->
+         Column(
+             modifier = Modifier
+                 .padding(
+diff --git a/app/src/main/java/eu/kanade/presentation/components/AdaptiveSheet.kt b/app/src/main/java/eu/kanade/presentation/components/AdaptiveSheet.kt
+index 694ed53c9..ee0992f22 100644
+--- a/app/src/main/java/eu/kanade/presentation/components/AdaptiveSheet.kt
++++ b/app/src/main/java/eu/kanade/presentation/components/AdaptiveSheet.kt
+@@ -6,16 +6,22 @@ import androidx.compose.animation.fadeIn
+ import androidx.compose.animation.fadeOut
+ import androidx.compose.animation.togetherWith
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.SideEffect
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalView
+ import androidx.compose.ui.window.Dialog
+ import androidx.compose.ui.window.DialogProperties
++import androidx.compose.ui.window.DialogWindowProvider
+ import cafe.adriel.voyager.core.annotation.InternalVoyagerApi
+ import cafe.adriel.voyager.core.lifecycle.DisposableEffectIgnoringConfiguration
+ import cafe.adriel.voyager.core.screen.Screen
+ import cafe.adriel.voyager.navigator.Navigator
+ import eu.kanade.presentation.util.ScreenTransition
+ import eu.kanade.presentation.util.isTabletUi
++import tachiyomi.presentation.core.components.LocalAdaptiveSheetDismissRequest
+ import tachiyomi.presentation.core.components.material.NavigationOverlayScope
++import tachiyomi.presentation.core.components.rememberAdaptiveSheetState
+ import tachiyomi.presentation.core.components.AdaptiveSheet as AdaptiveSheetImpl
+ 
+ @OptIn(InternalVoyagerApi::class)
+@@ -71,22 +77,29 @@ fun AdaptiveSheet(
+     onDismissRequest: () -> Unit,
+     modifier: Modifier = Modifier,
+     enableSwipeDismiss: Boolean = true,
+-    content: @Composable () -> Unit,
++    content: @Composable (dismiss: () -> Unit) -> Unit,
+ ) {
+     val isTabletUi = isTabletUi()
++    val state = rememberAdaptiveSheetState()
+ 
+     Dialog(
+-        onDismissRequest = onDismissRequest,
++        onDismissRequest = { if (enableImplicitDismiss) state.dismiss() },
+         properties = dialogProperties,
+     ) {
++        val window = (LocalView.current.parent as? DialogWindowProvider)?.window
++        SideEffect {
++            window?.setDimAmount(0f)
++            window?.setWindowAnimations(0)
++        }
+         NavigationOverlayScope {
+             AdaptiveSheetImpl(
+                 modifier = modifier,
++                state = state,
+                 isTabletUi = isTabletUi,
+                 enableSwipeDismiss = enableSwipeDismiss,
+                 onDismissRequest = onDismissRequest,
+             ) {
+-                content()
++                CompositionLocalProvider(LocalAdaptiveSheetDismissRequest provides state::dismiss) { content(state::dismiss) }
+             }
+         }
+     }
+diff --git a/app/src/main/java/eu/kanade/presentation/components/TabbedDialog.kt b/app/src/main/java/eu/kanade/presentation/components/TabbedDialog.kt
+index 602b54ec5..55092bb43 100644
+--- a/app/src/main/java/eu/kanade/presentation/components/TabbedDialog.kt
++++ b/app/src/main/java/eu/kanade/presentation/components/TabbedDialog.kt
+@@ -1,12 +1,10 @@
+ package eu.kanade.presentation.components
+ 
+-import androidx.compose.animation.animateContentSize
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.ColumnScope
+ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.wrapContentSize
+-import androidx.compose.foundation.pager.HorizontalPager
+ import androidx.compose.foundation.pager.PagerState
+ import androidx.compose.foundation.pager.rememberPagerState
+ import androidx.compose.material.icons.Icons
+@@ -23,16 +21,14 @@ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.runtime.setValue
+-import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.util.fastForEachIndexed
+ import kotlinx.collections.immutable.ImmutableList
+ import kotlinx.coroutines.launch
+ import tachiyomi.i18n.MR
++import tachiyomi.presentation.core.components.AdaptiveHeightPager
+ import tachiyomi.presentation.core.components.material.TabText
+-import tachiyomi.presentation.core.components.rememberFrameTimeProtectedPagerFlingBehavior
+-import tachiyomi.presentation.core.components.settlePagerOnWidthChange
+ import tachiyomi.presentation.core.components.withFrameTimeProtection
+ import tachiyomi.presentation.core.i18n.stringResource
+ 
+@@ -78,13 +74,7 @@ fun TabbedDialog(
+             }
+             HorizontalDivider()
+ 
+-            HorizontalPager(
+-                modifier = Modifier.settlePagerOnWidthChange(pagerState).animateContentSize(),
+-                state = pagerState,
+-                flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(pagerState),
+-                verticalAlignment = Alignment.Top,
+-                pageContent = { page -> content(page) },
+-            )
++            AdaptiveHeightPager(state = pagerState, content = content)
+         }
+     }
+ }
+diff --git a/app/src/main/java/eu/kanade/presentation/manga/DuplicateMangaDialog.kt b/app/src/main/java/eu/kanade/presentation/manga/DuplicateMangaDialog.kt
+index 87db729a7..20a9874af 100644
+--- a/app/src/main/java/eu/kanade/presentation/manga/DuplicateMangaDialog.kt
++++ b/app/src/main/java/eu/kanade/presentation/manga/DuplicateMangaDialog.kt
+@@ -116,7 +116,7 @@ fun DuplicateMangaDialog(
+             // KMK <--
+             onDismissRequest()
+         },
+-    ) {
++    ) { onDismissRequest ->
+         Column(
+             modifier = Modifier
+                 .padding(vertical = TabbedDialogPaddings.Vertical)
+diff --git a/app/src/main/java/eu/kanade/presentation/manga/components/MangaBottomActionMenu.kt b/app/src/main/java/eu/kanade/presentation/manga/components/MangaBottomActionMenu.kt
+index 842b571b8..b06e89046 100644
+--- a/app/src/main/java/eu/kanade/presentation/manga/components/MangaBottomActionMenu.kt
++++ b/app/src/main/java/eu/kanade/presentation/manga/components/MangaBottomActionMenu.kt
+@@ -76,6 +76,10 @@ import tachiyomi.i18n.aniyomi.AYMR
+ import tachiyomi.i18n.ank.AMR
+ import tachiyomi.i18n.kmk.KMR
+ import tachiyomi.i18n.sy.SYMR
++import tachiyomi.presentation.core.components.frameTimeProtectedFloatAsState
++import tachiyomi.presentation.core.components.material.SelectionActionBar
++import tachiyomi.presentation.core.components.material.selectionActionBarVerticalPadding
++import tachiyomi.presentation.core.components.material.selectionActionButtonSize
+ import tachiyomi.presentation.core.i18n.stringResource
+ import uy.kohesive.injekt.Injekt
+ import uy.kohesive.injekt.api.get
+@@ -99,11 +103,7 @@ fun MangaBottomActionMenu(
+     onExternalClicked: (() -> Unit)? = null,
+     onInternalClicked: (() -> Unit)? = null,
+ ) {
+-    AnimatedVisibility(
+-        visible = visible,
+-        enter = expandVertically(expandFrom = Alignment.Bottom),
+-        exit = shrinkVertically(shrinkTowards = Alignment.Bottom),
+-    ) {
++    SelectionActionBar(visible = visible) {
+         val scope = rememberCoroutineScope()
+         val playerPreferences: PlayerPreferences = Injekt.get()
+         Surface(
+@@ -130,7 +130,7 @@ fun MangaBottomActionMenu(
+                             .only(WindowInsetsSides.Bottom)
+                             .asPaddingValues(),
+                     )
+-                    .padding(horizontal = 8.dp, vertical = 12.dp),
++                    .padding(horizontal = 8.dp, vertical = selectionActionBarVerticalPadding()),
+             ) {
+                 if (onBookmarkClicked != null) {
+                     Button(
+@@ -275,8 +275,9 @@ internal fun RowScope.Button(
+     // KMK <--
+     content: (@Composable () -> Unit)? = null,
+ ) {
+-    val animatedWeight by animateFloatAsState(
++    val animatedWeight by frameTimeProtectedFloatAsState(
+         targetValue = if (toConfirm) 2f else 1f,
++        animationSpec = androidx.compose.animation.core.spring(),
+         label = "weight",
+     )
+     // KMK -->
+@@ -293,7 +294,7 @@ internal fun RowScope.Button(
+     // KMK <--
+     Box(
+         modifier = Modifier
+-            .size(48.dp)
++            .size(selectionActionButtonSize())
+             .weight(animatedWeight)
+             .combinedClickable(
+                 interactionSource = null,
+@@ -353,11 +354,7 @@ fun LibraryBottomActionMenu(
+     // SY <--
+     modifier: Modifier = Modifier,
+ ) {
+-    AnimatedVisibility(
+-        visible = visible,
+-        enter = expandVertically(animationSpec = tween(delayMillis = 300)),
+-        exit = shrinkVertically(animationSpec = tween()),
+-    ) {
++    SelectionActionBar(visible = visible) {
+         val scope = rememberCoroutineScope()
+         Surface(
+             modifier = modifier,
+@@ -382,7 +379,7 @@ fun LibraryBottomActionMenu(
+                         WindowInsets.navigationBars
+                             .only(WindowInsetsSides.Bottom),
+                     )
+-                    .padding(horizontal = 8.dp, vertical = 12.dp),
++                    .padding(horizontal = 8.dp, vertical = selectionActionBarVerticalPadding()),
+             ) {
+                 Button(
+                     title = stringResource(MR.strings.action_move_category),
+@@ -415,7 +412,7 @@ fun LibraryBottomActionMenu(
+                         onClick = { downloadExpanded = !downloadExpanded },
+                     ) {
+                         DownloadDropdownMenu(
+-                            expanded = downloadExpanded,
++                            expanded = visible && downloadExpanded,
+                             onDismissRequest = { downloadExpanded = false },
+                             onDownloadClicked = onDownloadClicked,
+                             offset = BottomBarMenuDpOffset,
+@@ -455,7 +452,7 @@ fun LibraryBottomActionMenu(
+                     onClick = { overflowMenuOpen = true },
+                 ) {
+                     DropdownMenu(
+-                        expanded = overflowMenuOpen,
++                        expanded = visible && overflowMenuOpen,
+                         onDismissRequest = { overflowMenuOpen = false },
+                         offset = BottomBarMenuDpOffset,
+                     ) {
+diff --git a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsAdvancedScreen.kt b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsAdvancedScreen.kt
+index 30fa0355d..70233c9d5 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsAdvancedScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsAdvancedScreen.kt
+@@ -88,6 +88,7 @@ import tachiyomi.i18n.ank.AMR
+ import tachiyomi.i18n.kmk.KMR
+ import tachiyomi.i18n.sy.SYMR
+ import tachiyomi.presentation.core.components.LabeledCheckbox
++import tachiyomi.presentation.core.components.rememberFrameTimeProtectedFlingBehavior
+ import tachiyomi.presentation.core.i18n.stringResource
+ import tachiyomi.presentation.core.util.collectAsState
+ import uy.kohesive.injekt.Injekt
+@@ -467,7 +468,7 @@ object SettingsAdvancedScreen : SearchableSettings {
+             onDismissRequest = onDismissRequest,
+             title = { Text(text = stringResource(AMR.strings.clean_up_downloaded_episodes)) },
+             text = {
+-                LazyColumn {
++                LazyColumn(flingBehavior = rememberFrameTimeProtectedFlingBehavior()) {
+                     options.forEachIndexed { index, option ->
+                         item {
+                             LabeledCheckbox(
+diff --git a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsSearchScreen.kt b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsSearchScreen.kt
+index de642929e..c7aa82e35 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsSearchScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsSearchScreen.kt
+@@ -24,7 +24,6 @@ import androidx.compose.material3.Icon
+ import androidx.compose.material3.IconButton
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Text
+-import androidx.compose.material3.TopAppBar
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+ import androidx.compose.runtime.LaunchedEffect
+@@ -58,6 +57,7 @@ import eu.kanade.presentation.more.settings.screen.player.PlayerSettingsSubtitle
+ import eu.kanade.presentation.util.Screen
+ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.aniyomi.AYMR
++import tachiyomi.presentation.core.components.material.NavigationTopAppBar
+ import tachiyomi.presentation.core.components.material.Scaffold
+ import tachiyomi.presentation.core.components.rememberFrameTimeProtectedFlingBehavior
+ import tachiyomi.presentation.core.i18n.stringResource
+@@ -99,7 +99,7 @@ class SettingsSearchScreen(
+         Scaffold(
+             topBar = {
+                 Column {
+-                    TopAppBar(
++                    NavigationTopAppBar(
+                         navigationIcon = {
+                             val canPop = remember { navigator.canPop }
+                             if (canPop) {
+diff --git a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsSecurityScreen.kt b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsSecurityScreen.kt
+index 4a3fcfbb0..afb43c827 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsSecurityScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsSecurityScreen.kt
+@@ -40,6 +40,7 @@ import tachiyomi.core.common.i18n.stringResource
+ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.ank.AMR
+ import tachiyomi.i18n.sy.SYMR
++import tachiyomi.presentation.core.components.rememberFrameTimeProtectedFlingBehavior
+ import tachiyomi.presentation.core.i18n.pluralStringResource
+ import tachiyomi.presentation.core.i18n.stringResource
+ import tachiyomi.presentation.core.util.collectAsState
+@@ -208,7 +209,7 @@ object SettingsSecurityScreen : SearchableSettings {
+             onDismissRequest = onDismissRequest,
+             title = { Text(text = stringResource(SYMR.strings.biometric_lock_days)) },
+             text = {
+-                LazyColumn {
++                LazyColumn(flingBehavior = rememberFrameTimeProtectedFlingBehavior()) {
+                     DayOption.entries.forEach { day ->
+                         item {
+                             val isSelected = selected.contains(day)
+diff --git a/app/src/main/java/eu/kanade/presentation/more/settings/widget/MultiSelectListPreferenceWidget.kt b/app/src/main/java/eu/kanade/presentation/more/settings/widget/MultiSelectListPreferenceWidget.kt
+index c9ac35184..a99b66ecb 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/settings/widget/MultiSelectListPreferenceWidget.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/settings/widget/MultiSelectListPreferenceWidget.kt
+@@ -14,6 +14,7 @@ import androidx.compose.ui.window.DialogProperties
+ import eu.kanade.presentation.more.settings.Preference
+ import tachiyomi.i18n.MR
+ import tachiyomi.presentation.core.components.LabeledCheckbox
++import tachiyomi.presentation.core.components.rememberFrameTimeProtectedFlingBehavior
+ import tachiyomi.presentation.core.i18n.stringResource
+ 
+ @Composable
+@@ -41,7 +42,7 @@ fun MultiSelectListPreferenceWidget(
+             onDismissRequest = { isDialogShown = false },
+             title = { Text(text = preference.title) },
+             text = {
+-                LazyColumn {
++                LazyColumn(flingBehavior = rememberFrameTimeProtectedFlingBehavior()) {
+                     preference.entries.forEach { current ->
+                         item {
+                             val isSelected = selected.contains(current.key)
+diff --git a/app/src/main/java/eu/kanade/presentation/track/TrackerSearch.kt b/app/src/main/java/eu/kanade/presentation/track/TrackerSearch.kt
+index 449452d52..0b22e0bdd 100644
+--- a/app/src/main/java/eu/kanade/presentation/track/TrackerSearch.kt
++++ b/app/src/main/java/eu/kanade/presentation/track/TrackerSearch.kt
+@@ -44,7 +44,6 @@ import androidx.compose.material3.IconButton
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Surface
+ import androidx.compose.material3.Text
+-import androidx.compose.material3.TopAppBar
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+@@ -80,6 +79,7 @@ import kotlinx.coroutines.launch
+ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.ank.AMR
+ import tachiyomi.presentation.core.components.ScrollbarLazyColumn
++import tachiyomi.presentation.core.components.material.NavigationTopAppBar
+ import tachiyomi.presentation.core.components.material.Scaffold
+ import tachiyomi.presentation.core.components.material.padding
+ import tachiyomi.presentation.core.i18n.stringResource
+@@ -110,7 +110,7 @@ fun TrackerSearch(
+     Scaffold(
+         topBar = {
+             Column {
+-                TopAppBar(
++                NavigationTopAppBar(
+                     navigationIcon = {
+                         IconButton(onClick = onDismissRequest) {
+                             Icon(
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/SourceFilterDialog.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/SourceFilterDialog.kt
+index 64694c680..3ae77c402 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/SourceFilterDialog.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/SourceFilterDialog.kt
+@@ -35,6 +35,7 @@ import tachiyomi.presentation.core.components.SelectItem
+ import tachiyomi.presentation.core.components.SortItem
+ import tachiyomi.presentation.core.components.TextItem
+ import tachiyomi.presentation.core.components.TriStateItem
++import tachiyomi.presentation.core.components.rememberFrameTimeProtectedFlingBehavior
+ import tachiyomi.presentation.core.i18n.stringResource
+ import eu.kanade.tachiyomi.animesource.model.AnimeFilter as Filter
+ 
+@@ -59,8 +60,8 @@ fun SourceFilterDialog(
+ ) {
+     val updateFilters = { onUpdate(filters) }
+ 
+-    AdaptiveSheet(onDismissRequest = onDismissRequest) {
+-        LazyColumn {
++    AdaptiveSheet(onDismissRequest = onDismissRequest) { onDismissRequest ->
++        LazyColumn(flingBehavior = rememberFrameTimeProtectedFlingBehavior()) {
+             stickyHeader(
+                 key = "$STICKY_HEADER_KEY_PREFIX-title",
+             ) {
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/cast/components/CastControlSheet.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/cast/components/CastControlSheet.kt
+index fcaf96a16..e76f8a27d 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/cast/components/CastControlSheet.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/cast/components/CastControlSheet.kt
+@@ -1,3 +1,4 @@
++
+ import android.annotation.SuppressLint
+ import androidx.compose.foundation.clickable
+ import androidx.compose.foundation.layout.Arrangement
+@@ -29,6 +30,7 @@ import eu.kanade.tachiyomi.ui.player.cast.components.CastPlayerDialog
+ import eu.kanade.tachiyomi.ui.player.cast.components.CastQualityDialog
+ import eu.kanade.tachiyomi.ui.player.cast.components.QueueItemRow
+ import tachiyomi.i18n.ank.AMR
++import tachiyomi.presentation.core.components.rememberFrameTimeProtectedFlingBehavior
+ import tachiyomi.presentation.core.i18n.stringResource
+ 
+ @SuppressLint("StateFlowValueCalledInComposition")
+@@ -75,7 +77,7 @@ fun CastControlSheet(
+                 style = MaterialTheme.typography.titleSmall,
+                 modifier = Modifier.padding(vertical = 8.dp),
+             )
+-            LazyColumn {
++            LazyColumn(flingBehavior = rememberFrameTimeProtectedFlingBehavior()) {
+                 items(queueItems) { item ->
+                     QueueItemRow(
+                         item = item,
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/cast/components/CastDialogs.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/cast/components/CastDialogs.kt
+index a53697a53..cde963af2 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/cast/components/CastDialogs.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/cast/components/CastDialogs.kt
+@@ -31,6 +31,7 @@ import eu.kanade.tachiyomi.ui.player.CastManager
+ import eu.kanade.tachiyomi.ui.player.PlayerViewModel
+ import eu.kanade.tachiyomi.ui.player.controls.components.sheets.HosterState
+ import tachiyomi.i18n.ank.AMR
++import tachiyomi.presentation.core.components.rememberFrameTimeProtectedFlingBehavior
+ import tachiyomi.presentation.core.i18n.stringResource
+ 
+ @SuppressLint("StateFlowValueCalledInComposition")
+@@ -45,7 +46,7 @@ fun CastQualityDialog(
+             onDismissRequest = onDismiss,
+             title = { Text(stringResource(AMR.strings.title_cast_quality)) },
+             text = {
+-                LazyColumn {
++                LazyColumn(flingBehavior = rememberFrameTimeProtectedFlingBehavior()) {
+                     val hosterState = viewModel.hosterState.value
+                         .filterIsInstance<HosterState.Ready>()
+                         .firstOrNull()
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/cast/components/ExpandedControllerScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/cast/components/ExpandedControllerScreen.kt
+index 9403d6947..e763c890a 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/cast/components/ExpandedControllerScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/cast/components/ExpandedControllerScreen.kt
+@@ -935,7 +935,7 @@ private fun TracksSelectionDialog(
+         onDismissRequest = onDismiss,
+         title = { Text(stringResource(AMR.strings.cast_tracks)) },
+         text = {
+-            LazyColumn {
++            LazyColumn(flingBehavior = rememberFrameTimeProtectedFlingBehavior()) {
+                 val subtitleTracks = tracks.filter { it.type == MediaTrack.TYPE_TEXT }
+                 val audioTracks = tracks.filter { it.type == MediaTrack.TYPE_AUDIO }
+ 
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/controls/components/sheets/GenericTracksSheet.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/controls/components/sheets/GenericTracksSheet.kt
+index 4762299dd..8abc6bb6c 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/controls/components/sheets/GenericTracksSheet.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/controls/components/sheets/GenericTracksSheet.kt
+@@ -43,6 +43,7 @@ import eu.kanade.tachiyomi.ui.player.VideoTrack
+ import kotlinx.collections.immutable.ImmutableList
+ import tachiyomi.i18n.aniyomi.AYMR
+ import tachiyomi.presentation.core.components.material.padding
++import tachiyomi.presentation.core.components.rememberFrameTimeProtectedFlingBehavior
+ import tachiyomi.presentation.core.i18n.stringResource
+ 
+ @Composable
+@@ -58,7 +59,7 @@ fun <T> GenericTracksSheet(
+     PlayerSheet(onDismissRequest, dismissEvent = dismissEvent) {
+         Column(modifier) {
+             header()
+-            LazyColumn {
++            LazyColumn(flingBehavior = rememberFrameTimeProtectedFlingBehavior()) {
+                 items(tracks) {
+                     track(it)
+                 }
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveHeightPager.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveHeightPager.kt
+new file mode 100644
+index 000000000..6aae4dd81
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveHeightPager.kt
+@@ -0,0 +1,53 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.BoxWithConstraints
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.pager.HorizontalPager
++import androidx.compose.foundation.pager.PagerState
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clipToBounds
++import androidx.compose.ui.layout.layout
++import androidx.compose.ui.unit.constrainHeight
++import kotlin.math.ceil
++import kotlin.math.floor
++import kotlin.math.roundToInt
++
++/** Measure page content against the available window, then interpolate its viewport with the swipe. */
++@Composable
++fun AdaptiveHeightPager(
++    state: PagerState,
++    modifier: Modifier = Modifier,
++    content: @Composable (Int) -> Unit,
++) {
++    BoxWithConstraints(modifier.fillMaxWidth()) {
++        // Layout-only cache: pages and the viewport read/write it in the same measure pass.
++        val heights = remember(constraints.maxWidth, constraints.maxHeight) { mutableMapOf<Int, Int>() }
++        HorizontalPager(
++            state = state,
++            verticalAlignment = Alignment.Top,
++            flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(state),
++            modifier = Modifier.settlePagerOnWidthChange(state).clipToBounds().layout { measurable, constraints ->
++                val page = measurable.measure(constraints.copy(minHeight = 0))
++                val position = (state.currentPage + state.currentPageOffsetFraction).coerceIn(0f, (state.pageCount - 1).coerceAtLeast(0).toFloat())
++                val before = floor(position).toInt()
++                val after = ceil(position).toInt()
++                val h0 = heights[before] ?: heights[after] ?: page.height
++                val h1 = heights[after] ?: h0
++                val height = constraints.constrainHeight((h0 + (h1 - h0) * (position - before)).roundToInt())
++                layout(page.width, height) { page.placeRelative(0, 0) }
++            },
++        ) { page ->
++            Box(
++                Modifier.fillMaxWidth().layout { measurable, constraints ->
++                    val item = measurable.measure(constraints.copy(minHeight = 0))
++                    heights[page] = item.height
++                    layout(item.width, item.height) { item.placeRelative(0, 0) }
++                },
++            ) { content(page) }
++        }
++    }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheet.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheet.kt
+index 8d9696d45..7e27d191b 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheet.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheet.kt
+@@ -1,60 +1,14 @@
+ package tachiyomi.presentation.core.components
+ 
+-import android.content.res.Configuration.ORIENTATION_LANDSCAPE
+-import androidx.activity.compose.BackHandler
+-import androidx.compose.animation.core.animateFloatAsState
+-import androidx.compose.animation.core.tween
+-import androidx.compose.animation.rememberSplineBasedDecay
+-import androidx.compose.foundation.clickable
+-import androidx.compose.foundation.gestures.AnchoredDraggableState
+-import androidx.compose.foundation.gestures.DraggableAnchors
+-import androidx.compose.foundation.gestures.Orientation
+-import androidx.compose.foundation.gestures.anchoredDraggable
+-import androidx.compose.foundation.gestures.animateTo
+-import androidx.compose.foundation.layout.Box
++import android.content.res.Configuration
+ import androidx.compose.foundation.layout.WindowInsets
+-import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.ime
+ import androidx.compose.foundation.layout.navigationBars
+-import androidx.compose.foundation.layout.offset
+-import androidx.compose.foundation.layout.padding
+-import androidx.compose.foundation.layout.requiredWidthIn
+-import androidx.compose.foundation.layout.statusBarsPadding
+-import androidx.compose.foundation.layout.systemBarsPadding
+ import androidx.compose.foundation.layout.union
+-import androidx.compose.foundation.layout.widthIn
+-import androidx.compose.foundation.layout.windowInsetsPadding
+-import androidx.compose.foundation.shape.CornerSize
+-import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Surface
+ import androidx.compose.runtime.Composable
+-import androidx.compose.runtime.LaunchedEffect
+-import androidx.compose.runtime.getValue
+-import androidx.compose.runtime.mutableFloatStateOf
+-import androidx.compose.runtime.remember
+-import androidx.compose.runtime.rememberCoroutineScope
+-import androidx.compose.runtime.setValue
+-import androidx.compose.runtime.snapshotFlow
+-import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+-import androidx.compose.ui.draw.alpha
+-import androidx.compose.ui.geometry.Offset
+-import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+-import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+-import androidx.compose.ui.input.nestedscroll.nestedScroll
+-import androidx.compose.ui.layout.onSizeChanged
+ import androidx.compose.ui.platform.LocalConfiguration
+-import androidx.compose.ui.platform.LocalDensity
+-import androidx.compose.ui.unit.IntOffset
+-import androidx.compose.ui.unit.Velocity
+ import androidx.compose.ui.unit.dp
+-import kotlinx.coroutines.flow.collectLatest
+-import kotlinx.coroutines.flow.drop
+-import kotlinx.coroutines.flow.filter
+-import kotlinx.coroutines.launch
+-import kotlin.math.roundToInt
+-
+-private val sheetAnimationSpec = tween<Float>(durationMillis = 350)
+ 
+ @Composable
+ fun AdaptiveSheet(
+@@ -63,202 +17,15 @@ fun AdaptiveSheet(
+     onDismissRequest: () -> Unit,
+     modifier: Modifier = Modifier,
+     contentWindowInsets: WindowInsets = WindowInsets.navigationBars.union(WindowInsets.ime),
++    state: AdaptiveSheetState = rememberAdaptiveSheetState(),
+     content: @Composable () -> Unit,
+-) {
+-    val density = LocalDensity.current
+-    val scope = rememberCoroutineScope()
+-    val maxWidth = if (LocalConfiguration.current.orientation == ORIENTATION_LANDSCAPE) {
+-        600.dp
+-    } else {
+-        460.dp
+-    }
+-
+-    if (isTabletUi) {
+-        var targetAlpha by remember { mutableFloatStateOf(0f) }
+-        val alpha by animateFloatAsState(
+-            targetValue = targetAlpha,
+-            animationSpec = sheetAnimationSpec,
+-            label = "alpha",
+-        )
+-        val internalOnDismissRequest: () -> Unit = {
+-            scope.launch {
+-                targetAlpha = 0f
+-                onDismissRequest()
+-            }
+-        }
+-        Box(
+-            modifier = Modifier
+-                .clickable(
+-                    interactionSource = null,
+-                    indication = null,
+-                    onClick = internalOnDismissRequest,
+-                )
+-                .fillMaxSize()
+-                .alpha(alpha),
+-            contentAlignment = Alignment.Center,
+-        ) {
+-            Surface(
+-                modifier = Modifier
+-                    .requiredWidthIn(max = maxWidth)
+-                    .clickable(
+-                        interactionSource = null,
+-                        indication = null,
+-                        onClick = {},
+-                    )
+-                    .systemBarsPadding()
+-                    .padding(vertical = 16.dp)
+-                    .then(modifier),
+-                shape = MaterialTheme.shapes.extraLarge,
+-                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+-                content = {
+-                    BackHandler(enabled = alpha > 0f, onBack = internalOnDismissRequest)
+-                    content()
+-                },
+-            )
+-
+-            LaunchedEffect(Unit) {
+-                targetAlpha = 1f
+-            }
+-        }
+-    } else {
+-        val decayAnimationSpec = rememberSplineBasedDecay<Float>()
+-        val anchoredDraggableState = remember {
+-            AnchoredDraggableState(
+-                initialValue = 1,
+-                positionalThreshold = { with(density) { 56.dp.toPx() } },
+-                velocityThreshold = { with(density) { 125.dp.toPx() } },
+-                snapAnimationSpec = sheetAnimationSpec,
+-                decayAnimationSpec = decayAnimationSpec,
+-            )
+-        }
+-        val internalOnDismissRequest = {
+-            if (anchoredDraggableState.settledValue == 0) {
+-                scope.launch { anchoredDraggableState.animateTo(1) }
+-            }
+-        }
+-        Box(
+-            modifier = Modifier
+-                .clickable(
+-                    interactionSource = null,
+-                    indication = null,
+-                    onClick = internalOnDismissRequest,
+-                )
+-                .fillMaxSize()
+-                .onSizeChanged {
+-                    val anchors = DraggableAnchors {
+-                        0 at 0f
+-                        1 at it.height.toFloat()
+-                    }
+-                    anchoredDraggableState.updateAnchors(anchors)
+-                },
+-            contentAlignment = Alignment.BottomCenter,
+-        ) {
+-            Surface(
+-                modifier = Modifier
+-                    .widthIn(max = maxWidth)
+-                    .clickable(
+-                        interactionSource = null,
+-                        indication = null,
+-                        onClick = {},
+-                    )
+-                    .then(
+-                        if (enableSwipeDismiss) {
+-                            Modifier.nestedScroll(
+-                                remember(anchoredDraggableState) {
+-                                    anchoredDraggableState.preUpPostDownNestedScrollConnection(
+-                                        onFling = { scope.launch { anchoredDraggableState.settle(it) } },
+-                                    )
+-                                },
+-                            )
+-                        } else {
+-                            Modifier
+-                        },
+-                    )
+-                    .then(modifier)
+-                    .offset {
+-                        IntOffset(
+-                            0,
+-                            anchoredDraggableState.offset
+-                                .takeIf { it.isFinite() }
+-                                ?.roundToInt()
+-                                ?: 0,
+-                        )
+-                    }
+-                    .anchoredDraggable(
+-                        state = anchoredDraggableState,
+-                        orientation = Orientation.Vertical,
+-                        enabled = enableSwipeDismiss,
+-                    )
+-                    .statusBarsPadding(),
+-                shape = MaterialTheme.shapes.extraLarge.copy(bottomStart = CornerSize(0.dp), bottomEnd = CornerSize(0.dp)),
+-                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+-                content = {
+-                    BackHandler(
+-                        enabled = anchoredDraggableState.targetValue == 0,
+-                        onBack = internalOnDismissRequest,
+-                    )
+-                    Box(Modifier.windowInsetsPadding(contentWindowInsets)) { content() }
+-                },
+-            )
+-
+-            LaunchedEffect(anchoredDraggableState) {
+-                scope.launch { anchoredDraggableState.animateTo(0) }
+-                snapshotFlow { anchoredDraggableState.settledValue }
+-                    .drop(1)
+-                    .filter { it == 1 }
+-                    .collectLatest {
+-                        onDismissRequest()
+-                    }
+-            }
+-        }
+-    }
+-}
+-
+-private fun <T> AnchoredDraggableState<T>.preUpPostDownNestedScrollConnection(
+-    onFling: (velocity: Float) -> Unit,
+-) = object : NestedScrollConnection {
+-    override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+-        val delta = available.toFloat()
+-        return if (delta < 0 && source == NestedScrollSource.UserInput) {
+-            dispatchRawDelta(delta).toOffset()
+-        } else {
+-            Offset.Zero
+-        }
+-    }
+-
+-    override fun onPostScroll(
+-        consumed: Offset,
+-        available: Offset,
+-        source: NestedScrollSource,
+-    ): Offset {
+-        return if (source == NestedScrollSource.UserInput) {
+-            dispatchRawDelta(available.toFloat()).toOffset()
+-        } else {
+-            Offset.Zero
+-        }
+-    }
+-
+-    override suspend fun onPreFling(available: Velocity): Velocity {
+-        val toFling = available.toFloat()
+-        return if (toFling < 0 && offset > anchors.minPosition()) {
+-            onFling(toFling)
+-            // since we go to the anchor with tween settling, consume all for the best UX
+-            available
+-        } else {
+-            Velocity.Zero
+-        }
+-    }
+-
+-    override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+-        onFling(available.toFloat())
+-        return available
+-    }
+-
+-    private fun Float.toOffset(): Offset = Offset(0f, this)
+-
+-    @JvmName("velocityToFloat")
+-    private fun Velocity.toFloat() = this.y
+-
+-    @JvmName("offsetToFloat")
+-    private fun Offset.toFloat(): Float = this.y
+-}
++) = AdaptiveSheetLayout(
++    isTabletUi = isTabletUi,
++    allowImplicitDismiss = enableSwipeDismiss,
++    onDismissRequest = onDismissRequest,
++    modifier = modifier,
++    contentWindowInsets = contentWindowInsets,
++    maxWidth = if (LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE) 600.dp else 460.dp,
++    state = state,
++    content = content,
++)
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheetLayout.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheetLayout.kt
+new file mode 100644
+index 000000000..561844e7d
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheetLayout.kt
+@@ -0,0 +1,286 @@
++@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
++
++package tachiyomi.presentation.core.components
++
++import androidx.activity.compose.BackHandler
++import androidx.compose.animation.core.Animatable
++import androidx.compose.animation.core.FastOutSlowInEasing
++import androidx.compose.animation.core.animate
++import androidx.compose.animation.core.tween
++import androidx.compose.foundation.MutatePriority
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.gestures.AnchoredDraggableDefaults
++import androidx.compose.foundation.gestures.AnchoredDraggableState
++import androidx.compose.foundation.gestures.DraggableAnchors
++import androidx.compose.foundation.gestures.FlingBehavior
++import androidx.compose.foundation.gestures.Orientation
++import androidx.compose.foundation.gestures.ScrollScope
++import androidx.compose.foundation.gestures.anchoredDraggable
++import androidx.compose.foundation.gestures.animateTo
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.offset
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.statusBarsPadding
++import androidx.compose.foundation.layout.systemBarsPadding
++import androidx.compose.foundation.layout.widthIn
++import androidx.compose.foundation.layout.windowInsetsPadding
++import androidx.compose.foundation.shape.CornerSize
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Surface
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.SideEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.rememberUpdatedState
++import androidx.compose.runtime.setValue
++import androidx.compose.runtime.snapshotFlow
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.drawBehind
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.graphics.graphicsLayer
++import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
++import androidx.compose.ui.input.nestedscroll.NestedScrollSource
++import androidx.compose.ui.input.nestedscroll.nestedScroll
++import androidx.compose.ui.input.pointer.PointerEventPass
++import androidx.compose.ui.input.pointer.pointerInput
++import androidx.compose.ui.layout.onSizeChanged
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.unit.Dp
++import androidx.compose.ui.unit.IntOffset
++import androidx.compose.ui.unit.Velocity
++import androidx.compose.ui.unit.dp
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.CoroutineStart
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.awaitCancellation
++import kotlinx.coroutines.cancelAndJoin
++import kotlinx.coroutines.flow.collect
++import kotlinx.coroutines.flow.filter
++import kotlinx.coroutines.launch
++import kotlin.math.abs
++import kotlin.math.roundToInt
++
++private const val SHEET_EXPANDED = 0
++private const val SHEET_HIDDEN = 1
++private val SheetMotion = tween<Float>(260, easing = FastOutSlowInEasing)
++
++@Composable
++internal fun AdaptiveSheetLayout(
++    isTabletUi: Boolean,
++    allowImplicitDismiss: Boolean,
++    onDismissRequest: () -> Unit,
++    modifier: Modifier,
++    contentWindowInsets: WindowInsets,
++    maxWidth: Dp,
++    state: AdaptiveSheetState,
++    content: @Composable () -> Unit,
++) {
++    val dismiss by rememberUpdatedState(onDismissRequest)
++    fun complete() {
++        if (!state.completed) {
++            state.completed = true
++            dismiss()
++        }
++    }
++    val scrim = MaterialTheme.colorScheme.scrim
++    BackHandler(enabled = allowImplicitDismiss && !state.isClosing, onBack = state::dismiss)
++    DisposableEffect(state) { onDispose { state.fractionReader = { 0f } } }
++
++    if (isTabletUi) {
++        val alpha = remember { Animatable(if (state.hasPresented) 1f else 0f) }
++        val reader = remember(alpha) { { alpha.value } }
++        SideEffect { state.fractionReader = reader }
++        LaunchedEffect(state, state.isClosing) {
++            state.hasPresented = true
++            val target = if (state.isClosing) 0f else 1f
++            if (abs(alpha.value - target) > 0.001f) withFrameTimeProtection { alpha.animateTo(target, SheetMotion) }
++            if (state.isClosing) complete()
++        }
++        Box(
++            Modifier.fillMaxSize()
++                .drawBehind { drawRect(scrim.copy(alpha = 0.32f * alpha.value)) }
++                .clickable(interactionSource = null, indication = null, enabled = allowImplicitDismiss && !state.isClosing, onClick = state::dismiss),
++            contentAlignment = Alignment.Center,
++        ) {
++            Surface(
++                modifier = Modifier.widthIn(max = maxWidth).systemBarsPadding().padding(vertical = 16.dp)
++                    .then(modifier).blockClosingInput(state.isClosing).graphicsLayer { this.alpha = alpha.value }
++                    .clickable(interactionSource = null, indication = null, onClick = {}),
++                shape = MaterialTheme.shapes.extraLarge,
++                color = MaterialTheme.colorScheme.surfaceContainerHigh,
++                content = content,
++            )
++        }
++        return
++    }
++
++    val density = LocalDensity.current
++    val scope = rememberCoroutineScope()
++    val drag = remember { AnchoredDraggableState(if (state.hasPresented) SHEET_EXPANDED else SHEET_HIDDEN) }
++    var height by remember { mutableIntStateOf(0) }
++    var entering by remember { mutableStateOf(!state.hasPresented) }
++    val reader = remember(drag) { { sheetVisibleFraction(drag.offset, height) } }
++    SideEffect { state.fractionReader = reader }
++    val threshold = remember(density) { { distance: Float -> minOf(with(density) { 56.dp.toPx() }, distance * 0.25f) } }
++    val fling = rememberFrameTimeProtectedFlingBehavior(
++        AnchoredDraggableDefaults.flingBehavior(drag, positionalThreshold = threshold, animationSpec = SheetMotion),
++    )
++    val nested = remember(drag, fling, scope) { SheetNestedScroll(drag, fling, scope) { allowImplicitDismiss && !state.isClosing } }
++    // The flag can change inside a navigation sheet without replacing its scroll connection.
++    SideEffect { nested.allowed = { allowImplicitDismiss && !state.isClosing } }
++    DisposableEffect(nested) { onDispose { nested.cancel() } }
++
++    LaunchedEffect(drag, height > 0, state.isClosing) {
++        if (height == 0) {
++            if (state.isClosing) complete()
++            return@LaunchedEffect
++        }
++        state.hasPresented = true
++        if (state.isClosing) {
++            withFrameTimeProtection {
++                drag.anchoredDrag(targetValue = SHEET_HIDDEN, dragPriority = MutatePriority.PreventUserInput) { anchors, target ->
++                    val end = anchors.positionOf(target)
++                    if (end.isFinite()) {
++                        val start = drag.offset.takeIf { it.isFinite() } ?: end
++                        if (start < end - 0.5f) {
++                            animate(start, end, drag.lastVelocity, SheetMotion) { value, velocity -> dragTo(value, velocity) }
++                        } else {
++                            dragTo(end)
++                        }
++                    }
++                }
++            }
++            complete()
++        } else {
++            try {
++                withFrameTimeProtection { drag.animateTo(SHEET_EXPANDED, SheetMotion) }
++            } finally {
++                entering = false
++            }
++        }
++    }
++    LaunchedEffect(drag, state) {
++        snapshotFlow { !entering && height > 0 && drag.offset.isFinite() && drag.offset >= height - 0.5f }
++            .filter { it }.collect { state.dismiss() }
++    }
++    Box(
++        Modifier.fillMaxSize()
++            .drawBehind { drawRect(scrim.copy(alpha = 0.32f * sheetVisibleFraction(drag.offset, height))) }
++            .clickable(interactionSource = null, indication = null, enabled = allowImplicitDismiss && !state.isClosing, onClick = state::dismiss)
++            .statusBarsPadding(),
++        contentAlignment = Alignment.BottomCenter,
++    ) {
++        Surface(
++            modifier = Modifier.widthIn(max = maxWidth)
++                .nestedScroll(nested)
++                .then(modifier)
++                .blockClosingInput(state.isClosing)
++                .onSizeChanged {
++                    height = it.height
++                    if (height > 0) {
++                        drag.updateAnchors(
++                            DraggableAnchors {
++                                SHEET_EXPANDED at 0f
++                                SHEET_HIDDEN at height.toFloat()
++                            },
++                        )
++                    }
++                }
++                .offset { IntOffset(0, drag.offset.takeIf { it.isFinite() }?.roundToInt() ?: height) }
++                .graphicsLayer { alpha = if (height > 0 && drag.offset.isFinite()) 1f else 0f }
++                .anchoredDraggable(drag, Orientation.Vertical, enabled = allowImplicitDismiss && !state.isClosing, flingBehavior = fling)
++                .clickable(interactionSource = null, indication = null, onClick = {}),
++            shape = MaterialTheme.shapes.extraLarge.copy(bottomStart = CornerSize(0.dp), bottomEnd = CornerSize(0.dp)),
++            color = MaterialTheme.colorScheme.surfaceContainerHigh,
++        ) {
++            Box(Modifier.windowInsetsPadding(contentWindowInsets)) { content() }
++        }
++    }
++}
++
++/** Nested content and direct sheet drags use the very same native distance/velocity decision. */
++private class SheetNestedScroll(
++    private val state: AnchoredDraggableState<Int>,
++    private val fling: FlingBehavior,
++    private val scope: CoroutineScope,
++    var allowed: () -> Boolean,
++) : NestedScrollConnection {
++    private var dragJob: Job? = null
++    private var moved = false
++
++    fun cancel() {
++        dragJob?.cancel()
++        dragJob = null
++    }
++
++    private fun consume(delta: Float): Float {
++        if (!allowed()) return 0f
++        val old = state.offset
++        if (!old.isFinite()) return 0f
++        val end = (old + delta).coerceIn(state.anchors.minPosition(), state.anchors.maxPosition())
++        if (end == old) return 0f
++        if (dragJob?.isActive != true) {
++            dragJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
++                state.anchoredDrag(dragPriority = MutatePriority.UserInput) { awaitCancellation() }
++            }
++        }
++        moved = true
++        return state.dispatchRawDelta(delta)
++    }
++
++    override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset =
++        if (source == NestedScrollSource.UserInput && available.y < 0) Offset(0f, consume(available.y)) else Offset.Zero
++
++    override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset =
++        if (source == NestedScrollSource.UserInput) Offset(0f, consume(available.y)) else Offset.Zero
++
++    private suspend fun settle(velocity: Float) {
++        dragJob?.cancelAndJoin()
++        dragJob = null
++        if (!allowed()) return
++        state.anchoredDrag {
++            val scroll = object : ScrollScope {
++                override fun scrollBy(pixels: Float): Float {
++                    val old = state.offset
++                    val next = (old + pixels).coerceIn(state.anchors.minPosition(), state.anchors.maxPosition())
++                    dragTo(next)
++                    return next - old
++                }
++            }
++            with(fling) { scroll.performFling(velocity) }
++        }
++        moved = false
++    }
++
++    override suspend fun onPreFling(available: Velocity): Velocity =
++        if (allowed() && available.y < 0f && state.offset > 0f) {
++            settle(available.y)
++            available
++        } else {
++            Velocity.Zero
++        }
++
++    override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity =
++        if (allowed() && (moved || state.offset > 0.5f)) {
++            settle(available.y)
++            available
++        } else {
++            Velocity.Zero
++        }
++}
++
++private fun Modifier.blockClosingInput(closing: Boolean): Modifier = pointerInput(closing) {
++    if (closing) {
++        awaitPointerEventScope {
++            while (true) awaitPointerEvent(PointerEventPass.Initial).changes.forEach { it.consume() }
++        }
++    }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheetState.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheetState.kt
+new file mode 100644
+index 000000000..0e4f22cbb
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/AdaptiveSheetState.kt
+@@ -0,0 +1,34 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.Stable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.runtime.staticCompositionLocalOf
++
++/** One dismissal path for the dialog window, backdrop, back button and content actions. */
++@Stable
++class AdaptiveSheetState internal constructor() {
++    internal var closing by mutableStateOf(false)
++        private set
++    internal var hasPresented = false
++    internal var completed = false
++    internal var fractionReader: () -> Float by mutableStateOf({ 0f })
++
++    val isClosing: Boolean get() = closing
++    val visibleFraction: Float get() = fractionReader().coerceIn(0f, 1f)
++
++    fun dismiss() {
++        closing = true
++    }
++}
++
++@Composable
++fun rememberAdaptiveSheetState(): AdaptiveSheetState = remember { AdaptiveSheetState() }
++
++internal fun sheetVisibleFraction(offset: Float, height: Int): Float =
++    if (height <= 0 || !offset.isFinite()) 0f else (1f - offset / height).coerceIn(0f, 1f)
++
++val LocalAdaptiveSheetDismissRequest = staticCompositionLocalOf<(() -> Unit)?> { null }
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/AnimatedNavigationRow.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/AnimatedNavigationRow.kt
+index 725a3cc6a..957b4a97b 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/AnimatedNavigationRow.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/AnimatedNavigationRow.kt
+@@ -1,5 +1,6 @@
+ package tachiyomi.presentation.core.components.material
+ 
++import androidx.compose.animation.core.AnimationSpec
+ import androidx.compose.animation.core.FastOutSlowInEasing
+ import androidx.compose.animation.core.tween
+ import androidx.compose.runtime.Composable
+@@ -16,11 +17,12 @@ import kotlin.math.roundToInt
+ fun AnimatedNavigationRow(
+     visible: Boolean,
+     modifier: Modifier = Modifier,
++    animationSpec: AnimationSpec<Float> = tween(220, easing = FastOutSlowInEasing),
+     content: @Composable () -> Unit,
+ ) {
+     val fraction = frameTimeProtectedFloatAsState(
+         targetValue = if (visible) 1f else 0f,
+-        animationSpec = tween(220, easing = FastOutSlowInEasing),
++        animationSpec = animationSpec,
+         label = "navigationExtraRow",
+     )
+     if (!visible && fraction.value == 0f) return
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationToolbar.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationToolbar.kt
+index 08cf8a337..db8352f3c 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationToolbar.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationToolbar.kt
+@@ -16,10 +16,10 @@ import androidx.compose.ui.unit.dp
+ @Composable
+ fun NavigationTopAppBar(
+     title: @Composable () -> Unit,
+-    navigationIcon: @Composable () -> Unit,
+-    actions: @Composable RowScope.() -> Unit,
+-    colors: TopAppBarColors,
+-    scrollBehavior: TopAppBarScrollBehavior?,
++    navigationIcon: @Composable () -> Unit = {},
++    actions: @Composable RowScope.() -> Unit = {},
++    colors: TopAppBarColors = TopAppBarDefaults.topAppBarColors(),
++    scrollBehavior: TopAppBarScrollBehavior? = null,
+     modifier: Modifier = Modifier,
+     windowInsets: WindowInsets = TopAppBarDefaults.windowInsets,
+ ) {
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/SelectionActionBar.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/SelectionActionBar.kt
+new file mode 100644
+index 000000000..0020f926f
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/SelectionActionBar.kt
+@@ -0,0 +1,45 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.animation.core.LinearOutSlowInEasing
++import androidx.compose.animation.core.tween
++import androidx.compose.foundation.layout.Box
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.input.pointer.PointerEventPass
++import androidx.compose.ui.input.pointer.pointerInput
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.unit.Dp
++import androidx.compose.ui.unit.dp
++
++@Composable
++fun selectionActionButtonSize(): Dp {
++    val scale = LocalDensity.current.fontScale
++    return when {
++        scale > 1.3f -> (24f + 16f * scale).dp.coerceAtLeast(56.dp)
++        isCompactBrowsingWindow() -> 40.dp
++        else -> 48.dp
++    }
++}
++
++@Composable
++fun selectionActionBarVerticalPadding(): Dp = if (isCompactBrowsingWindow()) 4.dp else 8.dp
++
++/** No long-press delay; retiring actions stop accepting input as soon as selection ends. */
++@Composable
++fun SelectionActionBar(visible: Boolean, modifier: Modifier = Modifier, content: @Composable () -> Unit) {
++    AnimatedNavigationRow(
++        visible = visible,
++        modifier = modifier,
++        animationSpec = tween(180, easing = LinearOutSlowInEasing),
++    ) {
++        Box(
++            Modifier.pointerInput(visible) {
++                if (!visible) {
++                    awaitPointerEventScope {
++                        while (true) awaitPointerEvent(PointerEventPass.Initial).changes.forEach { it.consume() }
++                    }
++                }
++            },
++        ) { content() }
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSheetMotionTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSheetMotionTest.kt
+new file mode 100644
+index 000000000..e3cabf6d8
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSheetMotionTest.kt
+@@ -0,0 +1,122 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.requiredSize
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.onNodeWithTag
++import androidx.compose.ui.test.performTouchInput
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.unit.Density
++import androidx.compose.ui.unit.dp
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34])
++class NavigationChromeSheetMotionTest {
++    @Test
++    fun `phone dismissal waits for the same motion that drives its scrim`() = assertLifecycle(false)
++
++    @Test
++    fun `centered dismissal also waits for its fade instead of removing the window immediately`() = assertLifecycle(true)
++
++    private fun assertLifecycle(tablet: Boolean) = runComposeUiTest {
++        val state = AdaptiveSheetState()
++        var dismissed = 0
++        mainClock.autoAdvance = false
++        setContent {
++            CompositionLocalProvider(LocalDensity provides Density(1f)) {
++                Box(Modifier.requiredSize(400.dp, 600.dp)) {
++                    AdaptiveSheet(tablet, true, { dismissed++ }, contentWindowInsets = WindowInsets(0), state = state) {
++                        Box(Modifier.fillMaxWidth().height(240.dp))
++                    }
++                }
++            }
++        }
++        mainClock.advanceTimeByFrame()
++        waitForIdle()
++        mainClock.advanceTimeBy(96)
++        runOnIdle {
++            assertTrue(state.visibleFraction in 0.01f..0.99f, "enter=${state.visibleFraction}")
++            assertEquals(0, dismissed)
++        }
++        mainClock.advanceTimeBy(500)
++        runOnIdle {
++            assertEquals(1f, state.visibleFraction, 0.01f)
++            state.dismiss()
++        }
++        mainClock.advanceTimeByFrame()
++        waitForIdle()
++        mainClock.advanceTimeBy(96)
++        runOnIdle {
++            assertTrue(state.visibleFraction in 0.01f..0.99f, "exit=${state.visibleFraction}")
++            assertEquals(0, dismissed)
++        }
++        mainClock.advanceTimeBy(500)
++        runOnIdle {
++            assertEquals(0f, state.visibleFraction, 0.01f)
++            assertEquals(1, dismissed)
++            state.dismiss()
++        }
++        mainClock.advanceTimeBy(500)
++        runOnIdle { assertEquals(1, dismissed) }
++    }
++
++    @Test
++    fun `content drag closes after a modest distance even without release velocity`() = assertContentDrag(80f, false, true)
++
++    @Test
++    fun `content short fast flick closes using velocity`() = assertContentDrag(40f, true, true)
++
++    @Test
++    fun `content small slow movement restores the sheet`() = assertContentDrag(24f, false, false)
++
++    private fun assertContentDrag(distance: Float, fast: Boolean, closes: Boolean) = runComposeUiTest {
++        val state = AdaptiveSheetState()
++        var dismissed = 0
++        setContent {
++            CompositionLocalProvider(LocalDensity provides Density(1f)) {
++                Box(Modifier.requiredSize(400.dp, 600.dp)) {
++                    AdaptiveSheet(false, true, { dismissed++ }, contentWindowInsets = WindowInsets(0), state = state) {
++                        Column(
++                            Modifier.fillMaxWidth().testTag("body")
++                                .verticalScroll(rememberScrollState(), flingBehavior = rememberFrameTimeProtectedFlingBehavior()),
++                        ) { Box(Modifier.fillMaxWidth().height(1400.dp)) }
++                    }
++                }
++            }
++        }
++        waitForIdle()
++        onNodeWithTag("body").performTouchInput {
++            down(center)
++            if (fast) {
++                repeat(4) { moveBy(Offset(0f, distance / 4), delayMillis = 16) }
++            } else {
++                moveBy(Offset(0f, distance))
++                advanceEventTime(250)
++            }
++            up()
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(if (closes) 1 else 0, dismissed, "distance=$distance fast=$fast fraction=${state.visibleFraction}")
++            assertEquals(if (closes) 0f else 1f, state.visibleFraction, 0.01f)
++        }
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSheetPagerHeightTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSheetPagerHeightTest.kt
+new file mode 100644
+index 000000000..175cf3123
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSheetPagerHeightTest.kt
+@@ -0,0 +1,81 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.requiredSize
++import androidx.compose.foundation.pager.PagerState
++import androidx.compose.foundation.pager.rememberPagerState
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.layout.onGloballyPositioned
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.onNodeWithTag
++import androidx.compose.ui.test.performTouchInput
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.unit.Density
++import androidx.compose.ui.unit.dp
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34])
++class NavigationChromeSheetPagerHeightTest {
++    @Test
++    fun `height follows a held swipe both from short to tall and tall to short`() = runComposeUiTest {
++        lateinit var state: PagerState
++        var height = 0
++        setContent {
++            CompositionLocalProvider(LocalDensity provides Density(1f)) {
++                Column(Modifier.requiredSize(400.dp, 600.dp)) {
++                    state = rememberPagerState { 2 }
++                    AdaptiveHeightPager(state, Modifier.testTag("pages").onGloballyPositioned { height = it.size.height }) { page ->
++                        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
++                            Box(Modifier.fillMaxWidth().height(if (page == 0) 140.dp else 420.dp))
++                        }
++                    }
++                }
++            }
++        }
++        runOnIdle { assertEquals(140, height) }
++        onNodeWithTag("pages").performTouchInput {
++            down(Offset(width * 0.85f, center.y))
++            moveBy(Offset(-260f, 0f))
++        }
++        runOnIdle { assertTrue(height in 141..419, "forward=$height offset=${state.currentPageOffsetFraction}") }
++        onNodeWithTag("pages").performTouchInput {
++            advanceEventTime(200)
++            up()
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(1, state.currentPage)
++            assertEquals(420, height)
++        }
++        onNodeWithTag("pages").performTouchInput {
++            down(Offset(width * 0.15f, center.y))
++            moveBy(Offset(260f, 0f))
++        }
++        runOnIdle { assertTrue(height in 141..419, "reverse=$height offset=${state.currentPageOffsetFraction}") }
++        onNodeWithTag("pages").performTouchInput {
++            advanceEventTime(200)
++            up()
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(0, state.currentPage)
++            assertEquals(140, height)
++        }
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeSelectionBarTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeSelectionBarTest.kt
+new file mode 100644
+index 000000000..462049372
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeSelectionBarTest.kt
+@@ -0,0 +1,63 @@
++package tachiyomi.presentation.core.components.material
++
++import android.content.res.Configuration
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.requiredSize
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.layout.onGloballyPositioned
++import androidx.compose.ui.platform.LocalConfiguration
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.unit.Density
++import androidx.compose.ui.unit.dp
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34])
++class NavigationChromeSelectionBarTest {
++    @Test
++    fun `selection actions begin immediately and use compact controls`() = runComposeUiTest {
++        val visible = mutableStateOf(false)
++        var height = 0
++        var button = 0.dp
++        var padding = 0.dp
++        setContent {
++            val config = Configuration(LocalConfiguration.current).apply {
++                screenWidthDp = 400
++                screenHeightDp = 600
++            }
++            CompositionLocalProvider(LocalConfiguration provides config, LocalDensity provides Density(1f)) {
++                button = selectionActionButtonSize()
++                padding = selectionActionBarVerticalPadding()
++                Column(Modifier.requiredSize(400.dp, 160.dp)) {
++                    SelectionActionBar(visible.value, Modifier.onGloballyPositioned { height = it.size.height }) {
++                        Box(Modifier.height(48.dp))
++                    }
++                }
++            }
++        }
++        mainClock.autoAdvance = false
++        runOnIdle {
++            assertEquals(40.dp, button)
++            assertEquals(4.dp, padding)
++            visible.value = true
++        }
++        mainClock.advanceTimeByFrame()
++        waitForIdle()
++        mainClock.advanceTimeBy(64)
++        runOnIdle { assertTrue(height in 1..47, "entry should already be visible: $height") }
++        mainClock.advanceTimeBy(500)
++        runOnIdle { assertEquals(48, height) }
++    }
++}
