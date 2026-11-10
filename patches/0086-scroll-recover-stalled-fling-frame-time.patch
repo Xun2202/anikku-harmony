@@ -1,0 +1,544 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 11:08:06 +0000
+Subject: [PATCH] fix(scroll): recover fling time when frame stamps stall
+
+Shared clock protection, diagnostics and regressions with Mihon 0081. The user confirms a smooth pre-fold baseline and stuttering free-decay tails after folding. Retained preview.32 samples show exactly-zero requested scroll deltas in 3/256 pre-fold steps, 91/512 unfolded steps and 56/256 folded-back steps, with matching consumption. Keep the original default spline and frame driver. Preserve healthy frame timestamps; on repeated/backwards or near-frozen timestamps switch only the current fling to elapsed monotonic arrival time, retaining cancellation and remaining velocity. Verify healthy/virtual clocks, repeated/clamped stamps, real callback pauses and recovery scope; reproduce the motion plateaus with the real default spline under a quantized frame clock. Tail format 2 records raw/delivered clocks and actual placements. The old outer draw hook was cached and often did not run, so remove it rather than interpret zero calls as dropped frames. This targets a concrete animation-output defect while real-device cadence and the upstream platform timestamp cause still require feedback.
+---
+ .../core/components/FlingFrameClock.kt        | 62 ++++++++++++
+ .../core/components/FlingTailTrace.kt         | 37 ++++---
+ .../core/components/PanoramaMasonry.kt        | 31 ++----
+ .../core/components/PanoramaScrollTrace.kt    |  2 +-
+ .../NavigationChromeFlingClockTest.kt         | 81 ++++++++++++++++
+ .../NavigationChromeFlingClockUiTest.kt       | 97 +++++++++++++++++++
+ .../NavigationChromeFlingTailTest.kt          | 28 +++---
+ 7 files changed, 286 insertions(+), 52 deletions(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/FlingFrameClock.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFlingClockTest.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFlingClockUiTest.kt
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/FlingFrameClock.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/FlingFrameClock.kt
+new file mode 100644
+index 000000000..70c3c48c5
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/FlingFrameClock.kt
+@@ -0,0 +1,62 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.runtime.MonotonicFrameClock
++import kotlinx.coroutines.currentCoroutineContext
++import kotlinx.coroutines.withContext
++
++/**
++ * Keep the platform clock while it progresses. A repeated/clamped frame stamp can leave the
++ * millisecond-based Android spline at the same position even though another frame arrived.
++ * Once that happens, advance this fling by monotonic arrival time until it ends. The original
++ * frame callbacks still drive the animation; no timer, frame-rate assumption or decay change.
++ */
++internal class FlingFrameClock(
++    private val parent: MonotonicFrameClock,
++    private val nanoTime: () -> Long = System::nanoTime,
++    private val sample: ((raw: Long, delivered: Long, arrival: Long, corrected: Boolean) -> Unit)? = null,
++) : MonotonicFrameClock {
++    private var previousRaw = Long.MIN_VALUE
++    private var previousArrival = 0L
++    private var previousDelivered = 0L
++    private var anchorArrival = 0L
++    private var anchorDelivered = 0L
++    internal var corrected = false
++        private set
++
++    override suspend fun <R> withFrameNanos(onFrame: (frameTimeNanos: Long) -> R): R =
++        parent.withFrameNanos { raw ->
++            val arrival = nanoTime()
++            val first = previousRaw == Long.MIN_VALUE
++            if (!first && !corrected) {
++                val rawDelta = raw - previousRaw
++                val arrivalDelta = arrival - previousArrival
++                // Healthy 60/90/120 Hz clocks and virtual test clocks remain unchanged.
++                // BroadcastFrameClock may clamp repeated timestamps to a 1 ns increment.
++                if (rawDelta <= 0L || (rawDelta < 1_000_000L && arrivalDelta >= 4_000_000L)) {
++                    corrected = true
++                    anchorArrival = previousArrival
++                    anchorDelivered = previousDelivered
++                }
++            }
++            val delivered = if (corrected) {
++                (anchorDelivered + (arrival - anchorArrival).coerceAtLeast(0L)).coerceAtLeast(previousDelivered + 1L)
++            } else {
++                raw
++            }
++            previousRaw = raw
++            previousArrival = arrival
++            previousDelivered = delivered
++            sample?.invoke(raw, delivered, arrival, corrected)
++            onFrame(delivered)
++        }
++}
++
++internal suspend fun <T> withFlingFrameClock(tail: Long, block: suspend () -> T): T {
++    val parent = currentCoroutineContext()[MonotonicFrameClock] ?: return block()
++    val observer: ((Long, Long, Long, Boolean) -> Unit)? = if (tail == 0L) {
++        null
++    } else {
++        { raw, delivered, arrival, corrected -> FlingTailTrace.frame(tail, arrival, raw, delivered, corrected) }
++    }
++    return withContext(FlingFrameClock(parent, sample = observer)) { block() }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/FlingTailTrace.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/FlingTailTrace.kt
+index ad63aeec0..142cf13f6 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/FlingTailTrace.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/FlingTailTrace.kt
+@@ -45,11 +45,17 @@ object FlingTailTrace {
+         session.steps.append(now, asked.toRawBits().toLong(), consumed.toRawBits().toLong(), offset.toRawBits().toLong(), 0L)
+     }
+ 
+-    internal fun draw(grid: Int, now: Long, offset: Int, width: Int, height: Int, drawNanos: Long = 0L) = synchronized(lock) {
++    internal fun frame(id: Long, now: Long, raw: Long, delivered: Long, corrected: Boolean) = synchronized(lock) {
++        val session = current
++        if (!enabled || session == null || session.id != id || session.ended != 0L) return@synchronized
++        session.frames.append(now, raw, delivered, if (corrected) 1L else 0L, 0L)
++    }
++
++    internal fun place(grid: Int, now: Long, offset: Int, width: Int, height: Int, measureNanos: Long = 0L) = synchronized(lock) {
+         val session = current
+         if (!enabled || session == null || session.grid != grid) return@synchronized
+         if (session.ended != 0L && now - session.ended > FINAL_DRAW_GRACE_NS) return@synchronized
+-        session.draws.append(now, offset.toLong(), width.toLong(), height.toLong(), drawNanos)
++        session.placements.append(now, offset.toLong(), width.toLong(), height.toLong(), measureNanos)
+     }
+ 
+     internal fun end(id: Long, now: Long, outcome: String) = synchronized(lock) {
+@@ -61,7 +67,7 @@ object FlingTailTrace {
+ 
+     internal fun snapshot(): List<FlingTailSnapshot> = synchronized(lock) {
+         sessions.map {
+-            FlingTailSnapshot(it.id, it.grid, it.velocity, it.started, it.ended, it.outcome, it.steps.count, it.draws.count, it.steps.snapshot(), it.draws.snapshot())
++            FlingTailSnapshot(it.id, it.grid, it.velocity, it.started, it.ended, it.outcome, it.steps.count, it.placements.count, it.frames.count, it.steps.snapshot(), it.placements.snapshot(), it.frames.snapshot())
+         }
+     }
+ 
+@@ -69,10 +75,10 @@ object FlingTailTrace {
+     fun report(originNanos: Long): String = buildString {
+         val captured = snapshot()
+         appendLine()
+-        appendLine("## Fling tail samples (format 1)")
+-        appendLine("# Last 64 steps and grid draw calls per fling; first 4 and latest 12 flings. Earlier rows may be omitted.")
++        appendLine("## Fling tail samples (format 2)")
++        appendLine("# Last 64 steps, frame-clock samples and actual placements per fling; first 4 and latest 12 flings. Earlier rows may be omitted.")
+         appendLine("# Step asked/consumed are scroll deltas in px; offset is the float state after scrollBy.")
+-        appendLine("# Draw offset is the integer used to place cells; draw_wall_ms is inclusive CPU wall time, not GPU completion/presentation.")
++        appendLine("# Placement offset is the integer used to place cells; measure_wall_ms is CPU measure wall time, not GPU/presentation.")
+         appendLine("# dt is between adjacent retained calls of the same kind; first retained dt is n/a.")
+         appendLine("# step speed is inferred from asked/dt, not the decay model's instantaneous velocity.")
+         fun number(value: Double) = String.format(Locale.US, "%.3f", value)
+@@ -81,9 +87,9 @@ object FlingTailTrace {
+                 "tail_fling id=${session.id} grid=${session.grid} start_ms=${number((session.started - originNanos) / 1e6)} " +
+                     "end_ms=${if (session.ended == 0L) "n/a" else number((session.ended - originNanos) / 1e6)} " +
+                     "initial_px_s=${number(session.velocity.toDouble())} outcome=${session.outcome} " +
+-                    "steps_total=${session.stepCount} draws_total=${session.drawCount}",
++                    "steps_total=${session.stepCount} placements_total=${session.placementCount} frames_total=${session.frameCount}",
+             )
+-            for ((kind, rows) in listOf("step" to session.steps, "draw" to session.draws)) {
++            for ((kind, rows) in listOf("step" to session.steps, "place" to session.placements, "frame" to session.frames)) {
+                 for (row in rows.indices step WIDTH) {
+                     val time = rows[row]
+                     val dt = if (row == 0) 0L else time - rows[row - WIDTH]
+@@ -97,8 +103,12 @@ object FlingTailTrace {
+                                 "offset_px=${number(Float.fromBits(rows[row + 3].toInt()).toDouble())} " +
+                                 "speed_estimate_px_s=${if (dt <= 0L) "n/a" else number(asked * 1e9 / dt)}",
+                         )
++                    } else if (kind == "frame") {
++                        val rawDt = if (row == 0) "n/a" else number((rows[row + 1] - rows[row - WIDTH + 1]) / 1e6)
++                        val deliveredDt = if (row == 0) "n/a" else number((rows[row + 2] - rows[row - WIDTH + 2]) / 1e6)
++                        appendLine("tail_frame id=${session.id} $timing raw_ns=${rows[row + 1]} delivered_ns=${rows[row + 2]} raw_dt_ms=$rawDt delivered_dt_ms=$deliveredDt corrected=${rows[row + 3]}")
+                     } else {
+-                        appendLine("tail_draw id=${session.id} $timing placed_offset_px=${rows[row + 1]} viewport_px=${rows[row + 2]}x${rows[row + 3]} draw_wall_ms=${number(rows[row + 4] / 1e6)}")
++                        appendLine("tail_place id=${session.id} $timing placed_offset_px=${rows[row + 1]} viewport_px=${rows[row + 2]}x${rows[row + 3]} measure_wall_ms=${number(rows[row + 4] / 1e6)}")
+                     }
+                 }
+             }
+@@ -109,7 +119,8 @@ object FlingTailTrace {
+         var ended = 0L
+         var outcome = "active"
+         val steps = TailRows()
+-        val draws = TailRows()
++        val placements = TailRows()
++        val frames = TailRows()
+     }
+ 
+     private class TailRows {
+@@ -142,7 +153,9 @@ internal data class FlingTailSnapshot(
+     val ended: Long,
+     val outcome: String,
+     val stepCount: Int,
+-    val drawCount: Int,
++    val placementCount: Int,
++    val frameCount: Int,
+     val steps: LongArray,
+-    val draws: LongArray,
++    val placements: LongArray,
++    val frames: LongArray,
+ )
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+index d29c1a7b0..a3ec68816 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+@@ -30,7 +30,6 @@ import androidx.compose.runtime.snapshots.Snapshot
+ import androidx.compose.runtime.withFrameNanos
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clipToBounds
+-import androidx.compose.ui.draw.drawWithContent
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.layout.MeasureResult
+ import androidx.compose.ui.layout.Placeable
+@@ -117,11 +116,6 @@ sealed interface PanoramaCellHeight {
+ 
+ @Stable
+ class PanoramaMasonryState {
+-    // Plain fields: diagnostics must not observe scroll state or schedule an extra draw.
+-    internal var tracedPlacementOffset = 0
+-    internal var tracedPlacementWidth = 0
+-    internal var tracedPlacementHeight = 0
+-
+     internal val scrollableState: ScrollableState = ScrollableState { delta ->
+         val max = maxScroll
+         val current = scrollOffset
+@@ -531,20 +525,6 @@ fun PanoramaMasonry(
+     )
+     LazyLayout(
+         modifier = modifier
+-            .drawWithContent {
+-                val started = if (FlingTailTrace.enabled) System.nanoTime() else 0L
+-                drawContent()
+-                if (started != 0L) {
+-                    FlingTailTrace.draw(
+-                        state.traceId,
+-                        started,
+-                        state.tracedPlacementOffset,
+-                        state.tracedPlacementWidth,
+-                        state.tracedPlacementHeight,
+-                        System.nanoTime() - started,
+-                    )
+-                }
+-            }
+             .panoramaTouchTrace(state.traceId)
+             .semantics {
+                 if (userScrollEnabled) {
+@@ -574,6 +554,7 @@ fun PanoramaMasonry(
+             args = args.value,
+             content = latestContent.value,
+             prefetcher = prefetcher,
++            measureStarted = measureStart,
+         ).also { PanoramaFrameCounters.onMeasure(System.nanoTime() - measureStart) }
+     }
+ }
+@@ -639,6 +620,7 @@ private fun LazyLayoutMeasureScope.measureMasonry(
+     args: MasonryMeasureArgs,
+     content: PanoramaMasonryScope.() -> Unit,
+     prefetcher: PanoramaMasonryPrefetch,
++    measureStarted: Long,
+ ): MeasureResult {
+     val profiling = PanoramaFrameCounters.enabled
+     val planStart = if (profiling) System.nanoTime() else 0L
+@@ -822,12 +804,8 @@ private fun LazyLayoutMeasureScope.measureMasonry(
+ 
+     val layoutWidth = if (constraints.hasBoundedWidth) constraints.maxWidth else available + left + right
+     val layoutHeight = if (constraints.hasBoundedHeight) constraints.maxHeight else total.coerceAtLeast(0)
++    val measureNanos = if (FlingTailTrace.enabled) System.nanoTime() - measureStarted else 0L
+     return layout(layoutWidth, layoutHeight) {
+-        if (FlingTailTrace.enabled) {
+-            state.tracedPlacementOffset = scrollPx
+-            state.tracedPlacementWidth = layoutWidth
+-            state.tracedPlacementHeight = layoutHeight
+-        }
+         for ((rect, placeables) in placed) {
+             val x = left + rect.x
+             val y = topPad + rect.y - scrollPx
+@@ -835,6 +813,9 @@ private fun LazyLayoutMeasureScope.measureMasonry(
+                 placeable.place(x, y)
+             }
+         }
++        if (FlingTailTrace.enabled) {
++            FlingTailTrace.place(state.traceId, System.nanoTime(), scrollPx, layoutWidth, layoutHeight, measureNanos)
++        }
+     }
+ }
+ 
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaScrollTrace.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaScrollTrace.kt
+index 487243aa4..fdafda8b0 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaScrollTrace.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaScrollTrace.kt
+@@ -177,7 +177,7 @@ internal class TracedFlingBehavior(
+         val outcome: String
+         val left: Float
+         try {
+-            left = with(inner) { traced.performFling(initialVelocity) }
++            left = withFlingFrameClock(tail) { with(inner) { traced.performFling(initialVelocity) } }
+             outcome = if (abs(left) > 1f) "stopped" else "done"
+         } catch (e: CancellationException) {
+             if (tail != 0L) FlingTailTrace.end(tail, System.nanoTime(), "cancelled")
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFlingClockTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFlingClockTest.kt
+new file mode 100644
+index 000000000..f4e13fb16
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFlingClockTest.kt
+@@ -0,0 +1,81 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.runtime.MonotonicFrameClock
++import androidx.compose.runtime.withFrameNanos
++import kotlinx.coroutines.runBlocking
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++import kotlin.coroutines.cancellation.CancellationException
++
++class NavigationChromeFlingClockTest {
++    private class Source(val raw: LongArray, val arrivals: LongArray) : MonotonicFrameClock {
++        var calls = 0
++        var now = 0L
++        override suspend fun <R> withFrameNanos(onFrame: (Long) -> R): R {
++            val i = calls++
++            now = arrivals[i]
++            return onFrame(raw[i])
++        }
++    }
++
++    @Test
++    fun `healthy display clocks and accelerated virtual clocks keep their exact timestamps`() {
++        for (period in listOf(16_666_667L, 11_111_111L, 8_333_333L)) {
++            val raw = LongArray(12) { 1_000_000_000L + it * period }
++            // Test clocks deliberately run faster than wall time.
++            val source = Source(raw, LongArray(12) { 5_000L + it * 100_000L })
++            val clock = FlingFrameClock(source, nanoTime = { source.now })
++            val delivered = runBlocking(clock) { List(12) { withFrameNanos { it } } }
++            assertEquals(raw.toList(), delivered)
++            assertEquals(12, source.calls)
++            assertFalse(clock.corrected)
++        }
++    }
++
++    @Test
++    fun `repeated and one nanosecond clamped timestamps progress by actual arrivals until fling ends`() {
++        val start = 1_000_000_000L
++        val source = Source(
++            longArrayOf(start, start + 11_000_000L, start + 11_000_001L, start - 10L, start + 90_000_000L),
++            LongArray(5) { 20_000_000L + it * 11_000_000L },
++        )
++        val clock = FlingFrameClock(source, nanoTime = { source.now })
++        val delivered = runBlocking(clock) { List(5) { withFrameNanos { it } } }
++        assertEquals(List(5) { start + it * 11_000_000L }, delivered)
++        assertTrue(clock.corrected)
++        assertEquals(5, source.calls, "The wrapper must not request extra frames")
++    }
++
++    @Test
++    fun `real callback pauses advance elapsed time without assuming a fixed refresh rate`() {
++        val source = Source(longArrayOf(100L, 100L, 100L), longArrayOf(1L, 11_000_001L, 51_000_001L))
++        val clock = FlingFrameClock(source, nanoTime = { source.now })
++        val delivered = runBlocking(clock) { List(3) { withFrameNanos { it } } }
++        assertEquals(listOf(100L, 11_000_100L, 51_000_100L), delivered)
++    }
++
++    @Test
++    fun `correction is confined to one fling and parent cancellation propagates`() {
++        val bad = Source(longArrayOf(100L, 100L), longArrayOf(1L, 11_000_001L))
++        val corrected = FlingFrameClock(bad, nanoTime = { bad.now })
++        runBlocking(corrected) { repeat(2) { withFrameNanos { it } } }
++        assertTrue(corrected.corrected)
++        val good = Source(longArrayOf(200L, 11_000_200L), longArrayOf(1L, 11_000_001L))
++        val fresh = FlingFrameClock(good, nanoTime = { good.now })
++        assertEquals(listOf(200L, 11_000_200L), runBlocking(fresh) { List(2) { withFrameNanos { it } } })
++        assertFalse(fresh.corrected)
++        val cancellation = CancellationException("finger interrupted")
++        val cancelled = object : MonotonicFrameClock {
++            override suspend fun <R> withFrameNanos(onFrame: (Long) -> R): R = throw cancellation
++        }
++        var caught: CancellationException? = null
++        try {
++            runBlocking(FlingFrameClock(cancelled)) { withFrameNanos { it } }
++        } catch (error: CancellationException) {
++            caught = error
++        }
++        assertEquals(cancellation, caught)
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFlingClockUiTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFlingClockUiTest.kt
+new file mode 100644
+index 000000000..bc2726c44
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFlingClockUiTest.kt
+@@ -0,0 +1,97 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.gestures.FlingBehavior
++import androidx.compose.foundation.gestures.ScrollScope
++import androidx.compose.foundation.gestures.ScrollableDefaults
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.requiredSize
++import androidx.compose.runtime.MonotonicFrameClock
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.unit.dp
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.runBlocking
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34])
++class NavigationChromeFlingClockUiTest {
++    private class Frames(private val quantized: Boolean) : MonotonicFrameClock {
++        var elapsed = 0L
++        override suspend fun <R> withFrameNanos(onFrame: (Long) -> R): R {
++            elapsed += 11_111_111L
++            val stamp = if (quantized) elapsed / 16_666_667L * 16_666_667L else elapsed
++            return onFrame(1_000_000_000_000L + stamp)
++        }
++    }
++
++    @Test
++    fun `real default spline reproduces zero motion with quantized stamps and recovers its smooth tail`() = runComposeUiTest {
++        lateinit var native: FlingBehavior
++        setContent { native = ScrollableDefaults.flingBehavior() }
++        runOnIdle {
++            fun fling(quantized: Boolean, repair: Boolean): List<Float> {
++                val frames = Frames(quantized)
++                val clock = if (repair) FlingFrameClock(frames, nanoTime = { frames.elapsed }) else frames
++                val deltas = mutableListOf<Float>()
++                val scope = object : ScrollScope {
++                    override fun scrollBy(pixels: Float): Float {
++                        deltas += pixels
++                        return pixels
++                    }
++                }
++                runBlocking(clock) { with(native) { scope.performFling(12_000f) } }
++                return deltas
++            }
++            val healthy = fling(quantized = false, repair = false)
++            val faulty = fling(quantized = true, repair = false)
++            val repaired = fling(quantized = true, repair = true)
++            assertTrue(faulty.takeLast(64).count { it == 0f } >= 12)
++            assertTrue(repaired.takeLast(64).count { it == 0f } <= 2)
++            assertEquals(healthy.sumOf { it.toDouble() }, repaired.sumOf { it.toDouble() }, 0.01)
++            assertTrue(repaired.all { it >= 0f })
++        }
++    }
++
++    @Test
++    fun `placement diagnostics follow scrolling even when the parent draw is cached`() = runComposeUiTest {
++        val state = PanoramaMasonryState()
++        lateinit var scope: CoroutineScope
++        setContent {
++            scope = rememberCoroutineScope()
++            PanoramaMasonry(PanoramaColumns.Fixed(2), Modifier.requiredSize(400.dp, 500.dp), state = state) {
++                items(count = 100, key = { it }, height = { PanoramaCellHeight.Fixed(120.dp) }) {
++                    Box(Modifier.fillMaxWidth().height(120.dp))
++                }
++            }
++        }
++        runOnIdle {
++            FlingTailTrace.startRecording()
++            FlingTailTrace.begin(state.traceId, 1000f, System.nanoTime())
++        }
++        try {
++            for (offset in listOf(120f, 240f, 360f)) {
++                runOnIdle { scope.launch { state.scrollToOffset(offset) } }
++                waitForIdle()
++                runOnIdle {
++                    val trace = FlingTailTrace.snapshot().single()
++                    assertTrue(trace.placementCount > 0)
++                    assertEquals(offset.toLong(), trace.placements[trace.placements.size - 4])
++                }
++            }
++        } finally {
++            runOnIdle { FlingTailTrace.stopRecording() }
++        }
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFlingTailTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFlingTailTest.kt
+index 0b11ea346..46d93af23 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFlingTailTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFlingTailTest.kt
+@@ -33,36 +33,36 @@ class NavigationChromeFlingTailTest {
+     }
+ 
+     @Test
+-    fun `tail wrap preserves chronological last 64 steps and draws with independent totals`() {
++    fun `tail wrap preserves chronological last 64 steps and placements with independent totals`() {
+         FlingTailTrace.startRecording()
+         val id = FlingTailTrace.begin(2, 500f, 1L)
+         repeat(200) { i ->
+             FlingTailTrace.step(id, 100L + i, 0.25f, 0.25f, i / 4f)
+-            FlingTailTrace.draw(2, 1000L + i, i, 1264, 1848)
++            FlingTailTrace.place(2, 1000L + i, i, 1264, 1848)
+         }
+         val captured = FlingTailTrace.snapshot().single()
+         assertEquals(200, captured.stepCount)
+-        assertEquals(200, captured.drawCount)
++        assertEquals(200, captured.placementCount)
+         assertEquals(64 * 5, captured.steps.size)
+         assertEquals(236L, captured.steps.first())
+-        assertEquals(1136L, captured.draws.first())
+-        assertEquals(1199L, captured.draws[captured.draws.size - 5])
++        assertEquals(1136L, captured.placements.first())
++        assertEquals(1199L, captured.placements[captured.placements.size - 5])
+         assertTrue(FlingTailTrace.report(1L).contains("dt_ms=n/a"))
+     }
+ 
+     @Test
+-    fun `final placement can draw after decay ends without charging an idle gap to the tail`() {
++    fun `final placement can placement after decay ends without charging an idle gap to the tail`() {
+         FlingTailTrace.startRecording()
+         val id = FlingTailTrace.begin(1, 100f, 1L)
+         FlingTailTrace.end(id, 1_000_000L, "done")
+-        FlingTailTrace.draw(1, 11_000_000L, 17, 1264, 1848)
+-        FlingTailTrace.draw(1, 2_000_000_000L, 17, 1264, 1848)
++        FlingTailTrace.place(1, 11_000_000L, 17, 1264, 1848)
++        FlingTailTrace.place(1, 2_000_000_000L, 17, 1264, 1848)
+         FlingTailTrace.step(id, 3_000_000_000L, 1f, 1f, 18f)
+         val captured = FlingTailTrace.snapshot().single()
+-        assertEquals(1, captured.drawCount)
++        assertEquals(1, captured.placementCount)
+         assertEquals(0, captured.stepCount)
+         assertEquals("done", captured.outcome)
+-        assertEquals(17L, captured.draws[1])
++        assertEquals(17L, captured.placements[1])
+     }
+ 
+     @Test
+@@ -70,18 +70,18 @@ class NavigationChromeFlingTailTest {
+         FlingTailTrace.startRecording()
+         val id = FlingTailTrace.begin(1, 100f, 1_000_000L)
+         FlingTailTrace.step(id, 2_000_000L, 0.25f, 0.125f, 100_000.125f)
+-        FlingTailTrace.draw(3, 3_000_000L, 5, 9, 9)
+-        FlingTailTrace.draw(1, 4_000_000L, 100_000, 1264, 1848, 18_000_000L)
++        FlingTailTrace.place(3, 3_000_000L, 5, 9, 9)
++        FlingTailTrace.place(1, 4_000_000L, 100_000, 1264, 1848, 18_000_000L)
+         val captured = FlingTailTrace.snapshot().single()
+         assertEquals(0.25f, Float.fromBits(captured.steps[1].toInt()))
+         assertEquals(0.125f, Float.fromBits(captured.steps[2].toInt()))
+         assertEquals(100_000.125f, Float.fromBits(captured.steps[3].toInt()))
+-        assertEquals(1, captured.drawCount)
++        assertEquals(1, captured.placementCount)
+         val text = FlingTailTrace.report(1_000_000L)
+         assertTrue(text.contains("offset_px=100000.125"))
+         assertTrue(text.contains("placed_offset_px=100000 viewport_px=1264x1848"))
+         assertTrue(text.contains("speed_estimate_px_s=n/a"))
+-        assertTrue(text.contains("draw_wall_ms=18.000"))
++        assertTrue(text.contains("measure_wall_ms=18.000"))
+     }
+ 
+     @Test

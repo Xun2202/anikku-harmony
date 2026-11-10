@@ -811,3 +811,11 @@ gh release list --repo Xun2202/anikku-harmony
 - 0085与Mihon 0080同源：轻量/详细记录均追加独立版本1尾段。保留前4次作为基线及最近12次，每次各64步与grid draw，记录原始请求/消费、小数offset、实际布局整数位置、视口与inclusive CPU draw wall time；速度只从delta/dt推算，非物理模型瞬时速度。grid draw可来自捕获层，不是屏幕呈现/GPU完成。
 - 固定容量原始数组，无逐帧字符串或新增帧驱动，不改变原fling的速度、消费和返回剩余速度。导出线程格式化；停止清空，旧session token不会写进新记录。原主报告Mi6/An3与默认轻量保留，新尾段独立version1。
 - 六个定向回归覆盖关闭/重开与旧回调、环形保留顺序、保留基线、结束后最后draw而不混静止空档、小数/整数/CPU耗时、快照隔离与实际FlingBehavior委托。仍需真机正常→展开→折回各两次快甩到自然停下，约20–30秒导出；此版用于定位尾段，未声称持续卡已修复。Animeko没有本自建PanoramaMasonry/TracedFlingBehavior，不直接移植。
+
+## 2026-11-10：惯性帧时间停滞保护
+
+- 用户确认32新日志展开前顺滑、切换后减速尾段变卡。保留样本内，原始请求delta为0从前段3/256升至展开91/512、折回56/256；消费与请求相同，不是父滚动吃掉；0步后又有非零/较大步。不能只看约90Hz回调就判流畅，位置在动画输出阶段已停顿。
+- 实读AndroidX Compose BOM2026.10.00对应foundation/animation 1.13.0-beta01源码：DefaultFlingBehavior用AnimationState.animateDecay，delta=value-lastValue，SplineBasedFloatDecayAnimationSpec按毫秒playTime取位置。因此重复/被clamp为1ns推进的帧时间会产生位移平台。0086与Mihon 0081共用FlingFrameClock：健康帧原样；时间倒退/重复，或实际间隔≥4ms但帧时间推进<1ms时，本次惯性以故障前一帧锚定单调到达时间，直到结束。无新增帧源、不改曲线/原速度/边界消费/取消/剩余速度，下一次惯性重新判断，虚拟测试时钟不按真实时速运行。
+- 四项真实runtime JVM时钟测试已本地24秒通过：健康60/90/120与加速虚拟时钟原值、重复/1ns钳制、实际回调停顿、作用域恢复与取消。新增真实默认spline故障复现/修复回归，并验证实际Masonry滚动放置探针；既有触摸中断/滚动条与原始委托回归仍按CI执行。
+- 纠正32采集缺口：外层drawWithContent会被Compose缓存，不能当逐帧绘制或掉帧统计。移除该探针/临时state字段，尾段独立格式2增加raw/delivered帧时间、corrected标记、每次实际布局放置/整数offset/视口及measure wall；旧主格式Mi6/An3及默认轻量保持。布局次数也不等于屏幕呈现。
+- 新版需真机确认尾段零位移比例和手感是否恢复，以及时钟保护是否触发；32未保存原始帧时间，尚不能将平台帧时间异常当已直接观测的唯一原因。用户安装后保留玻璃，轻量录正常→展开→折回各两次快甩自然停下，约20–30秒。Animeko无本Masonry/TracedFlingBehavior，不直接套用此局部保护。
