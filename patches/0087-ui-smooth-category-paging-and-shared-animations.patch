@@ -1,0 +1,625 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 11:50:36 +0000
+Subject: [PATCH] perf(ui): smooth category paging and share animation clock
+ protection
+
+Shared animation policy and regression tests with Mihon 0082. The user reports smoother inertia after preview.33 but stuttering horizontal category swipes. Pager snapping and explicit page transitions previously bypassed the fling clock protection, and currentPage changes persisted preferences/rebuilt active state before the gesture settled. Protect native targeted pager flings while forwarding remaining-distance updates, protect explicit page animations, observe settledPage for persistence, and resolve category item lists on the existing background grouping pipeline so getters return stable lists. Apply the same clock policy to custom category indicators, scrolling category strips, navigation movement/press feedback and scroller fades, preserving their timing, retargeting and visual styling. Cover all existing native pagers in these apps. Add real Compose regression for bidirectional swipes, settled-only persistence, rapid page retargeting and intermediate indicator animation. This addresses confirmed repeated work and the unprotected animation path; no timing log for this new symptom or measured FPS gain is claimed.
+---
+ .../presentation/components/TabbedDialog.kt   |   5 +-
+ .../presentation/components/TabbedScreen.kt   |   7 +-
+ .../library/components/LibraryContent.kt      |   6 +-
+ .../library/components/LibraryPager.kt        |   2 +
+ .../manga/components/MangaCoverDialog.kt      |   5 +-
+ .../ui/library/LibraryScreenModel.kt          |   7 +-
+ .../kanade/tachiyomi/ui/library/LibraryTab.kt |   5 +-
+ .../panels/components/MultiCardPanel.kt       |   2 +
+ .../components/AnimationFrameProtection.kt    |  90 ++++++++++++++
+ .../core/components/VerticalFastScroller.kt   |   4 +-
+ .../material/BrowsingTabSelector.kt           |   9 +-
+ .../material/CapsuleTouchFeedback.kt          |   3 +-
+ .../components/material/NavigationCapsule.kt  |   5 +-
+ .../components/material/NavigationChrome.kt   |   4 +-
+ .../NavigationChromePagerAnimationTest.kt     | 115 ++++++++++++++++++
+ 15 files changed, 246 insertions(+), 23 deletions(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/AnimationFrameProtection.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromePagerAnimationTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/components/TabbedDialog.kt b/app/src/main/java/eu/kanade/presentation/components/TabbedDialog.kt
+index 69b58c616..8c276de95 100644
+--- a/app/src/main/java/eu/kanade/presentation/components/TabbedDialog.kt
++++ b/app/src/main/java/eu/kanade/presentation/components/TabbedDialog.kt
+@@ -31,6 +31,8 @@ import kotlinx.collections.immutable.ImmutableList
+ import kotlinx.coroutines.launch
+ import tachiyomi.i18n.MR
+ import tachiyomi.presentation.core.components.material.TabText
++import tachiyomi.presentation.core.components.rememberFrameTimeProtectedPagerFlingBehavior
++import tachiyomi.presentation.core.components.withFrameTimeProtection
+ import tachiyomi.presentation.core.i18n.stringResource
+ 
+ object TabbedDialogPaddings {
+@@ -64,7 +66,7 @@ fun TabbedDialog(
+                     tabTitles.fastForEachIndexed { index, tab ->
+                         Tab(
+                             selected = pagerState.currentPage == index,
+-                            onClick = { scope.launch { pagerState.animateScrollToPage(index) } },
++                            onClick = { scope.launch { withFrameTimeProtection { pagerState.animateScrollToPage(index) } } },
+                             text = { TabText(text = tab) },
+                             unselectedContentColor = MaterialTheme.colorScheme.onSurface,
+                         )
+@@ -78,6 +80,7 @@ fun TabbedDialog(
+             HorizontalPager(
+                 modifier = Modifier.animateContentSize(),
+                 state = pagerState,
++                flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(pagerState),
+                 verticalAlignment = Alignment.Top,
+                 pageContent = { page -> content(page) },
+             )
+diff --git a/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt b/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
+index 9dbc20ed4..31db81a52 100644
+--- a/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
+@@ -35,6 +35,8 @@ import tachiyomi.presentation.core.components.material.TabText
+ import tachiyomi.presentation.core.components.material.browsingChromeContainerColor
+ import tachiyomi.presentation.core.components.material.isCompactBrowsingWindow
+ import tachiyomi.presentation.core.components.material.rememberBrowsingTopAppBarScrollBehavior
++import tachiyomi.presentation.core.components.rememberFrameTimeProtectedPagerFlingBehavior
++import tachiyomi.presentation.core.components.withFrameTimeProtection
+ import tachiyomi.presentation.core.i18n.stringResource
+ 
+ @Composable
+@@ -101,7 +103,7 @@ fun TabbedScreen(
+                                     labels = tabs.map { stringResource(it.titleRes) },
+                                     selectedIndex = state.currentPage,
+                                     badges = tabs.map { it.badgeNumber },
+-                                    onSelect = { scope.launch { state.animateScrollToPage(it) } },
++                                    onSelect = { scope.launch { withFrameTimeProtection { state.animateScrollToPage(it) } } },
+                                 )
+                             } else {
+                                 AppBarTitle(stringResource(titleRes))
+@@ -123,7 +125,7 @@ fun TabbedScreen(
+                         tabs.forEachIndexed { index, tab ->
+                             Tab(
+                                 selected = state.currentPage == index,
+-                                onClick = { scope.launch { state.animateScrollToPage(index) } },
++                                onClick = { scope.launch { withFrameTimeProtection { state.animateScrollToPage(index) } } },
+                                 text = { TabText(text = stringResource(tab.titleRes), badgeCount = tab.badgeNumber) },
+                                 unselectedContentColor = MaterialTheme.colorScheme.onSurface,
+                             )
+@@ -143,6 +145,7 @@ fun TabbedScreen(
+             HorizontalPager(
+                 modifier = Modifier.fillMaxSize(),
+                 state = state,
++                flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(state),
+                 verticalAlignment = Alignment.Top,
+             ) { page ->
+                 tabs[page].content(
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LibraryContent.kt b/app/src/main/java/eu/kanade/presentation/library/components/LibraryContent.kt
+index 21da0bc8b..511294ba8 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LibraryContent.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LibraryContent.kt
+@@ -7,7 +7,6 @@ import androidx.compose.foundation.layout.calculateStartPadding
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.pager.PagerState
+ import androidx.compose.runtime.Composable
+-import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+@@ -22,6 +21,7 @@ import kotlinx.coroutines.launch
+ import tachiyomi.domain.category.model.Category
+ import tachiyomi.domain.library.model.LibraryDisplayMode
+ import tachiyomi.domain.library.model.LibraryManga
++import tachiyomi.presentation.core.components.ObserveSettledPage
+ import tachiyomi.presentation.core.components.material.PullRefresh
+ import kotlin.time.Duration.Companion.seconds
+ 
+@@ -93,8 +93,6 @@ fun LibraryContent(
+             )
+         }
+ 
+-        LaunchedEffect(pagerState.currentPage) {
+-            onChangeCurrentPage(pagerState.currentPage)
+-        }
++        ObserveSettledPage(pagerState, onChangeCurrentPage)
+     }
+ }
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LibraryPager.kt b/app/src/main/java/eu/kanade/presentation/library/components/LibraryPager.kt
+index 25bfdc49f..2f7f9e8dc 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LibraryPager.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LibraryPager.kt
+@@ -26,6 +26,7 @@ import tachiyomi.domain.library.model.LibraryDisplayMode
+ import tachiyomi.domain.library.model.LibraryManga
+ import tachiyomi.i18n.MR
+ import tachiyomi.presentation.core.components.material.browsingContentVerticalPadding
++import tachiyomi.presentation.core.components.rememberFrameTimeProtectedPagerFlingBehavior
+ import tachiyomi.presentation.core.screens.EmptyScreen
+ import tachiyomi.presentation.core.util.plus
+ 
+@@ -54,6 +55,7 @@ fun LibraryPager(
+         HorizontalPager(
+             modifier = Modifier.fillMaxSize(),
+             state = state,
++            flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(state),
+             verticalAlignment = Alignment.Top,
+         ) { page ->
+             if (page !in ((state.currentPage - 1)..(state.currentPage + 1))) {
+diff --git a/app/src/main/java/eu/kanade/presentation/manga/components/MangaCoverDialog.kt b/app/src/main/java/eu/kanade/presentation/manga/components/MangaCoverDialog.kt
+index cd5899930..80108f547 100644
+--- a/app/src/main/java/eu/kanade/presentation/manga/components/MangaCoverDialog.kt
++++ b/app/src/main/java/eu/kanade/presentation/manga/components/MangaCoverDialog.kt
+@@ -62,6 +62,8 @@ import tachiyomi.domain.manga.model.Manga
+ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.aniyomi.AYMR
+ import tachiyomi.presentation.core.components.material.Scaffold
++import tachiyomi.presentation.core.components.rememberFrameTimeProtectedPagerFlingBehavior
++import tachiyomi.presentation.core.components.withFrameTimeProtection
+ import tachiyomi.presentation.core.i18n.stringResource
+ import tachiyomi.presentation.core.util.clickableNoIndication
+ 
+@@ -107,7 +109,7 @@ fun MangaCoverDialog(
+ 
+     val onImageSwitchClicked: () -> Unit = {
+         scope.launchUI {
+-            pagerState.animateScrollToPage(1 - pagerState.currentPage)
++            withFrameTimeProtection { pagerState.animateScrollToPage(1 - pagerState.currentPage) }
+         }
+     }
+     // <-- AY
+@@ -245,6 +247,7 @@ fun MangaCoverDialog(
+                 // AY -->
+                 HorizontalPager(
+                     state = pagerState,
++                    flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(pagerState),
+                 ) { page ->
+                     // <-- AY
+                     AndroidView(
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryScreenModel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryScreenModel.kt
+index a9232ef87..247388eff 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryScreenModel.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryScreenModel.kt
+@@ -316,7 +316,8 @@ class LibraryScreenModel(
+                             )
+                         }
+                     }
+-                // KMK <--
++                    // KMK <--
++                    .mapValues { (_, ids) -> ids.fastMapNotNull { data.favoritesById[it] } }
+             }
+                 .collectLatest {
+                     mutableState.update { state ->
+@@ -1634,7 +1635,7 @@ class LibraryScreenModel(
+         // KMK -->
+         private val activeCategoryId: Long? = null,
+         // KMK <--
+-        private val groupedFavorites: Map<Category, List</* LibraryItem */ Long>> = emptyMap(),
++        private val groupedFavorites: Map<Category, List<LibraryItem>> = emptyMap(),
+         // SY -->
+         val isSyncEnabled: Boolean = false,
+         val groupType: Int = LibraryGroup.BY_DEFAULT,
+@@ -1688,7 +1689,7 @@ class LibraryScreenModel(
+         }
+ 
+         fun getItemsForCategory(category: Category): List<LibraryItem> {
+-            return groupedFavorites[category].orEmpty().fastMapNotNull { libraryData.favoritesById[it] }
++            return groupedFavorites[category].orEmpty()
+         }
+ 
+         fun getItemCountForCategory(category: Category): Int? {
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt
+index 96c316ff7..74610f51d 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt
+@@ -83,6 +83,7 @@ import tachiyomi.presentation.core.components.material.BrowsingTabSelector
+ import tachiyomi.presentation.core.components.material.Scaffold
+ import tachiyomi.presentation.core.components.material.isCompactBrowsingWindow
+ import tachiyomi.presentation.core.components.material.rememberBrowsingTopAppBarScrollBehavior
++import tachiyomi.presentation.core.components.withFrameTimeProtection
+ import tachiyomi.presentation.core.i18n.stringResource
+ import tachiyomi.presentation.core.screens.EmptyScreen
+ import tachiyomi.presentation.core.screens.EmptyScreenAction
+@@ -196,7 +197,7 @@ data object LibraryTab : Tab {
+                                     labels = categories.map { it.visualName },
+                                     selectedIndex = pagerState.currentPage,
+                                     badges = categories.map { state.getItemCountForCategory(it) },
+-                                    onSelect = { scope.launch { pagerState.animateScrollToPage(it) } },
++                                    onSelect = { scope.launch { withFrameTimeProtection { pagerState.animateScrollToPage(it) } } },
+                                 )
+                             }
+                         } else {
+@@ -244,7 +245,7 @@ data object LibraryTab : Tab {
+                             categories = categories,
+                             pagerState = pagerState,
+                             getItemCountForCategory = { state.getItemCountForCategory(it) },
+-                            onTabItemClick = { scope.launch { pagerState.animateScrollToPage(it) } },
++                            onTabItemClick = { scope.launch { withFrameTimeProtection { pagerState.animateScrollToPage(it) } } },
+                         )
+                     }
+                 }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/controls/components/panels/components/MultiCardPanel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/controls/components/panels/components/MultiCardPanel.kt
+index 41c6ca44f..a0051571e 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/controls/components/panels/components/MultiCardPanel.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/controls/components/panels/components/MultiCardPanel.kt
+@@ -39,6 +39,7 @@ import androidx.compose.ui.unit.dp
+ import androidx.constraintlayout.compose.ConstraintLayout
+ import eu.kanade.tachiyomi.ui.player.controls.CARDS_MAX_WIDTH
+ import tachiyomi.presentation.core.components.material.padding
++import tachiyomi.presentation.core.components.rememberFrameTimeProtectedPagerFlingBehavior
+ 
+ @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
+ @Composable
+@@ -81,6 +82,7 @@ fun MultiCardPanel(
+                 )
+                 HorizontalPager(
+                     state = pagerState,
++                    flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(pagerState),
+                     pageSize = PageSize.Fixed(LocalConfiguration.current.screenWidthDp.dp * 0.9f),
+                     verticalAlignment = Alignment.Top,
+                     pageSpacing = MaterialTheme.padding.small,
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/AnimationFrameProtection.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/AnimationFrameProtection.kt
+new file mode 100644
+index 000000000..123408126
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/AnimationFrameProtection.kt
+@@ -0,0 +1,90 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.animation.core.Animatable
++import androidx.compose.animation.core.AnimationSpec
++import androidx.compose.animation.core.VectorConverter
++import androidx.compose.foundation.ExperimentalFoundationApi
++import androidx.compose.foundation.gestures.FlingBehavior
++import androidx.compose.foundation.gestures.ScrollScope
++import androidx.compose.foundation.gestures.ScrollableDefaults
++import androidx.compose.foundation.gestures.TargetedFlingBehavior
++import androidx.compose.foundation.pager.PagerDefaults
++import androidx.compose.foundation.pager.PagerState
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.SideEffect
++import androidx.compose.runtime.State
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberUpdatedState
++import androidx.compose.runtime.snapshotFlow
++import kotlinx.coroutines.channels.Channel
++import kotlinx.coroutines.flow.collect
++import kotlinx.coroutines.launch
++
++/** The same per-operation clock guard as scrolling; healthy and virtual clocks stay unchanged. */
++suspend fun <T> withFrameTimeProtection(block: suspend () -> T): T = withFlingFrameClock(0L, block)
++
++@Composable
++fun rememberFrameTimeProtectedFlingBehavior(
++    native: FlingBehavior = ScrollableDefaults.flingBehavior(),
++): FlingBehavior = remember(native) {
++    object : FlingBehavior {
++        override suspend fun ScrollScope.performFling(initialVelocity: Float): Float {
++            val scope = this
++            return withFrameTimeProtection { with(native) { scope.performFling(initialVelocity) } }
++        }
++    }
++}
++
++@OptIn(ExperimentalFoundationApi::class)
++@Composable
++fun rememberFrameTimeProtectedPagerFlingBehavior(state: PagerState): TargetedFlingBehavior {
++    val native = PagerDefaults.flingBehavior(state)
++    return remember(native) {
++        object : TargetedFlingBehavior {
++            override suspend fun ScrollScope.performFling(
++                initialVelocity: Float,
++                onRemainingScrollOffsetUpdate: (Float) -> Unit,
++            ): Float {
++                val scope = this
++                return withFrameTimeProtection {
++                    with(native) { scope.performFling(initialVelocity, onRemainingScrollOffsetUpdate) }
++                }
++            }
++        }
++    }
++}
++
++/** Conflate targets and let Animatable interrupt its old job, retaining retargeting velocity. */
++@Composable
++fun frameTimeProtectedFloatAsState(
++    targetValue: Float,
++    animationSpec: AnimationSpec<Float>,
++    label: String,
++): State<Float> {
++    val animation = remember { Animatable(targetValue, Float.VectorConverter, visibilityThreshold = 0.01f, label = label) }
++    val spec by rememberUpdatedState(animationSpec)
++    val targets = remember { Channel<Float>(Channel.CONFLATED) }
++    SideEffect { targets.trySend(targetValue) }
++    LaunchedEffect(targets) {
++        for (target in targets) {
++            val latest = targets.tryReceive().getOrNull() ?: target
++            launch {
++                if (latest != animation.targetValue) {
++                    withFrameTimeProtection { animation.animateTo(latest, spec) }
++                }
++            }
++        }
++    }
++    return animation.asState()
++}
++
++/** Do not persist intermediate categories or rebuild screen state while a pager is moving. */
++@Composable
++fun ObserveSettledPage(state: PagerState, onPage: (Int) -> Unit) {
++    val currentOnPage by rememberUpdatedState(onPage)
++    LaunchedEffect(state) {
++        snapshotFlow { state.settledPage }.collect { currentOnPage(it) }
++    }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+index b5d999678..5d5878735 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+@@ -1403,7 +1403,7 @@ private suspend fun Animatable<Float, AnimationVector1D>.holdOpaqueWhileThumbGra
+             awaitThumbNotHeld(held)
+         }
+         if (!held()) {
+-            animateTo(0f, animationSpec = ImmediateFadeOutAnimationSpec)
++            withFrameTimeProtection { animateTo(0f, animationSpec = ImmediateFadeOutAnimationSpec) }
+         }
+         return
+     }
+@@ -1429,7 +1429,7 @@ private suspend fun Animatable<Float, AnimationVector1D>.fadeUnlessThumbGrabbed(
+     return coroutineScope {
+         val fadeFinished = CompletableDeferred<Boolean>()
+         val animation = launch {
+-            this@fadeUnlessThumbGrabbed.fade()
++            withFrameTimeProtection { this@fadeUnlessThumbGrabbed.fade() }
+             fadeFinished.complete(true)
+         }
+         val grab = launch {
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt
+index f813d8706..b7b1d2ccf 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt
+@@ -1,7 +1,6 @@
+ package tachiyomi.presentation.core.components.material
+ 
+ import androidx.compose.animation.core.FastOutSlowInEasing
+-import androidx.compose.animation.core.animateFloatAsState
+ import androidx.compose.animation.core.tween
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Box
+@@ -41,6 +40,9 @@ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.unit.LayoutDirection
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
++import tachiyomi.presentation.core.components.frameTimeProtectedFloatAsState
++import tachiyomi.presentation.core.components.rememberFrameTimeProtectedFlingBehavior
++import tachiyomi.presentation.core.components.withFrameTimeProtection
+ 
+ /** A fixed screen title beside scrolling categories; only the category strip fades at its edges. */
+ @Composable
+@@ -57,7 +59,7 @@ fun BrowsingTabSelector(
+     val state = rememberLazyListState(initialFirstVisibleItemIndex = selected)
+     val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
+     val indicatorColor = MaterialTheme.colorScheme.primary
+-    val animatedSelection by animateFloatAsState(
++    val animatedSelection by frameTimeProtectedFloatAsState(
+         targetValue = selected.toFloat(),
+         animationSpec = tween(durationMillis = 250, easing = FastOutSlowInEasing),
+         label = "browsingTabIndicator",
+@@ -65,7 +67,7 @@ fun BrowsingTabSelector(
+     LaunchedEffect(selected, labels.size) {
+         val item = state.layoutInfo.visibleItemsInfo.firstOrNull { it.index == selected }
+         if (item == null || item.offset < 0 || item.offset + item.size > state.layoutInfo.viewportEndOffset) {
+-            state.animateScrollToItem(selected)
++            withFrameTimeProtection { state.animateScrollToItem(selected) }
+         }
+     }
+     BoxWithConstraints(modifier.fillMaxWidth()) {
+@@ -84,6 +86,7 @@ fun BrowsingTabSelector(
+             )
+             LazyRow(
+                 state = state,
++                flingBehavior = rememberFrameTimeProtectedFlingBehavior(),
+                 modifier = Modifier
+                     .weight(1f)
+                     .selectableGroup()
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleTouchFeedback.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleTouchFeedback.kt
+index fe9bf065b..fc2fed840 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleTouchFeedback.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/CapsuleTouchFeedback.kt
+@@ -7,6 +7,7 @@ import androidx.compose.runtime.Stable
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.launch
++import tachiyomi.presentation.core.components.withFrameTimeProtection
+ import kotlin.math.abs
+ import kotlin.math.roundToInt
+ 
+@@ -28,7 +29,7 @@ internal class CapsuleTouchFeedback {
+             // A reversal continues at the same progress speed, without restarting a full easing.
+             val duration = (abs(target - progress.value) * 260f).roundToInt()
+             if (duration > 0) {
+-                progress.animateTo(target, tween(duration, easing = LinearEasing))
++                withFrameTimeProtection { progress.animateTo(target, tween(duration, easing = LinearEasing)) }
+             } else {
+                 progress.snapTo(target)
+             }
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+index 2fda0b094..25b82862a 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+@@ -47,6 +47,7 @@ import androidx.compose.ui.unit.IntSize
+ import androidx.compose.ui.unit.LayoutDirection
+ import androidx.compose.ui.unit.dp
+ import kotlinx.coroutines.launch
++import tachiyomi.presentation.core.components.withFrameTimeProtection
+ import kotlin.math.abs
+ import kotlin.math.roundToInt
+ 
+@@ -112,7 +113,7 @@ fun NavigationCapsule(
+     }
+     val motion = spring<Float>(dampingRatio = 0.86f, stiffness = 420f)
+     LaunchedEffect(selected, itemCount) {
+-        if (dragPosition == null) position.animateTo(selected.toFloat(), motion)
++        if (dragPosition == null) withFrameTimeProtection { position.animateTo(selected.toFloat(), motion) }
+     }
+     fun settle(index: Int, commit: Boolean) {
+         val from = dragPosition ?: position.value
+@@ -120,7 +121,7 @@ fun NavigationCapsule(
+             position.snapTo(from)
+             dragPosition = null
+             if (commit && index != latestActualSelected) latestOnSelect(index)
+-            position.animateTo(index.toFloat(), motion)
++            withFrameTimeProtection { position.animateTo(index.toFloat(), motion) }
+         }
+     }
+     Box(
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+index fb80b5a20..f0f2dbd69 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+@@ -3,7 +3,6 @@ package tachiyomi.presentation.core.components.material
+ import android.view.accessibility.AccessibilityManager
+ import androidx.compose.animation.core.FastOutLinearInEasing
+ import androidx.compose.animation.core.LinearOutSlowInEasing
+-import androidx.compose.animation.core.animateFloatAsState
+ import androidx.compose.animation.core.tween
+ import androidx.compose.foundation.gestures.awaitEachGesture
+ import androidx.compose.foundation.gestures.awaitFirstDown
+@@ -43,6 +42,7 @@ import androidx.compose.ui.unit.Dp
+ import androidx.compose.ui.unit.Velocity
+ import androidx.compose.ui.unit.dp
+ import dev.chrisbanes.haze.HazeState
++import tachiyomi.presentation.core.components.frameTimeProtectedFloatAsState
+ import kotlin.math.abs
+ import kotlin.math.roundToInt
+ 
+@@ -316,7 +316,7 @@ fun rememberBrowsingNavigationBarState(enabled: Boolean, resetKey: Any?): Browsi
+         // A window/density change cancels the old finger sequence, not its visible/hidden choice.
+         state.endGesture()
+     }
+-    state.animation = animateFloatAsState(
++    state.animation = frameTimeProtectedFloatAsState(
+         targetValue = if (state.visible) 0f else 1f,
+         animationSpec = tween(
+             durationMillis = state.animationDurationMillis,
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromePagerAnimationTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromePagerAnimationTest.kt
+new file mode 100644
+index 000000000..ca39294e1
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromePagerAnimationTest.kt
+@@ -0,0 +1,115 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.animation.core.tween
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.requiredSize
++import androidx.compose.foundation.pager.HorizontalPager
++import androidx.compose.foundation.pager.PagerState
++import androidx.compose.foundation.pager.rememberPagerState
++import androidx.compose.runtime.mutableFloatStateOf
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.onNodeWithTag
++import androidx.compose.ui.test.performTouchInput
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.test.swipeLeft
++import androidx.compose.ui.test.swipeRight
++import androidx.compose.ui.unit.dp
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.launch
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34])
++class NavigationChromePagerAnimationTest {
++    @Test
++    fun `category animation persists only its settled page and rapid retargeting ends on the latest page`() = runComposeUiTest {
++        lateinit var pager: PagerState
++        lateinit var scope: CoroutineScope
++        val saved = mutableListOf<Int>()
++        setContent {
++            pager = rememberPagerState { 12 }
++            scope = rememberCoroutineScope()
++            ObserveSettledPage(pager) { saved += it }
++            HorizontalPager(
++                state = pager,
++                flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(pager),
++                modifier = Modifier.requiredSize(400.dp, 500.dp),
++            ) { Box(Modifier.fillMaxSize()) }
++        }
++        mainClock.autoAdvance = false
++        runOnIdle { scope.launch { withFrameTimeProtection { pager.animateScrollToPage(3) } } }
++        mainClock.advanceTimeBy(80)
++        runOnIdle { assertEquals(listOf(0), saved) }
++        mainClock.advanceTimeBy(1500)
++        runOnIdle {
++            assertEquals(3, pager.settledPage)
++            assertEquals(listOf(0, 3), saved)
++            scope.launch { withFrameTimeProtection { pager.animateScrollToPage(9) } }
++        }
++        mainClock.advanceTimeBy(32)
++        runOnIdle { scope.launch { withFrameTimeProtection { pager.animateScrollToPage(2) } } }
++        mainClock.advanceTimeBy(2000)
++        runOnIdle {
++            assertEquals(2, pager.settledPage)
++            assertEquals(2, saved.last())
++            assertTrue(9 !in saved)
++        }
++    }
++
++    @Test
++    fun `protected native pager fling snaps correctly in both directions`() = runComposeUiTest {
++        lateinit var pager: PagerState
++        setContent {
++            pager = rememberPagerState { 6 }
++            HorizontalPager(
++                state = pager,
++                flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(pager),
++                modifier = Modifier.requiredSize(400.dp, 500.dp).testTag("categories"),
++            ) { Box(Modifier.fillMaxSize()) }
++        }
++        onNodeWithTag("categories").performTouchInput { swipeLeft(durationMillis = 180) }
++        waitForIdle()
++        var leftPage = 0
++        runOnIdle {
++            leftPage = pager.settledPage
++            assertTrue(leftPage in 1..5)
++            assertEquals(0f, pager.currentPageOffsetFraction, 0.001f)
++        }
++        onNodeWithTag("categories").performTouchInput { swipeRight(durationMillis = 180) }
++        waitForIdle()
++        runOnIdle {
++            assertTrue(pager.settledPage < leftPage)
++            assertEquals(0f, pager.currentPageOffsetFraction, 0.001f)
++        }
++    }
++
++    @Test
++    fun `protected indicator keeps intermediate animation and conflates rapid target changes`() = runComposeUiTest {
++        val target = mutableFloatStateOf(0f)
++        var value = 0f
++        setContent {
++            value = frameTimeProtectedFloatAsState(target.floatValue, tween(250), "indicator").value
++        }
++        mainClock.autoAdvance = false
++        runOnIdle { target.floatValue = 1f }
++        mainClock.advanceTimeBy(96)
++        runOnIdle { assertTrue(value in 0.01f..0.99f) }
++        runOnIdle {
++            target.floatValue = 0f
++            target.floatValue = 0.4f
++            target.floatValue = 0.8f
++        }
++        mainClock.advanceTimeBy(500)
++        runOnIdle { assertEquals(0.8f, value, 0.001f) }
++    }
++}

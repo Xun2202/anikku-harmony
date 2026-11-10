@@ -819,3 +819,12 @@ gh release list --repo Xun2202/anikku-harmony
 - 四项真实runtime JVM时钟测试已本地24秒通过：健康60/90/120与加速虚拟时钟原值、重复/1ns钳制、实际回调停顿、作用域恢复与取消。新增真实默认spline故障复现/修复回归，并验证实际Masonry滚动放置探针；既有触摸中断/滚动条与原始委托回归仍按CI执行。
 - 纠正32采集缺口：外层drawWithContent会被Compose缓存，不能当逐帧绘制或掉帧统计。移除该探针/临时state字段，尾段独立格式2增加raw/delivered帧时间、corrected标记、每次实际布局放置/整数offset/视口及measure wall；旧主格式Mi6/An3及默认轻量保持。布局次数也不等于屏幕呈现。
 - 新版需真机确认尾段零位移比例和手感是否恢复，以及时钟保护是否触发；32未保存原始帧时间，尚不能将平台帧时间异常当已直接观测的唯一原因。用户安装后保留玻璃，轻量录正常→展开→折回各两次快甩自然停下，约20–30秒。Animeko无本Masonry/TracedFlingBehavior，不直接套用此局部保护。
+
+## 2026-11-10：分类横滑与共用分页优化
+
+- 用户对33反馈“好像很顺滑了”，新问题主要是书架分类左右滑动明显卡；尚未比较冷启动与折叠状态，不假定与前次完全同因。0087与Mihon 0082共用AnimationFrameProtection，沿用原FlingFrameClock，不改其已获正向反馈的算法。
+- 当前分类页面的原生PagerDefaults目标惯性、animateScrollToPage点击路径与自定义指示条原先未接保护。新增TargetedFlingBehavior代理，完整转发原始velocity/ScrollScope消费/剩余偏移回调与返回速度；显式分页也接同一按操作作用域的时间保护。覆盖Mihon3个HorizontalPager入口，Anikku5个（额外封面/播放器面板）；不碰播放器解码/阅读器窗口策略。
+- LibraryContent改观察settledPage，滑动/跨过中点时不再反复持久化当前分类；指示UI仍随currentPage变化。分类IDs到LibraryItem的列表解析移到原后台分组/排序流水线（Mi Default、An IO）一次生成；State getter直接返回稳定列表，减少页切换/选中状态引发的新列表/下游重组。搜索/过滤/排序/内容变化仍重建数据。
+- 自定义分类指示条保留250ms渐变与边缘遮罩，分类条自动/手动滚动、导航位移/按压和滑块渐隐共享保护；FloatAsState沿用conflated channel+Animatable互斥中断语义，保留中间值与快速重定向，不改布局/玻璃样式/手势阈值。
+- 新增真实Compose回归：正常分页、快速重定向及仅保存settled分类，左右手势原生吸附，指示条中间值/连续目标合并。原惯性/导航/光效回归继续；实际横滑流畅度需用户更新后确认，未编造FPS收益。
+- Animeko实查CollectionPage与详情/日程等也有KMP commonMain Pager，不能标不适用；它采用独立LazyPagingItems/状态和跨平台Coroutine，不能直接引入本JVM System.nanoTime helper。其同类时钟适用性待Android专项证据/平台实现评估，Tachiyomi分类数据改动不直接移植；本轮记录待确认，未额外构建第三款。
