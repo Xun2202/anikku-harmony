@@ -887,3 +887,11 @@ gh release list --repo Xun2202/anikku-harmony
 - 新NavigationChromeSheetWindowTest走实际Compose Dialog窗口、与app相同edge-to-edge/dim/animation设置及NavigationOverlayScope；点击筛选按钮后检查可见与最终fraction、未自发关闭，内容关闭后连续再开3次，手机与居中两项。之前仅直接在Activity内容里测核心组件，不能代表真实弹窗首次布局时序；该盲区补齐，原有10项交互及其它必要回归保留。
 - 仅MangaBottomActionMenu（章节/剧集选择）上padding+4dp：紧凑8dp、其它12dp；下padding仍4/8dp、按钮40/48dp和无300ms延迟保留。书架LibraryBottomActionMenu继续现有紧凑高度，避免一起抬高。
 - Animeko没有此自定义AdaptiveSheet readiness key/observer链，独立Material3/KMP路径的上轮判断复用；本轮不改第三款。规则docs/rules/apk-shared-ui.md现有AGENTS入口继续加载，并补真实Dialog开关/重开验收范围。
+
+## 2026-11-15：插件标题、第二行筛选及自然回首（0097）
+
+- 用户希望插件名字体变大，热门/最近更新放回第二行并与书架第二行同高；自然滑回顶部时导航应随内容带出，避免空带。0097与Mihon 0093同步；本项替代先前插件标题/筛选单行压缩方案。
+- BrowseSourceToolbar恢复正常AppBarTitle字号及可用宽度，移除80dp/titleMedium压缩标题。热门/最新/筛选/An保存搜索始终在第二行横滑，搜索和多选仍保持同样结构/高度，滚动状态与动作保留。BrowsingFilterRow与书架独立分类行、LibraryTabs和全局搜索共用browsingSecondaryRowHeight：紧凑40dp、普通48dp；主栏仍原40/56/大字64dp。An原外置分隔线改行内叠放，不额外增加1dp。书架单行分类与选中动画保留。
+- 回首根因：插件全景直接调用PanoramaMasonry，旧边缘监听只装在FastScrollPanoramaMasonry；前轮补原生list/grid时误以为所有全景已有监听。现在观察下移到PanoramaMasonry的实际视口，带滚动条wrapper移除重复观察；所有全景随真实leading offset带回标题，顶部提交visible/动画终值，不再露出旧padding空带。普通列表/网格沿用已有保护，不改FlingFrameClock内核或导航手势阈值。
+- 更新NavigationChromeBrowseHeaderTest验证正常22sp标题、两行80/104dp及分类/筛选40/48dp一致，末筛选仍能横滑点击。新增NavigationChromePanoramaHeaderTest两项：裸全景与书架fast wrapper在真实指针松开时记录正offset/回甩velocity，之后靠惯性到0，检查导航显示、首封面与header相接、离开顶部不回弹隐藏；不中途暂停指针以免丢失释放速度。旧面板/重开/分页/长按/性能必要回归保留。
+- Animeko独立KMP collection/details导航，无本Bare/Fast PanoramaMasonry包装层差异；前轮实际源码判断复用，不照搬本补丁。现有AGENTS触发的档案共享UI规则更新二行策略与底层边缘owner，真机Pura X Max视觉/手感仍由安装反馈。

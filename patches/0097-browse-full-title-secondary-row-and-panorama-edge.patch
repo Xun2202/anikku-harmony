@@ -1,0 +1,625 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:00:58 +0000
+Subject: [PATCH] fix(browse): restore full title and shared secondary filter
+ row
+
+Address user feedback that plugin names are too small, popular/latest should sit on a second row matching library categories, and natural return to the top leaves a hidden header and empty spacer. Shared fix with Mihon 0093. Remove the compact source title/filter combination and restore normal AppBarTitle typography and available width. Keep filters on a persistent horizontally scrollable second row in regular/search/selection states, preserving saved searches and all actions. Share 40dp compact/48dp regular secondary-row metrics with library category rows and global search; draw Anikku category divider within the row instead of adding height. The source panorama uses bare PanoramaMasonry while the library uses its fast-scroll wrapper. Move boundary observation into the masonry viewport and remove the outer duplicate, so both variants follow the leading content spacer and commit revealed navigation after inertia reaches the start. Preserve the original fling kernel and gesture policy. Update the title/row-height regression for compact and tall windows and add real raw/fast panorama pointer-release tests, recording positive release offset/velocity and checking inertial arrival, header/content alignment and stable departure from the start.
+---
+ .../browse/components/BrowseSourceToolbar.kt  |   3 +-
+ .../browse/components/GlobalSearchToolbar.kt  |  15 +-
+ .../library/components/LibraryTabs.kt         |  11 +-
+ .../source/browse/BrowseSourceScreen.kt       |  20 +--
+ .../core/components/PanoramaMasonry.kt        |  24 +--
+ .../material/BrowsingTabSelector.kt           |  16 +-
+ .../material/BrowsingToolbarContent.kt        |  35 ++---
+ .../NavigationChromeBrowseHeaderTest.kt       |  64 +++++---
+ .../NavigationChromePanoramaHeaderTest.kt     | 142 ++++++++++++++++++
+ 9 files changed, 235 insertions(+), 95 deletions(-)
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromePanoramaHeaderTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceToolbar.kt b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceToolbar.kt
+index 09107871d..d3fa16517 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceToolbar.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/BrowseSourceToolbar.kt
+@@ -40,7 +40,6 @@ fun BrowseSourceToolbar(
+     // KMK <--
+     onSearch: (String) -> Unit,
+     scrollBehavior: TopAppBarScrollBehavior? = null,
+-    titleContent: (@Composable () -> Unit)? = null,
+     // KMK -->
+     toggleSelectionMode: () -> Unit,
+     isRunning: Boolean,
+@@ -54,7 +53,7 @@ fun BrowseSourceToolbar(
+ 
+     SearchToolbar(
+         navigateUp = navigateUp,
+-        titleContent = titleContent ?: { AppBarTitle(title) },
++        titleContent = { AppBarTitle(title) },
+         searchQuery = searchQuery,
+         onChangeSearchQuery = onSearchQueryChange,
+         onSearch = onSearch,
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/components/GlobalSearchToolbar.kt b/app/src/main/java/eu/kanade/presentation/browse/components/GlobalSearchToolbar.kt
+index 89ab3cad9..2f7c11f57 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/components/GlobalSearchToolbar.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/components/GlobalSearchToolbar.kt
+@@ -1,13 +1,10 @@
+ package eu.kanade.presentation.browse.components
+ 
+ import androidx.compose.foundation.background
+-import androidx.compose.foundation.horizontalScroll
+-import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.fillMaxWidth
+-import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.material.icons.Icons
+@@ -16,7 +13,6 @@ import androidx.compose.material.icons.outlined.FilterList
+ import androidx.compose.material.icons.outlined.PushPin
+ import androidx.compose.material3.FilterChip
+ import androidx.compose.material3.FilterChipDefaults
+-import androidx.compose.material3.HorizontalDivider
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.LinearProgressIndicator
+ import androidx.compose.material3.MaterialTheme
+@@ -31,9 +27,9 @@ import eu.kanade.presentation.components.SearchToolbar
+ import eu.kanade.tachiyomi.ui.browse.source.globalsearch.SourceFilter
+ import kotlinx.collections.immutable.persistentListOf
+ import tachiyomi.i18n.MR
++import tachiyomi.presentation.core.components.material.BrowsingFilterRow
+ import tachiyomi.presentation.core.components.material.browsingChromeContainerColor
+ import tachiyomi.presentation.core.components.material.padding
+-import tachiyomi.presentation.core.components.rememberFrameTimeProtectedFlingBehavior
+ import tachiyomi.presentation.core.i18n.stringResource
+ 
+ @Composable
+@@ -85,12 +81,7 @@ fun GlobalSearchToolbar(
+             }
+         }
+ 
+-        Row(
+-            modifier = Modifier
+-                .horizontalScroll(rememberScrollState(), flingBehavior = rememberFrameTimeProtectedFlingBehavior())
+-                .padding(horizontal = MaterialTheme.padding.small),
+-            horizontalArrangement = Arrangement.spacedBy(MaterialTheme.padding.small),
+-        ) {
++        BrowsingFilterRow(state = rememberScrollState()) {
+             // TODO: make this UX better; it only applies when triggering a new search
+             if (!hideSourceFilter) {
+                 // KMK -->
+@@ -147,7 +138,5 @@ fun GlobalSearchToolbar(
+                 },
+             )
+         }
+-
+-        HorizontalDivider()
+     }
+ }
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LibraryTabs.kt b/app/src/main/java/eu/kanade/presentation/library/components/LibraryTabs.kt
+index 512627b8d..2a9ac9677 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LibraryTabs.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LibraryTabs.kt
+@@ -1,12 +1,15 @@
+ package eu.kanade.presentation.library.components
+ 
+-import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.pager.PagerState
+ import androidx.compose.material3.HorizontalDivider
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.PrimaryScrollableTabRow
+ import androidx.compose.material3.Tab
+ import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.zIndex
+@@ -14,6 +17,7 @@ import eu.kanade.presentation.category.visualName
+ import tachiyomi.domain.category.model.Category
+ import tachiyomi.presentation.core.components.material.TabText
+ import tachiyomi.presentation.core.components.material.browsingChromeContainerColor
++import tachiyomi.presentation.core.components.material.browsingSecondaryRowHeight
+ 
+ @Composable
+ internal fun LibraryTabs(
+@@ -23,8 +27,9 @@ internal fun LibraryTabs(
+     onTabItemClick: (Int) -> Unit,
+ ) {
+     val currentPageIndex = pagerState.currentPage.coerceAtMost(categories.lastIndex)
+-    Column(modifier = Modifier.zIndex(2f)) {
++    Box(modifier = Modifier.height(browsingSecondaryRowHeight()).zIndex(2f)) {
+         PrimaryScrollableTabRow(
++            modifier = Modifier.fillMaxSize(),
+             selectedTabIndex = currentPageIndex,
+             containerColor = browsingChromeContainerColor(),
+             edgePadding = 0.dp,
+@@ -47,6 +52,6 @@ internal fun LibraryTabs(
+             }
+         }
+ 
+-        HorizontalDivider()
++        HorizontalDivider(Modifier.align(Alignment.BottomCenter))
+     }
+ }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreen.kt
+index 206f98f69..3706400b4 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreen.kt
+@@ -12,7 +12,6 @@ import androidx.compose.material.icons.outlined.FilterList
+ import androidx.compose.material.icons.outlined.NewReleases
+ import androidx.compose.material3.FilterChip
+ import androidx.compose.material3.FilterChipDefaults
+-import androidx.compose.material3.HorizontalDivider
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.SnackbarHost
+@@ -46,7 +45,6 @@ import eu.kanade.presentation.browse.components.RemoveMangaDialog
+ import eu.kanade.presentation.browse.components.SavedSearchCreateDialog
+ import eu.kanade.presentation.browse.components.SavedSearchDeleteDialog
+ import eu.kanade.presentation.category.components.ChangeCategoryDialog
+-import eu.kanade.presentation.components.AppBarTitle
+ import eu.kanade.presentation.components.BulkSelectionToolbar
+ import eu.kanade.presentation.manga.DuplicateMangaDialog
+ import eu.kanade.presentation.util.AssistContentScreen
+@@ -75,12 +73,9 @@ import tachiyomi.core.common.util.lang.launchIO
+ import tachiyomi.domain.source.model.StubSource
+ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.kmk.KMR
+-import tachiyomi.presentation.core.components.material.AnimatedNavigationRow
+ import tachiyomi.presentation.core.components.material.BrowsingFilterRow
+-import tachiyomi.presentation.core.components.material.BrowsingToolbarTitle
+ import tachiyomi.presentation.core.components.material.Scaffold
+ import tachiyomi.presentation.core.components.material.browsingChromeContainerColor
+-import tachiyomi.presentation.core.components.material.isCompactBrowsingWindow
+ import tachiyomi.presentation.core.components.material.padding
+ import tachiyomi.presentation.core.components.material.rememberBrowsingTopAppBarScrollBehavior
+ import tachiyomi.presentation.core.i18n.stringResource
+@@ -190,7 +185,6 @@ data class BrowseSourceScreen(
+                 enabled = state.toolbarQuery == null && !bulkFavoriteState.selectionMode,
+             ),
+             topBar = { scrollBehavior ->
+-                val inlineFilters = isCompactBrowsingWindow() && state.toolbarQuery == null
+                 val filterScrollState = rememberScrollState()
+                 val filters: @Composable () -> Unit = {
+                     BrowsingFilterRow(state = filterScrollState) {
+@@ -291,11 +285,6 @@ data class BrowseSourceScreen(
+                     // KMK -->
+                     if (bulkFavoriteState.selectionMode) {
+                         BulkSelectionToolbar(
+-                            titleContent = if (inlineFilters) {
+-                                { BrowsingToolbarTitle(title = { Text("${bulkFavoriteState.selection.size}") }, content = filters) }
+-                            } else {
+-                                null
+-                            },
+                             selectedCount = bulkFavoriteState.selection.size,
+                             isRunning = bulkFavoriteState.isRunning,
+                             onClickClearSelection = bulkFavoriteScreenModel::toggleSelectionMode,
+@@ -314,11 +303,6 @@ data class BrowseSourceScreen(
+                     } else {
+                         // KMK <--
+                         BrowseSourceToolbar(
+-                            titleContent = if (inlineFilters) {
+-                                { BrowsingToolbarTitle(title = { AppBarTitle(screenModel.source?.name) }, content = filters) }
+-                            } else {
+-                                null
+-                            },
+                             scrollBehavior = scrollBehavior,
+                             searchQuery = state.toolbarQuery,
+                             onSearchQueryChange = screenModel::setToolbarQuery,
+@@ -342,9 +326,7 @@ data class BrowseSourceScreen(
+                         )
+                     }
+ 
+-                    AnimatedNavigationRow(visible = !inlineFilters) { filters() }
+-
+-                    if (!inlineFilters) HorizontalDivider()
++                    filters()
+                 }
+             },
+             snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+index a3ec68816..b8b6e07fe 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+@@ -524,7 +524,17 @@ fun PanoramaMasonry(
+         ),
+     )
+     LazyLayout(
+-        modifier = modifier
++        modifier = modifier.observeBrowsingLeadingScroll(
++            trailingRemaining = {
++                if (state.viewportHeight > 0 && state.contentHeight > 0) {
++                    (state.maxScroll - state.scrollOffset).coerceAtLeast(0f)
++                } else {
++                    Float.POSITIVE_INFINITY
++                }
++            },
++        ) {
++            state.scrollOffset
++        }
+             .panoramaTouchTrace(state.traceId)
+             .semantics {
+                 if (userScrollEnabled) {
+@@ -577,17 +587,7 @@ fun FastScrollPanoramaMasonry(
+ ) {
+     VerticalMasonryFastScroller(
+         state = state,
+-        modifier = modifier.observeBrowsingLeadingScroll(
+-            trailingRemaining = {
+-                if (state.viewportHeight > 0 && state.contentHeight > 0) {
+-                    (state.maxScroll - state.scrollOffset).coerceAtLeast(0f)
+-                } else {
+-                    Float.POSITIVE_INFINITY
+-                }
+-            },
+-        ) {
+-            state.scrollOffset
+-        },
++        modifier = modifier,
+         thumbAllowed = thumbAllowed,
+         thumbColor = thumbColor,
+         // Track insets overlap the screen padding; adding both would reserve it twice.
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt
+index 41a4de093..222c10770 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt
+@@ -58,6 +58,7 @@ fun BrowsingTabSelector(
+ ) {
+     if (labels.isEmpty()) return
+     val selected = selectedIndex.coerceIn(labels.indices)
++    val rowHeight = if (title.isNotEmpty()) 40.dp else browsingSecondaryRowHeight()
+     val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
+     val indicatorColor = MaterialTheme.colorScheme.primary
+     val animatedSelection by frameTimeProtectedFloatAsState(
+@@ -74,7 +75,7 @@ fun BrowsingTabSelector(
+     BoxWithConstraints(modifier.fillMaxWidth()) {
+         val titleMaxWidth = maxWidth * 0.45f
+         Row(
+-            modifier = Modifier.fillMaxWidth().height(40.dp),
++            modifier = Modifier.fillMaxWidth().height(rowHeight),
+             verticalAlignment = Alignment.CenterVertically,
+             horizontalArrangement = Arrangement.spacedBy(6.dp),
+         ) {
+@@ -98,11 +99,14 @@ fun BrowsingTabSelector(
+                         drawContent()
+                         val visible = state.layoutInfo.visibleItemsInfo
+                         val inset = 8.dp.toPx()
+-                        val indicator = browsingTabIndicatorBounds(animatedSelection.coerceIn(0f, labels.lastIndex.toFloat())) { index ->
+-                            visible.firstOrNull { it.index == index }?.let {
+-                                (it.offset + inset) to (it.size - 2 * inset).coerceAtLeast(0f)
++                        val indicator =
++                            browsingTabIndicatorBounds(
++                                animatedSelection.coerceIn(0f, labels.lastIndex.toFloat()),
++                            ) { index ->
++                                visible.firstOrNull { it.index == index }?.let {
++                                    (it.offset + inset) to (it.size - 2 * inset).coerceAtLeast(0f)
++                                }
+                             }
+-                        }
+                         indicator?.let { (start, width) ->
+                             val x = if (rtl) size.width - start - width else start
+                             drawRoundRect(
+@@ -139,7 +143,7 @@ fun BrowsingTabSelector(
+                 itemsIndexed(labels) { index, label ->
+                     Box(
+                         Modifier
+-                            .height(40.dp)
++                            .height(rowHeight)
+                             .width(IntrinsicSize.Max)
+                             .widthIn(min = 48.dp, max = 180.dp)
+                             .selectable(selected = index == selected, role = Role.Tab, onClick = { onSelect(index) })
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingToolbarContent.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingToolbarContent.kt
+index 9b40d0560..6fb4abadd 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingToolbarContent.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingToolbarContent.kt
+@@ -6,40 +6,35 @@ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.RowScope
+-import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.layout.padding
+-import androidx.compose.foundation.layout.widthIn
++import androidx.compose.material3.HorizontalDivider
+ import androidx.compose.material3.LocalMinimumInteractiveComponentSize
+-import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.ProvideTextStyle
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.unit.Dp
+ import androidx.compose.ui.unit.dp
+ import tachiyomi.presentation.core.components.rememberFrameTimeProtectedFlingBehavior
+ 
+-/** Compact browse titles share the main toolbar with their horizontally scrollable filters. */
++/** Match the library's compact category strip or regular Material tab row. */
+ @Composable
+-fun BrowsingToolbarTitle(title: @Composable () -> Unit, content: @Composable () -> Unit) {
+-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+-        Box(Modifier.widthIn(max = 80.dp).padding(end = 4.dp)) {
+-            ProvideTextStyle(MaterialTheme.typography.titleMedium, content = title)
+-        }
+-        Box(Modifier.weight(1f)) { content() }
+-    }
+-}
++fun browsingSecondaryRowHeight(): Dp = if (isCompactBrowsingWindow()) 40.dp else 48.dp
+ 
+ @Composable
+ fun BrowsingFilterRow(state: ScrollState, modifier: Modifier = Modifier, content: @Composable RowScope.() -> Unit) {
+-    val height = navigationToolbarHeight()
++    val height = browsingSecondaryRowHeight()
+     CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides minOf(height, 48.dp)) {
+-        Row(
+-            modifier.height(height).horizontalScroll(state, flingBehavior = rememberFrameTimeProtectedFlingBehavior()).padding(horizontal = 4.dp),
+-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+-            verticalAlignment = Alignment.CenterVertically,
+-            content = content,
+-        )
++        Box(modifier.height(height)) {
++            Row(
++                Modifier.fillMaxSize().horizontalScroll(state, flingBehavior = rememberFrameTimeProtectedFlingBehavior()).padding(horizontal = 4.dp),
++                horizontalArrangement = Arrangement.spacedBy(4.dp),
++                verticalAlignment = Alignment.CenterVertically,
++                content = content,
++            )
++            HorizontalDivider(Modifier.align(Alignment.BottomCenter))
++        }
+     }
+ }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeBrowseHeaderTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeBrowseHeaderTest.kt
+index bcac07fea..1fc606c02 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeBrowseHeaderTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeBrowseHeaderTest.kt
+@@ -13,8 +13,10 @@ import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+ import androidx.compose.foundation.lazy.rememberLazyListState
+ import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.material3.FilterChip
++import androidx.compose.material3.LocalTextStyle
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.geometry.Offset
+@@ -29,6 +31,7 @@ import androidx.compose.ui.test.performScrollTo
+ import androidx.compose.ui.test.runComposeUiTest
+ import androidx.compose.ui.unit.Density
+ import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.launch
+ import org.junit.Test
+@@ -46,37 +49,58 @@ import tachiyomi.presentation.core.components.FastScrollLazyVerticalGrid
+ @Config(sdk = [34])
+ class NavigationChromeBrowseHeaderTest {
+     @Test
+-    fun `compact source title and filters fit one common toolbar and filters remain reachable`() = runComposeUiTest {
+-        var height = 0
++    fun `source title keeps normal size above filters matching the library secondary row`() = runComposeUiTest {
++        val tall = mutableStateOf(false)
++        var headerHeight = 0
++        var filterHeight = 0
++        var categoryHeight = 0
++        var titleSize = 0.sp
+         var clicked = false
+         setContent {
+             val config = Configuration(LocalConfiguration.current).apply {
+                 screenWidthDp = 400
+-                screenHeightDp = 600
++                screenHeightDp = if (tall.value) 900 else 600
+             }
+             CompositionLocalProvider(LocalConfiguration provides config, LocalDensity provides Density(1f)) {
+-                Column(Modifier.requiredSize(400.dp, 200.dp)) {
+-                    NavigationTopAppBar(
+-                        title = {
+-                            BrowsingToolbarTitle(title = { Text("插件作品") }) {
+-                                BrowsingFilterRow(rememberScrollState()) {
+-                                    listOf("热门", "最新", "我的长名称搜索", "筛选").forEach { label ->
+-                                        FilterChip(selected = false, onClick = { clicked = label == "筛选" }, label = { Text(label) })
+-                                    }
+-                                }
++                Column(Modifier.requiredSize(400.dp, 250.dp)) {
++                    Column(Modifier.onGloballyPositioned { headerHeight = it.size.height }) {
++                        NavigationTopAppBar(
++                            title = {
++                                titleSize = LocalTextStyle.current.fontSize
++                                Text("插件作品")
++                            },
++                            navigationIcon = { Box(Modifier.size(40.dp)) },
++                            actions = { repeat(3) { Box(Modifier.size(40.dp)) } },
++                            windowInsets = WindowInsets(0),
++                        )
++                        BrowsingFilterRow(rememberScrollState(), Modifier.onGloballyPositioned { filterHeight = it.size.height }) {
++                            listOf("热门", "最新", "我的长名称搜索", "筛选", "另一个长名称搜索").forEach { label ->
++                                FilterChip(selected = false, onClick = { clicked = label == "筛选" }, label = { Text(label) })
+                             }
+-                        },
+-                        navigationIcon = { Box(Modifier.size(40.dp)) },
+-                        actions = { repeat(3) { Box(Modifier.size(40.dp)) } },
+-                        windowInsets = WindowInsets(0),
+-                        modifier = Modifier.onGloballyPositioned { height = it.size.height },
+-                    )
++                        }
++                    }
++                    BrowsingTabSelector(title = "", labels = listOf("分类一", "分类二"), selectedIndex = 0, onSelect = {}, modifier = Modifier.onGloballyPositioned { categoryHeight = it.size.height })
+                 }
+             }
+         }
+-        runOnIdle { assertEquals(40, height) }
++        runOnIdle {
++            assertEquals(22.sp, titleSize)
++            assertEquals(80, headerHeight)
++            assertEquals(40, filterHeight)
++            assertEquals(categoryHeight, filterHeight)
++        }
+         onNodeWithText("筛选").performScrollTo().performClick()
+-        runOnIdle { assertTrue(clicked) }
++        runOnIdle {
++            assertTrue(clicked)
++            tall.value = true
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(22.sp, titleSize)
++            assertEquals(104, headerHeight)
++            assertEquals(48, filterHeight)
++            assertEquals(categoryHeight, filterHeight)
++        }
+     }
+ 
+     @Test
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromePanoramaHeaderTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromePanoramaHeaderTest.kt
+new file mode 100644
+index 000000000..64ac24508
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromePanoramaHeaderTest.kt
+@@ -0,0 +1,142 @@
++package tachiyomi.presentation.core.components.material
++
++import android.content.res.Configuration
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.requiredSize
++import androidx.compose.material3.Text
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
++import androidx.compose.ui.input.nestedscroll.NestedScrollSource
++import androidx.compose.ui.input.nestedscroll.nestedScroll
++import androidx.compose.ui.layout.onGloballyPositioned
++import androidx.compose.ui.layout.positionInRoot
++import androidx.compose.ui.platform.LocalConfiguration
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.onNodeWithTag
++import androidx.compose.ui.test.performTouchInput
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.unit.Density
++import androidx.compose.ui.unit.Velocity
++import androidx.compose.ui.unit.dp
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.launch
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import tachiyomi.presentation.core.components.FastScrollPanoramaMasonry
++import tachiyomi.presentation.core.components.PanoramaCellHeight
++import tachiyomi.presentation.core.components.PanoramaColumns
++import tachiyomi.presentation.core.components.PanoramaMasonry
++import tachiyomi.presentation.core.components.PanoramaMasonryScope
++import tachiyomi.presentation.core.components.PanoramaMasonryState
++import tachiyomi.presentation.core.components.rememberPanoramaMasonryState
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34])
++class NavigationChromePanoramaHeaderTest {
++    @Test
++    fun `source panorama inertia brings its two-row header back without a blank band`() = assertCoastToStart(false)
++
++    @Test
++    fun `library panorama keeps the same return behavior after moving observation into the viewport`() = assertCoastToStart(true)
++
++    private fun assertCoastToStart(fastScroller: Boolean) = runComposeUiTest {
++        lateinit var chrome: BrowsingNavigationBarState
++        lateinit var grid: PanoramaMasonryState
++        lateinit var scope: CoroutineScope
++        var headerBottom = 0f
++        var firstCoverTop = 0f
++        var releaseOffset = Float.NaN
++        var releaseVelocity = 0f
++        setContent {
++            val config = Configuration(LocalConfiguration.current).apply {
++                screenWidthDp = 400
++                screenHeightDp = 600
++            }
++            CompositionLocalProvider(LocalConfiguration provides config, LocalDensity provides Density(1f)) {
++                chrome = rememberBrowsingNavigationBarState(enabled = true, resetKey = Unit)
++                scope = rememberCoroutineScope()
++                grid = rememberPanoramaMasonryState()
++                Box(Modifier.requiredSize(400.dp, 600.dp)) {
++                    CompositionLocalProvider(LocalBrowsingNavigationBarState provides chrome) {
++                        Scaffold(
++                            topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior(),
++                            contentWindowInsets = WindowInsets(0),
++                            topBar = {
++                                Column(Modifier.onGloballyPositioned { headerBottom = it.positionInRoot().y + it.size.height }) {
++                                    NavigationTopAppBar(title = { Text("插件作品") }, windowInsets = WindowInsets(0))
++                                    Box(Modifier.fillMaxWidth().height(browsingSecondaryRowHeight())) { Text("热门  最近更新") }
++                                }
++                            },
++                        ) { padding ->
++                            val covers: PanoramaMasonryScope.() -> Unit = {
++                                items(100, key = { it }, height = { PanoramaCellHeight.Fixed(100.dp) }) { index ->
++                                    Box(
++                                        Modifier.fillMaxWidth().height(100.dp).onGloballyPositioned {
++                                            if (index == 0) firstCoverTop = it.positionInRoot().y
++                                        },
++                                    )
++                                }
++                            }
++                            val probe = remember(grid) {
++                                object : NestedScrollConnection {
++                                    override suspend fun onPreFling(available: Velocity): Velocity {
++                                        releaseOffset = grid.scrollOffset
++                                        releaseVelocity = available.y
++                                        return Velocity.Zero
++                                    }
++                                }
++                            }
++                            val modifier = Modifier.fillMaxSize().testTag("panorama").nestedScroll(probe)
++                            if (fastScroller) {
++                                FastScrollPanoramaMasonry(columns = PanoramaColumns.Fixed(2), state = grid, modifier = modifier, contentPadding = padding, content = covers)
++                            } else {
++                                PanoramaMasonry(columns = PanoramaColumns.Fixed(2), state = grid, modifier = modifier, contentPadding = padding, content = covers)
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        runOnIdle { scope.launch { grid.scrollToOffset(400f) } }
++        waitForIdle()
++        runOnIdle {
++            chrome.nestedScrollConnection.onPostScroll(Offset(0f, -40f), Offset.Zero, NestedScrollSource.UserInput)
++            assertFalse(chrome.visible)
++        }
++        waitForIdle()
++        onNodeWithTag("panorama").performTouchInput {
++            down(Offset(center.x, height * 0.25f))
++            repeat(4) { moveBy(Offset(0f, 45f), delayMillis = 15) }
++            up()
++        }
++        waitForIdle()
++        runOnIdle {
++            assertTrue(releaseOffset > 100f, "The return must reach the start by inertia after release: $releaseOffset")
++            assertTrue(releaseVelocity > 1000f, "The pointer release must retain its return velocity: $releaseVelocity")
++            assertEquals(0f, grid.scrollOffset, 0.5f)
++            assertTrue(chrome.visible)
++            assertEquals(0f, chrome.hiddenFraction, 0.01f)
++            assertEquals(firstCoverTop, headerBottom, 1f, "The revealed header must fill its content spacer")
++            scope.launch { grid.scrollToOffset(300f) }
++        }
++        waitForIdle()
++        runOnIdle { assertEquals(0f, chrome.hiddenFraction, 0.01f, "Leaving the start must not restore an old hidden target") }
++    }
++}
