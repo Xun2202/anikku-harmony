@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 11:29:19 +0000
+Subject: [PATCH] fix(ui): wake fast scroller on programmatic position changes
+
+Preserve the existing visible thumb and immediate-grab behavior after restoring or programmatically scrolling a list. Notify on actual offset changes, including when isScrollInProgress is false; do not notify on alpha or chrome-only recompositions. Keep direct normalized geometry. Fix new pager tests to use the measured viewport origin when a required-size fixture exceeds the Robolectric screen; compare append-scroll response against a synchronized control so ongoing residual decay cannot invalidate the assertion. Do not remove or weaken the existing thumb/coast regression.
+---
+ .../core/components/FastScrollerProgress.kt       | 15 +++++++++++++++
+ .../core/components/VerticalFastScroller.kt       |  8 ++++----
+ .../NavigationChromeFastScrollerProgressTest.kt   | 12 ++++++++----
+ .../NavigationChromePagerTransitionTest.kt        |  7 ++++---
+ 4 files changed, 31 insertions(+), 11 deletions(-)
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/FastScrollerProgress.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/FastScrollerProgress.kt
+index 6ee65c71a..4a2fb040e 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/FastScrollerProgress.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/FastScrollerProgress.kt
+@@ -6,6 +6,7 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.SideEffect
+ import androidx.compose.runtime.remember
++import kotlinx.coroutines.flow.MutableSharedFlow
+ 
+ private class ScrollerSample(var count: Int = 0, var rendered: Float = 0f)
+ 
+@@ -38,3 +39,17 @@ internal fun rememberFastScrollerDragTravel(liveTravel: Float, held: Boolean): F
+     travel.held = held
+     return travel.value
+ }
++
++private class LastScrollPosition(var value: Float = Float.NaN)
++
++/** Programmatic scrolling must wake the thumb too; chrome/alpha-only recomposition must not. */
++@Composable
++internal fun FastScrollerPositionChanged(scrolled: MutableSharedFlow<Unit>, position: Float) {
++    val previous = remember { LastScrollPosition() }
++    SideEffect {
++        if (position != previous.value) {
++            previous.value = position
++            scrolled.tryEmit(Unit)
++        }
++    }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+index 127dd9817..2f4fb9eae 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+@@ -483,7 +483,7 @@ fun VerticalGridFastScroller(
+                     else -> (scrollOffset.toFloat() / extraScrollRange).coerceIn(0f, 1f)
+                 }
+                 thumbProgress = proportion
+-                if (state.isScrollInProgress) scrolled.tryEmit(Unit)
++                FastScrollerPositionChanged(scrolled, scrollOffset.toFloat())
+             }
+ 
+             // Thumb alpha
+@@ -774,7 +774,7 @@ fun IrregularVerticalGridFastScroller(
+                     !state.canScrollForward -> 1f
+                     else -> (scrollOffset / (range - scrollViewportHeightPx).coerceAtLeast(1f)).coerceIn(0f, 1f)
+                 }
+-                if (state.isScrollInProgress) scrolled.tryEmit(Unit)
++                FastScrollerPositionChanged(scrolled, scrollOffset.toFloat())
+             }
+ 
+             // Thumb alpha
+@@ -958,7 +958,7 @@ fun VerticalMasonryFastScroller(
+                     !state.canScrollForward -> 1f
+                     else -> (state.scrollOffset / state.maxScroll.coerceAtLeast(1f)).coerceIn(0f, 1f)
+                 }
+-                if (state.isScrollInProgress) scrolled.tryEmit(Unit)
++                FastScrollerPositionChanged(scrolled, state.scrollOffset)
+             }
+ 
+             val isThumbVisible = alpha.value > 0f
+@@ -1103,7 +1103,7 @@ internal fun VerticalTimelineFastScroller(
+                         it.scrollOffset.toFloat() / (it.contentSize - it.viewportSize).coerceAtLeast(1)
+                     }?.coerceIn(0f, 1f) ?: 0f
+                 }
+-                if (state.isScrollInProgress) scrolled.tryEmit(Unit)
++                FastScrollerPositionChanged(scrolled, state.scrollIndicatorState?.scrollOffset?.toFloat() ?: 0f)
+             }
+ 
+             val isThumbVisible = alpha.value > 0f
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFastScrollerProgressTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFastScrollerProgressTest.kt
+index 7271a1811..afd6fede8 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFastScrollerProgressTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFastScrollerProgressTest.kt
+@@ -20,25 +20,29 @@ class NavigationChromeFastScrollerProgressTest {
+     @Test
+     fun `append correction is continuous while real scrolling stays immediate`() = runComposeUiTest {
+         val progress = mutableFloatStateOf(0.6f)
++        val baselineProgress = mutableFloatStateOf(0.6f)
+         val count = mutableIntStateOf(100)
++        var baseline = 0f
+         var rendered = 0f
+-        setContent { rendered = rememberFastScrollerProgress(progress.floatValue, count.intValue, false, true) }
++        setContent {
++            baseline = rememberFastScrollerProgress(baselineProgress.floatValue, count.intValue, false, true)
++            rendered = rememberFastScrollerProgress(progress.floatValue, count.intValue, false, true)
++        }
+         mainClock.autoAdvance = false
+         runOnIdle {
+             count.intValue = 200
+             progress.floatValue = 0.3f
++            baselineProgress.floatValue = 0.3f
+         }
+         mainClock.advanceTimeByFrame()
+         runOnIdle { assertEquals(0.6f, rendered, 0.01f) }
+         mainClock.advanceTimeBy(80)
+-        var before = 0f
+         runOnIdle {
+             assertTrue(rendered in 0.31f..0.59f)
+-            before = rendered
+             progress.floatValue += 0.05f
+         }
+         mainClock.advanceTimeByFrame()
+-        runOnIdle { assertTrue(rendered > before, "actual scroll must not wait for the append animation") }
++        runOnIdle { assertEquals(0.05f, rendered - baseline, 0.001f, "actual scroll must not wait for the append animation") }
+         mainClock.advanceTimeBy(300)
+         runOnIdle { assertEquals(0.35f, rendered, 0.001f) }
+     }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromePagerTransitionTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromePagerTransitionTest.kt
+index 42ab5ce51..730e5db65 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromePagerTransitionTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromePagerTransitionTest.kt
+@@ -52,6 +52,7 @@ class NavigationChromePagerTransitionTest {
+         lateinit var chrome: BrowsingNavigationBarState
+         lateinit var pager: PagerState
+         lateinit var lists: List<LazyListState>
++        var viewportY = 0f
+         var headerY = 0f
+         var bottomY = 0f
+         setContent {
+@@ -61,7 +62,7 @@ class NavigationChromePagerTransitionTest {
+                 lists = remember { listOf(LazyListState(20), LazyListState(if (incomingAtTop) 0 else 20), LazyListState()) }
+                 CompositionLocalProvider(LocalBrowsingNavigationBarState provides chrome) {
+                     Scaffold(
+-                        modifier = Modifier.requiredSize(400.dp, 600.dp),
++                        modifier = Modifier.requiredSize(400.dp, 600.dp).onGloballyPositioned { viewportY = it.positionInRoot().y },
+                         topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior(),
+                         contentWindowInsets = WindowInsets(0),
+                         topBar = {
+@@ -108,8 +109,8 @@ class NavigationChromePagerTransitionTest {
+             assertFalse(chrome.visible, "A partial incoming edge must not overwrite the old hidden target")
+             val expected = if (incomingAtTop) 1f - progress else 1f
+             assertEquals(expected, chrome.hiddenFraction, 0.02f)
+-            assertEquals(-100f * expected, headerY, 1.5f)
+-            assertEquals(560f + 40f * expected, bottomY, 1.5f)
++            assertEquals(viewportY - 100f * expected, headerY, 1.5f)
++            assertEquals(viewportY + 560f + 40f * expected, bottomY, 1.5f)
+             assertTrue(abs(headerY) > 1f, "Held paging must interpolate rather than snap the header")
+         }
+         onNodeWithTag("pager").performTouchInput {

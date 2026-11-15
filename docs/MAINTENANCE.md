@@ -905,3 +905,7 @@ gh release list --repo Xun2202/anikku-harmony
 - 详情滚动条按章节/集数、真实视口与列数估计：章节行本身超过两个视口才启用，长简介不误触发；短详情隐藏、长列表仍可拖。手机/平板和An adaptive/fixed grid均接入，无Pura型号判断。
 - 紧凑主栏与第二行统一36dp（原40dp），内嵌分类同步；普通56/48dp、大字主栏64dp保持。顶部安全区最多减2dp且不越displayCutout；正常22sp插件标题、横滑筛选、搜索/多选结构、选中条动画及详情透明色保留。
 - 现有`*NavigationChrome*` CI筛选自动包含新增ContentViewport/FastScrollerProgress/PagerTransition测试；验证导航进度与内容位移、滚动状态/视口不变、首尾保护、追加分页连续而实际滚动不滞后、抓取换算、短详情阈值、持指翻页与取消；保留真实松手惯性回首、触摸/面板/性能必要回归。Animeko独立KMP状态/布局不适用本实现，复用前轮实际源码判断，本轮未扩展APK补丁。
+
+### 0099：首轮CI回归补正
+
+首轮未发布即被必要回归拦截：位置恢复时isScrollInProgress为false，新的滚动条没有被唤醒，原有本体grab测试落到了内容；改为仅对真实offset变化发显示信号，包含程序恢复，不因alpha/导航重组反复唤醒。保留原触摸/惯性测试原断言。新增分页测试用同钟对照分离衰减与实际滚动，分页拖动测试以真实viewport origin替代绝对0（Robolectric requiredSize超屏产生-65px起点）。原CI 43708675512失败但没有Release；修正后仍用本轮未发布的preview.53正式验证。
