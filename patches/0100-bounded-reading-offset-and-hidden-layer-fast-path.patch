@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 11:40:12 +0000
+Subject: [PATCH] fix(ui): bound reading displacement for bidirectional fast
+ flings
+
+The user prioritizes content stability and explicitly rejects large whole-page movement or a slow-then-fast reverse fling. Full-header compensation can oppose a fast return fling while both bars hide. Bound the shared-progress reading offset to 4 percent of viewport height, capped at 24dp and actual header height, retaining leading-space deduction and trailing reachability. This deliberately provides gentle partial displacement rather than guaranteeing full clearance of the translucent header. Keep lazy constraints, scroll deltas and fling velocity unchanged. Skip geometry reads entirely when chrome is hidden or pinned to avoid unnecessary layer updates during coasts. Update actual layer-position and adaptive movement-budget regressions.
+---
+ .../material/BrowsingContentViewport.kt       | 16 +++++++++++-----
+ .../NavigationChromeContentViewportTest.kt    | 19 +++++++++++--------
+ 2 files changed, 22 insertions(+), 13 deletions(-)
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingContentViewport.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingContentViewport.kt
+index 0d3ccbff8..492511338 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingContentViewport.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingContentViewport.kt
+@@ -5,8 +5,9 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clipToBounds
+ import androidx.compose.ui.graphics.graphicsLayer
++import androidx.compose.ui.unit.dp
+ 
+-/** Protect the leading reading area without remeasuring cells or consuming any scroll/fling delta. */
++/** Gently uncover reading content without large displacement, remeasure or consumed scroll/fling. */
+ @Composable
+ internal fun BrowsingContentViewport(
+     leadingOffset: () -> Float,
+@@ -21,16 +22,18 @@ internal fun BrowsingContentViewport(
+     Box(Modifier.clipToBounds(), propagateMinConstraints = true) {
+         Box(
+             Modifier.graphicsLayer {
+-                translationY = if (!chrome.contentProtectionEnabled) {
++                val hidden = chrome.animation?.value ?: 0f
++                translationY = if (!chrome.contentProtectionEnabled || hidden >= 1f || chrome.headerHeightPx <= 0f) {
+                     0f
+                 } else {
+                     browsingContentProtectionOffset(
+                         chrome.headerHeightPx,
+                         // Edge spacers and incoming pager pages already reserve their own header.
+                         // Using the backing animation avoids translating an incoming top page twice.
+-                        chrome.animation?.value ?: 0f,
++                        hidden,
+                         leadingOffset(),
+                         trailingRemaining(),
++                        browsingContentMovementBudget(chrome.headerHeightPx, size.height, 24.dp.toPx()),
+                     )
+                 }
+             },
+@@ -39,10 +42,13 @@ internal fun BrowsingContentViewport(
+     }
+ }
+ 
+-internal fun browsingContentProtectionOffset(headerHeight: Float, hidden: Float, leading: Float, remaining: Float): Float {
++internal fun browsingContentMovementBudget(headerHeight: Float, viewportHeight: Float, maximum: Float): Float =
++    minOf(headerHeight, viewportHeight * 0.04f, maximum).coerceAtLeast(0f)
++
++internal fun browsingContentProtectionOffset(headerHeight: Float, hidden: Float, leading: Float, remaining: Float, movementBudget: Float): Float {
+     if (headerHeight <= 0f) return 0f
+     val reserved = (headerHeight - leading.coerceAtLeast(0f)).coerceIn(0f, headerHeight)
+-    val required = (headerHeight * (1f - hidden.coerceIn(0f, 1f)) - reserved).coerceAtLeast(0f)
++    val required = (movementBudget.coerceIn(0f, headerHeight) * (1f - hidden.coerceIn(0f, 1f)) - reserved).coerceAtLeast(0f)
+     // Preserve the reachable last row at the trailing edge instead of pushing it behind the capsule.
+     return minOf(required, remaining.coerceAtLeast(0f))
+ }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeContentViewportTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeContentViewportTest.kt
+index e44f62c74..f204872c4 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeContentViewportTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeContentViewportTest.kt
+@@ -72,7 +72,7 @@ class NavigationChromeContentViewportTest {
+         }
+         waitForIdle()
+         runOnIdle {
+-            assertEquals(originY + 50f, cover.positionInRoot().y, 0.5f)
++            assertEquals(originY + 12f, cover.positionInRoot().y, 0.5f)
+             assertEquals(20, list.firstVisibleItemIndex)
+             assertEquals(0, list.firstVisibleItemScrollOffset)
+             assertEquals(600, viewportHeight)
+@@ -80,7 +80,7 @@ class NavigationChromeContentViewportTest {
+         }
+         waitForIdle()
+         runOnIdle {
+-            assertEquals(originY + 100f, cover.positionInRoot().y, 0.5f)
++            assertEquals(originY + 24f, cover.positionInRoot().y, 0.5f)
+             assertEquals(20, list.firstVisibleItemIndex)
+             hidden.floatValue = 1f
+         }
+@@ -90,12 +90,15 @@ class NavigationChromeContentViewportTest {
+ 
+     @Test
+     fun `edge spacers are not duplicated and trailing content remains reachable`() {
+-        assertEquals(0f, browsingContentProtectionOffset(100f, 0f, 0f, Float.POSITIVE_INFINITY))
+-        assertEquals(20f, browsingContentProtectionOffset(100f, 0f, 20f, Float.POSITIVE_INFINITY))
+-        assertEquals(50f, browsingContentProtectionOffset(100f, 0.5f, Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY))
+-        assertEquals(0f, browsingContentProtectionOffset(100f, 1f, Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY))
+-        assertEquals(15f, browsingContentProtectionOffset(100f, 0f, Float.POSITIVE_INFINITY, 15f))
+-        assertEquals(0f, browsingContentProtectionOffset(100f, 0f, Float.POSITIVE_INFINITY, 0f))
++        assertEquals(24f, browsingContentMovementBudget(100f, 600f, 24f))
++        assertEquals(12f, browsingContentMovementBudget(100f, 300f, 24f))
++        assertEquals(10f, browsingContentMovementBudget(10f, 600f, 24f))
++        assertEquals(0f, browsingContentProtectionOffset(100f, 0f, 0f, Float.POSITIVE_INFINITY, 24f))
++        assertEquals(0f, browsingContentProtectionOffset(100f, 0f, 20f, Float.POSITIVE_INFINITY, 24f))
++        assertEquals(12f, browsingContentProtectionOffset(100f, 0.5f, Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY, 24f))
++        assertEquals(0f, browsingContentProtectionOffset(100f, 1f, Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY, 24f))
++        assertEquals(15f, browsingContentProtectionOffset(100f, 0f, Float.POSITIVE_INFINITY, 15f, 24f))
++        assertEquals(0f, browsingContentProtectionOffset(100f, 0f, Float.POSITIVE_INFINITY, 0f, 24f))
+     }
+ 
+     @Test

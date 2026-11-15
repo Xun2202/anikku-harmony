@@ -97,3 +97,4 @@
 0097-browse-full-title-secondary-row-and-panorama-edge.patch
 0098-browsing-content-pager-and-live-scrollbars.patch
 0099-scroller-restored-position-signal-and-regression-basis.patch
+0100-bounded-reading-offset-and-hidden-layer-fast-path.patch
