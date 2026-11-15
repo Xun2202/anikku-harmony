@@ -895,3 +895,13 @@ gh release list --repo Xun2202/anikku-harmony
 - 回首根因：插件全景直接调用PanoramaMasonry，旧边缘监听只装在FastScrollPanoramaMasonry；前轮补原生list/grid时误以为所有全景已有监听。现在观察下移到PanoramaMasonry的实际视口，带滚动条wrapper移除重复观察；所有全景随真实leading offset带回标题，顶部提交visible/动画终值，不再露出旧padding空带。普通列表/网格沿用已有保护，不改FlingFrameClock内核或导航手势阈值。
 - 更新NavigationChromeBrowseHeaderTest验证正常22sp标题、两行80/104dp及分类/筛选40/48dp一致，末筛选仍能横滑点击。新增NavigationChromePanoramaHeaderTest两项：裸全景与书架fast wrapper在真实指针松开时记录正offset/回甩velocity，之后靠惯性到0，检查导航显示、首封面与header相接、离开顶部不回弹隐藏；不中途暂停指针以免丢失释放速度。旧面板/重开/分页/长按/性能必要回归保留。
 - Animeko独立KMP collection/details导航，无本Bare/Fast PanoramaMasonry包装层差异；前轮实际源码判断复用，不照搬本补丁。现有AGENTS触发的档案共享UI规则更新二行策略与底层边缘owner，真机Pura X Max视觉/手感仍由安装反馈。
+
+## 2026-11-15：内容让位、分类过渡与共用滚动条（0098）
+
+- 0098与Mihon 0094同步。用户本轮明确希望导航展开时内容让位，但不要整页重排、消耗拖动或让惯性先慢后快；这项取代此前“内容完全不移动”的要求，仅适用于可收放的浏览视口。`BrowsingContentViewport`保持lazy constraints与scroll offset不变，以graphicsLayer跟随同一导航动画；扣除已有首占位，尾部限于真实剩余量，末项仍可达。固定导航/详情不套用内容位移，快速双向甩动、按次手势意图锁和帧时间保护内核保留。尚不能据机器回归宣称Pura X Max手感通过。
+- 参考Chromium Browser Controls文档（https://chromium.googlesource.com/chromium/src/+/main/docs/ui/android/browser_controls.md）：控制栏和内容offset同步、活动滚动期间避免昂贵重排；只借鉴原则，不移植其浏览器多进程架构或消耗scroll delta的规则。结合AndroidX RecyclerView FastScroller及Compose Material3 Scrollbar源码，保留书架48dp可抓取thumb，短详情隐藏，未盲目改成所有页面的被动细线。
+- `BrowsingPagerPage`按每页可见宽度合成首尾边缘对共享导航的约束，旧页只在最终settled后提交边缘显示状态；持指跨过半页不会先切内容、落位后才弹导航，取消则恢复。LibraryTab与TabbedScreen不再在settle时另做强制reset；空分类也注册边缘。所有书架显示模式和通用标签页接入。
+- 共用list/grid/An irregular/masonry/timeline滚动条保留玻璃、触摸判定与淡出；逻辑位置归一化、同帧投影到实时导航轨道，不为导航动画每帧重启collector或独立追赶。抓住时只冻结输入换算、不冻结视觉轨道；新增分页用200ms残差衰减，普通滚动立即反映，按住时暂停残差动画。时间线使用像素scroll indicator，避免按首项index整格跳。Mihon来源全景补FastScroll wrapper；An来源已复用HarmonyPanoramaGrid，沿用其共用wrapper；普通来源/扩展/迁移/全局搜索共用FastScroll，reverse特殊列表保留原行为。
+- 详情滚动条按章节/集数、真实视口与列数估计：章节行本身超过两个视口才启用，长简介不误触发；短详情隐藏、长列表仍可拖。手机/平板和An adaptive/fixed grid均接入，无Pura型号判断。
+- 紧凑主栏与第二行统一36dp（原40dp），内嵌分类同步；普通56/48dp、大字主栏64dp保持。顶部安全区最多减2dp且不越displayCutout；正常22sp插件标题、横滑筛选、搜索/多选结构、选中条动画及详情透明色保留。
+- 现有`*NavigationChrome*` CI筛选自动包含新增ContentViewport/FastScrollerProgress/PagerTransition测试；验证导航进度与内容位移、滚动状态/视口不变、首尾保护、追加分页连续而实际滚动不滞后、抓取换算、短详情阈值、持指翻页与取消；保留真实松手惯性回首、触摸/面板/性能必要回归。Animeko独立KMP状态/布局不适用本实现，复用前轮实际源码判断，本轮未扩展APK补丁。

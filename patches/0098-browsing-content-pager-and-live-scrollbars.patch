@@ -1,0 +1,1919 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 11:22:30 +0000
+Subject: [PATCH] fix(ui): synchronize reading space, pager chrome and fast
+ scrollbars
+
+Shared with Mihon 0094. Protect leading reading content with the same chrome progress without consuming nested scroll/fling or resizing lazy viewports; keep edge spacers and trailing reachability. Coordinate chrome with visible pager page weights, preserve cancelled swipes, and remove category-settle resets. Follow live track bounds in the current frame, store thumb progress in normalized coordinates, freeze only held finger conversion, and ease only appended-content corrections. Use pixel-based timeline progress. Hide short detail chapter scrollbars using runtime viewport/column density, retaining long-list dragging. Connect passive browse lists and missing source panorama entry points to the shared fast scroller. Use 36dp compact primary/secondary rows, with at most 2dp status trimming clamped to camera cutout; preserve normal/large-font sizes and transparent details. Add held pager, content geometry, append correction, grab travel and short-detail regressions; update existing compact header tests.
+---
+ .../browse/ExtensionFilterScreen.kt           |   6 +-
+ .../presentation/browse/GlobalSearchScreen.kt |   6 +-
+ .../presentation/components/TabbedScreen.kt   |  19 +-
+ .../library/components/LibraryPager.kt        | 197 ++++++------
+ .../kanade/presentation/manga/MangaScreen.kt  |   3 +
+ .../kanade/tachiyomi/ui/library/LibraryTab.kt |   2 +-
+ .../core/components/ChapterScrollbar.kt       |  41 +++
+ .../core/components/FastScrollerProgress.kt   |  40 +++
+ .../presentation/core/components/LazyList.kt  |  15 +-
+ .../core/components/PanoramaMasonry.kt        |   3 +
+ .../core/components/VerticalFastScroller.kt   | 280 +++++++++---------
+ .../material/BrowsingContentViewport.kt       |  48 +++
+ .../material/BrowsingPagerViewport.kt         |  76 +++++
+ .../material/BrowsingScrollInsets.kt          |  25 +-
+ .../material/BrowsingTabSelector.kt           |   2 +-
+ .../material/BrowsingToolbarContent.kt        |   2 +-
+ .../components/material/NavigationChrome.kt   |  31 +-
+ .../components/material/NavigationToolbar.kt  |  20 +-
+ ...avigationChromeFastScrollerProgressTest.kt |  76 +++++
+ .../NavigationChromeBrowseHeaderTest.kt       |   4 +-
+ .../NavigationChromeConsistentToolbarTest.kt  |  22 +-
+ .../NavigationChromeContentViewportTest.kt    | 107 +++++++
+ .../NavigationChromePagerTransitionTest.kt    | 144 +++++++++
+ 23 files changed, 879 insertions(+), 290 deletions(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/ChapterScrollbar.kt
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/FastScrollerProgress.kt
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingContentViewport.kt
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingPagerViewport.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFastScrollerProgressTest.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeContentViewportTest.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromePagerTransitionTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/ExtensionFilterScreen.kt b/app/src/main/java/eu/kanade/presentation/browse/ExtensionFilterScreen.kt
+index be7ac0302..5f35f7a3a 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/ExtensionFilterScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/ExtensionFilterScreen.kt
+@@ -5,7 +5,6 @@ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.width
+-import androidx.compose.foundation.lazy.LazyColumn
+ import androidx.compose.foundation.lazy.items
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+@@ -26,9 +25,9 @@ import eu.kanade.tachiyomi.util.system.LocaleHelper
+ import kotlinx.collections.immutable.persistentListOf
+ import kotlinx.collections.immutable.persistentSetOf
+ import tachiyomi.i18n.MR
++import tachiyomi.presentation.core.components.FastScrollLazyColumn
+ import tachiyomi.presentation.core.components.material.Scaffold
+ import tachiyomi.presentation.core.components.material.padding
+-import tachiyomi.presentation.core.components.rememberFrameTimeProtectedFlingBehavior
+ import tachiyomi.presentation.core.i18n.stringResource
+ import tachiyomi.presentation.core.screens.EmptyScreen
+ 
+@@ -69,13 +68,12 @@ private fun ExtensionFilterContent(
+     onClickLang: (String) -> Unit,
+ ) {
+     val context = LocalContext.current
+-    LazyColumn(
++    FastScrollLazyColumn(
+         contentPadding = contentPadding,
+         // KMK -->
+         modifier = Modifier
+             .padding(start = MaterialTheme.padding.small),
+         // KMK <--,
+-        flingBehavior = rememberFrameTimeProtectedFlingBehavior(),
+     ) {
+         items(state.languages) { language ->
+             // KMK -->
+diff --git a/app/src/main/java/eu/kanade/presentation/browse/GlobalSearchScreen.kt b/app/src/main/java/eu/kanade/presentation/browse/GlobalSearchScreen.kt
+index 65eca163f..f49ca2a3d 100644
+--- a/app/src/main/java/eu/kanade/presentation/browse/GlobalSearchScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/browse/GlobalSearchScreen.kt
+@@ -1,7 +1,6 @@
+ package eu.kanade.presentation.browse
+ 
+ import androidx.compose.foundation.layout.PaddingValues
+-import androidx.compose.foundation.lazy.LazyColumn
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.State
+ import androidx.compose.runtime.collectAsState
+@@ -22,8 +21,8 @@ import eu.kanade.tachiyomi.ui.browse.source.globalsearch.SourceFilter
+ import eu.kanade.tachiyomi.util.system.LocaleHelper
+ import kotlinx.collections.immutable.ImmutableMap
+ import tachiyomi.domain.manga.model.Manga
++import tachiyomi.presentation.core.components.FastScrollLazyColumn
+ import tachiyomi.presentation.core.components.material.Scaffold
+-import tachiyomi.presentation.core.components.rememberFrameTimeProtectedFlingBehavior
+ import tachiyomi.domain.source.model.Source as DomainSource
+ 
+ @Composable
+@@ -120,9 +119,8 @@ internal fun GlobalSearchContent(
+     selection: List<Manga>,
+     // KMK <--
+ ) {
+-    LazyColumn(
++    FastScrollLazyColumn(
+         contentPadding = contentPadding,
+-        flingBehavior = rememberFrameTimeProtectedFlingBehavior(),
+     ) {
+         items.forEach { (source, result) ->
+             item(key = "global-search-${source.id}") {
+diff --git a/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt b/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
+index 2cddf906f..9302ee08a 100644
+--- a/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/components/TabbedScreen.kt
+@@ -31,6 +31,7 @@ import kotlinx.collections.immutable.ImmutableList
+ import kotlinx.collections.immutable.persistentListOf
+ import kotlinx.coroutines.launch
+ import tachiyomi.presentation.core.components.material.AnimatedNavigationRow
++import tachiyomi.presentation.core.components.material.BrowsingPagerPage
+ import tachiyomi.presentation.core.components.material.BrowsingTabSelector
+ import tachiyomi.presentation.core.components.material.Scaffold
+ import tachiyomi.presentation.core.components.material.TabText
+@@ -70,7 +71,7 @@ fun TabbedScreen(
+     Scaffold(
+         topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior(
+             enabled = collapseNavigation && !searching && !bulkFavoriteState.selectionMode,
+-            resetKey = state.currentPage,
++            resetKey = Unit,
+         ),
+         topBar = { scrollBehavior ->
+             Column {
+@@ -179,13 +180,15 @@ fun TabbedScreen(
+                 flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(state),
+                 verticalAlignment = Alignment.Top,
+             ) { page ->
+-                tabs[page].content(
+-                    PaddingValues(
+-                        top = contentPadding.calculateTopPadding(),
+-                        bottom = contentPadding.calculateBottomPadding(),
+-                    ),
+-                    snackbarHostState,
+-                )
++                BrowsingPagerPage(state, page) {
++                    tabs[page].content(
++                        PaddingValues(
++                            top = contentPadding.calculateTopPadding(),
++                            bottom = contentPadding.calculateBottomPadding(),
++                        ),
++                        snackbarHostState,
++                    )
++                }
+             }
+         }
+     }
+diff --git a/app/src/main/java/eu/kanade/presentation/library/components/LibraryPager.kt b/app/src/main/java/eu/kanade/presentation/library/components/LibraryPager.kt
+index b2f7ee918..37f831ff1 100644
+--- a/app/src/main/java/eu/kanade/presentation/library/components/LibraryPager.kt
++++ b/app/src/main/java/eu/kanade/presentation/library/components/LibraryPager.kt
+@@ -25,7 +25,9 @@ import tachiyomi.domain.category.model.Category
+ import tachiyomi.domain.library.model.LibraryDisplayMode
+ import tachiyomi.domain.library.model.LibraryManga
+ import tachiyomi.i18n.MR
++import tachiyomi.presentation.core.components.material.BrowsingPagerPage
+ import tachiyomi.presentation.core.components.material.browsingContentVerticalPadding
++import tachiyomi.presentation.core.components.material.observeBrowsingLeadingScroll
+ import tachiyomi.presentation.core.components.rememberFrameTimeProtectedFlingBehavior
+ import tachiyomi.presentation.core.components.rememberFrameTimeProtectedPagerFlingBehavior
+ import tachiyomi.presentation.core.components.settlePagerOnWidthChange
+@@ -64,106 +66,108 @@ fun LibraryPager(
+                 // To make sure only one offscreen page is being composed
+                 return@HorizontalPager
+             }
+-            val category = getCategoryForPage(page)
+-            val items = getItemsForCategory(category)
++            BrowsingPagerPage(state, page) {
++                val category = getCategoryForPage(page)
++                val items = getItemsForCategory(category)
+ 
+-            if (items.isEmpty()) {
+-                LibraryPagerEmptyScreen(
+-                    searchQuery = searchQuery,
+-                    hasActiveFilters = hasActiveFilters,
+-                    contentPadding = contentPadding,
+-                    onGlobalSearchClicked = onGlobalSearchClicked,
+-                )
+-                return@HorizontalPager
+-            }
+-
+-            val displayMode by getDisplayMode(page)
+-            // AY -->
+-            val configuration = LocalConfiguration.current
+-            val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+-            val columns by remember(isLandscape) { getColumnsForOrientation(isLandscape) }
+-            // <-- AY
+-
+-            val onClickManga: (LibraryManga) -> Unit = { onClickManga(category, it) }
+-            val onLongClickManga: (LibraryManga) -> Unit = { onLongClickManga(category, it) }
+-
+-            when (displayMode) {
+-                LibraryDisplayMode.List -> {
+-                    LibraryList(
+-                        items = items,
+-                        // AY -->
+-                        entries = columns,
+-                        containerHeight = containerHeightPx,
+-                        // <-- AY
+-                        contentPadding = contentPadding,
+-                        selection = selection,
+-                        onClick = onClickManga,
+-                        onLongClick = onLongClickManga,
+-                        onClickContinueReading = onClickContinueReading,
+-                        searchQuery = searchQuery,
+-                        onGlobalSearchClicked = onGlobalSearchClicked,
+-                    )
+-                }
+-                LibraryDisplayMode.CompactGrid, LibraryDisplayMode.CoverOnlyGrid -> {
+-                    LibraryCompactGrid(
+-                        items = items,
+-                        showTitle = displayMode is LibraryDisplayMode.CompactGrid,
+-                        columns = columns,
+-                        contentPadding = contentPadding,
+-                        selection = selection,
+-                        onClick = onClickManga,
+-                        onLongClick = onLongClickManga,
+-                        onClickContinueReading = onClickContinueReading,
+-                        searchQuery = searchQuery,
+-                        onGlobalSearchClicked = onGlobalSearchClicked,
+-                    )
+-                }
+-                // Harmony -->
+-                LibraryDisplayMode.CompactGridPanorama -> {
+-                    LibraryCompactGrid(
+-                        items = items,
+-                        showTitle = true,
+-                        columns = columns,
+-                        contentPadding = contentPadding,
+-                        selection = selection,
+-                        onClick = onClickManga,
+-                        onLongClick = onLongClickManga,
+-                        onClickContinueReading = onClickContinueReading,
++                if (items.isEmpty()) {
++                    LibraryPagerEmptyScreen(
+                         searchQuery = searchQuery,
+-                        onGlobalSearchClicked = onGlobalSearchClicked,
+-                        usePanoramaCover = true,
+-                    )
+-                }
+-                // Harmony <--
+-                LibraryDisplayMode.ComfortableGrid -> {
+-                    LibraryComfortableGrid(
+-                        items = items,
+-                        columns = columns,
++                        hasActiveFilters = hasActiveFilters,
+                         contentPadding = contentPadding,
+-                        selection = selection,
+-                        onClick = onClickManga,
+-                        onLongClick = onLongClickManga,
+-                        onClickContinueReading = onClickContinueReading,
+-                        searchQuery = searchQuery,
+                         onGlobalSearchClicked = onGlobalSearchClicked,
+                     )
++                    return@BrowsingPagerPage
+                 }
+-                // KMK -->
+-                LibraryDisplayMode.ComfortableGridPanorama -> {
+-                    LibraryComfortableGrid(
+-                        items = items,
+-                        columns = columns,
+-                        contentPadding = contentPadding,
+-                        selection = selection,
+-                        onClick = onClickManga,
+-                        onLongClick = onLongClickManga,
+-                        onClickContinueReading = onClickContinueReading,
+-                        searchQuery = searchQuery,
+-                        onGlobalSearchClicked = onGlobalSearchClicked,
+-                        usePanoramaCover = true,
+-                    )
++
++                val displayMode by getDisplayMode(page)
++                // AY -->
++                val configuration = LocalConfiguration.current
++                val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
++                val columns by remember(isLandscape) { getColumnsForOrientation(isLandscape) }
++                // <-- AY
++
++                val onClickManga: (LibraryManga) -> Unit = { onClickManga(category, it) }
++                val onLongClickManga: (LibraryManga) -> Unit = { onLongClickManga(category, it) }
++
++                when (displayMode) {
++                    LibraryDisplayMode.List -> {
++                        LibraryList(
++                            items = items,
++                            // AY -->
++                            entries = columns,
++                            containerHeight = containerHeightPx,
++                            // <-- AY
++                            contentPadding = contentPadding,
++                            selection = selection,
++                            onClick = onClickManga,
++                            onLongClick = onLongClickManga,
++                            onClickContinueReading = onClickContinueReading,
++                            searchQuery = searchQuery,
++                            onGlobalSearchClicked = onGlobalSearchClicked,
++                        )
++                    }
++                    LibraryDisplayMode.CompactGrid, LibraryDisplayMode.CoverOnlyGrid -> {
++                        LibraryCompactGrid(
++                            items = items,
++                            showTitle = displayMode is LibraryDisplayMode.CompactGrid,
++                            columns = columns,
++                            contentPadding = contentPadding,
++                            selection = selection,
++                            onClick = onClickManga,
++                            onLongClick = onLongClickManga,
++                            onClickContinueReading = onClickContinueReading,
++                            searchQuery = searchQuery,
++                            onGlobalSearchClicked = onGlobalSearchClicked,
++                        )
++                    }
++                    // Harmony -->
++                    LibraryDisplayMode.CompactGridPanorama -> {
++                        LibraryCompactGrid(
++                            items = items,
++                            showTitle = true,
++                            columns = columns,
++                            contentPadding = contentPadding,
++                            selection = selection,
++                            onClick = onClickManga,
++                            onLongClick = onLongClickManga,
++                            onClickContinueReading = onClickContinueReading,
++                            searchQuery = searchQuery,
++                            onGlobalSearchClicked = onGlobalSearchClicked,
++                            usePanoramaCover = true,
++                        )
++                    }
++                    // Harmony <--
++                    LibraryDisplayMode.ComfortableGrid -> {
++                        LibraryComfortableGrid(
++                            items = items,
++                            columns = columns,
++                            contentPadding = contentPadding,
++                            selection = selection,
++                            onClick = onClickManga,
++                            onLongClick = onLongClickManga,
++                            onClickContinueReading = onClickContinueReading,
++                            searchQuery = searchQuery,
++                            onGlobalSearchClicked = onGlobalSearchClicked,
++                        )
++                    }
++                    // KMK -->
++                    LibraryDisplayMode.ComfortableGridPanorama -> {
++                        LibraryComfortableGrid(
++                            items = items,
++                            columns = columns,
++                            contentPadding = contentPadding,
++                            selection = selection,
++                            onClick = onClickManga,
++                            onLongClick = onLongClickManga,
++                            onClickContinueReading = onClickContinueReading,
++                            searchQuery = searchQuery,
++                            onGlobalSearchClicked = onGlobalSearchClicked,
++                            usePanoramaCover = true,
++                        )
++                    }
++                    // KMK <--
+                 }
+-                // KMK <--
+             }
+         }
+     }
+@@ -182,11 +186,16 @@ private fun LibraryPagerEmptyScreen(
+         else -> MR.strings.information_no_manga_category
+     }
+ 
++    val scrollState = rememberScrollState()
+     Column(
+         modifier = Modifier
++            .observeBrowsingLeadingScroll(
++                trailingRemaining = { (scrollState.maxValue - scrollState.value).toFloat() },
++                leadingOffset = { scrollState.value.toFloat() },
++            )
+             .padding(contentPadding + PaddingValues(horizontal = 1.dp, vertical = browsingContentVerticalPadding()))
+             .fillMaxSize()
+-            .verticalScroll(rememberScrollState(), flingBehavior = rememberFrameTimeProtectedFlingBehavior()),
++            .verticalScroll(scrollState, flingBehavior = rememberFrameTimeProtectedFlingBehavior()),
+     ) {
+         if (!searchQuery.isNullOrEmpty()) {
+             GlobalSearchItem(
+diff --git a/app/src/main/java/eu/kanade/presentation/manga/MangaScreen.kt b/app/src/main/java/eu/kanade/presentation/manga/MangaScreen.kt
+index 46828ad9e..24b32cd95 100644
+--- a/app/src/main/java/eu/kanade/presentation/manga/MangaScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/manga/MangaScreen.kt
+@@ -122,6 +122,7 @@ import tachiyomi.presentation.core.components.TwoPanelBox
+ import tachiyomi.presentation.core.components.material.PullRefresh
+ import tachiyomi.presentation.core.components.material.Scaffold
+ import tachiyomi.presentation.core.components.material.padding
++import tachiyomi.presentation.core.components.rememberChapterScrollbarAllowed
+ import tachiyomi.presentation.core.components.rememberFrameTimeProtectedFlingBehavior
+ import tachiyomi.presentation.core.i18n.stringResource
+ import tachiyomi.presentation.core.util.collectAsState
+@@ -648,6 +649,7 @@ private fun MangaScreenSmallImpl(
+                 // AY -->
+                 // AM -->
+                 FastScrollIrregularLazyVerticalGrid(
++                    thumbAllowed = rememberChapterScrollbarAllowed(chapterListState, chapters.size, gridSize),
+                     // <-- AM
+                     modifier = Modifier.fillMaxHeight(),
+                     state = chapterListState,
+@@ -1310,6 +1312,7 @@ private fun MangaScreenLargeImpl(
+                         // AY -->
+                         // AM -->
+                         FastScrollIrregularLazyVerticalGrid(
++                            thumbAllowed = rememberChapterScrollbarAllowed(chapterListState, chapters.size, gridSize),
+                             // <-- AM
+                             modifier = Modifier.fillMaxHeight(),
+                             state = chapterListState,
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt
+index 70b00e5dc..87c8378a4 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/library/LibraryTab.kt
+@@ -180,7 +180,7 @@ data object LibraryTab : Tab {
+         Scaffold(
+             topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior(
+                 enabled = !state.selectionMode && state.searchQuery == null,
+-                resetKey = state.coercedActiveCategoryIndex,
++                resetKey = Unit,
+             ),
+             topBar = { scrollBehavior ->
+                 Column {
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/ChapterScrollbar.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/ChapterScrollbar.kt
+new file mode 100644
+index 000000000..8f8cbd4bb
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/ChapterScrollbar.kt
+@@ -0,0 +1,41 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.lazy.LazyListState
++import androidx.compose.foundation.lazy.grid.LazyGridState
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberUpdatedState
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.unit.dp
++import kotlin.math.ceil
++
++/** Description/header height alone must not enable a chapter fast scroller on a short detail page. */
++@Composable
++fun rememberChapterScrollbarAllowed(state: LazyListState, chapterCount: Int): () -> Boolean {
++    val count = rememberUpdatedState(chapterCount)
++    val density = LocalDensity.current
++    val rowHeight = with(density) { 56.dp.toPx() } * density.fontScale.coerceAtLeast(1f)
++    return remember(state, rowHeight) {
++        { chapterScrollbarUseful(count.value, 1, state.layoutInfo.viewportSize.height, rowHeight) }
++    }
++}
++
++@Composable
++fun rememberChapterScrollbarAllowed(state: LazyGridState, chapterCount: Int, columns: Int): () -> Boolean {
++    val count = rememberUpdatedState(chapterCount)
++    val requestedColumns = rememberUpdatedState(columns)
++    val density = LocalDensity.current
++    val rowHeight = with(density) { 56.dp.toPx() } * density.fontScale.coerceAtLeast(1f)
++    val adaptiveWidth = with(density) { 128.dp.toPx() }
++    return remember(state, rowHeight, adaptiveWidth) {
++        {
++            val viewport = state.layoutInfo.viewportSize
++            val fittedColumns = requestedColumns.value.takeIf { it > 0 }
++                ?: (viewport.width / adaptiveWidth).toInt().coerceAtLeast(1)
++            chapterScrollbarUseful(count.value, fittedColumns, viewport.height, rowHeight)
++        }
++    }
++}
++
++internal fun chapterScrollbarUseful(count: Int, columns: Int, viewportHeight: Int, minimumRowHeight: Float): Boolean =
++    viewportHeight > 0 && ceil(count.toDouble() / columns.coerceAtLeast(1)) * minimumRowHeight > viewportHeight * 2.0
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/FastScrollerProgress.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/FastScrollerProgress.kt
+new file mode 100644
+index 000000000..6ee65c71a
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/FastScrollerProgress.kt
+@@ -0,0 +1,40 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.animation.core.Animatable
++import androidx.compose.animation.core.tween
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.SideEffect
++import androidx.compose.runtime.remember
++
++private class ScrollerSample(var count: Int = 0, var rendered: Float = 0f)
++
++/** Only appended content is eased. Actual scrolling and chrome geometry stay frame-synchronous. */
++@Composable
++internal fun rememberFastScrollerProgress(progress: Float, itemCount: Int, held: Boolean, visible: Boolean): Float {
++    val previous = remember { ScrollerSample() }
++    val correction = remember(itemCount) {
++        if (itemCount > previous.count && previous.count > 0 && visible && !held) previous.rendered - progress else 0f
++    }
++    val remaining = remember(itemCount) { Animatable(if (correction == 0f) 0f else 1f) }
++    LaunchedEffect(remaining, held) {
++        if (!held && remaining.value > 0f) withFrameTimeProtection { remaining.animateTo(0f, tween(200)) }
++    }
++    val rendered = (progress + correction * remaining.value).coerceIn(0f, 1f)
++    SideEffect {
++        previous.count = itemCount
++        previous.rendered = rendered
++    }
++    return rendered
++}
++
++private class DragTravel(var value: Float = 1f, var held: Boolean = false)
++
++/** Keep finger-to-content conversion stable while the visual track follows the navigation. */
++@Composable
++internal fun rememberFastScrollerDragTravel(liveTravel: Float, held: Boolean): Float {
++    val travel = remember { DragTravel() }
++    if (!held || !travel.held) travel.value = liveTravel.coerceAtLeast(1f)
++    travel.held = held
++    return travel.value
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/LazyList.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/LazyList.kt
+index 0e61f29c9..ea73b4b09 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/LazyList.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/LazyList.kt
+@@ -19,7 +19,7 @@ import tachiyomi.presentation.core.components.material.observeBrowsingLeadingScr
+ import tachiyomi.presentation.core.util.drawVerticalScrollbar
+ 
+ /**
+- * LazyColumn with scrollbar (non-controllable).
++ * LazyColumn with the shared draggable browsing scrollbar.
+  */
+ @Composable
+ fun ScrollbarLazyColumn(
+@@ -33,6 +33,19 @@ fun ScrollbarLazyColumn(
+     userScrollEnabled: Boolean = true,
+     content: LazyListScope.() -> Unit,
+ ) {
++    if (!reverseLayout) {
++        FastScrollLazyColumn(
++            modifier = modifier,
++            state = state,
++            contentPadding = contentPadding,
++            reverseLayout = reverseLayout,
++            verticalArrangement = verticalArrangement,
++            horizontalAlignment = horizontalAlignment,
++            userScrollEnabled = userScrollEnabled,
++            content = content,
++        )
++        return
++    }
+     val direction = LocalLayoutDirection.current
+     val density = LocalDensity.current
+     val positionOffset = remember(contentPadding, direction, density) {
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+index b8b6e07fe..8a0a1ab0e 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/PanoramaMasonry.kt
+@@ -139,6 +139,8 @@ class PanoramaMasonryState {
+     var viewportHeight by mutableIntStateOf(0)
+         internal set
+ 
++    internal var totalItemsCount by mutableIntStateOf(0)
++
+     var contentHeight by mutableIntStateOf(0)
+         internal set
+ 
+@@ -629,6 +631,7 @@ private fun LazyLayoutMeasureScope.measureMasonry(
+ 
+     val intervals = state.intervalsFor(content)
+     val count = intervals.itemCount
++    state.totalItemsCount = count
+     // Harmony: snapshot read in measure. A band commit remeasures without recomposing the shelf.
+     val contentEpoch = panoramaContentEpoch(PanoramaMasonryContentEpoch.intValue, intervals)
+     val direction = layoutDirection
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+index 5d5878735..127dd9817 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/VerticalFastScroller.kt
+@@ -80,6 +80,8 @@ import kotlinx.coroutines.flow.sample
+ import kotlinx.coroutines.launch
+ import tachiyomi.presentation.core.components.Scroller.EXACT_HEIGHT_KEY_PREFIX
+ import tachiyomi.presentation.core.components.Scroller.STICKY_HEADER_KEY_PREFIX
++import tachiyomi.presentation.core.components.material.BrowsingContentViewport
++import tachiyomi.presentation.core.components.material.browsingTrailingRemaining
+ import tachiyomi.presentation.core.components.material.rememberBrowsingScrollInsets
+ import kotlin.math.abs
+ import kotlin.math.max
+@@ -111,7 +113,20 @@ fun VerticalFastScroller(
+     }
+     SubcomposeLayout(modifier = modifier) { constraints ->
+         val contentPlaceable = subcompose("content") {
+-            Box(Modifier.fastScrollerGlassSource(thumbGlass.takeIf { glassVisible.value }), propagateMinConstraints = true) { content() }
++            BrowsingContentViewport(
++                leadingOffset = { if (!listState.canScrollBackward) 0f else listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == 0 }?.let { -it.offset.toFloat() } ?: Float.POSITIVE_INFINITY },
++                trailingRemaining = {
++                    val info = listState.layoutInfo
++                    browsingTrailingRemaining(
++                        terminalVisible = info.totalItemsCount > 0 && info.visibleItemsInfo.any { it.index == info.totalItemsCount - 1 },
++                        lastItemBottom = info.visibleItemsInfo.maxOfOrNull { it.offset + it.size } ?: 0,
++                        afterPadding = info.afterContentPadding,
++                        viewportEnd = info.viewportEndOffset,
++                    )
++                },
++            ) {
++                Box(Modifier.fastScrollerGlassSource(thumbGlass.takeIf { glassVisible.value }), propagateMinConstraints = true) { content() }
++            }
+         }.map { it.measure(constraints) }
+         val contentHeight = contentPlaceable.fastMaxBy { it.height }?.height ?: 0
+         val contentWidth = contentPlaceable.fastMaxBy { it.width }?.width ?: 0
+@@ -136,11 +151,10 @@ fun VerticalFastScroller(
+                     bottomContentPadding,
+                     with(density) { listState.layoutInfo.afterContentPadding.toDp() },
+                 ),
+-                dragging = isThumbDragged || thumbPressed.pressed,
+             )
+             val thumbTopPadding = with(density) { trackTopPadding.toPx() }
+             val thumbBottomPadding = with(density) { trackBottomPadding.toPx() }
+-            var thumbOffsetY by remember { mutableFloatStateOf(thumbTopPadding) }
++            var thumbProgress by remember { mutableFloatStateOf(0f) }
+             val scrolled = remember {
+                 MutableSharedFlow<Unit>(
+                     extraBufferCapacity = 1,
+@@ -157,6 +171,7 @@ fun VerticalFastScroller(
+             val heightPx = contentHeight.toFloat() - thumbTopPadding - thumbBottomPadding
+             val thumbHeightPx = with(LocalDensity.current) { ThumbLength.toPx() }
+             val trackHeightPx = heightPx - thumbHeightPx
++            val dragTrackHeightPx = rememberFastScrollerDragTravel(trackHeightPx, isThumbDragged || thumbPressed.pressed)
+             if (trackHeightPx <= 0f) {
+                 LaunchedEffect(alpha) { alpha.snapTo(0f) }
+                 return@subcompose
+@@ -193,9 +208,9 @@ fun VerticalFastScroller(
+             if (maxRemainingSections < 0.5) return@subcompose
+ 
+             // When thumb dragged
+-            LaunchedEffect(thumbOffsetY) {
++            LaunchedEffect(thumbProgress) {
+                 if (layoutInfo.totalItemsCount == 0 || !isThumbDragged) return@LaunchedEffect
+-                val thumbProportion = (thumbOffsetY - thumbTopPadding) / trackHeightPx
++                val thumbProportion = thumbProgress
+                 if (thumbProportion >= 0.999f) {
+                     listState.scrollToItem(layoutInfo.totalItemsCount - 1)
+                     val lastSize = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.size ?: 0
+@@ -228,7 +243,7 @@ fun VerticalFastScroller(
+                     !listState.canScrollForward -> 1f
+                     else -> (1f - remainingSections / maxRemainingSections).coerceIn(0f, 1f)
+                 }
+-                thumbOffsetY = trackHeightPx * proportion + thumbTopPadding
++                thumbProgress = proportion
+                 if (stableScrollInProgress) scrolled.tryEmit(Unit)
+             }
+ 
+@@ -255,7 +270,12 @@ fun VerticalFastScroller(
+             // 8.dp is the upstream end inset from padding(horizontal = 8.dp). The drawn thumb
+             // stays on that edge; the extra hit width grows toward the content.
+             HarmonyScrollerThumb(
+-                offsetY = thumbOffsetY,
++                offsetY = thumbTopPadding + trackHeightPx * rememberFastScrollerProgress(
++                    progress = thumbProgress,
++                    itemCount = listState.layoutInfo.totalItemsCount,
++                    held = isThumbDragged || thumbPressed.pressed,
++                    visible = alpha.value > 0f,
++                ),
+                 alpha = alpha.value,
+                 thumbColor = thumbColor,
+                 glassState = thumbGlass.takeIf { glassVisible.value },
+@@ -265,11 +285,7 @@ fun VerticalFastScroller(
+                 interactionSource = dragInteractionSource,
+                 contentScrolling = { listState.isScrollInProgress },
+                 onDragDelta = { delta ->
+-                    val newOffsetY = thumbOffsetY + delta
+-                    thumbOffsetY = newOffsetY.coerceIn(
+-                        thumbTopPadding,
+-                        thumbTopPadding + trackHeightPx,
+-                    )
++                    thumbProgress = (thumbProgress + delta / dragTrackHeightPx).coerceIn(0f, 1f)
+                 },
+                 excludeSystemGestures = (isThumbVisible || thumbPressed.pressed) &&
+                     !isThumbDragged &&
+@@ -354,7 +370,20 @@ fun VerticalGridFastScroller(
+     }
+     SubcomposeLayout(modifier = modifier) { constraints ->
+         val contentPlaceable = subcompose("content") {
+-            Box(Modifier.fastScrollerGlassSource(thumbGlass.takeIf { glassVisible.value }), propagateMinConstraints = true) { content() }
++            BrowsingContentViewport(
++                leadingOffset = { if (!state.canScrollBackward) 0f else state.layoutInfo.visibleItemsInfo.firstOrNull { it.index == 0 }?.let { -it.offset.y.toFloat() } ?: Float.POSITIVE_INFINITY },
++                trailingRemaining = {
++                    val info = state.layoutInfo
++                    browsingTrailingRemaining(
++                        terminalVisible = info.totalItemsCount > 0 && info.visibleItemsInfo.any { it.index == info.totalItemsCount - 1 },
++                        lastItemBottom = info.visibleItemsInfo.maxOfOrNull { it.offset.y + it.size.height } ?: 0,
++                        afterPadding = info.afterContentPadding,
++                        viewportEnd = info.viewportEndOffset,
++                    )
++                },
++            ) {
++                Box(Modifier.fastScrollerGlassSource(thumbGlass.takeIf { glassVisible.value }), propagateMinConstraints = true) { content() }
++            }
+         }.map { it.measure(constraints) }
+         val contentHeight = contentPlaceable.fastMaxBy { it.height }?.height ?: 0
+         val contentWidth = contentPlaceable.fastMaxBy { it.width }?.width ?: 0
+@@ -382,11 +411,10 @@ fun VerticalGridFastScroller(
+                     bottomContentPadding,
+                     with(density) { state.layoutInfo.afterContentPadding.toDp() },
+                 ),
+-                dragging = isThumbDragged || thumbPressed.pressed,
+             )
+             val thumbTopPadding = with(density) { trackTopPadding.toPx() }
+             val thumbBottomPadding = with(density) { trackBottomPadding.toPx() }
+-            var thumbOffsetY by remember { mutableFloatStateOf(thumbTopPadding) }
++            var thumbProgress by remember { mutableFloatStateOf(0f) }
+             val scrolled = remember {
+                 MutableSharedFlow<Unit>(
+                     extraBufferCapacity = 1,
+@@ -397,6 +425,7 @@ fun VerticalGridFastScroller(
+             val heightPx = contentHeight.toFloat() - thumbTopPadding - thumbBottomPadding
+             val thumbHeightPx = with(LocalDensity.current) { ThumbLength.toPx() }
+             val trackHeightPx = heightPx - thumbHeightPx
++            val dragTrackHeightPx = rememberFastScrollerDragTravel(trackHeightPx, isThumbDragged || thumbPressed.pressed)
+             if (trackHeightPx <= 0f) {
+                 LaunchedEffect(alpha) { alpha.snapTo(0f) }
+                 return@subcompose
+@@ -408,7 +437,7 @@ fun VerticalGridFastScroller(
+             val scrollRange = computeGridScrollRange(state = state, columnCount = columnCount)
+ 
+             // When thumb dragged
+-            LaunchedEffect(thumbOffsetY) {
++            LaunchedEffect(thumbProgress) {
+                 if (layoutInfo.totalItemsCount == 0 || !isThumbDragged) return@LaunchedEffect
+                 val visibleItems = state.layoutInfo.visibleItemsInfo
+                 val startChild = visibleItems.first()
+@@ -417,7 +446,7 @@ fun VerticalGridFastScroller(
+                 val laidOutRows = 1 + abs(endChild.index - startChild.index) / columnCount
+                 val avgSizePerRow = (laidOutArea.toFloat() / laidOutRows).coerceAtLeast(1f)
+ 
+-                val scrollRatio = (thumbOffsetY - thumbTopPadding) / trackHeightPx
++                val scrollRatio = thumbProgress
+                 if (scrollRatio <= 0.001f || scrollRatio >= 0.999f) {
+                     if (scrollRatio <= 0.001f) {
+                         state.scrollToItem(0)
+@@ -441,8 +470,7 @@ fun VerticalGridFastScroller(
+             }
+ 
+             // When list scrolled
+-            LaunchedEffect(layoutInfo, trackHeightPx, thumbTopPadding, isThumbDragged) {
+-                if (state.layoutInfo.totalItemsCount == 0 || isThumbDragged) return@LaunchedEffect
++            if (state.layoutInfo.totalItemsCount > 0 && !isThumbDragged) {
+                 val scrollOffset = computeGridScrollOffset(state = state, columnCount = columnCount)
+                 /*
+                     LazyGridItemInfo doesn't always give the accurate height of the object, so we clamp the proportion
+@@ -454,8 +482,8 @@ fun VerticalGridFastScroller(
+                     !state.canScrollForward -> 1f
+                     else -> (scrollOffset.toFloat() / extraScrollRange).coerceIn(0f, 1f)
+                 }
+-                thumbOffsetY = trackHeightPx * proportion + thumbTopPadding
+-                scrolled.tryEmit(Unit)
++                thumbProgress = proportion
++                if (state.isScrollInProgress) scrolled.tryEmit(Unit)
+             }
+ 
+             // Thumb alpha
+@@ -479,7 +507,12 @@ fun VerticalGridFastScroller(
+ 
+             // Harmony -->
+             HarmonyScrollerThumb(
+-                offsetY = thumbOffsetY,
++                offsetY = thumbTopPadding + trackHeightPx * rememberFastScrollerProgress(
++                    progress = thumbProgress,
++                    itemCount = state.layoutInfo.totalItemsCount,
++                    held = isThumbDragged || thumbPressed.pressed,
++                    visible = alpha.value > 0f,
++                ),
+                 alpha = alpha.value,
+                 thumbColor = thumbColor,
+                 glassState = thumbGlass.takeIf { glassVisible.value },
+@@ -489,11 +522,7 @@ fun VerticalGridFastScroller(
+                 interactionSource = dragInteractionSource,
+                 contentScrolling = { state.isScrollInProgress },
+                 onDragDelta = { delta ->
+-                    val newOffsetY = thumbOffsetY + delta
+-                    thumbOffsetY = newOffsetY.coerceIn(
+-                        thumbTopPadding,
+-                        thumbTopPadding + trackHeightPx,
+-                    )
++                    thumbProgress = (thumbProgress + delta / dragTrackHeightPx).coerceIn(0f, 1f)
+                 },
+                 excludeSystemGestures = (isThumbVisible || thumbPressed.pressed) &&
+                     !isThumbDragged &&
+@@ -589,7 +618,20 @@ fun IrregularVerticalGridFastScroller(
+     }
+     SubcomposeLayout(modifier = modifier) { constraints ->
+         val contentPlaceable = subcompose("content") {
+-            Box(Modifier.fastScrollerGlassSource(thumbGlass.takeIf { glassVisible.value }), propagateMinConstraints = true) { content() }
++            BrowsingContentViewport(
++                leadingOffset = { if (!state.canScrollBackward) 0f else state.layoutInfo.visibleItemsInfo.firstOrNull { it.index == 0 }?.let { -it.offset.y.toFloat() } ?: Float.POSITIVE_INFINITY },
++                trailingRemaining = {
++                    val info = state.layoutInfo
++                    browsingTrailingRemaining(
++                        terminalVisible = info.totalItemsCount > 0 && info.visibleItemsInfo.any { it.index == info.totalItemsCount - 1 },
++                        lastItemBottom = info.visibleItemsInfo.maxOfOrNull { it.offset.y + it.size.height } ?: 0,
++                        afterPadding = info.afterContentPadding,
++                        viewportEnd = info.viewportEndOffset,
++                    )
++                },
++            ) {
++                Box(Modifier.fastScrollerGlassSource(thumbGlass.takeIf { glassVisible.value }), propagateMinConstraints = true) { content() }
++            }
+         }.map { it.measure(constraints) }
+         val contentHeight = contentPlaceable.fastMaxBy { it.height }?.height ?: 0
+         val contentWidth = contentPlaceable.fastMaxBy { it.width }?.width ?: 0
+@@ -648,11 +690,10 @@ fun IrregularVerticalGridFastScroller(
+                     bottomContentPadding,
+                     with(density) { state.layoutInfo.afterContentPadding.toDp() },
+                 ),
+-                dragging = isThumbDragged || thumbPressed.pressed,
+             )
+             val thumbTopPadding = with(density) { trackTopPadding.toPx() }
+             val thumbBottomPadding = with(density) { trackBottomPadding.toPx() }
+-            var thumbOffsetY by remember { mutableFloatStateOf(thumbTopPadding) }
++            var thumbProgress by remember { mutableFloatStateOf(0f) }
+             val scrolled = remember {
+                 MutableSharedFlow<Unit>(
+                     extraBufferCapacity = 1,
+@@ -663,6 +704,7 @@ fun IrregularVerticalGridFastScroller(
+             val heightPx = contentHeight.toFloat() - thumbTopPadding - thumbBottomPadding
+             val thumbHeightPx = with(LocalDensity.current) { ThumbLength.toPx() }
+             val trackHeightPx = heightPx - thumbHeightPx
++            val dragTrackHeightPx = rememberFastScrollerDragTravel(trackHeightPx, isThumbDragged || thumbPressed.pressed)
+             if (trackHeightPx <= 0f) {
+                 LaunchedEffect(alpha) { alpha.snapTo(0f) }
+                 return@subcompose
+@@ -684,9 +726,9 @@ fun IrregularVerticalGridFastScroller(
+             }
+ 
+             // When thumb dragged
+-            LaunchedEffect(thumbOffsetY) {
++            LaunchedEffect(thumbProgress) {
+                 if (layoutInfo.totalItemsCount == 0 || !isThumbDragged /* ANK --> */ || trackHeightPx <= 0 /* ANK <-- */) return@LaunchedEffect
+-                val scrollRatio = (thumbOffsetY - thumbTopPadding) / trackHeightPx
++                val scrollRatio = thumbProgress
+                 if (scrollRatio <= 0.001f || scrollRatio >= 0.999f) {
+                     if (scrollRatio <= 0.001f) {
+                         state.scrollToItem(0)
+@@ -724,45 +766,16 @@ fun IrregularVerticalGridFastScroller(
+                 scrolled.tryEmit(Unit)
+             }
+ 
+-            // When list scrolled
+-            // Harmony -->
+-            // layoutInfo moves every frame. Collecting it keeps this effect alive,
+-            // and a grabbed thumb is still ignored.
+-            val lastScrollOffset = remember { MutableData(Int.MIN_VALUE) }
+-            LaunchedEffect(trackHeightPx, thumbTopPadding, scrollViewportHeightPx, isThumbDragged) {
+-                snapshotFlow {
+-                    Triple(
+-                        state.layoutInfo.totalItemsCount,
+-                        computeScrollOffset(
+-                            state = state,
+-                            headerHeights = headerHeights,
+-                            cachedGridItemHeight = cachedGridItemHeight,
+-                        ),
+-                        computeScrollRange(
+-                            state = state,
+-                            headerHeights = headerHeights,
+-                            cachedGridItemHeight = cachedGridItemHeight,
+-                        ),
+-                    )
+-                }.collect { (total, scrollOffset, scrollRange) ->
+-                    if (isThumbDraggedState.value) return@collect
+-                    if (total == 0) return@collect
+-                    val extraScrollRange = (scrollRange.toFloat() - scrollViewportHeightPx).coerceAtLeast(1f)
+-                    val proportion = when {
+-                        !state.canScrollBackward -> 0f
+-                        !state.canScrollForward -> 1f
+-                        else -> (scrollOffset.toFloat() / extraScrollRange)
+-                            .coerceIn(0f, 1f)
+-                    }
+-                    val target = trackHeightPx * proportion + thumbTopPadding
+-                    if (scrollOffset != lastScrollOffset.value) {
+-                        lastScrollOffset.value = scrollOffset
+-                        scrolled.tryEmit(Unit)
+-                    }
+-                    thumbOffsetY = target
++            if (!isThumbDragged) {
++                val scrollOffset = computeScrollOffset(state, headerHeights, cachedGridItemHeight)
++                val range = computeScrollRange(state, headerHeights, cachedGridItemHeight)
++                thumbProgress = when {
++                    !state.canScrollBackward -> 0f
++                    !state.canScrollForward -> 1f
++                    else -> (scrollOffset / (range - scrollViewportHeightPx).coerceAtLeast(1f)).coerceIn(0f, 1f)
+                 }
++                if (state.isScrollInProgress) scrolled.tryEmit(Unit)
+             }
+-            // <-- Harmony
+ 
+             // Thumb alpha
+             val isThumbVisible = alpha.value > 0f
+@@ -785,7 +798,12 @@ fun IrregularVerticalGridFastScroller(
+ 
+             // Harmony -->
+             HarmonyScrollerThumb(
+-                offsetY = thumbOffsetY,
++                offsetY = thumbTopPadding + trackHeightPx * rememberFastScrollerProgress(
++                    progress = thumbProgress,
++                    itemCount = state.layoutInfo.totalItemsCount,
++                    held = isThumbDragged || thumbPressed.pressed,
++                    visible = alpha.value > 0f,
++                ),
+                 alpha = alpha.value,
+                 thumbColor = thumbColor,
+                 glassState = thumbGlass.takeIf { glassVisible.value },
+@@ -795,11 +813,7 @@ fun IrregularVerticalGridFastScroller(
+                 interactionSource = dragInteractionSource,
+                 contentScrolling = { state.isScrollInProgress },
+                 onDragDelta = { delta ->
+-                    val newOffsetY = thumbOffsetY + delta
+-                    thumbOffsetY = newOffsetY.coerceIn(
+-                        thumbTopPadding,
+-                        thumbTopPadding + trackHeightPx,
+-                    )
++                    thumbProgress = (thumbProgress + delta / dragTrackHeightPx).coerceIn(0f, 1f)
+                 },
+                 excludeSystemGestures = (isThumbVisible || thumbPressed.pressed) &&
+                     !isThumbDragged &&
+@@ -886,7 +900,12 @@ fun VerticalMasonryFastScroller(
+     }
+     SubcomposeLayout(modifier = modifier) { constraints ->
+         val contentPlaceable = subcompose("content") {
+-            Box(Modifier.fastScrollerGlassSource(thumbGlass.takeIf { glassVisible.value }), propagateMinConstraints = true) { content() }
++            BrowsingContentViewport(
++                leadingOffset = { state.scrollOffset },
++                trailingRemaining = { if (state.viewportHeight > 0 && state.contentHeight > 0) (state.maxScroll - state.scrollOffset).coerceAtLeast(0f) else Float.POSITIVE_INFINITY },
++            ) {
++                Box(Modifier.fastScrollerGlassSource(thumbGlass.takeIf { glassVisible.value }), propagateMinConstraints = true) { content() }
++            }
+         }.map { it.measure(constraints) }
+         val contentHeight = contentPlaceable.fastMaxBy { it.height }?.height ?: 0
+         val contentWidth = contentPlaceable.fastMaxBy { it.width }?.width ?: 0
+@@ -906,11 +925,10 @@ fun VerticalMasonryFastScroller(
+                     bottomContentPadding,
+                     with(density) { state.afterContentPadding.toDp() },
+                 ),
+-                dragging = isThumbDragged || thumbPressed.pressed,
+             )
+             val thumbTopPadding = with(density) { trackTopPadding.toPx() }
+             val thumbBottomPadding = with(density) { trackBottomPadding.toPx() }
+-            var thumbOffsetY by remember { mutableFloatStateOf(thumbTopPadding) }
++            var thumbProgress by remember { mutableFloatStateOf(0f) }
+             val scrolled = remember {
+                 MutableSharedFlow<Unit>(
+                     extraBufferCapacity = 1,
+@@ -921,38 +939,26 @@ fun VerticalMasonryFastScroller(
+             val heightPx = contentHeight.toFloat() - thumbTopPadding - thumbBottomPadding
+             val thumbHeightPx = with(LocalDensity.current) { ThumbLength.toPx() }
+             val trackHeightPx = heightPx - thumbHeightPx
++            val dragTrackHeightPx = rememberFastScrollerDragTravel(trackHeightPx, isThumbDragged || thumbPressed.pressed)
+             if (trackHeightPx <= 0f) {
+                 LaunchedEffect(alpha) { alpha.snapTo(0f) }
+                 return@subcompose
+             }
+ 
+-            LaunchedEffect(thumbOffsetY) {
++            LaunchedEffect(thumbProgress) {
+                 if (!isThumbDragged) return@LaunchedEffect
+-                val ratio = ((thumbOffsetY - thumbTopPadding) / trackHeightPx).coerceIn(0f, 1f)
++                val ratio = thumbProgress
+                 state.scrollToOffset(ratio * state.maxScroll)
+                 scrolled.tryEmit(Unit)
+             }
+ 
+-            val lastScrollOffset = remember { MutableData(Float.NaN) }
+-            // Harmony: a fling moves the offset every frame, and restarting this effect
+-            // stalled the shelf. The collector stays up and still skips a grabbed thumb.
+-            LaunchedEffect(trackHeightPx, thumbTopPadding, isThumbDragged) {
+-                snapshotFlow {
+-                    Triple(state.scrollOffset, state.maxScroll, state.canScrollForward)
+-                }.collect { (scrollOffset, maxScroll, canScrollForward) ->
+-                    if (isThumbDraggedState.value) return@collect
+-                    val proportion = if (!canScrollForward) {
+-                        1f
+-                    } else {
+-                        (scrollOffset / maxScroll).coerceIn(0f, 1f)
+-                    }
+-                    val target = trackHeightPx * proportion + thumbTopPadding
+-                    if (scrollOffset != lastScrollOffset.value) {
+-                        lastScrollOffset.value = scrollOffset
+-                        scrolled.tryEmit(Unit)
+-                    }
+-                    thumbOffsetY = target
++            if (!isThumbDragged) {
++                thumbProgress = when {
++                    !state.canScrollBackward -> 0f
++                    !state.canScrollForward -> 1f
++                    else -> (state.scrollOffset / state.maxScroll.coerceAtLeast(1f)).coerceIn(0f, 1f)
+                 }
++                if (state.isScrollInProgress) scrolled.tryEmit(Unit)
+             }
+ 
+             val isThumbVisible = alpha.value > 0f
+@@ -973,7 +979,12 @@ fun VerticalMasonryFastScroller(
+             // cancelled on the frame that applies it. pressed / isThumbDragged keep the same
+             // pointer attached after the thumb would otherwise have faded out.
+             HarmonyScrollerThumb(
+-                offsetY = thumbOffsetY,
++                offsetY = thumbTopPadding + trackHeightPx * rememberFastScrollerProgress(
++                    progress = thumbProgress,
++                    itemCount = state.totalItemsCount,
++                    held = isThumbDragged || thumbPressed.pressed,
++                    visible = alpha.value > 0f,
++                ),
+                 alpha = alpha.value,
+                 thumbColor = thumbColor,
+                 glassState = thumbGlass.takeIf { glassVisible.value },
+@@ -983,11 +994,7 @@ fun VerticalMasonryFastScroller(
+                 interactionSource = dragInteractionSource,
+                 contentScrolling = { state.isScrollInProgress },
+                 onDragDelta = { delta ->
+-                    val newOffsetY = thumbOffsetY + delta
+-                    thumbOffsetY = newOffsetY.coerceIn(
+-                        thumbTopPadding,
+-                        thumbTopPadding + trackHeightPx,
+-                    )
++                    thumbProgress = (thumbProgress + delta / dragTrackHeightPx).coerceIn(0f, 1f)
+                 },
+                 excludeSystemGestures = (isThumbVisible || thumbPressed.pressed) &&
+                     !isThumbDragged &&
+@@ -1028,7 +1035,20 @@ internal fun VerticalTimelineFastScroller(
+     }
+     SubcomposeLayout(modifier = modifier) { constraints ->
+         val contentPlaceable = subcompose("content") {
+-            Box(Modifier.fastScrollerGlassSource(thumbGlass.takeIf { glassVisible.value }), propagateMinConstraints = true) { content() }
++            BrowsingContentViewport(
++                leadingOffset = { if (!state.canScrollBackward) 0f else state.layoutInfo.visibleItemsInfo.firstOrNull { it.index == 0 }?.let { -it.offset.y.toFloat() } ?: Float.POSITIVE_INFINITY },
++                trailingRemaining = {
++                    val info = state.layoutInfo
++                    browsingTrailingRemaining(
++                        terminalVisible = info.totalItemsCount > 0 && info.visibleItemsInfo.any { it.index == info.totalItemsCount - 1 },
++                        lastItemBottom = info.visibleItemsInfo.maxOfOrNull { it.offset.y + it.size.height } ?: 0,
++                        afterPadding = info.afterContentPadding,
++                        viewportEnd = info.viewportEndOffset,
++                    )
++                },
++            ) {
++                Box(Modifier.fastScrollerGlassSource(thumbGlass.takeIf { glassVisible.value }), propagateMinConstraints = true) { content() }
++            }
+         }.map { it.measure(constraints) }
+         val contentHeight = contentPlaceable.fastMaxBy { it.height }?.height ?: 0
+         val contentWidth = contentPlaceable.fastMaxBy { it.width }?.width ?: 0
+@@ -1048,11 +1068,10 @@ internal fun VerticalTimelineFastScroller(
+                     bottomContentPadding,
+                     with(density) { state.layoutInfo.afterContentPadding.toDp() },
+                 ),
+-                dragging = isThumbDragged || thumbPressed.pressed,
+             )
+             val thumbTopPadding = with(density) { trackTopPadding.toPx() }
+             val thumbBottomPadding = with(density) { trackBottomPadding.toPx() }
+-            var thumbOffsetY by remember { mutableFloatStateOf(thumbTopPadding) }
++            var thumbProgress by remember { mutableFloatStateOf(0f) }
+             val scrolled = remember {
+                 MutableSharedFlow<Unit>(
+                     extraBufferCapacity = 1,
+@@ -1063,38 +1082,28 @@ internal fun VerticalTimelineFastScroller(
+             val heightPx = contentHeight.toFloat() - thumbTopPadding - thumbBottomPadding
+             val thumbHeightPx = with(LocalDensity.current) { ThumbLength.toPx() }
+             val trackHeightPx = heightPx - thumbHeightPx
++            val dragTrackHeightPx = rememberFastScrollerDragTravel(trackHeightPx, isThumbDragged || thumbPressed.pressed)
+             if (trackHeightPx <= 0f) {
+                 LaunchedEffect(alpha) { alpha.snapTo(0f) }
+                 return@subcompose
+             }
+ 
+-            LaunchedEffect(thumbOffsetY) {
++            LaunchedEffect(thumbProgress) {
+                 if (!isThumbDragged) return@LaunchedEffect
+-                val ratio = ((thumbOffsetY - thumbTopPadding) / trackHeightPx).coerceIn(0f, 1f)
++                val ratio = thumbProgress
+                 state.scrollToItem((ratio * (state.layoutInfo.totalItemsCount - 1)).roundToInt().coerceAtLeast(0))
+                 scrolled.tryEmit(Unit)
+             }
+ 
+-            val lastScrollOffset = remember { MutableData(Float.NaN) }
+-            // Harmony: a fling moves the offset every frame, and restarting this effect
+-            // stalled the shelf. The collector stays up and still skips a grabbed thumb.
+-            LaunchedEffect(trackHeightPx, thumbTopPadding, isThumbDragged) {
+-                snapshotFlow {
+-                    Triple(state.firstVisibleItemIndex.toFloat(), (state.layoutInfo.totalItemsCount - 1).coerceAtLeast(1).toFloat(), state.canScrollForward)
+-                }.collect { (scrollOffset, maxScroll, canScrollForward) ->
+-                    if (isThumbDraggedState.value) return@collect
+-                    val proportion = if (!canScrollForward) {
+-                        1f
+-                    } else {
+-                        (scrollOffset / maxScroll).coerceIn(0f, 1f)
+-                    }
+-                    val target = trackHeightPx * proportion + thumbTopPadding
+-                    if (scrollOffset != lastScrollOffset.value) {
+-                        lastScrollOffset.value = scrollOffset
+-                        scrolled.tryEmit(Unit)
+-                    }
+-                    thumbOffsetY = target
++            if (!isThumbDragged) {
++                thumbProgress = when {
++                    !state.canScrollBackward -> 0f
++                    !state.canScrollForward -> 1f
++                    else -> state.scrollIndicatorState?.let {
++                        it.scrollOffset.toFloat() / (it.contentSize - it.viewportSize).coerceAtLeast(1)
++                    }?.coerceIn(0f, 1f) ?: 0f
+                 }
++                if (state.isScrollInProgress) scrolled.tryEmit(Unit)
+             }
+ 
+             val isThumbVisible = alpha.value > 0f
+@@ -1115,7 +1124,12 @@ internal fun VerticalTimelineFastScroller(
+             // cancelled on the frame that applies it. pressed / isThumbDragged keep the same
+             // pointer attached after the thumb would otherwise have faded out.
+             HarmonyScrollerThumb(
+-                offsetY = thumbOffsetY,
++                offsetY = thumbTopPadding + trackHeightPx * rememberFastScrollerProgress(
++                    progress = thumbProgress,
++                    itemCount = state.layoutInfo.totalItemsCount,
++                    held = isThumbDragged || thumbPressed.pressed,
++                    visible = alpha.value > 0f,
++                ),
+                 alpha = alpha.value,
+                 thumbColor = thumbColor,
+                 glassState = thumbGlass.takeIf { glassVisible.value },
+@@ -1125,11 +1139,7 @@ internal fun VerticalTimelineFastScroller(
+                 interactionSource = dragInteractionSource,
+                 contentScrolling = { state.isScrollInProgress },
+                 onDragDelta = { delta ->
+-                    val newOffsetY = thumbOffsetY + delta
+-                    thumbOffsetY = newOffsetY.coerceIn(
+-                        thumbTopPadding,
+-                        thumbTopPadding + trackHeightPx,
+-                    )
++                    thumbProgress = (thumbProgress + delta / dragTrackHeightPx).coerceIn(0f, 1f)
+                 },
+                 excludeSystemGestures = (isThumbVisible || thumbPressed.pressed) &&
+                     !isThumbDragged &&
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingContentViewport.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingContentViewport.kt
+new file mode 100644
+index 000000000..0d3ccbff8
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingContentViewport.kt
+@@ -0,0 +1,48 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clipToBounds
++import androidx.compose.ui.graphics.graphicsLayer
++
++/** Protect the leading reading area without remeasuring cells or consuming any scroll/fling delta. */
++@Composable
++internal fun BrowsingContentViewport(
++    leadingOffset: () -> Float,
++    trailingRemaining: () -> Float,
++    content: @Composable () -> Unit,
++) {
++    val chrome = LocalBrowsingChrome.current?.chrome
++    if (chrome == null) {
++        content()
++        return
++    }
++    Box(Modifier.clipToBounds(), propagateMinConstraints = true) {
++        Box(
++            Modifier.graphicsLayer {
++                translationY = if (!chrome.contentProtectionEnabled) {
++                    0f
++                } else {
++                    browsingContentProtectionOffset(
++                        chrome.headerHeightPx,
++                        // Edge spacers and incoming pager pages already reserve their own header.
++                        // Using the backing animation avoids translating an incoming top page twice.
++                        chrome.animation?.value ?: 0f,
++                        leadingOffset(),
++                        trailingRemaining(),
++                    )
++                }
++            },
++            propagateMinConstraints = true,
++        ) { content() }
++    }
++}
++
++internal fun browsingContentProtectionOffset(headerHeight: Float, hidden: Float, leading: Float, remaining: Float): Float {
++    if (headerHeight <= 0f) return 0f
++    val reserved = (headerHeight - leading.coerceAtLeast(0f)).coerceIn(0f, headerHeight)
++    val required = (headerHeight * (1f - hidden.coerceIn(0f, 1f)) - reserved).coerceAtLeast(0f)
++    // Preserve the reachable last row at the trailing edge instead of pushing it behind the capsule.
++    return minOf(required, remaining.coerceAtLeast(0f))
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingPagerViewport.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingPagerViewport.kt
+new file mode 100644
+index 000000000..f11dcad35
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingPagerViewport.kt
+@@ -0,0 +1,76 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.foundation.pager.PagerState
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.Stable
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.snapshotFlow
++import androidx.compose.runtime.staticCompositionLocalOf
++import kotlinx.coroutines.flow.collect
++import kotlinx.coroutines.flow.distinctUntilChanged
++import kotlin.math.abs
++
++private val LocalBrowsingPagerPage = staticCompositionLocalOf<BrowsingPagerPageScope?> { null }
++
++/** Let a page's edge reveal the shared controls in proportion to its visible width. */
++@Composable
++fun BrowsingPagerPage(state: PagerState, page: Int, content: @Composable () -> Unit) {
++    val scope = remember(state, page) { BrowsingPagerPageScope(state, page) }
++    CompositionLocalProvider(LocalBrowsingPagerPage provides scope, content = content)
++}
++
++@Stable
++internal class BrowsingPagerPageScope(private val state: PagerState, private val page: Int) {
++    val weight: Float get() = (1f - abs(state.currentPage + state.currentPageOffsetFraction - page)).coerceIn(0f, 1f)
++    val isSettled: Boolean
++        get() = !state.isScrollInProgress && state.currentPage == page && state.currentPageOffsetFraction == 0f
++}
++
++@Stable
++internal class BrowsingPagerViewport(
++    private val page: BrowsingPagerPageScope,
++    val leadingOffset: () -> Float,
++    val trailingRemaining: () -> Float,
++) {
++    val isSettled: Boolean get() = page.isSettled
++
++    fun hiddenFraction(headerHeight: Float, bottomHeight: Float): Float {
++        val weight = page.weight
++        // Do not read unmeasured/offscreen geometry or let prefetch change visibility.
++        if (weight <= 0f) return 1f
++        val edge = browsingTrailingHiddenFraction(
++            browsingLeadingHiddenFraction(1f, leadingOffset(), headerHeight),
++            trailingRemaining(),
++            bottomHeight,
++        )
++        return 1f - (1f - edge) * weight
++    }
++}
++
++@Composable
++internal fun rememberBrowsingPagerViewport(
++    chrome: BrowsingNavigationBarState,
++    leadingOffset: () -> Float,
++    trailingRemaining: () -> Float,
++): BrowsingPagerViewport? {
++    val page = LocalBrowsingPagerPage.current ?: return null
++    val viewport = remember(page, leadingOffset, trailingRemaining) {
++        BrowsingPagerViewport(page, leadingOffset, trailingRemaining)
++    }
++    DisposableEffect(chrome, viewport) {
++        chrome.pagerViewports.add(viewport)
++        onDispose { chrome.pagerViewports.remove(viewport) }
++    }
++    LaunchedEffect(chrome, viewport) {
++        snapshotFlow { viewport.isSettled }.distinctUntilChanged().collect { settled ->
++            if (settled) {
++                chrome.leadingOffset = leadingOffset
++                chrome.trailingRemaining = trailingRemaining
++            }
++        }
++    }
++    return viewport
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingScrollInsets.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingScrollInsets.kt
+index ed783f4d5..ba39f3240 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingScrollInsets.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingScrollInsets.kt
+@@ -17,7 +17,6 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+ import androidx.compose.ui.input.nestedscroll.nestedScroll
+ import androidx.compose.ui.layout.boundsInWindow
+ import androidx.compose.ui.layout.onGloballyPositioned
+-import androidx.compose.ui.platform.LocalConfiguration
+ import androidx.compose.ui.platform.LocalDensity
+ import androidx.compose.ui.unit.Dp
+ import kotlinx.coroutines.flow.collect
+@@ -34,13 +33,15 @@ fun Modifier.observeBrowsingLeadingScroll(
+     val currentTail by rememberUpdatedState(trailingRemaining)
+     val activeSource = remember(chrome) { { currentOffset() } }
+     val activeTail = remember(chrome) { { currentTail?.invoke() ?: Float.POSITIVE_INFINITY } }
++    val pagerViewport = rememberBrowsingPagerViewport(chrome, activeSource, activeTail)
+     fun activate() {
++        if (pagerViewport?.isSettled == false) return
+         chrome.leadingOffset = activeSource
+         chrome.trailingRemaining = activeTail
+     }
+     LaunchedEffect(chrome, activeSource, activeTail) {
+         snapshotFlow {
+-            if (chrome.leadingOffset !== activeSource) {
++            if (pagerViewport?.isSettled == false || chrome.leadingOffset !== activeSource) {
+                 0
+             } else {
+                 when {
+@@ -65,7 +66,7 @@ fun Modifier.observeBrowsingLeadingScroll(
+             }
+         }
+     }
+-    val connection = remember(chrome, activeSource) {
++    val connection = remember(chrome, activeSource, pagerViewport) {
+         object : NestedScrollConnection {
+             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                 if (kotlin.math.abs(available.y) > kotlin.math.abs(available.x)) activate()
+@@ -89,7 +90,7 @@ fun Modifier.observeBrowsingLeadingScroll(
+         if (chrome.leadingOffset == null && inWindow) activate()
+         // Programmatic jumps finish through layout, without a nested-scroll callback. Commit
+         // the measured boundary here as well: snapshotFlow can dispatch after this layout frame.
+-        if (chrome.leadingOffset === activeSource) {
++        if (pagerViewport?.isSettled != false && chrome.leadingOffset === activeSource) {
+             if (activeSource() <= 0.5f) {
+                 chrome.revealAtStart()
+             } else if (activeTail() <= 0.5f) {
+@@ -99,10 +100,8 @@ fun Modifier.observeBrowsingLeadingScroll(
+     }.nestedScroll(connection)
+ }
+ 
+-private class FrozenBrowsingTrack(var insets: Pair<Dp, Dp>? = null)
+-
+ @Composable
+-fun rememberBrowsingScrollInsets(topContentPadding: Dp, bottomContentPadding: Dp, dragging: Boolean): Pair<Dp, Dp> {
++fun rememberBrowsingScrollInsets(topContentPadding: Dp, bottomContentPadding: Dp): Pair<Dp, Dp> {
+     val chrome = LocalBrowsingChrome.current?.chrome
+     val density = LocalDensity.current
+     val statusTop = WindowInsets.statusBars.getTop(density).toFloat()
+@@ -126,15 +125,5 @@ fun rememberBrowsingScrollInsets(topContentPadding: Dp, bottomContentPadding: Dp
+             top.toDp() to bottom.toDp()
+         }
+     }
+-    val configuration = LocalConfiguration.current
+-    val frozen = remember(
+-        chrome,
+-        density.density,
+-        density.fontScale,
+-        configuration.screenWidthDp,
+-        configuration.screenHeightDp,
+-    ) { FrozenBrowsingTrack() }
+-    // Keep the last displayed track on the first down as well as while dragging.
+-    if (!dragging || frozen.insets == null) frozen.insets = live
+-    return frozen.insets!!
++    return live
+ }
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt
+index 222c10770..415f90c40 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingTabSelector.kt
+@@ -58,7 +58,7 @@ fun BrowsingTabSelector(
+ ) {
+     if (labels.isEmpty()) return
+     val selected = selectedIndex.coerceIn(labels.indices)
+-    val rowHeight = if (title.isNotEmpty()) 40.dp else browsingSecondaryRowHeight()
++    val rowHeight = if (title.isNotEmpty()) navigationToolbarHeight() else browsingSecondaryRowHeight()
+     val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
+     val indicatorColor = MaterialTheme.colorScheme.primary
+     val animatedSelection by frameTimeProtectedFloatAsState(
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingToolbarContent.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingToolbarContent.kt
+index 6fb4abadd..c73a33f0f 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingToolbarContent.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/BrowsingToolbarContent.kt
+@@ -21,7 +21,7 @@ import tachiyomi.presentation.core.components.rememberFrameTimeProtectedFlingBeh
+ 
+ /** Match the library's compact category strip or regular Material tab row. */
+ @Composable
+-fun browsingSecondaryRowHeight(): Dp = if (isCompactBrowsingWindow()) 40.dp else 48.dp
++fun browsingSecondaryRowHeight(): Dp = if (isCompactBrowsingWindow()) 36.dp else 48.dp
+ 
+ @Composable
+ fun BrowsingFilterRow(state: ScrollState, modifier: Modifier = Modifier, content: @Composable RowScope.() -> Unit) {
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+index 8baf61c47..fa818184b 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationChrome.kt
+@@ -19,6 +19,7 @@ import androidx.compose.runtime.derivedStateOf
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableFloatStateOf
+ import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateListOf
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.rememberUpdatedState
+@@ -55,7 +56,7 @@ fun isCompactBrowsingWindow(): Boolean {
+ @Composable
+ fun navigationToolbarHeight(): Dp = when {
+     LocalDensity.current.fontScale > 1.3f -> 64.dp
+-    isCompactBrowsingWindow() -> 40.dp
++    isCompactBrowsingWindow() -> 36.dp
+     else -> 56.dp
+ }
+ 
+@@ -101,7 +102,7 @@ fun BrowsingNavigationChrome(content: @Composable () -> Unit) {
+     if (chrome == null) content() else BrowsingChromeOverlay(chrome, content = content)
+ }
+ 
+-/** Keep the viewport and content padding fixed. Only the floating controls move. */
++/** Controls and content protection share this progress; lazy layout constraints stay fixed. */
+ @Composable
+ fun BrowsingChromeOverlay(
+     state: BrowsingNavigationBarState,
+@@ -133,19 +134,31 @@ class BrowsingNavigationBarState internal constructor(
+         initialVisible,
+         fastFlingVelocity = NAVIGATION_CHROME_FAST_FLING_VELOCITY * density,
+     )
+-    private val pinnedOwners = mutableSetOf<Any>()
++    private val pinnedOwners = mutableStateListOf<Any>()
++    internal val contentProtectionEnabled: Boolean get() = enabled() && pinnedOwners.isEmpty()
+     internal var animation: State<Float>? = null
+     internal val glassState = HazeState()
+     internal var headerHeightPx by mutableFloatStateOf(0f)
+     internal var bottomHeightPx by mutableFloatStateOf(0f)
+     internal var leadingOffset: (() -> Float)? by mutableStateOf(null)
+     internal var trailingRemaining: (() -> Float)? by mutableStateOf(null)
++    internal val pagerViewports = mutableStateListOf<BrowsingPagerViewport>()
+     val hiddenFraction: Float
+-        get() = browsingTrailingHiddenFraction(
+-            browsingLeadingHiddenFraction(animation?.value ?: 0f, leadingOffset?.invoke(), headerHeightPx),
+-            trailingRemaining?.invoke(),
+-            bottomHeightPx,
+-        )
++        get() {
++            val animated = animation?.value ?: 0f
++            if (pagerViewports.isNotEmpty()) {
++                // Page edges share the pager's progress, without changing the saved target
++                // until the destination settles. A cancelled swipe restores the old target.
++                return pagerViewports.fold(animated) { hidden, page ->
++                    minOf(hidden, page.hiddenFraction(headerHeightPx, bottomHeightPx))
++                }
++            }
++            return browsingTrailingHiddenFraction(
++                browsingLeadingHiddenFraction(animated, leadingOffset?.invoke(), headerHeightPx),
++                trailingRemaining?.invoke(),
++                bottomHeightPx,
++            )
++        }
+     var visible by mutableStateOf(initialVisible)
+         private set
+ 
+@@ -178,7 +191,7 @@ class BrowsingNavigationBarState internal constructor(
+ 
+     internal fun setPinned(owner: Any, pinned: Boolean) {
+         if (pinned) {
+-            pinnedOwners.add(owner)
++            if (owner !in pinnedOwners) pinnedOwners.add(owner)
+             reset()
+         } else {
+             pinnedOwners.remove(owner)
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationToolbar.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationToolbar.kt
+index db8352f3c..8701658f0 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationToolbar.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationToolbar.kt
+@@ -2,6 +2,10 @@ package tachiyomi.presentation.core.components.material
+ 
+ import androidx.compose.foundation.layout.RowScope
+ import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.WindowInsetsSides
++import androidx.compose.foundation.layout.displayCutout
++import androidx.compose.foundation.layout.only
++import androidx.compose.foundation.layout.union
+ import androidx.compose.material3.LocalMinimumInteractiveComponentSize
+ import androidx.compose.material3.TopAppBar
+ import androidx.compose.material3.TopAppBarColors
+@@ -10,6 +14,7 @@ import androidx.compose.material3.TopAppBarScrollBehavior
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalDensity
+ import androidx.compose.ui.unit.dp
+ 
+ /** One height and icon allocation for regular, search and selection modes. */
+@@ -21,7 +26,7 @@ fun NavigationTopAppBar(
+     colors: TopAppBarColors = TopAppBarDefaults.topAppBarColors(),
+     scrollBehavior: TopAppBarScrollBehavior? = null,
+     modifier: Modifier = Modifier,
+-    windowInsets: WindowInsets = TopAppBarDefaults.windowInsets,
++    windowInsets: WindowInsets = browsingToolbarWindowInsets(),
+ ) {
+     val height = navigationToolbarHeight()
+     CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides minOf(height, 48.dp)) {
+@@ -37,3 +42,16 @@ fun NavigationTopAppBar(
+         )
+     }
+ }
++
++/** Trim only unused status-bar space; never cross the actual camera cutout. */
++@Composable
++fun browsingToolbarWindowInsets(): WindowInsets {
++    val base = TopAppBarDefaults.windowInsets
++    if (!isCompactBrowsingWindow()) return base
++    val density = LocalDensity.current
++    val top = compactToolbarStatusInset(base.getTop(density), WindowInsets.displayCutout.getTop(density), with(density) { 2.dp.roundToPx() })
++    return WindowInsets(top = top).union(base.only(WindowInsetsSides.Horizontal))
++}
++
++internal fun compactToolbarStatusInset(statusTop: Int, cutoutTop: Int, trim: Int): Int =
++    maxOf((statusTop - trim).coerceAtLeast(0), cutoutTop)
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFastScrollerProgressTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFastScrollerProgressTest.kt
+new file mode 100644
+index 000000000..7271a1811
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeFastScrollerProgressTest.kt
+@@ -0,0 +1,76 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.runtime.mutableFloatStateOf
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.runComposeUiTest
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34])
++class NavigationChromeFastScrollerProgressTest {
++    @Test
++    fun `append correction is continuous while real scrolling stays immediate`() = runComposeUiTest {
++        val progress = mutableFloatStateOf(0.6f)
++        val count = mutableIntStateOf(100)
++        var rendered = 0f
++        setContent { rendered = rememberFastScrollerProgress(progress.floatValue, count.intValue, false, true) }
++        mainClock.autoAdvance = false
++        runOnIdle {
++            count.intValue = 200
++            progress.floatValue = 0.3f
++        }
++        mainClock.advanceTimeByFrame()
++        runOnIdle { assertEquals(0.6f, rendered, 0.01f) }
++        mainClock.advanceTimeBy(80)
++        var before = 0f
++        runOnIdle {
++            assertTrue(rendered in 0.31f..0.59f)
++            before = rendered
++            progress.floatValue += 0.05f
++        }
++        mainClock.advanceTimeByFrame()
++        runOnIdle { assertTrue(rendered > before, "actual scroll must not wait for the append animation") }
++        mainClock.advanceTimeBy(300)
++        runOnIdle { assertEquals(0.35f, rendered, 0.001f) }
++    }
++
++    @Test
++    fun `drag travel freezes only input conversion while held and refreshes after release`() = runComposeUiTest {
++        val travel = mutableFloatStateOf(500f)
++        val held = mutableStateOf(false)
++        var conversion = 0f
++        setContent { conversion = rememberFastScrollerDragTravel(travel.floatValue, held.value) }
++        runOnIdle {
++            assertEquals(500f, conversion)
++            held.value = true
++        }
++        waitForIdle()
++        runOnIdle { travel.floatValue = 400f }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(500f, conversion)
++            held.value = false
++        }
++        waitForIdle()
++        runOnIdle { assertEquals(400f, conversion) }
++    }
++
++    @Test
++    fun `short chapter details stay quiet and useful range follows viewport and actual columns`() {
++        assertFalse(chapterScrollbarUseful(10, 1, 600, 56f))
++        assertFalse(chapterScrollbarUseful(30, 2, 600, 56f))
++        assertTrue(chapterScrollbarUseful(30, 1, 600, 56f))
++        assertFalse(chapterScrollbarUseful(30, 1, 1000, 56f))
++        assertTrue(chapterScrollbarUseful(300, 3, 1000, 56f))
++        assertFalse(chapterScrollbarUseful(300, 1, 0, 56f))
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeBrowseHeaderTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeBrowseHeaderTest.kt
+index 1fc606c02..c45ff14c2 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeBrowseHeaderTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeBrowseHeaderTest.kt
+@@ -85,8 +85,8 @@ class NavigationChromeBrowseHeaderTest {
+         }
+         runOnIdle {
+             assertEquals(22.sp, titleSize)
+-            assertEquals(80, headerHeight)
+-            assertEquals(40, filterHeight)
++            assertEquals(72, headerHeight)
++            assertEquals(36, filterHeight)
+             assertEquals(categoryHeight, filterHeight)
+         }
+         onNodeWithText("筛选").performScrollTo().performClick()
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConsistentToolbarTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConsistentToolbarTest.kt
+index a3759faac..7307cfd27 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConsistentToolbarTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeConsistentToolbarTest.kt
+@@ -113,39 +113,39 @@ class NavigationChromeConsistentToolbarTest {
+         }
+         mainClock.autoAdvance = false
+         runOnIdle {
+-            assertEquals(40, mainHeight)
+-            assertEquals(40, headerHeight)
++            assertEquals(36, mainHeight)
++            assertEquals(36, headerHeight)
+             mode.intValue = 1
+         }
+         mainClock.advanceTimeByFrame()
+         waitForIdle()
+         runOnIdle {
+-            assertEquals(40, mainHeight)
+-            assertEquals(40, headerHeight)
++            assertEquals(36, mainHeight)
++            assertEquals(36, headerHeight)
+             mode.intValue = 2
+         }
+         mainClock.advanceTimeByFrame()
+         waitForIdle()
+         mainClock.advanceTimeBy(96)
+         runOnIdle {
+-            assertEquals(40, mainHeight)
+-            assertEquals(40, childHeight)
+-            assertTrue(headerHeight in 41..79, "height=$headerHeight")
++            assertEquals(36, mainHeight)
++            assertEquals(36, childHeight)
++            assertTrue(headerHeight in 37..71, "height=$headerHeight")
+         }
+         mainClock.advanceTimeBy(500)
+         runOnIdle {
+-            assertEquals(80, headerHeight)
++            assertEquals(72, headerHeight)
+             mode.intValue = 0
+         }
+         mainClock.advanceTimeByFrame()
+         waitForIdle()
+         mainClock.advanceTimeBy(96)
+         runOnIdle {
+-            assertEquals(40, mainHeight)
+-            assertTrue(headerHeight in 41..79, "height=$headerHeight")
++            assertEquals(36, mainHeight)
++            assertTrue(headerHeight in 37..71, "height=$headerHeight")
+         }
+         mainClock.advanceTimeBy(500)
+-        runOnIdle { assertEquals(40, headerHeight) }
++        runOnIdle { assertEquals(36, headerHeight) }
+     }
+ 
+     @Test
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeContentViewportTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeContentViewportTest.kt
+new file mode 100644
+index 000000000..e44f62c74
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeContentViewportTest.kt
+@@ -0,0 +1,107 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.requiredSize
++import androidx.compose.foundation.lazy.LazyListState
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.mutableFloatStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.layout.LayoutCoordinates
++import androidx.compose.ui.layout.onGloballyPositioned
++import androidx.compose.ui.layout.positionInRoot
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.unit.Density
++import androidx.compose.ui.unit.dp
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import tachiyomi.presentation.core.components.FastScrollLazyColumn
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34])
++class NavigationChromeContentViewportTest {
++    @Test
++    fun `reveal moves viewed content with controls without changing lazy geometry or scroll position`() = runComposeUiTest {
++        val hidden = mutableFloatStateOf(1f)
++        lateinit var list: LazyListState
++        var originY = 0f
++        lateinit var cover: LayoutCoordinates
++        var viewportHeight = 0
++        setContent {
++            CompositionLocalProvider(LocalDensity provides Density(1f)) {
++                val chrome = remember {
++                    BrowsingNavigationBarState(enabled = { true }).apply {
++                        headerHeightPx = 100f
++                        animation = hidden
++                    }
++                }
++                list = remember { LazyListState(20) }
++                CompositionLocalProvider(LocalBrowsingChrome provides BrowsingTopAppBarScrollBehavior(androidx.compose.material3.TopAppBarDefaults.pinnedScrollBehavior(), chrome)) {
++                    FastScrollLazyColumn(
++                        modifier = Modifier.requiredSize(400.dp, 600.dp),
++                        state = list,
++                        contentPadding = PaddingValues(top = 100.dp, bottom = 40.dp),
++                    ) {
++                        items(100) { index ->
++                            Box(
++                                Modifier.fillMaxWidth().height(60.dp).onGloballyPositioned {
++                                    if (index == 20) {
++                                        cover = it
++                                        viewportHeight = list.layoutInfo.viewportSize.height
++                                    }
++                                },
++                            )
++                        }
++                    }
++                }
++            }
++        }
++        runOnIdle {
++            originY = cover.positionInRoot().y
++            hidden.floatValue = 0.5f
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(originY + 50f, cover.positionInRoot().y, 0.5f)
++            assertEquals(20, list.firstVisibleItemIndex)
++            assertEquals(0, list.firstVisibleItemScrollOffset)
++            assertEquals(600, viewportHeight)
++            hidden.floatValue = 0f
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(originY + 100f, cover.positionInRoot().y, 0.5f)
++            assertEquals(20, list.firstVisibleItemIndex)
++            hidden.floatValue = 1f
++        }
++        waitForIdle()
++        runOnIdle { assertEquals(originY, cover.positionInRoot().y, 0.5f) }
++    }
++
++    @Test
++    fun `edge spacers are not duplicated and trailing content remains reachable`() {
++        assertEquals(0f, browsingContentProtectionOffset(100f, 0f, 0f, Float.POSITIVE_INFINITY))
++        assertEquals(20f, browsingContentProtectionOffset(100f, 0f, 20f, Float.POSITIVE_INFINITY))
++        assertEquals(50f, browsingContentProtectionOffset(100f, 0.5f, Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY))
++        assertEquals(0f, browsingContentProtectionOffset(100f, 1f, Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY))
++        assertEquals(15f, browsingContentProtectionOffset(100f, 0f, Float.POSITIVE_INFINITY, 15f))
++        assertEquals(0f, browsingContentProtectionOffset(100f, 0f, Float.POSITIVE_INFINITY, 0f))
++    }
++
++    @Test
++    fun `compact status trim keeps cutout and never creates negative insets`() {
++        assertEquals(22, compactToolbarStatusInset(24, 0, 2))
++        assertEquals(24, compactToolbarStatusInset(24, 24, 2))
++        assertEquals(0, compactToolbarStatusInset(0, 0, 2))
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromePagerTransitionTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromePagerTransitionTest.kt
+new file mode 100644
+index 000000000..42ab5ce51
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromePagerTransitionTest.kt
+@@ -0,0 +1,144 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.requiredSize
++import androidx.compose.foundation.lazy.LazyListState
++import androidx.compose.foundation.pager.HorizontalPager
++import androidx.compose.foundation.pager.PagerState
++import androidx.compose.foundation.pager.rememberPagerState
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.input.nestedscroll.NestedScrollSource
++import androidx.compose.ui.layout.onGloballyPositioned
++import androidx.compose.ui.layout.positionInRoot
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.onNodeWithTag
++import androidx.compose.ui.test.performTouchInput
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.unit.Density
++import androidx.compose.ui.unit.dp
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import tachiyomi.presentation.core.components.FastScrollLazyColumn
++import tachiyomi.presentation.core.components.rememberFrameTimeProtectedPagerFlingBehavior
++import kotlin.math.abs
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34])
++class NavigationChromePagerTransitionTest {
++    @Test
++    fun `incoming top reveals both bars during held drag and cancellation restores hidden old page`() =
++        assertPagerTransition(incomingAtTop = true)
++
++    @Test
++    fun `incoming deep page does not force chrome open during held drag or cancellation`() =
++        assertPagerTransition(incomingAtTop = false)
++
++    private fun assertPagerTransition(incomingAtTop: Boolean) = runComposeUiTest {
++        lateinit var chrome: BrowsingNavigationBarState
++        lateinit var pager: PagerState
++        lateinit var lists: List<LazyListState>
++        var headerY = 0f
++        var bottomY = 0f
++        setContent {
++            CompositionLocalProvider(LocalDensity provides Density(1f)) {
++                chrome = rememberBrowsingNavigationBarState(enabled = true, resetKey = Unit)
++                pager = rememberPagerState { 3 }
++                lists = remember { listOf(LazyListState(20), LazyListState(if (incomingAtTop) 0 else 20), LazyListState()) }
++                CompositionLocalProvider(LocalBrowsingNavigationBarState provides chrome) {
++                    Scaffold(
++                        modifier = Modifier.requiredSize(400.dp, 600.dp),
++                        topBarScrollBehavior = rememberBrowsingTopAppBarScrollBehavior(),
++                        contentWindowInsets = WindowInsets(0),
++                        topBar = {
++                            Box(Modifier.fillMaxWidth().height(100.dp).onGloballyPositioned { headerY = it.positionInRoot().y })
++                        },
++                        bottomBar = {
++                            BrowsingChromeOverlay(chrome, atBottom = true) {
++                                Box(Modifier.fillMaxWidth().height(40.dp).onGloballyPositioned { bottomY = it.positionInRoot().y })
++                            }
++                        },
++                    ) { padding ->
++                        HorizontalPager(
++                            state = pager,
++                            beyondViewportPageCount = 1,
++                            flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(pager),
++                            modifier = Modifier.fillMaxSize().testTag("pager"),
++                        ) { page ->
++                            BrowsingPagerPage(pager, page) {
++                                FastScrollLazyColumn(state = lists[page], contentPadding = padding, modifier = Modifier.fillMaxSize()) {
++                                    items(100) { Box(Modifier.fillMaxWidth().height(60.dp)) }
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        runOnIdle { chrome.nestedScrollConnection.onPostScroll(Offset(0f, -40f), Offset.Zero, NestedScrollSource.UserInput) }
++        waitForIdle()
++        runOnIdle {
++            assertFalse(chrome.visible)
++            assertEquals(1f, chrome.hiddenFraction, 0.01f, "An offscreen top page must not reveal chrome")
++        }
++        onNodeWithTag("pager").performTouchInput {
++            down(Offset(360f, 300f))
++            repeat(4) { moveBy(Offset(-70f, 0f), delayMillis = 30) }
++        }
++        waitForIdle()
++        runOnIdle {
++            val progress = pager.currentPage + pager.currentPageOffsetFraction
++            assertTrue(progress in 0.5f..0.9f, "The finger must remain down beyond the halfway point: $progress")
++            assertTrue(pager.isScrollInProgress)
++            assertEquals(0, pager.settledPage, "Persistence must keep the old category until settling")
++            assertFalse(chrome.visible, "A partial incoming edge must not overwrite the old hidden target")
++            val expected = if (incomingAtTop) 1f - progress else 1f
++            assertEquals(expected, chrome.hiddenFraction, 0.02f)
++            assertEquals(-100f * expected, headerY, 1.5f)
++            assertEquals(560f + 40f * expected, bottomY, 1.5f)
++            assertTrue(abs(headerY) > 1f, "Held paging must interpolate rather than snap the header")
++        }
++        onNodeWithTag("pager").performTouchInput {
++            repeat(4) { moveBy(Offset(58f, 0f), delayMillis = 40) }
++            advanceEventTime(200)
++            up()
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(0, pager.settledPage)
++            assertEquals(0f, pager.currentPageOffsetFraction, 0.001f)
++            assertFalse(chrome.visible)
++            assertEquals(1f, chrome.hiddenFraction, 0.01f, "Cancelling must restore the old hidden chrome")
++            assertEquals(20, lists[0].firstVisibleItemIndex)
++        }
++        onNodeWithTag("pager").performTouchInput {
++            down(Offset(360f, 300f))
++            repeat(4) { moveBy(Offset(-78f, 0f), delayMillis = 40) }
++            advanceEventTime(200)
++            up()
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(1, pager.settledPage)
++            assertEquals(0f, pager.currentPageOffsetFraction, 0.001f)
++            assertEquals(incomingAtTop, chrome.visible)
++            assertEquals(if (incomingAtTop) 0f else 1f, chrome.hiddenFraction, 0.01f)
++            assertEquals(if (incomingAtTop) 0 else 20, lists[1].firstVisibleItemIndex)
++            assertEquals(20, lists[0].firstVisibleItemIndex)
++        }
++    }
++}
