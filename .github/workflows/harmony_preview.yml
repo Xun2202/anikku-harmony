@@ -157,7 +157,7 @@ jobs:
           ./gradlew :presentation-core:testDebugUnitTest \
             --tests '*PanoramaMasonryLayoutTest' --tests '*PanoramaMasonryFlingTest.a coast from the content survives and a coast from the thumb does not' --tests '*PanoramaAutoColumnsTest' --tests '*NavigationChrome*' --tests '*Timeline*Test' \
             :app:testPreviewUnitTest \
-            --tests '*PanoramaCoverShapesTest' --tests '*PanoramaShapeModeTest' --tests '*PanoramaLayoutPolicyTest' --tests '*HarmonyFramePerfTest' \
+            --tests '*PanoramaCoverShapesTest' --tests '*PanoramaShapeModeTest' --tests '*PanoramaLayoutPolicyTest' --tests '*HarmonyFramePerfTest' --tests '*NavigationChrome*' \
             -Penable-updater --stacktrace
           ./gradlew assemblePreview -Penable-updater --stacktrace
 
@@ -168,9 +168,11 @@ jobs:
         run: |
           python3 - <<'PY_REPORT'
           import os
+          from itertools import chain
           from pathlib import Path
           import xml.etree.ElementTree as ET
-          for report in Path(os.environ['TEST_RESULTS']).glob('TEST-*.xml'):
+          root = Path(os.environ['TEST_RESULTS'])
+          for report in chain(root.glob('TEST-*.xml'), (root.parents[3] / 'app/build/test-results').rglob('TEST-*.xml')):
               for case in ET.parse(report).getroot().findall('testcase'):
                   for failure in case.findall('failure'):
                       print(case.attrib.get('name'), failure.attrib.get('message'))
