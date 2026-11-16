@@ -923,3 +923,7 @@ gh release list --repo Xun2202/anikku-harmony
 - 来源内容区横向松手切Popular/Latest/Filtered，双向且首尾不循环，跳过不支持的入口；搜索/多选/弹窗关闭，纵/斜滑/长按优先，折叠中断不误切。首次到筛选只开原sheet，取消不替换列表；应用才记录独立可变Filter快照，返回复用已应用条件与已访问Paging流，不预先加载别页。key实际LazyPagingItems切换时重置旧查询Lazy位置，避免长列表旧index顶到新短列表尾；An保存搜索/元数据保留。
 - 详情左滑只在松手达距时异步查一次当前作品有效最近历史，章节缺失/无历史/读取失败回退原首未读，保留已存页码/播放进度；取消协程不吞，防重复启动。用户选章偏好问题未答时已明确先按“上次位置优先”执行；FAB原策略不变。两侧32dp或真实系统手势区不抢返回；章节行滑动、横向内容条、长按/多选/面板优先。An作为继续观看，沿用内/外部播放器选择，仅Episodes启用，Seasons保留单季入口，不装成漫画阅读器。
 - 更新原导航/几何回归，新增SourceBrowseSwipe/DetailContinueSwipe/DetailContinueTarget与FilterSnapshot测试；两款CI增加app的NavigationChrome筛选并打印app失败报告。9份关键共用组件逐字节一致，保留fork适配；Animeko独立KMP架构不适用这些Tachiyomi组件，本轮不扩功能。真机手感与布局仍由用户安装反馈。
+
+### 0102：首轮CI测试适配
+
+首轮正式CI 43909670810未发布：Mihon上游未提供nightly单测任务，app快照测试改用已有testDebugUnitTest，Nightly仍只组装签名包；An保留原Preview测试。旧重建恢复测试仍断言6dp展开，更新为3+3未开、再12到18dp打开；收放端点保留真实Compose自动时钟，柔和起步改用TargetBasedAnimation确定采样，避免target尚未送入前手动推进时钟而误判。补渲染范围约束，不删端点/阈值/新手势测试；原新来源横滑6/详情横滑6/历史目标4/分页边界与其它An回归已通过，app单测在最终轮核对。

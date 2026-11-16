@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 16:49:32 +0000
+Subject: [PATCH] test(ui): align restored reveal and deterministic spring
+ checks
+
+Keep the integration test on the real Compose auto-advancing clock for both animation endpoints. Check gentle spring onset and speed-paced settling with deterministic TargetBasedAnimation samples instead of advancing a clock before target delivery. Update window-restoration reveal expectations from 6dp to the newly requested 18dp, and assert rendered spring overshoot stays inside physical navigation bounds. No production behavior or original endpoint assertions removed. Shared between Mihon 0098 and Anikku 0102.
+---
+ .../material/NavigationChromeGeometryTest.kt        | 13 ++++++++++++-
+ .../material/NavigationChromeLayoutTest.kt          |  8 ++------
+ .../material/NavigationChromeScrollTrackerTest.kt   | 12 ++++++++++++
+ 3 files changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGeometryTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGeometryTest.kt
+index 386a2ccb5..5177f9e13 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGeometryTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeGeometryTest.kt
+@@ -1,5 +1,6 @@
+ package tachiyomi.presentation.core.components.material
+ 
++import androidx.compose.runtime.mutableFloatStateOf
+ import org.junit.jupiter.api.Assertions.assertEquals
+ import org.junit.jupiter.api.Assertions.assertFalse
+ import org.junit.jupiter.api.Assertions.assertTrue
+@@ -68,8 +69,18 @@ class NavigationChromeGeometryTest {
+         assertFalse(hidden.visible)
+         hidden.beginGesture()
+         assertFalse(hidden.onPreScroll(0f, 3f, true))
+-        assertTrue(hidden.onPreScroll(0f, 3f, true))
++        assertFalse(hidden.onPreScroll(0f, 3f, true))
++        assertTrue(hidden.onPreScroll(0f, 12f, true))
+         val shown = NavigationChromeScrollTracker(initialVisible = true)
+         assertTrue(shown.visible)
+     }
++
++    @Test
++    fun `spring rendering remains within physical navigation bounds`() {
++        val progress = mutableFloatStateOf(1.02f)
++        val state = BrowsingNavigationBarState { true }.apply { animation = progress }
++        assertEquals(1f, state.hiddenFraction)
++        progress.floatValue = -0.02f
++        assertEquals(0f, state.hiddenFraction)
++    }
+ }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
+index 49ba84c47..bee1e302c 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeLayoutTest.kt
+@@ -309,20 +309,16 @@ class NavigationChromeLayoutTest {
+         lateinit var chrome: BrowsingNavigationBarState
+         setContent { chrome = rememberBrowsingNavigationBarState(enabled = true, resetKey = Unit) }
+         waitForIdle()
+-        mainClock.autoAdvance = false
+         runOnIdle {
+             chrome.nestedScrollConnection.onPostScroll(Offset(0f, -20f), Offset.Zero, NestedScrollSource.UserInput)
+         }
+-        mainClock.advanceTimeBy(600)
++        waitForIdle()
+         runOnIdle {
+             assertFalse(chrome.visible)
+             assertEquals(1f, chrome.hiddenFraction, "Shared animation must reach the hidden position")
+         }
+         runOnIdle { chrome.nestedScrollConnection.onPreScroll(Offset(0f, 20f), NestedScrollSource.UserInput) }
+-        mainClock.advanceTimeByFrame()
+-        mainClock.advanceTimeBy(32)
+-        runOnIdle { assertTrue(chrome.hiddenFraction > 0.6f, "Reveal must not rush most of its travel into the opening frames") }
+-        mainClock.advanceTimeBy(600)
++        waitForIdle()
+         runOnIdle {
+             assertTrue(chrome.visible)
+             assertEquals(0f, chrome.hiddenFraction, "Shared animation must return to the visible position")
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
+index 3d266ecc4..b40539cc5 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeScrollTrackerTest.kt
+@@ -1,5 +1,7 @@
+ package tachiyomi.presentation.core.components.material
+ 
++import androidx.compose.animation.core.TargetBasedAnimation
++import androidx.compose.animation.core.VectorConverter
+ import org.junit.jupiter.api.Assertions.assertEquals
+ import org.junit.jupiter.api.Assertions.assertFalse
+ import org.junit.jupiter.api.Assertions.assertTrue
+@@ -258,4 +260,14 @@ class NavigationChromeScrollTrackerTest {
+         assertFalse(compactBrowsingWindow(664, 939, 1.5f))
+         assertFalse(compactBrowsingWindow(0, 0, 1f))
+     }
++
++    @Test
++    fun `spring starts gently and faster pacing shortens its settling time`() {
++        val gentle = TargetBasedAnimation(browsingChromeMotionSpec(225), Float.VectorConverter, 0f, 1f)
++        val quick = TargetBasedAnimation(browsingChromeMotionSpec(100), Float.VectorConverter, 0f, 1f)
++        assertEquals(0f, gentle.getValueFromNanos(0L))
++        assertTrue(gentle.getValueFromNanos(32_000_000L) in 0.005f..0.25f, "Opening must not rush most travel into the first 32ms")
++        assertEquals(1f, gentle.getValueFromNanos(gentle.durationNanos))
++        assertTrue(quick.durationNanos < gentle.durationNanos)
++    }
+ }
