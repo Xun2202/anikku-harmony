@@ -100,3 +100,4 @@
 0100-bounded-reading-offset-and-hidden-layer-fast-path.patch
 0101-browse-swipe-resume-and-soft-navigation.patch
 0102-navigation-spring-and-restored-intent-regressions.patch
+0103-browse-real-pager-position-restore-and-detail-transition.patch

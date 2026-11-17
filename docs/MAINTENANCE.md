@@ -927,3 +927,11 @@ gh release list --repo Xun2202/anikku-harmony
 ### 0102：首轮CI测试适配
 
 首轮正式CI 43909670810未发布：Mihon上游未提供nightly单测任务，app快照测试改用已有testDebugUnitTest，Nightly仍只组装签名包；An保留原Preview测试。旧重建恢复测试仍断言6dp展开，更新为3+3未开、再12到18dp打开；收放端点保留真实Compose自动时钟，柔和起步改用TargetBasedAnimation确定采样，避免target尚未送入前手动推进时钟而误判。补渲染范围约束，不删端点/阈值/新手势测试；原新来源横滑6/详情横滑6/历史目标4/分页边界与其它An回归已通过，app单测在最终轮核对。
+
+## 2026-11-17：真实横向分页与返回位置修复（0103）
+
+- 用户实测上一版来源浏览进入详情再返回丢位置、横滑没有拖动动画。移除依赖临时LazyPagingItems对象的key；来源、模式、query revision作为SaveableStateHolder稳定键，只有新查询重置位置；每个模式复用已访问Paging流，迁移/推荐的单列表接口保留同缓存。
+- 来源内容改真实HorizontalPager，和书架共用帧时钟保护的fling、宽度归位和BrowsingPagerPage导航owner；拖动时两页同时移动，松手落位才提交模式，首尾不循环，不可见邻页不发请求。未配置筛选到位后打开原面板并回弹，取消保留原列表，应用后动画进入筛选。
+- 详情改真实双页滑动：详情/既有LoadingScreen一起跟手，短拖、取消回弹，落位后才异步选取有效最近历史/首未读并进入原Reader或播放器。保留两侧系统返回边缘、章节行/横向条/长按/多选优先；Activity接管后在stop/return复位，失败不滞留加载页；宽度变化取消半拖。FAB策略不变。
+- 与Mihon 0099的共用组件和真实Compose位移/生命周期回归保持逐字节一致。Anikku仅Episodes续播，保留saved searches/metadata/内外播放器；Mihon沿原ReaderActivity转场。Animeko独立KMP架构沿前轮实查，不套用本实现。
+- 检查聚焦真实持指位移、松手/取消/筛选以及list/grid/panorama完全离开重建且Paging身份变化后的精确位置恢复。格式检查本地完成，Android编译与回归由现有CI执行，真机手感待安装反馈；版本、run、签名和SHA以档案现状/本轮核验记录为准。

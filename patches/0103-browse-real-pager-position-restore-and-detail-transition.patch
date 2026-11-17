@@ -1,0 +1,1871 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 12:22:09 +0000
+Subject: [PATCH] browse: restore source positions and animate real swipe pages
+
+Replace post-release callbacks with native pager geometry and stable source/mode/query saveable keys. Detail continuation follows the finger, settles or cancels before handoff, and resets on Activity return.
+
+Shared components match mihon-harmony 0099. Keep app-specific metadata, source filters and player selection; migration/recommendation consumers retain the cached single-list API.
+---
+ .../kanade/presentation/manga/MangaScreen.kt  |  17 +-
+ .../source/browse/BrowseSourceScreen.kt       | 141 ++++----
+ .../source/browse/BrowseSourceScreenModel.kt  | 121 ++++---
+ .../kanade/tachiyomi/ui/manga/MangaScreen.kt  |  22 +-
+ ...avigationChromeSourceFilterSnapshotTest.kt |  12 +
+ .../core/components/DetailContinuePager.kt    | 208 +++++++++++
+ .../core/components/DetailContinueSwipe.kt    |  60 ----
+ .../core/components/SourceBrowseMode.kt       |  18 +
+ .../core/components/SourceBrowseModeSwipe.kt  |  66 ----
+ .../core/components/SourceBrowsePager.kt      |  85 +++++
+ ...NavigationChromeDetailContinueSwipeTest.kt | 336 +++++++++++++++---
+ ...NavigationChromeSourceBrowseRestoreTest.kt | 167 +++++++++
+ .../NavigationChromeSourceBrowseSwipeTest.kt  | 201 ++++++-----
+ 13 files changed, 1066 insertions(+), 388 deletions(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/DetailContinuePager.kt
+ delete mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/DetailContinueSwipe.kt
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/SourceBrowseMode.kt
+ delete mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/SourceBrowseModeSwipe.kt
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/SourceBrowsePager.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseRestoreTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/manga/MangaScreen.kt b/app/src/main/java/eu/kanade/presentation/manga/MangaScreen.kt
+index 2d9a1b137..23d748a7b 100644
+--- a/app/src/main/java/eu/kanade/presentation/manga/MangaScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/manga/MangaScreen.kt
+@@ -117,10 +117,10 @@ import tachiyomi.domain.source.model.StubSource
+ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.aniyomi.AYMR
+ import tachiyomi.i18n.kmk.KMR
++import tachiyomi.presentation.core.components.DetailContinuePager
+ import tachiyomi.presentation.core.components.FastScrollIrregularLazyVerticalGrid
+ import tachiyomi.presentation.core.components.Scroller.EXACT_HEIGHT_KEY_PREFIX
+ import tachiyomi.presentation.core.components.TwoPanelBox
+-import tachiyomi.presentation.core.components.detailContinueSwipe
+ import tachiyomi.presentation.core.components.material.PullRefresh
+ import tachiyomi.presentation.core.components.material.Scaffold
+ import tachiyomi.presentation.core.components.material.padding
+@@ -164,7 +164,10 @@ fun MangaScreen(
+     onFilterButtonClicked: () -> Unit,
+     onRefresh: () -> Unit,
+     onContinueReading: () -> Unit,
+-    onSwipeContinue: () -> Unit = onContinueReading,
++    onSwipeContinue: suspend () -> Boolean = {
++        onContinueReading()
++        true
++    },
+     swipeContinueEnabled: Boolean = true,
+     onSearch: (query: String, global: Boolean) -> Unit,
+ 
+@@ -232,12 +235,10 @@ fun MangaScreen(
+         }
+     }
+ 
+-    Box(
+-        modifier = Modifier.fillMaxSize().detailContinueSwipe(
+-            enabled = swipeContinueEnabled && state.dialog == null && state.manga.fetchType == FetchType.Episodes &&
+-                state.chapters.isNotEmpty() && state.chapters.none { it.selected },
+-            onContinue = onSwipeContinue,
+-        ),
++    DetailContinuePager(
++        enabled = swipeContinueEnabled && state.dialog == null && state.manga.fetchType == FetchType.Episodes &&
++            state.chapters.isNotEmpty() && state.chapters.none { it.selected },
++        onContinue = onSwipeContinue,
+     ) {
+         if (!isTabletUi) {
+             MangaScreenSmallImpl(
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreen.kt
+index 950a17ac9..6167751a1 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreen.kt
+@@ -23,7 +23,6 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
+-import androidx.compose.runtime.key
+ import androidx.compose.runtime.mutableIntStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.rememberCoroutineScope
+@@ -36,6 +35,7 @@ import androidx.compose.ui.platform.LocalConfiguration
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.platform.LocalHapticFeedback
+ import androidx.compose.ui.platform.LocalUriHandler
++import androidx.paging.compose.collectAsLazyPagingItems
+ import cafe.adriel.voyager.core.model.rememberScreenModel
+ import cafe.adriel.voyager.navigator.LocalNavigator
+ import cafe.adriel.voyager.navigator.currentOrThrow
+@@ -70,19 +70,18 @@ import kotlinx.coroutines.channels.Channel
+ import kotlinx.coroutines.flow.collectLatest
+ import kotlinx.coroutines.flow.receiveAsFlow
+ import mihon.feature.migration.dialog.MigrateMangaDialog
+-import mihon.presentation.core.util.collectAsLazyPagingItems
+ import tachiyomi.core.common.Constants
+ import tachiyomi.core.common.util.lang.launchIO
+ import tachiyomi.domain.source.model.StubSource
+ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.kmk.KMR
++import tachiyomi.presentation.core.components.SourceBrowsePager
+ import tachiyomi.presentation.core.components.material.BrowsingFilterRow
+ import tachiyomi.presentation.core.components.material.BrowsingPaginationBoundary
+ import tachiyomi.presentation.core.components.material.Scaffold
+ import tachiyomi.presentation.core.components.material.browsingChromeContainerColor
+ import tachiyomi.presentation.core.components.material.padding
+ import tachiyomi.presentation.core.components.material.rememberBrowsingTopAppBarScrollBehavior
+-import tachiyomi.presentation.core.components.sourceBrowseModeSwipe
+ import tachiyomi.presentation.core.i18n.stringResource
+ import tachiyomi.presentation.core.screens.LoadingScreen
+ import tachiyomi.source.local.LocalSource
+@@ -177,8 +176,6 @@ data class BrowseSourceScreen(
+         }
+ 
+         // KMK -->
+-        val mangaList = screenModel.mangaPagerFlowFlow.collectAsLazyPagingItems()
+-
+         val isConfigurableSource = screenModel.source.anyIs<ConfigurableSource>()
+         // KMK <--
+ 
+@@ -287,6 +284,7 @@ data class BrowseSourceScreen(
+                 ) {
+                     // KMK -->
+                     if (bulkFavoriteState.selectionMode) {
++                        val mangaList = remember(state.listing) { screenModel.mangaPagerFlow(state.listing) }.collectAsLazyPagingItems()
+                         BulkSelectionToolbar(
+                             selectedCount = bulkFavoriteState.selection.size,
+                             isRunning = bulkFavoriteState.isRunning,
+@@ -334,72 +332,77 @@ data class BrowseSourceScreen(
+             },
+             snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
+         ) { paddingValues ->
+-            BrowsingPaginationBoundary(endReached = mangaList.loadState.append.endOfPaginationReached) {
+-                Box(
+-                    modifier = Modifier.fillMaxSize().sourceBrowseModeSwipe(
+-                        enabled = state.toolbarQuery == null && state.dialog == null && !bulkFavoriteState.selectionMode,
+-                        onSwipe = screenModel::swipeListing,
+-                    ),
+-                ) {
+-                    // A new query starts at the top instead of reusing another mode's lazy index.
+-                    key(mangaList) {
+-                        BrowseSourceContent(
+-                            source = screenModel.source,
+-                            mangaList = mangaList,
+-                            columns = screenModel.getColumnsPreference(LocalConfiguration.current.orientation),
+-                            // AY -->
+-                            entries = screenModel.getColumnsPreferenceForCurrentOrientation(LocalConfiguration.current.orientation),
+-                            topBarHeight = topBarHeight,
+-                            // <-- AY
+-                            displayMode = screenModel.displayMode,
+-                            snackbarHostState = snackbarHostState,
+-                            contentPadding = paddingValues,
+-                            onWebViewClick = onWebViewClick,
+-                            onHelpClick = { uriHandler.openUri(Constants.URL_HELP) },
+-                            onLocalSourceHelpClick = onHelpClick,
+-                            onMangaClick = { manga ->
+-                                // KMK -->
+-                                if (bulkFavoriteState.selectionMode) {
+-                                    bulkFavoriteScreenModel.toggleSelection(manga)
+-                                } else {
+-                                    // KMK <--
+-                                    navigator.push(
+-                                        MangaScreen(
+-                                            mangaId = manga.id,
+-                                            // KMK -->
+-                                            // Finding the entry to be merged to, so we don't want to expand description
+-                                            // so that user can see the `Merge to another` button
+-                                            fromSource = smartSearchConfig == null,
+-                                            // KMK <--
+-                                            smartSearchConfig = smartSearchConfig,
+-                                        ),
+-                                    )
+-                                }
+-                            },
+-                            onMangaLongClick = { manga ->
+-                                // KMK -->
+-                                if (bulkFavoriteState.selectionMode) {
+-                                    navigator.push(MangaScreen(manga.id, true))
+-                                } else {
+-                                    // KMK <--
+-                                    scope.launchIO {
+-                                        val duplicates = screenModel.getDuplicateLibraryManga(manga)
+-                                        when {
+-                                            manga.favorite -> screenModel.setDialog(BrowseSourceScreenModel.Dialog.RemoveManga(manga))
+-                                            duplicates.isNotEmpty() -> screenModel.setDialog(
+-                                                BrowseSourceScreenModel.Dialog.AddDuplicateManga(manga, duplicates),
+-                                            )
+-                                            else -> screenModel.addFavorite(manga)
+-                                        }
+-                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
++            SourceBrowsePager(
++                selectedMode = state.listing.mode,
++                supportsLatest = (screenModel.source as CatalogueSource).supportsLatest,
++                supportsFilters = state.filterable && state.filters.isNotEmpty(),
++                enabled = state.toolbarQuery == null && state.dialog == null && !bulkFavoriteState.selectionMode,
++                onSelectMode = screenModel::selectBrowseMode,
++                pageKey = { mode -> "$sourceId:${screenModel.listingForMode(mode)?.scrollKey ?: "unconfigured"}" },
++            ) { mode ->
++                val listing = screenModel.listingForMode(mode)
++                if (listing == null) {
++                    LoadingScreen()
++                    return@SourceBrowsePager
++                }
++                val mangaList = remember(listing) { screenModel.mangaPagerFlow(listing) }.collectAsLazyPagingItems()
++                BrowsingPaginationBoundary(endReached = mangaList.loadState.append.endOfPaginationReached) {
++                    BrowseSourceContent(
++                        source = screenModel.source,
++                        mangaList = mangaList,
++                        columns = screenModel.getColumnsPreference(LocalConfiguration.current.orientation),
++                        // AY -->
++                        entries = screenModel.getColumnsPreferenceForCurrentOrientation(LocalConfiguration.current.orientation),
++                        topBarHeight = topBarHeight,
++                        // <-- AY
++                        displayMode = screenModel.displayMode,
++                        snackbarHostState = snackbarHostState,
++                        contentPadding = paddingValues,
++                        onWebViewClick = onWebViewClick,
++                        onHelpClick = { uriHandler.openUri(Constants.URL_HELP) },
++                        onLocalSourceHelpClick = onHelpClick,
++                        onMangaClick = { manga ->
++                            // KMK -->
++                            if (bulkFavoriteState.selectionMode) {
++                                bulkFavoriteScreenModel.toggleSelection(manga)
++                            } else {
++                                // KMK <--
++                                navigator.push(
++                                    MangaScreen(
++                                        mangaId = manga.id,
++                                        // KMK -->
++                                        // Finding the entry to be merged to, so we don't want to expand description
++                                        // so that user can see the `Merge to another` button
++                                        fromSource = smartSearchConfig == null,
++                                        // KMK <--
++                                        smartSearchConfig = smartSearchConfig,
++                                    ),
++                                )
++                            }
++                        },
++                        onMangaLongClick = { manga ->
++                            // KMK -->
++                            if (bulkFavoriteState.selectionMode) {
++                                navigator.push(MangaScreen(manga.id, true))
++                            } else {
++                                // KMK <--
++                                scope.launchIO {
++                                    val duplicates = screenModel.getDuplicateLibraryManga(manga)
++                                    when {
++                                        manga.favorite -> screenModel.setDialog(BrowseSourceScreenModel.Dialog.RemoveManga(manga))
++                                        duplicates.isNotEmpty() -> screenModel.setDialog(
++                                            BrowseSourceScreenModel.Dialog.AddDuplicateManga(manga, duplicates),
++                                        )
++                                        else -> screenModel.addFavorite(manga)
+                                     }
++                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                 }
+-                            },
+-                            // KMK -->
+-                            selection = bulkFavoriteState.selection,
+-                            // KMK <--
+-                        )
+-                    }
++                            }
++                        },
++                        // KMK -->
++                        selection = bulkFavoriteState.selection,
++                        // KMK <--
++                    )
+                 }
+             }
+         }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreenModel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreenModel.kt
+index 957abe515..79b170d46 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreenModel.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/browse/source/browse/BrowseSourceScreenModel.kt
+@@ -148,6 +148,8 @@ open class BrowseSourceScreenModel(
+     var incognitoMode = mutableStateOf(getIncognitoState.await(source.id))
+     // KMK <--
+ 
++    private var queryRevision = 0L
++
+     init {
+         // KMK -->
+         screenModelScope.launch {
+@@ -239,36 +241,61 @@ open class BrowseSourceScreenModel(
+      */
+     private val hideInLibraryItems = sourcePreferences.hideInLibraryItems().get()
+     private var appliedFilterListing: Listing.Search? = null
++    private var lastSearchListing: Listing.Search? = null
+     private val visitedPagingFlows = mutableMapOf<Listing, Flow<PagingData<StateFlow<Pair<Manga, RaisedSearchMetadata?>>>>>()
+ 
+-    val mangaPagerFlowFlow = state.map { it.listing }
+-        .distinctUntilChanged()
+-        .map { listing ->
+-            // Retain only visited browse modes plus the current query. No offscreen requests.
+-            visitedPagingFlows.keys.removeAll {
+-                it is Listing.Search && it !== listing && it !== appliedFilterListing
+-            }
+-            visitedPagingFlows.getOrPut(listing) {
+-                Pager(PagingConfig(pageSize = 25)) {
+-                    // SY -->
+-                    createSourcePagingSource(listing.query ?: "", listing.filters)
+-                    // SY <--
+-                }.flow.map { pagingData ->
+-                    pagingData.map { (manga, metadata) ->
+-                        getManga.subscribe(manga.url, manga.source)
+-                            .map { it ?: manga }
+-                            // SY -->
+-                            .combineMetadata(metadata)
+-                            // SY <--
+-                            .stateIn(ioCoroutineScope)
+-                    }
+-                        .filter { !hideInLibraryItems || !it.value.first.favorite }
++    /** A flow is created only when a page becomes visible, and reused after detail navigation. */
++    fun mangaPagerFlow(listing: Listing): Flow<PagingData<StateFlow<Pair<Manga, RaisedSearchMetadata?>>>> {
++        visitedPagingFlows.keys.removeAll {
++            it is Listing.Search && it != listing && it != appliedFilterListing && it != lastSearchListing
++        }
++        return visitedPagingFlows.getOrPut(listing) {
++            Pager(PagingConfig(pageSize = 25)) {
++                // SY -->
++                createSourcePagingSource(listing.query ?: "", listing.filters)
++                // SY <--
++            }.flow.map { pagingData ->
++                pagingData.map { (manga, metadata) ->
++                    getManga.subscribe(manga.url, manga.source)
++                        .map { it ?: manga }
++                        // SY -->
++                        .combineMetadata(metadata)
++                        // SY <--
++                        .stateIn(ioCoroutineScope)
+                 }
+-                    .cachedIn(ioCoroutineScope)
++                    .filter { !hideInLibraryItems || !it.value.first.favorite }
+             }
++                .cachedIn(ioCoroutineScope)
+         }
++    }
++
++    // Migration and recommendation screens retain their single-list API and the same cache.
++    val mangaPagerFlowFlow = state.map { it.listing }
++        .distinctUntilChanged()
++        .map { mangaPagerFlow(it) }
+         .stateIn(ioCoroutineScope, SharingStarted.Lazily, emptyFlow())
+ 
++    fun listingForMode(mode: SourceBrowseMode): Listing? = when (mode) {
++        SourceBrowseMode.Popular -> Listing.Popular
++        SourceBrowseMode.Latest -> Listing.Latest
++        SourceBrowseMode.Filtered -> state.value.listing as? Listing.Search ?: lastSearchListing ?: appliedFilterListing
++    }
++
++    /** An unconfigured filter page opens the existing sheet and returns to the usable page. */
++    fun selectBrowseMode(mode: SourceBrowseMode): Boolean {
++        val listing = listingForMode(mode)
++        if (listing == null) {
++            openFilterSheet()
++            return false
++        }
++        if (listing is Listing.Search) {
++            mutableState.update { it.copy(listing = listing, toolbarQuery = listing.query) }
++        } else {
++            setListing(listing)
++        }
++        return true
++    }
++
+     fun getColumnsPreference(orientation: Int): GridCells {
+         val isLandscape = orientation == Configuration.ORIENTATION_LANDSCAPE
+         val columns = if (isLandscape) {
+@@ -315,36 +342,8 @@ open class BrowseSourceScreenModel(
+         // KMK <--
+     }
+ 
+-    fun swipeListing(forward: Boolean) {
+-        val source = source as? CatalogueSource ?: return
+-        val current = when (state.value.listing) {
+-            Listing.Popular -> SourceBrowseMode.Popular
+-            Listing.Latest -> SourceBrowseMode.Latest
+-            is Listing.Search -> SourceBrowseMode.Filtered
+-        }
+-        when (
+-            current.adjacent(
+-                forward,
+-                source.supportsLatest,
+-                state.value.filterable && state.value.filters.isNotEmpty(),
+-            )
+-        ) {
+-            SourceBrowseMode.Popular -> setListing(Listing.Popular)
+-            SourceBrowseMode.Latest -> setListing(Listing.Latest)
+-            SourceBrowseMode.Filtered -> {
+-                val applied = appliedFilterListing
+-                if (applied == null) {
+-                    // Leave the usable list in place until the first filter is actually applied.
+-                    openFilterSheet()
+-                } else {
+-                    mutableState.update { it.copy(listing = applied, toolbarQuery = applied.query) }
+-                }
+-            }
+-            null -> Unit
+-        }
+-    }
+-
+     fun setListing(listing: Listing) {
++        (state.value.listing as? Listing.Search)?.let { lastSearchListing = it }
+         mutableState.update { it.copy(listing = listing, toolbarQuery = null) }
+     }
+ 
+@@ -382,6 +381,7 @@ open class BrowseSourceScreenModel(
+             ?: Listing.Search(query = null, filters = source.getFilterList())
+ 
+         val listing = input.copy(
++            revision = ++queryRevision,
+             query = query ?: input.query,
+             filters = appliedFilters ?: input.filters,
+             savedSearchId = savedSearchId,
+@@ -428,6 +428,7 @@ open class BrowseSourceScreenModel(
+         }
+ 
+         val listing = Listing.Search(
++            revision = ++queryRevision,
+             query = if (genreExists) null else genreName,
+             filters = defaultFilters.copyStateTo(source.getFilterList()),
+         )
+@@ -576,11 +577,26 @@ open class BrowseSourceScreenModel(
+     }
+ 
+     sealed class Listing(open val query: String?, open val filters: FilterList) {
++        val mode: SourceBrowseMode
++            get() = when (this) {
++                Popular -> SourceBrowseMode.Popular
++                Latest -> SourceBrowseMode.Latest
++                is Search -> SourceBrowseMode.Filtered
++            }
++
++        val scrollKey: String
++            get() = when (this) {
++                Popular -> "popular"
++                Latest -> "latest"
++                is Search -> "search:$revision:$query:$savedSearchId"
++            }
++
+         data object Popular : Listing(query = GetRemoteManga.QUERY_POPULAR, filters = FilterList())
+         data object Latest : Listing(query = GetRemoteManga.QUERY_LATEST, filters = FilterList())
+         data class Search(
+             override val query: String?,
+             override val filters: FilterList,
++            val revision: Long = 0,
+             // KMK -->
+             val savedSearchId: Long? = null,
+             // KMK <--
+@@ -685,6 +701,7 @@ open class BrowseSourceScreenModel(
+             mutableState.update {
+                 it.copy(
+                     listing = Listing.Search(
++                        revision = ++queryRevision,
+                         query = search.query,
+                         filters = filters,
+                         // KMK -->
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/manga/MangaScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/manga/MangaScreen.kt
+index 816bbc604..fccf94b17 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/manga/MangaScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/manga/MangaScreen.kt
+@@ -263,18 +263,20 @@ class MangaScreen(
+             state = successState,
+             swipeContinueEnabled = !swipeContinueRunning && !bulkFavoriteState.selectionMode && bulkFavoriteState.dialog == null,
+             onSwipeContinue = {
+-                if (!swipeContinueRunning) {
++                if (swipeContinueRunning) {
++                    false
++                } else {
+                     swipeContinueRunning = true
+-                    scope.launch {
+-                        try {
+-                            continueWatching(
+-                                context,
+-                                screenModel.getSwipeContinueChapter(),
+-                                screenModel.alwaysUseExternalPlayer,
+-                            )
+-                        } finally {
+-                            swipeContinueRunning = false
++                    try {
++                        val episode = screenModel.getSwipeContinueChapter()
++                        if (episode == null) {
++                            false
++                        } else {
++                            continueWatching(context, episode, screenModel.alwaysUseExternalPlayer)
++                            true
+                         }
++                    } finally {
++                        swipeContinueRunning = false
+                     }
+                 }
+             },
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/ui/browse/source/browse/NavigationChromeSourceFilterSnapshotTest.kt b/app/src/test/java/eu/kanade/tachiyomi/ui/browse/source/browse/NavigationChromeSourceFilterSnapshotTest.kt
+index d4d79c7b5..59c34fbf4 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/ui/browse/source/browse/NavigationChromeSourceFilterSnapshotTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/ui/browse/source/browse/NavigationChromeSourceFilterSnapshotTest.kt
+@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.ui.browse.source.browse
+ import eu.kanade.tachiyomi.source.model.FilterList
+ import org.junit.jupiter.api.Assertions.assertEquals
+ import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertNotEquals
+ import org.junit.jupiter.api.Assertions.assertNotSame
+ import org.junit.jupiter.api.Assertions.assertTrue
+ import org.junit.jupiter.api.Test
+@@ -15,6 +16,17 @@ class NavigationChromeSourceFilterSnapshotTest {
+         object : Filter.Sort("Order", arrayOf("Name", "Date")) {},
+     )
+ 
++    @Test
++    fun `scroll identity survives new filter and paging objects but changes for a new query revision`() {
++        val original = BrowseSourceScreenModel.Listing.Search(query = "title", filters = defaults(), revision = 7)
++        val recreated = BrowseSourceScreenModel.Listing.Search(query = "title", filters = defaults(), revision = 7)
++        assertNotSame(original.filters, recreated.filters)
++        assertEquals(original.scrollKey, recreated.scrollKey)
++        assertNotEquals(original.scrollKey, recreated.copy(revision = 8).scrollKey)
++        assertNotEquals(original.scrollKey, recreated.copy(query = "another title").scrollKey)
++        assertNotEquals(BrowseSourceScreenModel.Listing.Popular.scrollKey, BrowseSourceScreenModel.Listing.Latest.scrollKey)
++    }
++
+     @Test
+     fun `editing or resetting a sheet cannot mutate the applied paging filters`() {
+         val draft = defaults()
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/DetailContinuePager.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/DetailContinuePager.kt
+new file mode 100644
+index 000000000..3972aa561
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/DetailContinuePager.kt
+@@ -0,0 +1,208 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.gestures.awaitEachGesture
++import androidx.compose.foundation.gestures.awaitFirstDown
++import androidx.compose.foundation.layout.BoxWithConstraints
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.systemGestures
++import androidx.compose.foundation.pager.HorizontalPager
++import androidx.compose.foundation.pager.PagerState
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.rememberUpdatedState
++import androidx.compose.runtime.setValue
++import androidx.compose.runtime.snapshotFlow
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clipToBounds
++import androidx.compose.ui.input.pointer.pointerInput
++import androidx.compose.ui.input.pointer.util.VelocityTracker
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.platform.LocalLayoutDirection
++import androidx.compose.ui.platform.LocalView
++import androidx.compose.ui.unit.LayoutDirection
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.LifecycleEventObserver
++import androidx.lifecycle.LifecycleOwner
++import androidx.lifecycle.findViewTreeLifecycleOwner
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import tachiyomi.presentation.core.screens.LoadingScreen
++import kotlin.math.abs
++
++/** Detail and its loading destination move together; only a completed page opens the reader. */
++@Composable
++fun DetailContinuePager(
++    enabled: Boolean,
++    onContinue: suspend () -> Boolean,
++    modifier: Modifier = Modifier,
++    previewContent: @Composable () -> Unit = { LoadingScreen() },
++    lifecycleOwner: LifecycleOwner? = LocalView.current.findViewTreeLifecycleOwner(),
++    content: @Composable () -> Unit,
++) {
++    val density = LocalDensity.current
++    val direction = LocalLayoutDirection.current
++    val gestures = WindowInsets.systemGestures
++    val leftEdge = maxOf(with(density) { 32.dp.toPx() }, gestures.getLeft(density, direction).toFloat())
++    val rightEdge = maxOf(with(density) { 32.dp.toPx() }, gestures.getRight(density, direction).toFloat())
++    val currentContinue by rememberUpdatedState(onContinue)
++    val canContinue by rememberUpdatedState(enabled)
++
++    BoxWithConstraints(modifier.fillMaxSize().clipToBounds()) {
++        // Half-drags are transient: folding and process restoration must not reopen the reader.
++        val pager = remember(maxWidth) { PagerState { 2 } }
++        val motion = remember(pager) { DetailContinueMotion() }
++        val scope = rememberCoroutineScope()
++
++        fun reset() {
++            motion.generation++
++            motion.settleJob?.cancel()
++            pager.requestScrollToPage(0)
++            motion.phase = DetailContinuePhase.Idle
++            motion.launched = false
++        }
++
++        fun settle(target: Int) {
++            val generation = ++motion.generation
++            motion.settleJob?.cancel()
++            motion.phase = DetailContinuePhase.Settling
++            motion.settleJob = scope.launch {
++                try {
++                    // Native pager spring, guarded by the same frame clock as library paging.
++                    withFrameTimeProtection { pager.animateScrollToPage(target) }
++                } finally {
++                    if (motion.generation == generation) motion.phase = DetailContinuePhase.Idle
++                }
++            }
++        }
++
++        DisposableEffect(lifecycleOwner, pager) {
++            val observer = LifecycleEventObserver { _, event ->
++                if (motion.launched && (event == Lifecycle.Event.ON_STOP || event == Lifecycle.Event.ON_RESUME)) {
++                    // Reset offscreen before the returning activity can draw a stranded page.
++                    reset()
++                }
++            }
++            lifecycleOwner?.lifecycle?.addObserver(observer)
++            onDispose {
++                lifecycleOwner?.lifecycle?.removeObserver(observer)
++                motion.generation++
++                motion.settleJob?.cancel()
++            }
++        }
++
++        LaunchedEffect(enabled, pager) {
++            if (!enabled && !motion.launching && !motion.launched) settle(0)
++        }
++        LaunchedEffect(pager, lifecycleOwner) {
++            snapshotFlow {
++                pager.settledPage == 1 && !pager.isScrollInProgress && motion.phase == DetailContinuePhase.Idle
++            }.collect { completed ->
++                if (completed && canContinue && !motion.launching && !motion.launched) {
++                    motion.launching = true
++                    val opened = try {
++                        currentContinue()
++                    } finally {
++                        motion.launching = false
++                    }
++                    if (!opened) {
++                        settle(0)
++                    } else {
++                        motion.launched = true
++                        if (lifecycleOwner != null) {
++                            // An external player can reject launch without leaving this activity.
++                            if (!lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
++                                reset()
++                            } else {
++                                delay(1000)
++                                if (motion.launched && lifecycleOwner.lifecycle.currentState == Lifecycle.State.RESUMED) reset()
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
++        HorizontalPager(
++            state = pager,
++            key = { it },
++            userScrollEnabled = false,
++            beyondViewportPageCount = 1,
++            reverseLayout = direction == LayoutDirection.Rtl,
++            flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(pager),
++            modifier = Modifier.fillMaxSize().pointerInput(enabled, pager, leftEdge, rightEdge) {
++                if (!enabled) return@pointerInput
++                awaitEachGesture {
++                    val down = awaitFirstDown(requireUnconsumed = false)
++                    if (motion.launching || motion.launched) return@awaitEachGesture
++                    val gestureWidth = size.width
++                    if (down.position.x <= leftEdge || down.position.x >= gestureWidth - rightEdge) return@awaitEachGesture
++                    val velocity = VelocityTracker().apply { addPosition(down.uptimeMillis, down.position) }
++                    var horizontal = false
++                    try {
++                        while (true) {
++                            // Children see Main first: chapter actions and horizontal rows own
++                            // their gesture, even when a row has reached its own end.
++                            val event = awaitPointerEvent()
++                            if (size.width != gestureWidth || event.changes.size != 1) break
++                            val change = event.changes.first()
++                            if (change.id != down.id || change.isConsumed) break
++                            velocity.addPosition(change.uptimeMillis, change.position)
++                            val total = change.position - down.position
++                            if (!horizontal) {
++                                if (change.uptimeMillis - down.uptimeMillis >= viewConfiguration.longPressTimeoutMillis) break
++                                if (total.getDistance() <= viewConfiguration.touchSlop) {
++                                    if (!change.pressed) break
++                                    continue
++                                }
++                                if (total.x >= 0f || abs(total.x) <= abs(total.y) * 1.25f) break
++                                motion.generation++
++                                motion.settleJob?.cancel()
++                                motion.phase = DetailContinuePhase.Dragging
++                                horizontal = true
++                                pager.dispatchRawDelta(-total.x - viewConfiguration.touchSlop)
++                            } else {
++                                pager.dispatchRawDelta(change.previousPosition.x - change.position.x)
++                            }
++                            change.consume()
++                            if (!change.pressed) {
++                                val progress = pager.currentPage + pager.currentPageOffsetFraction
++                                val speed = velocity.calculateVelocity().x
++                                val fast = 900.dp.toPx()
++                                val target = when {
++                                    speed > fast -> 0
++                                    speed < -fast && -total.x >= 56.dp.toPx() -> 1
++                                    progress >= 0.5f -> 1
++                                    else -> 0
++                                }
++                                settle(target)
++                                break
++                            }
++                        }
++                    } finally {
++                        if (motion.phase == DetailContinuePhase.Dragging) settle(0)
++                    }
++                }
++            },
++        ) { page ->
++            if (page == 0) content() else previewContent()
++        }
++    }
++}
++
++private enum class DetailContinuePhase { Idle, Dragging, Settling }
++
++private class DetailContinueMotion {
++    var phase by mutableStateOf(DetailContinuePhase.Idle)
++    var launching by mutableStateOf(false)
++    var launched by mutableStateOf(false)
++    var generation = 0L
++    var settleJob: Job? = null
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/DetailContinueSwipe.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/DetailContinueSwipe.kt
+deleted file mode 100644
+index 446970ead..000000000
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/DetailContinueSwipe.kt
++++ /dev/null
+@@ -1,60 +0,0 @@
+-package tachiyomi.presentation.core.components
+-
+-import androidx.compose.foundation.gestures.awaitEachGesture
+-import androidx.compose.foundation.gestures.awaitFirstDown
+-import androidx.compose.foundation.layout.WindowInsets
+-import androidx.compose.foundation.layout.systemGestures
+-import androidx.compose.runtime.rememberUpdatedState
+-import androidx.compose.ui.Modifier
+-import androidx.compose.ui.composed
+-import androidx.compose.ui.input.pointer.pointerInput
+-import androidx.compose.ui.platform.LocalDensity
+-import androidx.compose.ui.platform.LocalLayoutDirection
+-import androidx.compose.ui.unit.dp
+-import kotlin.math.abs
+-
+-/** A left swipe in the detail content invokes its existing continue action after release. */
+-fun Modifier.detailContinueSwipe(
+-    enabled: Boolean,
+-    onContinue: () -> Unit,
+-): Modifier = composed {
+-    val currentOnContinue = rememberUpdatedState(onContinue)
+-    val density = LocalDensity.current
+-    val layoutDirection = LocalLayoutDirection.current
+-    val gestures = WindowInsets.systemGestures
+-    val leftEdge = maxOf(with(density) { 32.dp.toPx() }, gestures.getLeft(density, layoutDirection).toFloat())
+-    val rightEdge = maxOf(with(density) { 32.dp.toPx() }, gestures.getRight(density, layoutDirection).toFloat())
+-    pointerInput(enabled, leftEdge, rightEdge) {
+-        if (!enabled) return@pointerInput
+-        awaitEachGesture {
+-            val down = awaitFirstDown(requireUnconsumed = false)
+-            val gestureWidth = size.width
+-            val commitDistance = minOf(gestureWidth * 0.2f, 96.dp.toPx()).coerceAtLeast(56.dp.toPx())
+-            // Leave both physical screen edges to Android's back gesture, including right-edge back.
+-            if (down.position.x <= leftEdge || down.position.x >= size.width - rightEdge) return@awaitEachGesture
+-            var horizontal = false
+-            while (true) {
+-                // The main pass reaches children first: row swipe actions and horizontal lists win.
+-                val event = awaitPointerEvent()
+-                if (size.width != gestureWidth || event.changes.size != 1) break
+-                val change = event.changes.first()
+-                if (change.id != down.id || change.isConsumed) break
+-                val delta = change.position - down.position
+-                if (!horizontal) {
+-                    if (change.uptimeMillis - down.uptimeMillis >= viewConfiguration.longPressTimeoutMillis) break
+-                    if (delta.getDistance() <= viewConfiguration.touchSlop) {
+-                        if (!change.pressed) break
+-                        continue
+-                    }
+-                    if (delta.x >= 0f || abs(delta.x) <= abs(delta.y) * 1.25f) break
+-                    horizontal = true
+-                }
+-                change.consume()
+-                if (!change.pressed) {
+-                    if (delta.x <= -commitDistance) currentOnContinue.value()
+-                    break
+-                }
+-            }
+-        }
+-    }
+-}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/SourceBrowseMode.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/SourceBrowseMode.kt
+new file mode 100644
+index 000000000..c07896893
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/SourceBrowseMode.kt
+@@ -0,0 +1,18 @@
++package tachiyomi.presentation.core.components
++
++/** Ordered, bounded navigation, including sources without latest or filters. */
++enum class SourceBrowseMode {
++    Popular,
++    Latest,
++    Filtered,
++    ;
++
++    fun adjacent(forward: Boolean, supportsLatest: Boolean, supportsFilters: Boolean): SourceBrowseMode? {
++        val modes = entries.filter {
++            (it != Latest || supportsLatest) && (it != Filtered || supportsFilters)
++        }
++        val index = modes.indexOf(this)
++        if (index < 0) return null
++        return modes.getOrNull(index + if (forward) 1 else -1)
++    }
++}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/SourceBrowseModeSwipe.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/SourceBrowseModeSwipe.kt
+deleted file mode 100644
+index e16c8cf26..000000000
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/SourceBrowseModeSwipe.kt
++++ /dev/null
+@@ -1,66 +0,0 @@
+-package tachiyomi.presentation.core.components
+-
+-import androidx.compose.foundation.gestures.awaitEachGesture
+-import androidx.compose.foundation.gestures.awaitFirstDown
+-import androidx.compose.runtime.rememberUpdatedState
+-import androidx.compose.ui.Modifier
+-import androidx.compose.ui.composed
+-import androidx.compose.ui.input.pointer.pointerInput
+-import androidx.compose.ui.unit.dp
+-import kotlin.math.abs
+-
+-/** Only the content owns this gesture; the horizontally scrolling filter row stays independent. */
+-fun Modifier.sourceBrowseModeSwipe(
+-    enabled: Boolean,
+-    onSwipe: (forward: Boolean) -> Unit,
+-): Modifier = composed {
+-    val currentOnSwipe = rememberUpdatedState(onSwipe)
+-    pointerInput(enabled) {
+-        if (!enabled) return@pointerInput
+-        awaitEachGesture {
+-            val down = awaitFirstDown(requireUnconsumed = false)
+-            val gestureWidth = size.width
+-            val commitDistance = minOf(gestureWidth * 0.2f, 96.dp.toPx()).coerceAtLeast(48.dp.toPx())
+-            var horizontal = false
+-            while (true) {
+-                val event = awaitPointerEvent()
+-                if (size.width != gestureWidth || event.changes.size != 1) break
+-                val change = event.changes.first()
+-                if (change.id != down.id || change.isConsumed) break
+-                val delta = change.position - down.position
+-                if (!horizontal) {
+-                    // Do not take over a held item or a predominantly vertical/diagonal scroll.
+-                    if (change.uptimeMillis - down.uptimeMillis >= viewConfiguration.longPressTimeoutMillis) break
+-                    if (delta.getDistance() <= viewConfiguration.touchSlop) {
+-                        if (!change.pressed) break
+-                        continue
+-                    }
+-                    if (abs(delta.x) <= abs(delta.y) * 1.25f) break
+-                    horizontal = true
+-                }
+-                change.consume()
+-                if (!change.pressed) {
+-                    if (abs(delta.x) >= commitDistance) currentOnSwipe.value(delta.x < 0f)
+-                    break
+-                }
+-            }
+-        }
+-    }
+-}
+-
+-/** Ordered, bounded navigation, including sources without latest or filters. */
+-enum class SourceBrowseMode {
+-    Popular,
+-    Latest,
+-    Filtered,
+-    ;
+-
+-    fun adjacent(forward: Boolean, supportsLatest: Boolean, supportsFilters: Boolean): SourceBrowseMode? {
+-        val modes = entries.filter {
+-            (it != Latest || supportsLatest) && (it != Filtered || supportsFilters)
+-        }
+-        val index = modes.indexOf(this)
+-        if (index < 0) return null
+-        return modes.getOrNull(index + if (forward) 1 else -1)
+-    }
+-}
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/SourceBrowsePager.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/SourceBrowsePager.kt
+new file mode 100644
+index 000000000..7822cd6e7
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/SourceBrowsePager.kt
+@@ -0,0 +1,85 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.pager.HorizontalPager
++import androidx.compose.foundation.pager.rememberPagerState
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberUpdatedState
++import androidx.compose.runtime.saveable.rememberSaveableStateHolder
++import androidx.compose.runtime.snapshotFlow
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import kotlinx.coroutines.launch
++import tachiyomi.presentation.core.components.material.BrowsingPagerPage
++import kotlin.math.abs
++
++/** Native, bounded paging with the same drag/fling and chrome ownership as library categories. */
++@Composable
++fun SourceBrowsePager(
++    selectedMode: SourceBrowseMode,
++    supportsLatest: Boolean,
++    supportsFilters: Boolean,
++    enabled: Boolean,
++    onSelectMode: (SourceBrowseMode) -> Boolean,
++    pageKey: (SourceBrowseMode) -> String,
++    modifier: Modifier = Modifier,
++    content: @Composable (SourceBrowseMode) -> Unit,
++) {
++    val modes = remember(supportsLatest, supportsFilters, selectedMode) {
++        SourceBrowseMode.entries.filter {
++            it == SourceBrowseMode.Popular || it == selectedMode ||
++                (it == SourceBrowseMode.Latest && supportsLatest) ||
++                (it == SourceBrowseMode.Filtered && supportsFilters)
++        }
++    }
++    val state = rememberPagerState(initialPage = modes.indexOf(selectedMode).coerceAtLeast(0)) { modes.size }
++    val holder = rememberSaveableStateHolder()
++    val selected by rememberUpdatedState(selectedMode)
++    val canSelect by rememberUpdatedState(enabled)
++    val selectMode by rememberUpdatedState(onSelectMode)
++
++    // Chip/search/filter submissions are external selections; use the native settle animation too.
++    LaunchedEffect(selectedMode, enabled, modes) {
++        val target = modes.indexOf(selectedMode).coerceAtLeast(0)
++        if (state.currentPage != target || (!enabled && state.currentPageOffsetFraction != 0f)) {
++            withFrameTimeProtection { state.animateScrollToPage(target) }
++        }
++    }
++    LaunchedEffect(state, modes) {
++        snapshotFlow { if (!state.isScrollInProgress) state.settledPage else null }.collect { page ->
++            val mode = modes.getOrNull(page ?: return@collect) ?: return@collect
++            if (mode != selected) {
++                // A first visit to an unconfigured filter opens its original sheet. Rejecting the
++                // selection animates back, retaining every lazy anchor underneath the sheet.
++                if (!canSelect || !selectMode(mode)) {
++                    // A dialog can disable paging in the same frame and start the same rollback.
++                    // Let that mutation cancel this child animation without losing the observer.
++                    launch {
++                        withFrameTimeProtection { state.animateScrollToPage(modes.indexOf(selected).coerceAtLeast(0)) }
++                    }
++                }
++            }
++        }
++    }
++    HorizontalPager(
++        state = state,
++        key = { modes[it].name },
++        userScrollEnabled = enabled,
++        flingBehavior = rememberFrameTimeProtectedPagerFlingBehavior(state),
++        verticalAlignment = Alignment.Top,
++        modifier = modifier.settlePagerOnWidthChange(state).fillMaxSize(),
++    ) { page ->
++        // Pager prefetch may compose a neighbour. Only collect its data once pixels are visible;
++        // an actual drag may load the adjacent page, an untouched offscreen page never does.
++        if (abs(state.currentPage + state.currentPageOffsetFraction - page) < 1f) {
++            val mode = modes[page]
++            BrowsingPagerPage(state, page) {
++                // Keys are source/mode/query revisions, never Flow or LazyPagingItems identities.
++                holder.SaveableStateProvider(pageKey(mode)) { content(mode) }
++            }
++        }
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeDetailContinueSwipeTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeDetailContinueSwipeTest.kt
+index 49b6ed3e0..dd495d4ea 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeDetailContinueSwipeTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeDetailContinueSwipeTest.kt
+@@ -13,61 +13,202 @@ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.layout.onGloballyPositioned
++import androidx.compose.ui.layout.positionInRoot
+ import androidx.compose.ui.platform.testTag
+ import androidx.compose.ui.test.ExperimentalTestApi
+ import androidx.compose.ui.test.onNodeWithTag
+ import androidx.compose.ui.test.performTouchInput
+ import androidx.compose.ui.test.runComposeUiTest
+ import androidx.compose.ui.test.swipe
+-import androidx.compose.ui.test.swipeRight
+ import androidx.compose.ui.unit.dp
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.LifecycleOwner
++import androidx.lifecycle.LifecycleRegistry
++import kotlinx.coroutines.CompletableDeferred
+ import org.junit.Test
+ import org.junit.jupiter.api.Assertions.assertEquals
+ import org.junit.jupiter.api.Assertions.assertTrue
+ import org.junit.runner.RunWith
+ import org.robolectric.RobolectricTestRunner
+ import org.robolectric.annotation.Config
++import kotlin.math.abs
+ 
+ @OptIn(ExperimentalTestApi::class)
+ @RunWith(RobolectricTestRunner::class)
+ @Config(sdk = [34], qualifiers = "mdpi")
+ class NavigationChromeDetailContinueSwipeTest {
+     @Test
+-    fun `only a committed left swipe invokes continue after release`() = runComposeUiTest {
++    fun `both real pages follow the held finger and continuation waits for native settlement`() = runComposeUiTest {
++        val handoff = CompletableDeferred<Boolean>()
+         var continues = 0
++        var detailX = Float.NaN
++        var previewX = Float.NaN
++        var pageWidth = 0
++        var previewAtCallback = Float.NaN
+         setContent {
+-            Box(Modifier.requiredSize(320.dp, 500.dp).detailContinueSwipe(true) { continues++ }.testTag("detail"))
++            DetailContinuePager(
++                enabled = true,
++                onContinue = {
++                    continues++
++                    previewAtCallback = previewX
++                    handoff.await()
++                },
++                lifecycleOwner = null,
++                modifier = Modifier.requiredSize(320.dp, 500.dp).testTag("pager"),
++                previewContent = {
++                    Box(Modifier.fillMaxSize().onGloballyPositioned { previewX = it.positionInRoot().x })
++                },
++            ) {
++                Box(
++                    Modifier.fillMaxSize().onGloballyPositioned {
++                        detailX = it.positionInRoot().x
++                        pageWidth = it.size.width
++                    },
++                )
++            }
+         }
+-        onNodeWithTag("detail").performTouchInput {
++        var initialX = 0f
++        runOnIdle { initialX = detailX }
++        onNodeWithTag("pager").performTouchInput {
+             down(Offset(250f, 250f))
+-            moveBy(Offset(-150f, 0f))
++            moveBy(Offset(-100f, 0f), delayMillis = 150)
++        }
++        runOnIdle {
++            // positionInRoot is the full layout position, unaffected by the pager's clip bounds.
++            assertTrue(detailX < initialX - 40f)
++            assertTrue(previewX > initialX && previewX < initialX + pageWidth)
++            assertEquals(pageWidth.toFloat(), previewX - detailX, 1f)
++            assertEquals(0, continues)
++        }
++        onNodeWithTag("pager").performTouchInput {
++            moveBy(Offset(-110f, 0f), delayMillis = 150)
++            up()
++        }
++        waitUntil { continues == 1 && abs(previewX - initialX) < 1f }
++        runOnIdle {
++            assertEquals(initialX, previewAtCallback, 2f, "Activity handoff must wait until the real preview settles")
++            assertEquals(initialX, previewX, 1f)
++            handoff.complete(true)
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(1, continues)
++            assertEquals(initialX, previewX, 1f, "Keep the settled page visible until Activity takeover")
+         }
+-        runOnIdle { assertEquals(0, continues) }
+-        onNodeWithTag("detail").performTouchInput { up() }
+-        runOnIdle { assertEquals(1, continues) }
+-        onNodeWithTag("detail").performTouchInput { swipeRight(durationMillis = 180) }
+-        onNodeWithTag("detail").performTouchInput {
++    }
++
++    @Test
++    fun `a missing continue target animates back to the same detail position`() = runComposeUiTest {
++        var continues = 0
++        var detailX = Float.NaN
++        var previewX = Float.NaN
++        var previewAtCallback = Float.NaN
++        setContent {
++            DetailContinuePager(
++                enabled = true,
++                onContinue = {
++                    continues++
++                    previewAtCallback = previewX
++                    false
++                },
++                lifecycleOwner = null,
++                modifier = Modifier.requiredSize(320.dp, 500.dp).testTag("pager"),
++                previewContent = { Box(Modifier.fillMaxSize().onGloballyPositioned { previewX = it.positionInRoot().x }) },
++            ) {
++                Box(Modifier.fillMaxSize().onGloballyPositioned { detailX = it.positionInRoot().x })
++            }
++        }
++        var initialX = 0f
++        runOnIdle { initialX = detailX }
++        onNodeWithTag("pager").performTouchInput {
++            swipe(start = Offset(250f, 250f), end = Offset(45f, 250f), durationMillis = 250)
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(1, continues)
++            assertEquals(initialX, previewAtCallback, 2f)
++            assertEquals(initialX, detailX, 1f)
++        }
++    }
++
++    @Test
++    fun `right short slow and cancelled drags restore the detail without continuing`() = runComposeUiTest {
++        var continues = 0
++        var detailX = Float.NaN
++        setContent {
++            DetailContinuePager(
++                enabled = true,
++                onContinue = {
++                    continues++
++                    true
++                },
++                lifecycleOwner = null,
++                modifier = Modifier.requiredSize(320.dp, 500.dp).testTag("pager"),
++            ) {
++                Box(Modifier.fillMaxSize().onGloballyPositioned { detailX = it.positionInRoot().x })
++            }
++        }
++        var initialX = 0f
++        runOnIdle { initialX = detailX }
++        onNodeWithTag("pager").performTouchInput {
++            swipe(start = Offset(70f, 250f), end = Offset(250f, 250f), durationMillis = 200)
++        }
++        waitForIdle()
++        runOnIdle { assertEquals(initialX, detailX, 1f) }
++        onNodeWithTag("pager").performTouchInput {
+             down(Offset(250f, 250f))
+-            moveBy(Offset(-24f, 0f))
++            moveBy(Offset(-70f, 0f), delayMillis = 250)
++            moveBy(Offset.Zero, delayMillis = 250)
+             up()
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(initialX, detailX, 1f)
++            assertEquals(0, continues)
++        }
++        onNodeWithTag("pager").performTouchInput {
+             down(Offset(250f, 250f))
+-            moveBy(Offset(-150f, 0f))
+-            cancel()
++            moveBy(Offset(-190f, 0f), delayMillis = 250)
++        }
++        runOnIdle {
++            assertTrue(detailX < initialX - 100f)
++            assertEquals(0, continues)
++        }
++        onNodeWithTag("pager").performTouchInput { cancel() }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(initialX, detailX, 1f)
++            assertEquals(0, continues)
+         }
+-        runOnIdle { assertEquals(1, continues) }
+     }
+ 
+     @Test
+     fun `physical screen edges stay available to system back`() = runComposeUiTest {
+         var continues = 0
++        var detailX = Float.NaN
+         setContent {
+-            Box(Modifier.requiredSize(320.dp, 500.dp).detailContinueSwipe(true) { continues++ }.testTag("detail"))
++            DetailContinuePager(
++                enabled = true,
++                onContinue = {
++                    continues++
++                    true
++                },
++                lifecycleOwner = null,
++                modifier = Modifier.requiredSize(320.dp, 500.dp).testTag("pager"),
++            ) { Box(Modifier.fillMaxSize().onGloballyPositioned { detailX = it.positionInRoot().x }) }
+         }
+-        onNodeWithTag("detail").performTouchInput {
+-            swipe(start = Offset(310f, 250f), end = Offset(100f, 250f), durationMillis = 180)
+-            swipe(start = Offset(10f, 250f), end = Offset(220f, 250f), durationMillis = 180)
++        var initialX = 0f
++        runOnIdle { initialX = detailX }
++        onNodeWithTag("pager").performTouchInput {
++            swipe(start = Offset(310f, 250f), end = Offset(70f, 250f), durationMillis = 200)
++            swipe(start = Offset(10f, 250f), end = Offset(250f, 250f), durationMillis = 200)
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(0, continues)
++            assertEquals(initialX, detailX, 1f)
+         }
+-        runOnIdle { assertEquals(0, continues) }
+     }
+ 
+     @Test
+@@ -77,19 +218,28 @@ class NavigationChromeDetailContinueSwipeTest {
+         setContent {
+             val scroll = rememberScrollState()
+             horizontalPosition = { scroll.value }
+-            Box(Modifier.requiredSize(320.dp, 500.dp).detailContinueSwipe(true) { continues++ }.testTag("detail")) {
++            DetailContinuePager(
++                enabled = true,
++                onContinue = {
++                    continues++
++                    true
++                },
++                lifecycleOwner = null,
++                modifier = Modifier.requiredSize(320.dp, 500.dp).testTag("pager"),
++            ) {
+                 Box(Modifier.fillMaxSize().horizontalScroll(scroll)) {
+                     Box(Modifier.requiredSize(1000.dp, 500.dp))
+                 }
+             }
+         }
+         repeat(6) {
+-            onNodeWithTag("detail").performTouchInput {
+-                swipe(start = Offset(250f, 250f), end = Offset(70f, 250f), durationMillis = 180)
++            onNodeWithTag("pager").performTouchInput {
++                swipe(start = Offset(250f, 250f), end = Offset(45f, 250f), durationMillis = 200)
+             }
++            waitForIdle()
+         }
+         runOnIdle {
+-            assertTrue(horizontalPosition() > 0)
++            assertEquals(680, horizontalPosition(), "Exercise the row's terminal boundary as well as its middle")
+             assertEquals(0, continues)
+         }
+     }
+@@ -99,7 +249,15 @@ class NavigationChromeDetailContinueSwipeTest {
+         var continues = 0
+         var chapterDrag = 0f
+         setContent {
+-            Box(Modifier.requiredSize(320.dp, 500.dp).detailContinueSwipe(true) { continues++ }.testTag("detail")) {
++            DetailContinuePager(
++                enabled = true,
++                onContinue = {
++                    continues++
++                    true
++                },
++                lifecycleOwner = null,
++                modifier = Modifier.requiredSize(320.dp, 500.dp).testTag("pager"),
++            ) {
+                 Box(
+                     Modifier.fillMaxSize().draggable(
+                         state = rememberDraggableState { chapterDrag += it },
+@@ -108,11 +266,12 @@ class NavigationChromeDetailContinueSwipeTest {
+                 )
+             }
+         }
+-        onNodeWithTag("detail").performTouchInput {
+-            swipe(start = Offset(250f, 250f), end = Offset(70f, 250f), durationMillis = 180)
++        onNodeWithTag("pager").performTouchInput {
++            swipe(start = Offset(250f, 250f), end = Offset(45f, 250f), durationMillis = 200)
+         }
++        waitForIdle()
+         runOnIdle {
+-            assertTrue(chapterDrag < 0f)
++            assertTrue(chapterDrag < -100f)
+             assertEquals(0, continues)
+         }
+     }
+@@ -124,16 +283,25 @@ class NavigationChromeDetailContinueSwipeTest {
+         setContent {
+             val scroll = rememberScrollState()
+             verticalPosition = { scroll.value }
+-            Box(Modifier.requiredSize(320.dp, 500.dp).detailContinueSwipe(true) { continues++ }.testTag("detail")) {
++            DetailContinuePager(
++                enabled = true,
++                onContinue = {
++                    continues++
++                    true
++                },
++                lifecycleOwner = null,
++                modifier = Modifier.requiredSize(320.dp, 500.dp).testTag("pager"),
++            ) {
+                 Box(Modifier.fillMaxSize().verticalScroll(scroll)) {
+                     Box(Modifier.requiredSize(320.dp, 1500.dp))
+                 }
+             }
+         }
+-        onNodeWithTag("detail").performTouchInput {
+-            swipe(start = Offset(220f, 400f), end = Offset(220f, 150f), durationMillis = 180)
+-            swipe(start = Offset(250f, 400f), end = Offset(100f, 180f), durationMillis = 180)
++        onNodeWithTag("pager").performTouchInput {
++            swipe(start = Offset(220f, 400f), end = Offset(220f, 150f), durationMillis = 200)
++            swipe(start = Offset(250f, 400f), end = Offset(100f, 180f), durationMillis = 200)
+         }
++        waitForIdle()
+         runOnIdle {
+             assertTrue(verticalPosition() > 0)
+             assertEquals(0, continues)
+@@ -141,32 +309,120 @@ class NavigationChromeDetailContinueSwipeTest {
+     }
+ 
+     @Test
+-    fun `long press and disabled dialogs or selection do not invoke continue`() = runComposeUiTest {
++    fun `long press disabled selection and disabling a held drag never continue`() = runComposeUiTest {
+         var continues = 0
+         var longPresses = 0
++        var detailX = Float.NaN
+         val enabled = mutableStateOf(true)
+         setContent {
+-            Box(Modifier.requiredSize(320.dp, 500.dp).detailContinueSwipe(enabled.value) { continues++ }.testTag("detail")) {
+-                Box(Modifier.fillMaxSize().combinedClickable(onClick = {}, onLongClick = { longPresses++ }))
++            DetailContinuePager(
++                enabled = enabled.value,
++                onContinue = {
++                    continues++
++                    true
++                },
++                lifecycleOwner = null,
++                modifier = Modifier.requiredSize(320.dp, 500.dp).testTag("pager"),
++            ) {
++                Box(
++                    Modifier.fillMaxSize().onGloballyPositioned { detailX = it.positionInRoot().x }
++                        .combinedClickable(onClick = {}, onLongClick = { longPresses++ }),
++                )
+             }
+         }
+-        onNodeWithTag("detail").performTouchInput {
++        var initialX = 0f
++        runOnIdle { initialX = detailX }
++        onNodeWithTag("pager").performTouchInput {
+             down(Offset(250f, 250f))
+             advanceEventTime(700)
+         }
+         mainClock.advanceTimeBy(700)
+-        onNodeWithTag("detail").performTouchInput {
+-            moveBy(Offset(-150f, 0f))
++        onNodeWithTag("pager").performTouchInput {
++            moveBy(Offset(-190f, 0f))
+             up()
+         }
++        waitForIdle()
+         runOnIdle {
+             assertEquals(1, longPresses)
+             assertEquals(0, continues)
+             enabled.value = false
+         }
+-        onNodeWithTag("detail").performTouchInput {
+-            swipe(start = Offset(250f, 250f), end = Offset(70f, 250f), durationMillis = 180)
++        onNodeWithTag("pager").performTouchInput {
++            swipe(start = Offset(250f, 250f), end = Offset(45f, 250f), durationMillis = 200)
++        }
++        runOnIdle { enabled.value = true }
++        onNodeWithTag("pager").performTouchInput {
++            down(Offset(250f, 250f))
++            moveBy(Offset(-190f, 0f), delayMillis = 200)
+         }
+-        runOnIdle { assertEquals(0, continues) }
++        runOnIdle { enabled.value = false }
++        onNodeWithTag("pager").performTouchInput { up() }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(0, continues)
++            assertEquals(initialX, detailX, 1f)
++        }
++    }
++
++    @Test
++    fun `activity stop and returning resume both reset the successful handoff page`() = runComposeUiTest {
++        lateinit var owner: TestLifecycleOwner
++        var continues = 0
++        var detailX = Float.NaN
++        var previewX = Float.NaN
++        runOnIdle {
++            owner = TestLifecycleOwner()
++            owner.registry.currentState = Lifecycle.State.RESUMED
++        }
++        setContent {
++            DetailContinuePager(
++                enabled = true,
++                onContinue = {
++                    continues++
++                    true
++                },
++                lifecycleOwner = owner,
++                modifier = Modifier.requiredSize(320.dp, 500.dp).testTag("pager"),
++                previewContent = { Box(Modifier.fillMaxSize().onGloballyPositioned { previewX = it.positionInRoot().x }) },
++            ) { Box(Modifier.fillMaxSize().onGloballyPositioned { detailX = it.positionInRoot().x }) }
++        }
++        var initialX = 0f
++        runOnIdle { initialX = detailX }
++        onNodeWithTag("pager").performTouchInput {
++            swipe(start = Offset(250f, 250f), end = Offset(45f, 250f), durationMillis = 250)
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(1, continues)
++            assertEquals(initialX, previewX, 1f)
++            owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
++            owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(initialX, detailX, 1f)
++            owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_START)
++            owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
++        }
++        onNodeWithTag("pager").performTouchInput {
++            swipe(start = Offset(250f, 250f), end = Offset(45f, 250f), durationMillis = 250)
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(2, continues)
++            assertEquals(initialX, previewX, 1f)
++            owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
++            owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(initialX, detailX, 1f)
++            assertEquals(2, continues)
++        }
++    }
++
++    private class TestLifecycleOwner : LifecycleOwner {
++        val registry = LifecycleRegistry(this)
++        override val lifecycle: Lifecycle get() = registry
+     }
+ }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseRestoreTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseRestoreTest.kt
+new file mode 100644
+index 000000000..bde23ffde
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseRestoreTest.kt
+@@ -0,0 +1,167 @@
++package tachiyomi.presentation.core.components
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.requiredSize
++import androidx.compose.foundation.lazy.grid.GridCells
++import androidx.compose.foundation.lazy.grid.rememberLazyGridState
++import androidx.compose.foundation.lazy.rememberLazyListState
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.saveable.LocalSaveableStateRegistry
++import androidx.compose.runtime.saveable.SaveableStateRegistry
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.unit.dp
++import androidx.paging.PagingData
++import androidx.paging.compose.collectAsLazyPagingItems
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.flow.flowOf
++import kotlinx.coroutines.launch
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertNotSame
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34], qualifiers = "mdpi")
++class NavigationChromeSourceBrowseRestoreTest {
++    @Test
++    fun `list retains exact index and offset after detail disposal with new paging identity`() = assertRestore(0)
++
++    @Test
++    fun `grid retains exact index and offset after detail disposal with new paging identity`() = assertRestore(1)
++
++    @Test
++    fun `panorama retains exact anchor after detail disposal with new paging identity`() = assertRestore(2)
++
++    private fun assertRestore(layout: Int) = runComposeUiTest {
++        val shown = mutableStateOf(true)
++        val generation = mutableIntStateOf(0)
++        val queryRevision = mutableIntStateOf(0)
++        val selected = mutableStateOf(SourceBrowseMode.Popular)
++        val registry = mutableStateOf(SaveableStateRegistry(null) { true })
++        val positions = mutableMapOf<SourceBrowseMode, () -> Pair<Int, Int>>()
++        val scrolls = mutableMapOf<SourceBrowseMode, suspend (Int, Int) -> Unit>()
++        lateinit var scope: CoroutineScope
++        var pagingIdentity: Any? = null
++        setContent {
++            if (shown.value) {
++                CompositionLocalProvider(LocalSaveableStateRegistry provides registry.value) {
++                    SourceBrowsePager(
++                        selectedMode = selected.value,
++                        supportsLatest = true,
++                        supportsFilters = true,
++                        enabled = true,
++                        onSelectMode = {
++                            selected.value = it
++                            true
++                        },
++                        pageKey = { "source-123:${it.name}:query-${queryRevision.intValue}" },
++                        modifier = Modifier.requiredSize(320.dp, 500.dp),
++                    ) { mode ->
++                        scope = rememberCoroutineScope()
++                        // Recreated on return, exactly as collectAsLazyPagingItems recreates its
++                        // presenter. The saveable key continues to describe the same source/query.
++                        val flow = remember(generation.intValue, mode) { flowOf(PagingData.from((0 until 200).toList())) }
++                        val paging = flow.collectAsLazyPagingItems()
++                        if (mode == selected.value) pagingIdentity = paging
++                        if (paging.itemCount > 0) {
++                            when (layout) {
++                                0 -> {
++                                    val state = rememberLazyListState()
++                                    positions[mode] = { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset }
++                                    scrolls[mode] = { index, offset -> state.scrollToItem(index, offset) }
++                                    FastScrollLazyColumn(state = state, modifier = Modifier.fillMaxSize()) {
++                                        items(paging.itemCount, key = { paging.peek(it) ?: it }) {
++                                            Box(Modifier.fillMaxSize().height(64.dp))
++                                        }
++                                    }
++                                }
++                                1 -> {
++                                    val state = rememberLazyGridState()
++                                    positions[mode] = { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset }
++                                    scrolls[mode] = { index, offset -> state.scrollToItem(index, offset) }
++                                    FastScrollLazyVerticalGrid(state = state, columns = GridCells.Fixed(2)) {
++                                        items(paging.itemCount, key = { paging.peek(it) ?: it }) {
++                                            Box(Modifier.fillMaxSize().height(64.dp))
++                                        }
++                                    }
++                                }
++                                else -> {
++                                    val state = rememberPanoramaMasonryState()
++                                    positions[mode] = { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset }
++                                    scrolls[mode] = { index, offset -> state.scrollToItem(index, offset) }
++                                    FastScrollPanoramaMasonry(state = state, columns = PanoramaColumns.Fixed(2)) {
++                                        items(
++                                            count = paging.itemCount,
++                                            key = { paging.peek(it) ?: it },
++                                            height = { PanoramaCellHeight.Fixed(if (it % 3 == 0) 100.dp else 150.dp) },
++                                        ) { Box(Modifier.fillMaxSize()) }
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        waitUntil { positions[SourceBrowseMode.Popular] != null }
++        runOnIdle { scope.launch { scrolls.getValue(SourceBrowseMode.Popular)(60, 17) } }
++        waitForIdle()
++        var expected = 0 to 0
++        var oldPaging: Any? = null
++        var saved: Map<String, List<Any?>> = emptyMap()
++        runOnIdle {
++            expected = positions.getValue(SourceBrowseMode.Popular)()
++            assertTrue(expected.first > 0)
++            oldPaging = pagingIdentity
++            saved = registry.value.performSave()
++            shown.value = false // source screen completely disposed while detail is shown
++        }
++        waitForIdle()
++        runOnIdle {
++            positions.clear()
++            scrolls.clear()
++            registry.value = SaveableStateRegistry(saved) { true }
++            generation.intValue++
++            shown.value = true
++        }
++        waitUntil { positions[SourceBrowseMode.Popular] != null }
++        waitForIdle()
++        runOnIdle {
++            assertNotSame(oldPaging, pagingIdentity)
++            assertEquals(expected, positions.getValue(SourceBrowseMode.Popular)(), "layout=$layout")
++            selected.value = SourceBrowseMode.Latest
++        }
++        waitForIdle()
++        runOnIdle { scope.launch { scrolls.getValue(SourceBrowseMode.Latest)(30, 9) } }
++        waitForIdle()
++        var latest = 0 to 0
++        runOnIdle {
++            latest = positions.getValue(SourceBrowseMode.Latest)()
++            selected.value = SourceBrowseMode.Popular
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(expected, positions.getValue(SourceBrowseMode.Popular)())
++            selected.value = SourceBrowseMode.Latest
++        }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(latest, positions.getValue(SourceBrowseMode.Latest)())
++            queryRevision.intValue++ // only a genuinely new query receives a fresh scroll state
++        }
++        waitForIdle()
++        runOnIdle { assertEquals(0 to 0, positions.getValue(SourceBrowseMode.Latest)()) }
++    }
++}
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseSwipeTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseSwipeTest.kt
+index 15e16ad65..74a64f659 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseSwipeTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseSwipeTest.kt
+@@ -1,11 +1,8 @@
+ package tachiyomi.presentation.core.components
+ 
+-import androidx.compose.foundation.combinedClickable
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.requiredSize
+-import androidx.compose.foundation.rememberScrollState
+-import androidx.compose.foundation.verticalScroll
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.geometry.Offset
+@@ -14,7 +11,6 @@ import androidx.compose.ui.test.ExperimentalTestApi
+ import androidx.compose.ui.test.onNodeWithTag
+ import androidx.compose.ui.test.performTouchInput
+ import androidx.compose.ui.test.runComposeUiTest
+-import androidx.compose.ui.test.swipe
+ import androidx.compose.ui.test.swipeLeft
+ import androidx.compose.ui.test.swipeRight
+ import androidx.compose.ui.unit.dp
+@@ -45,109 +41,148 @@ class NavigationChromeSourceBrowseSwipeTest {
+     }
+ 
+     @Test
+-    fun `held gesture commits only on release and goes in both directions`() = runComposeUiTest {
+-        val swipes = mutableListOf<Boolean>()
++    fun `content follows the held finger and selection commits only after native settlement`() = runComposeUiTest {
++        val selected = mutableStateOf(SourceBrowseMode.Popular)
++        val visits = mutableSetOf<SourceBrowseMode>()
++        val commits = mutableListOf<SourceBrowseMode>()
+         setContent {
+-            Box(Modifier.requiredSize(320.dp, 500.dp).sourceBrowseModeSwipe(true, { swipes += it }).testTag("content"))
++            SourceBrowsePager(
++                selectedMode = selected.value,
++                supportsLatest = true,
++                supportsFilters = true,
++                enabled = true,
++                onSelectMode = {
++                    selected.value = it
++                    commits += it
++                    true
++                },
++                pageKey = { it.name },
++                modifier = Modifier.requiredSize(320.dp, 500.dp).testTag("pager"),
++            ) { mode ->
++                visits += mode
++                Box(Modifier.fillMaxSize().testTag(mode.name))
++            }
+         }
+-        onNodeWithTag("content").performTouchInput {
+-            down(center)
+-            moveBy(Offset(-120f, 0f))
++        val initialX = onNodeWithTag("Popular").fetchSemanticsNode().positionInRoot.x
++        runOnIdle { assertEquals(setOf(SourceBrowseMode.Popular), visits) }
++        onNodeWithTag("pager").performTouchInput {
++            down(Offset(280f, 240f))
++            moveBy(Offset(-115f, 0f), delayMillis = 120)
+         }
+-        runOnIdle { assertTrue(swipes.isEmpty()) }
+-        onNodeWithTag("content").performTouchInput { up() }
+-        runOnIdle { assertEquals(listOf(true), swipes) }
+-        onNodeWithTag("content").performTouchInput { swipeRight(durationMillis = 180) }
+-        runOnIdle { assertEquals(listOf(true, false), swipes) }
+-    }
+-
+-    @Test
+-    fun `short and cancelled horizontal drags keep the current mode`() = runComposeUiTest {
+-        val swipes = mutableListOf<Boolean>()
+-        setContent {
+-            Box(Modifier.requiredSize(320.dp, 500.dp).sourceBrowseModeSwipe(true, { swipes += it }).testTag("content"))
++        val heldX = onNodeWithTag("Popular").fetchSemanticsNode().positionInRoot.x
++        val neighbourX = onNodeWithTag("Latest").fetchSemanticsNode().positionInRoot.x
++        runOnIdle {
++            assertTrue(heldX < initialX - 40f, "The current page must move while the finger is held")
++            assertTrue(neighbourX > initialX && neighbourX < initialX + 320f)
++            assertTrue(commits.isEmpty())
++            assertTrue(SourceBrowseMode.Filtered !in visits, "Prefetch must not start an invisible page")
+         }
+-        onNodeWithTag("content").performTouchInput {
+-            down(center)
+-            moveBy(Offset(-24f, 0f))
++        onNodeWithTag("pager").performTouchInput {
++            moveBy(Offset(-100f, 0f), delayMillis = 120)
+             up()
+         }
+-        onNodeWithTag("content").performTouchInput {
+-            down(center)
+-            moveBy(Offset(-120f, 0f))
+-            cancel()
+-        }
+-        runOnIdle { assertTrue(swipes.isEmpty()) }
++        waitForIdle()
++        runOnIdle { assertEquals(listOf(SourceBrowseMode.Latest), commits) }
++        onNodeWithTag("pager").performTouchInput { swipeRight(durationMillis = 200) }
++        waitForIdle()
++        runOnIdle { assertEquals(SourceBrowseMode.Popular, selected.value) }
+     }
+ 
+     @Test
+-    fun `folding during a held horizontal drag cancels it and next gesture uses new width`() = runComposeUiTest {
+-        val width = mutableStateOf(320.dp)
+-        val swipes = mutableListOf<Boolean>()
++    fun `short cancelled and disabled drags retain the original page and position`() = runComposeUiTest {
++        val enabled = mutableStateOf(true)
++        val commits = mutableListOf<SourceBrowseMode>()
+         setContent {
+-            Box(Modifier.requiredSize(width.value, 500.dp).sourceBrowseModeSwipe(true, { swipes += it }).testTag("content"))
++            SourceBrowsePager(
++                selectedMode = SourceBrowseMode.Popular,
++                supportsLatest = true,
++                supportsFilters = true,
++                enabled = enabled.value,
++                onSelectMode = {
++                    commits += it
++                    true
++                },
++                pageKey = { it.name },
++                modifier = Modifier.requiredSize(320.dp, 500.dp).testTag("pager"),
++            ) { mode -> Box(Modifier.fillMaxSize().testTag(mode.name)) }
+         }
+-        onNodeWithTag("content").performTouchInput {
++        val initialX = onNodeWithTag("Popular").fetchSemanticsNode().positionInRoot.x
++        onNodeWithTag("pager").performTouchInput {
+             down(center)
+-            moveBy(Offset(-120f, 0f))
++            moveBy(Offset(-65f, 0f), delayMillis = 200)
++            moveBy(Offset.Zero, delayMillis = 250)
++            cancel()
+         }
+-        runOnIdle { width.value = 400.dp }
+         waitForIdle()
+-        onNodeWithTag("content").performTouchInput { up() }
+-        runOnIdle { assertTrue(swipes.isEmpty()) }
+-        onNodeWithTag("content").performTouchInput { swipeLeft(durationMillis = 180) }
+-        runOnIdle { assertEquals(listOf(true), swipes) }
+-    }
+-
+-    @Test
+-    fun `vertical and diagonal scrolling belong to the list`() = runComposeUiTest {
+-        val swipes = mutableListOf<Boolean>()
+-        var scrollPosition = { 0 }
+-        setContent {
+-            val scroll = rememberScrollState()
+-            scrollPosition = { scroll.value }
+-            Box(Modifier.requiredSize(320.dp, 500.dp).sourceBrowseModeSwipe(true, { swipes += it }).testTag("content")) {
+-                Box(Modifier.fillMaxSize().verticalScroll(scroll)) {
+-                    Box(Modifier.requiredSize(320.dp, 1500.dp))
+-                }
+-            }
+-        }
+-        onNodeWithTag("content").performTouchInput {
+-            swipe(start = Offset(200f, 400f), end = Offset(200f, 150f), durationMillis = 180)
+-            swipe(start = Offset(240f, 400f), end = Offset(100f, 180f), durationMillis = 180)
+-        }
+-        runOnIdle {
+-            assertTrue(scrollPosition() > 0)
+-            assertTrue(swipes.isEmpty())
+-        }
++        assertEquals(initialX, onNodeWithTag("Popular").fetchSemanticsNode().positionInRoot.x, 0.5f)
++        runOnIdle { enabled.value = false }
++        onNodeWithTag("pager").performTouchInput { swipeLeft(durationMillis = 180) }
++        waitForIdle()
++        runOnIdle { assertTrue(commits.isEmpty()) }
++        assertEquals(initialX, onNodeWithTag("Popular").fetchSemanticsNode().positionInRoot.x, 0.5f)
+     }
+ 
+     @Test
+-    fun `long press and disabled selection or search mode do not switch lists`() = runComposeUiTest {
+-        val swipes = mutableListOf<Boolean>()
+-        val enabled = mutableStateOf(true)
+-        var longPresses = 0
++    fun `first filter selection opens once and rejects smoothly until a filter is applied`() = runComposeUiTest {
++        val selected = mutableStateOf(SourceBrowseMode.Popular)
++        val sheetOpen = mutableStateOf(false)
++        val configured = mutableStateOf(false)
++        var sheets = 0
+         setContent {
+-            Box(Modifier.requiredSize(320.dp, 500.dp).sourceBrowseModeSwipe(enabled.value, { swipes += it }).testTag("content")) {
+-                Box(Modifier.fillMaxSize().combinedClickable(onClick = {}, onLongClick = { longPresses++ }))
+-            }
++            SourceBrowsePager(
++                selectedMode = selected.value,
++                supportsLatest = false,
++                supportsFilters = true,
++                enabled = !sheetOpen.value,
++                onSelectMode = {
++                    if (it == SourceBrowseMode.Filtered && !configured.value) {
++                        sheets++
++                        sheetOpen.value = true
++                        false
++                    } else {
++                        selected.value = it
++                        true
++                    }
++                },
++                pageKey = { it.name },
++                modifier = Modifier.requiredSize(320.dp, 500.dp).testTag("pager"),
++            ) { mode -> Box(Modifier.fillMaxSize().testTag(mode.name)) }
+         }
+-        onNodeWithTag("content").performTouchInput {
++        val initialX = onNodeWithTag("Popular").fetchSemanticsNode().positionInRoot.x
++        onNodeWithTag("pager").performTouchInput {
+             down(center)
+-            advanceEventTime(700)
++            moveBy(Offset(-70f, 0f), delayMillis = 150)
+         }
+-        mainClock.advanceTimeBy(700)
+-        onNodeWithTag("content").performTouchInput {
+-            moveBy(Offset(-120f, 0f))
++        runOnIdle { assertEquals(0, sheets) }
++        onNodeWithTag("pager").performTouchInput {
++            moveBy(Offset(-150f, 0f), delayMillis = 150)
+             up()
+         }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(1, sheets)
++            assertEquals(SourceBrowseMode.Popular, selected.value)
++            sheetOpen.value = false // original sheet cancelled
++        }
++        waitForIdle()
++        assertEquals(initialX, onNodeWithTag("Popular").fetchSemanticsNode().positionInRoot.x, 0.5f)
++        onNodeWithTag("pager").performTouchInput { swipeLeft(durationMillis = 200) }
++        waitForIdle()
++        runOnIdle {
++            assertEquals(2, sheets)
++            configured.value = true // original sheet applied its independent snapshot
++            selected.value = SourceBrowseMode.Filtered
++            sheetOpen.value = false
++        }
++        waitForIdle()
++        assertEquals(initialX, onNodeWithTag("Filtered").fetchSemanticsNode().positionInRoot.x, 0.5f)
++        onNodeWithTag("pager").performTouchInput { swipeRight(durationMillis = 200) }
++        waitForIdle()
++        onNodeWithTag("pager").performTouchInput { swipeLeft(durationMillis = 200) }
++        waitForIdle()
+         runOnIdle {
+-            assertEquals(1, longPresses)
+-            assertTrue(swipes.isEmpty())
+-            enabled.value = false
++            assertEquals(2, sheets)
++            assertEquals(SourceBrowseMode.Filtered, selected.value)
+         }
+-        onNodeWithTag("content").performTouchInput { swipeLeft(durationMillis = 180) }
+-        onNodeWithTag("content").performTouchInput { swipeRight(durationMillis = 180) }
+-        runOnIdle { assertTrue(swipes.isEmpty()) }
+     }
+ }
