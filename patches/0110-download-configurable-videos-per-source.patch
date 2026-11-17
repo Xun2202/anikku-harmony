@@ -1,0 +1,570 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 14:42:03 +0000
+Subject: [PATCH] downloads: support configurable simultaneous videos per
+ source
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Separate source slots from video slots with a general 1–3 per-source setting (default 2). Reconcile stable episode jobs after cancellation finishes and serialize conflicting output filenames. Retain the MissAV-only HLS segment engine scope.
+
+Eight focused regressions include actual two-video loopback HTTP segment transfer, source/video limit independence, failure replacement, repeated updates, safe shrink/restart and conflicting file names. This is an Anikku queue capability; Mihon image downloads and Animeko independent KMP engines are outside this requested feature.
+---
+ .../settings/screen/SettingsDownloadScreen.kt |   9 +
+ .../data/download/DownloadQueueConcurrency.kt |  47 +++
+ .../tachiyomi/data/download/Downloader.kt     |  61 ++-
+ ...ationChromeDownloadQueueConcurrencyTest.kt | 352 ++++++++++++++++++
+ .../download/service/DownloadPreferences.kt   |   3 +
+ .../moko-resources/base/strings.xml           |   4 +
+ 6 files changed, 436 insertions(+), 40 deletions(-)
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDownloadScreen.kt b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDownloadScreen.kt
+index 47ba16f5a..7f6d0e043 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDownloadScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/settings/screen/SettingsDownloadScreen.kt
+@@ -52,6 +52,7 @@ object SettingsDownloadScreen : SearchableSettings {
+ 
+         val downloadPreferences = remember { Injekt.get<DownloadPreferences>() }
+         val parallelSourceLimit by downloadPreferences.parallelSourceLimit().collectAsState()
++        val parallelDownloadsPerSource by downloadPreferences.parallelDownloadsPerSource().collectAsState()
+         val basePreferences = remember { Injekt.get<BasePreferences>() }
+         // Harmony -->
+         val context = LocalContext.current
+@@ -67,9 +68,17 @@ object SettingsDownloadScreen : SearchableSettings {
+                 value = parallelSourceLimit,
+                 valueRange = 1..10,
+                 title = stringResource(MR.strings.pref_download_concurrent_sources),
++                subtitle = stringResource(AMR.strings.pref_harmony_parallel_sources_summary),
+                 onValueChanged = { downloadPreferences.parallelSourceLimit().set(it) },
+             ),
+             // Harmony -->
++            Preference.PreferenceItem.SliderPreference(
++                value = parallelDownloadsPerSource.coerceIn(1, 3),
++                valueRange = 1..3,
++                title = stringResource(AMR.strings.pref_harmony_parallel_downloads_per_source),
++                subtitle = stringResource(AMR.strings.pref_harmony_parallel_downloads_per_source_summary),
++                onValueChanged = { downloadPreferences.parallelDownloadsPerSource().set(it) },
++            ),
+             Preference.PreferenceItem.ListPreference(
+                 preference = downloadPreferences.downloadQuality(),
+                 entries = buildMap {
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt
+new file mode 100644
+index 000000000..f31579dd5
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt
+@@ -0,0 +1,47 @@
++package eu.kanade.tachiyomi.data.download
++
++import eu.kanade.tachiyomi.data.download.model.Download
++import eu.kanade.tachiyomi.util.storage.DiskUtil
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.NonCancellable
++import kotlinx.coroutines.currentCoroutineContext
++import kotlinx.coroutines.ensureActive
++import kotlinx.coroutines.withContext
++
++/** Source slots and per-source video slots are separate limits. */
++internal object DownloadQueueConcurrency {
++    fun select(queue: List<Download>, sourceLimit: Int, perSourceLimit: Int): List<Download> = queue
++        .filter { it.status.value <= Download.State.DOWNLOADING.value }
++        .groupBy { it.source }
++        .values
++        .take(sourceLimit.coerceIn(1, 10))
++        .flatMap { downloads ->
++            val count = perSourceLimit.coerceIn(1, 3)
++            // Distinct database episodes can resolve to the same storage/cache filename.
++            downloads.asSequence()
++                .distinctBy { DiskUtil.buildValidFilename(it.anime.ogTitle) to DiskUtil.buildValidFilename(it.episode.name) }
++                .take(count)
++                .toList()
++        }
++
++    /** Reconcile by immutable episode id; a reduced limit pauses excess jobs before replacements. */
++    class Workers {
++        private val jobs = mutableMapOf<Long, Pair<Download, Job>>()
++
++        suspend fun update(active: List<Download>, launch: (Download) -> Job) {
++            val activeIds = active.mapTo(mutableSetOf()) { it.episode.id }
++            val stopped = jobs.filterKeys { it !in activeIds }
++            stopped.forEach { (id, running) ->
++                running.second.cancel()
++                // Blocking HTTP/copy/native cleanup must close before this id can write again.
++                withContext(NonCancellable) { running.second.join() }
++                if (running.first.status == Download.State.DOWNLOADING) running.first.status = Download.State.QUEUE
++                jobs.remove(id)
++            }
++            currentCoroutineContext().ensureActive()
++            active.forEach { download ->
++                if (download.episode.id !in jobs) jobs[download.episode.id] = download to launch(download)
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 54c10999c..c1ff49111 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -235,53 +235,34 @@ class Downloader(
+             val activeDownloadsFlow = combine(
+                 queueState,
+                 downloadPreferences.parallelSourceLimit().changes(),
+-            ) { a, b -> a to b }.transformLatest { (queue, parallelCount) ->
+-                while (true) {
+-                    val activeDownloads = queue.asSequence()
+-                        // Ignore completed downloads, leave them in the queue
+-                        .filter { it.status.value <= Download.State.DOWNLOADING.value }
+-                        .groupBy { it.source }
+-                        .toList()
+-                        .take(parallelCount)
+-                        .map { (_, downloads) -> downloads.first() }
+-                    emit(activeDownloads)
+-
+-                    if (activeDownloads.isEmpty()) break
+-
+-                    // Suspend until a download enters the ERROR state
+-                    val activeDownloadsErroredFlow =
+-                        combine(activeDownloads.map(Download::statusFlow)) { states ->
+-                            states.contains(Download.State.ERROR)
+-                        }.filter { it }
+-                    activeDownloadsErroredFlow.first()
+-                }
++                downloadPreferences.parallelDownloadsPerSource().changes(),
++            ) { queue, sourceCount, perSourceCount -> Triple(queue, sourceCount, perSourceCount) }
++                .transformLatest { (queue, parallelCount, perSourceCount) ->
++                    while (true) {
++                        val activeDownloads = DownloadQueueConcurrency.select(queue, parallelCount, perSourceCount)
++                        emit(activeDownloads)
++
++                        if (activeDownloads.isEmpty()) break
++
++                        // Suspend until a download enters the ERROR state
++                        val activeDownloadsErroredFlow =
++                            combine(activeDownloads.map(Download::statusFlow)) { states ->
++                                states.contains(Download.State.ERROR)
++                            }.filter { it }
++                        activeDownloadsErroredFlow.first()
++                    }
+ 
+-                downloaderSessions.ifCurrent(owner) {
+-                    if (areAllDownloadsFinished()) stop()
++                    downloaderSessions.ifCurrent(owner) {
++                        if (areAllDownloadsFinished()) stop()
++                    }
+                 }
+-            }
+                 .distinctUntilChanged()
+ 
+             // Use supervisorScope to cancel child jobs when the downloader job is cancelled
+             supervisorScope {
+-                // Download.video changes during resolution; it must never be part of a map key.
+-                val downloadJobs = mutableMapOf<Long, Job>()
+-
++                val workers = DownloadQueueConcurrency.Workers()
+                 activeDownloadsFlow.collectLatest { activeDownloads ->
+-                    val activeIds = activeDownloads.mapTo(mutableSetOf()) { it.episode.id }
+-                    val downloadJobsToStop = downloadJobs.filter { it.key !in activeIds }
+-                    downloadJobsToStop.forEach { (download, job) ->
+-                        job.cancel()
+-                        // A removed/requeued episode can reuse the same directory. Finish its
+-                        // blocking copy before this collector starts a replacement child.
+-                        withContext(NonCancellable) { job.join() }
+-                        downloadJobs.remove(download)
+-                    }
+-
+-                    val downloadsToStart = activeDownloads.filter { it.episode.id !in downloadJobs }
+-                    downloadsToStart.forEach { download ->
+-                        downloadJobs[download.episode.id] = launchDownloadJob(download, owner)
+-                    }
++                    workers.update(activeDownloads) { launchDownloadJob(it, owner) }
+                 }
+             }
+         }
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt
+new file mode 100644
+index 000000000..d1d890006
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt
+@@ -0,0 +1,352 @@
++package eu.kanade.tachiyomi.data.download
++
++import com.sun.net.httpserver.HttpServer
++import eu.kanade.tachiyomi.animesource.model.Video
++import eu.kanade.tachiyomi.data.download.model.Download
++import eu.kanade.tachiyomi.source.online.HttpSource
++import io.mockk.every
++import io.mockk.mockk
++import kotlinx.coroutines.CompletableDeferred
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.CoroutineStart
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.awaitCancellation
++import kotlinx.coroutines.cancelAndJoin
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.runBlocking
++import kotlinx.coroutines.withTimeout
++import kotlinx.coroutines.yield
++import okhttp3.Headers.Companion.headersOf
++import okhttp3.OkHttpClient
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertNotEquals
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++import tachiyomi.domain.anime.model.Anime
++import tachiyomi.domain.episode.model.Episode
++import java.io.File
++import java.net.InetSocketAddress
++import java.util.concurrent.ConcurrentHashMap
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicBoolean
++import java.util.concurrent.atomic.AtomicInteger
++import kotlin.io.path.createTempDirectory
++
++class NavigationChromeDownloadQueueConcurrencyTest {
++    @Test
++    fun `every source name supports two or three videos independently of source slots`() {
++        val sources = listOf(source(1, "MissAV"), source(2, "Any anime source"), source(3, "Other source"))
++        val queue = sources.flatMapIndexed { index, source -> (1..4).map { download(source, index * 10L + it) } }
++        assertEquals(4, DownloadQueueConcurrency.select(queue, 2, 2).size)
++        assertEquals(listOf(2, 2), DownloadQueueConcurrency.select(queue, 2, 2).groupBy { it.source }.values.map { it.size })
++        assertEquals(3, DownloadQueueConcurrency.select(queue, 1, 3).size)
++        assertEquals(9, DownloadQueueConcurrency.select(queue, 3, 3).size)
++        sources.forEach { source ->
++            assertEquals(3, DownloadQueueConcurrency.select(queue.filter { it.source === source }, 1, 3).size)
++        }
++    }
++
++    @Test
++    fun `failed and completed items do not consume source or video slots`() {
++        val failedSource = source(1, "Failed source")
++        val runningSource = source(2, "Ordinary source")
++        val failed = download(failedSource, 1).apply { fail("test failure") }
++        val completed = download(runningSource, 2).apply { status = Download.State.DOWNLOADED }
++        val first = download(runningSource, 3)
++        val second = download(runningSource, 4).apply { status = Download.State.DOWNLOADING }
++        assertEquals(listOf(first, second), DownloadQueueConcurrency.select(listOf(failed, completed, first, second), 1, 2))
++    }
++
++    @Test
++    fun `limits are bounded and selection retains queue order within each source`() {
++        val source = source(1, "Generic source")
++        val queue = (1L..5).map { download(source, it) }
++        assertEquals(queue.take(1), DownloadQueueConcurrency.select(queue, 0, 0))
++        assertEquals(queue.take(3), DownloadQueueConcurrency.select(queue, 99, 99))
++    }
++
++    @Test
++    fun `repeated updates and mutable Video changes never launch an episode twice`() = runBlocking {
++        val owner = SupervisorJob()
++        val scope = CoroutineScope(owner + Dispatchers.IO)
++        val workers = DownloadQueueConcurrency.Workers()
++        val source = source(1, "Unrelated source")
++        val queue = listOf(download(source, 1), download(source, 2))
++        val launches = AtomicInteger()
++        val start: (Download) -> Job = { download ->
++            scope.launch(start = CoroutineStart.UNDISPATCHED) {
++                launches.incrementAndGet()
++                download.status = Download.State.DOWNLOADING
++                awaitCancellation()
++            }
++        }
++        try {
++            workers.update(queue, start)
++            queue.first().video = Video(videoUrl = "http://127.0.0.1/first", videoTitle = "720p")
++            workers.update(queue, start)
++            queue.first().video = Video(videoUrl = "http://127.0.0.1/second", videoTitle = "1080p")
++            workers.update(queue.toList(), start)
++            assertEquals(2, launches.get())
++        } finally {
++            workers.update(emptyList(), start)
++            owner.cancelAndJoin()
++        }
++    }
++
++    @Test
++    fun `lowering the limit waits for blocking IO then restores QUEUE before a safe restart`() = runBlocking {
++        val owner = SupervisorJob()
++        val scope = CoroutineScope(owner + Dispatchers.IO)
++        val workers = DownloadQueueConcurrency.Workers()
++        val source = source(1, "Any source")
++        val first = download(source, 1)
++        val second = download(source, 2)
++        val entered = CountDownLatch(1)
++        val restarted = CountDownLatch(1)
++        val release = CountDownLatch(1)
++        val launches = AtomicInteger()
++        val writing = AtomicInteger()
++        val maximum = AtomicInteger()
++        lateinit var firstWriter: Job
++        val start: (Download) -> Job = { download ->
++            if (download === first) {
++                scope.launch(start = CoroutineStart.UNDISPATCHED) {
++                    download.status = Download.State.DOWNLOADING
++                    awaitCancellation()
++                }
++            } else {
++                val generation = launches.incrementAndGet()
++                scope.launch {
++                    download.status = Download.State.DOWNLOADING
++                    maximum.accumulateAndGet(writing.incrementAndGet()) { previous, current -> maxOf(previous, current) }
++                    try {
++                        if (generation == 1) {
++                            entered.countDown()
++                            check(release.await(5, TimeUnit.SECONDS))
++                        } else {
++                            restarted.countDown()
++                            awaitCancellation()
++                        }
++                    } finally {
++                        writing.decrementAndGet()
++                    }
++                }.also { if (generation == 1) firstWriter = it }
++            }
++        }
++        try {
++            workers.update(listOf(first, second), start)
++            assertTrue(entered.await(3, TimeUnit.SECONDS))
++            val lowering = launch(Dispatchers.Default) { workers.update(listOf(first), start) }
++            withTimeout(3000) { while (!firstWriter.isCancelled) yield() }
++            assertFalse(lowering.isCompleted)
++            assertEquals(Download.State.DOWNLOADING, second.status)
++            assertEquals(1, launches.get())
++            release.countDown()
++            withTimeout(3000) { lowering.join() }
++            assertEquals(0, writing.get())
++            assertEquals(Download.State.QUEUE, second.status)
++            workers.update(listOf(first, second), start)
++            assertEquals(2, launches.get())
++            assertTrue(restarted.await(3, TimeUnit.SECONDS))
++            assertEquals(1, writing.get())
++            assertEquals(1, maximum.get())
++        } finally {
++            release.countDown()
++            workers.update(emptyList(), start)
++            owner.cancelAndJoin()
++        }
++    }
++
++    @Test
++    fun `one failed video is replaced while its surviving sibling keeps the same job`() = runBlocking {
++        val owner = SupervisorJob()
++        val scope = CoroutineScope(owner + Dispatchers.IO)
++        val workers = DownloadQueueConcurrency.Workers()
++        val source = source(1, "Generic source")
++        val queue = (1L..3).map { download(source, it) }
++        val failFirst = CompletableDeferred<Unit>()
++        val failed = CompletableDeferred<Unit>()
++        val counts = ConcurrentHashMap<Long, AtomicInteger>()
++        val jobs = ConcurrentHashMap<Long, Job>()
++        val start: (Download) -> Job = { download ->
++            scope.launch(start = CoroutineStart.UNDISPATCHED) {
++                counts.computeIfAbsent(download.episode.id) { AtomicInteger() }.incrementAndGet()
++                download.status = Download.State.DOWNLOADING
++                if (download === queue.first()) {
++                    failFirst.await()
++                    download.fail("synthetic HTTP failure")
++                    failed.complete(Unit)
++                } else {
++                    awaitCancellation()
++                }
++            }.also { jobs[download.episode.id] = it }
++        }
++        try {
++            workers.update(DownloadQueueConcurrency.select(queue, 1, 2), start)
++            val sibling = jobs.getValue(2)
++            failFirst.complete(Unit)
++            withTimeout(3000) { failed.await() }
++            workers.update(DownloadQueueConcurrency.select(queue, 1, 2), start)
++            assertTrue(sibling.isActive)
++            assertEquals(sibling, jobs.getValue(2))
++            assertEquals(listOf(1, 1, 1), queue.map { counts.getValue(it.episode.id).get() })
++            assertEquals(Download.State.ERROR, queue.first().status)
++        } finally {
++            workers.update(emptyList(), start)
++            owner.cancelAndJoin()
++        }
++    }
++
++    @Test
++    fun `different episode IDs targeting the same output are serialized`() {
++        val source = source(1, "Any source")
++        val first = download(source, 1, animeTitle = "Same/title", episodeTitle = "Same/episode")
++        val conflict = download(source, 2, animeTitle = "Same:title", episodeTitle = "Same:episode")
++        val different = download(source, 3)
++        val queue = listOf(first, conflict, different)
++        assertEquals(listOf(first, different), DownloadQueueConcurrency.select(queue, 1, 3))
++        first.status = Download.State.DOWNLOADED
++        assertEquals(listOf(conflict, different), DownloadQueueConcurrency.select(queue, 1, 3))
++    }
++
++    @Test
++    fun `two scheduled downloads concurrently fetch real loopback HLS into separate episode caches`() = runBlocking {
++        val root = createTempDirectory("queue-hls-http-").toFile()
++        val owner = SupervisorJob()
++        val scope = CoroutineScope(owner + Dispatchers.IO)
++        val workers = DownloadQueueConcurrency.Workers()
++        val executor = Executors.newFixedThreadPool(4)
++        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
++        val activeEpisodes = mutableMapOf<String, Int>()
++        val seenEpisodes = mutableSetOf<String>()
++        val bothEntered = CountDownLatch(2)
++        val overlap = AtomicBoolean()
++        val manifestCalls = AtomicInteger()
++        val segmentCalls = AtomicInteger()
++        val client = OkHttpClient.Builder().callTimeout(5, TimeUnit.SECONDS).build()
++        val prepared = ConcurrentHashMap<Long, DownloadHlsSegments.Prepared>()
++        val failures = ConcurrentHashMap<Long, Throwable>()
++        val jobs = mutableListOf<Job>()
++        val start: (Download) -> Job = { download ->
++            scope.launch {
++                download.status = Download.State.DOWNLOADING
++                try {
++                    val result = DownloadHlsSegments.prepare(
++                        client = client,
++                        sourceName = download.source.name,
++                        url = "http://127.0.0.1:${server.address.port}/m3u8?episode=${download.episode.id}",
++                        headers = headersOf(),
++                        cacheRoot = File(root, "episode-${download.episode.id}"),
++                        onProgress = {},
++                    ) ?: error("Expected supported synthetic HLS")
++                    prepared[download.episode.id] = result
++                    download.status = Download.State.DOWNLOADED
++                } catch (error: Exception) {
++                    failures[download.episode.id] = error
++                    download.fail("Synthetic HTTP integration failed")
++                }
++            }.also(jobs::add)
++        }
++        server.executor = executor
++        server.createContext("/m3u8") { exchange ->
++            manifestCalls.incrementAndGet()
++            val id = exchange.requestURI.rawQuery.substringAfter("episode=")
++            val body = buildString {
++                appendLine("#EXTM3U")
++                repeat(2) { index ->
++                    appendLine("#EXTINF:1.0,")
++                    appendLine("/segment?url=$id-$index")
++                }
++                appendLine("#EXT-X-ENDLIST")
++            }.toByteArray()
++            exchange.use {
++                it.sendResponseHeaders(200, body.size.toLong())
++                it.responseBody.use { output -> output.write(body) }
++            }
++        }
++        server.createContext("/segment") { exchange ->
++            segmentCalls.incrementAndGet()
++            val episode = exchange.requestURI.rawQuery.substringAfter("url=").substringBefore('-')
++            synchronized(activeEpisodes) {
++                activeEpisodes[episode] = activeEpisodes.getOrDefault(episode, 0) + 1
++                if (seenEpisodes.add(episode)) bothEntered.countDown()
++                if (activeEpisodes.size == 2) overlap.set(true)
++            }
++            try {
++                bothEntered.await(3, TimeUnit.SECONDS)
++                exchange.use {
++                    it.sendResponseHeaders(200, TS.size.toLong())
++                    it.responseBody.use { output -> output.write(TS) }
++                }
++            } finally {
++                synchronized(activeEpisodes) {
++                    val remaining = activeEpisodes.getValue(episode) - 1
++                    if (remaining == 0) activeEpisodes.remove(episode) else activeEpisodes[episode] = remaining
++                }
++            }
++        }
++        try {
++            server.start()
++            val source = source(1, "MissAV")
++            val queue = listOf(download(source, 1), download(source, 2))
++            workers.update(DownloadQueueConcurrency.select(queue, 1, 2), start)
++            withTimeout(12_000) { jobs.forEach { it.join() } }
++            assertTrue(failures.isEmpty(), failures.values.joinToString { it.toString() })
++            assertTrue(overlap.get(), "Two episode jobs must fetch segments at the same time")
++            assertEquals(2, manifestCalls.get())
++            assertEquals(4, segmentCalls.get())
++            assertEquals(2, prepared.size)
++            assertNotEquals(prepared.getValue(1).directory, prepared.getValue(2).directory)
++            queue.forEach { download ->
++                val result = prepared.getValue(download.episode.id)
++                assertEquals(Download.State.DOWNLOADED, download.status)
++                assertEquals(2L * TS.size, result.bytes)
++                assertEquals(2000L, result.durationMillis)
++                assertTrue(result.input.readText().startsWith("ffconcat version 1.0"))
++                val files = result.directory.listFiles().orEmpty().filter { it.extension == "ts" }
++                assertEquals(2, files.size)
++                assertTrue(files.all { it.readBytes().contentEquals(TS) })
++            }
++        } finally {
++            workers.update(emptyList(), start)
++            owner.cancelAndJoin()
++            server.stop(0)
++            executor.shutdownNow()
++            executor.awaitTermination(3, TimeUnit.SECONDS)
++            client.dispatcher.executorService.shutdownNow()
++            client.connectionPool.evictAll()
++            root.deleteRecursively()
++        }
++    }
++
++    private fun source(sourceId: Long, sourceName: String): HttpSource = mockk {
++        every { id } returns sourceId
++        every { name } returns sourceName
++    }
++
++    private fun download(
++        source: HttpSource,
++        episodeId: Long,
++        animeTitle: String = "Anime $episodeId",
++        episodeTitle: String = "Episode $episodeId",
++    ): Download {
++        val anime = mockk<Anime> {
++            every { id } returns episodeId
++            every { ogTitle } returns animeTitle
++        }
++        val episode = mockk<Episode> {
++            every { id } returns episodeId
++            every { name } returns episodeTitle
++        }
++        return Download(source, anime, episode).apply { status = Download.State.QUEUE }
++    }
++
++    private companion object {
++        val TS = ByteArray(188 * 4) { if (it % 188 == 0) 0x47 else 0 }
++    }
++}
+diff --git a/domain/src/main/java/tachiyomi/domain/download/service/DownloadPreferences.kt b/domain/src/main/java/tachiyomi/domain/download/service/DownloadPreferences.kt
+index c61ad9929..0e7d8c19d 100644
+--- a/domain/src/main/java/tachiyomi/domain/download/service/DownloadPreferences.kt
++++ b/domain/src/main/java/tachiyomi/domain/download/service/DownloadPreferences.kt
+@@ -46,6 +46,9 @@ class DownloadPreferences(
+ 
+     fun parallelSourceLimit() = preferenceStore.getInt("download_parallel_source_limit", 5)
+ 
++    // Harmony: number of videos per source, separate from simultaneous source slots.
++    fun parallelDownloadsPerSource() = preferenceStore.getInt("harmony_parallel_downloads_per_source", 2)
++
+     // KMK -->
+     fun downloadCacheRenewInterval() = preferenceStore.getInt("download_cache_renew_interval", 1)
+     // KMK <--
+diff --git a/i18n-ank/src/commonMain/moko-resources/base/strings.xml b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+index 21c130a4f..aa5e28eaa 100644
+--- a/i18n-ank/src/commonMain/moko-resources/base/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+@@ -287,4 +287,8 @@
+     <!-- Harmony fork: scroll performance recorder shared with Mihon -->
+     <string name="pref_harmony_scroll_perf_recorder">Scroll performance recorder (debug)</string>
+     <string name="pref_harmony_scroll_perf_recorder_summary">Shows a “Record” button at the bottom left. Tap it when scrolling stutters to create and share a performance log without titles or URLs.</string>
++    <!-- Harmony fork: source slots and per-source video slots are separate limits -->
++    <string name="pref_harmony_parallel_sources_summary">限制同时工作的不同图源，不是每个图源的视频数。</string>
++    <string name="pref_harmony_parallel_downloads_per_source">每个图源同时下载数</string>
++    <string name="pref_harmony_parallel_downloads_per_source_summary">同一图源同时下载的视频数，默认 2 部；上方设置控制同时工作的不同图源数量。</string>
+ </resources>
