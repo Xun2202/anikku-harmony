@@ -993,3 +993,13 @@ gh release list --repo Xun2202/anikku-harmony
 - 用户日志(2)/(3)同时有HTTP403/超时/503和aac_adtstoasc ADTS错误。原ffconcat逐文件重建TS解析状态可切断跨片PES/AAC，改本地HLS清单连续解析，仍无损copy、仍只限定MissAV本地代理下载；播放器/其他插件保留旧流程。6秒H264/AAC跨边界夹具原concat只保留241/283音频包，新HLS保留180视频包和283音频包；原手机媒体本体未取回，不能声称逐条真实视频已验证。
 - 401/403只解析刷新一次地址后续传，永久错误不反复打同一分片；清单和分片对暂时性错误有界重试。缓存总量一次恢复，不回放上千次进度；本地合并不计网速。失败摘要优先保留ADTS等真实错误而非仅info收尾。重新下载先校验临时SAF目录可安全清理再删除私有缓存，未知文件保留报错。
 - 新增前台生命周期、音频恢复、单项取消等待/候选暂停竞态、缓存续传/认证错误及持久暂停/速度回归，复用既有原生普通TS合并证据；全部最终版本与结果以档案现状为准。
+
+## 2026-11-18：熄屏反馈后的原生播放保活（0113）
+
+- 用户反馈Anikku59熄屏仍停下载。日志4确认流式音轨与任务仍在、wakeHeld=true，54.424s间播放头仅推进35840帧/4.480s，期间下载日志同步断档，无前台结束/网络阻断记录。可定位到现有保活没防住宿主/音频调度暂停，不能把stream/wakelock显示活动当真机通过；Android侧interactive一直true也不能当未熄屏证据。其他卓易通有声播放用户尚未对比。
+- 下载专属保活改由系统MediaPlayer循环本地30秒全零PCM WAVE，准备异步且15秒有界、独立Looper承接媒体回调；native循环不需App每80ms续写。保留唤醒锁，新增MediaSession播放状态、通知token及暂停/停止沿原下载暂停API；不申请音频焦点。可出现系统播控入口，保活停止即释放会话/播放器/接收器/线程。原书架更新BackgroundKeepAlive不改。
+- 屏幕开关/解锁广播、batteryExempt、原生playing/position、elapsed/uptime调度间隔进入稀疏日志；长断档醒来立即记录。此为有依据的新候选，尚不能承诺卓易通熄屏限制已绕过。参考Android官方MediaPlayer后台播放/setWakeMode及MediaSession文档，未新增依赖或接入原生鸿蒙API。
+- 音频helper与生成器、恢复/WAVE回归在Mi/An逐字节一致；波形检查标准头、完整时长与全零样本，原4项取消/资源释放/重建回归适配native检查。最终必要CI/签名/版本和更新索引见档案；后台效果由真机安装反馈闭环。
+
+- 59的完整缓存仍本地mux失败，摘要只剩Conversion failed和统计，原ADTS修复的合成输入通过不等于真实缓存已修。日志收集改保首2/末2数字ERROR/FATAL和独立warning尾部；关键词覆盖Malformed AAC/ADTS/bitstream/DTS/PTS/PES，持续脱敏。准确FFmpegKit1.18 Level源码声明次序正确，原enum次序比较非根因，不再沿错误假说改行为。
+- 仅当FFmpeg同一行明确Malformed AAC bitstream并推荐aac_adtstoasc时，一次串行本地加-bsf:a aac_adtstoasc重试，无网络重拉；第二次失败或其他诊断明确保留。不得凭“无效数据”跳片/丢音轨/转码或删除未知缓存。FFmpeg7.1.5的Matroska实现也为ADTS提供该滤镜，但当前手机真实原因尚缺具体ERROR，不声称已完全解决。六项日志/脱敏/上限/严格条件回归；一次中段损坏合成mux仍成功，不能据此认定用户缓存损坏。此前跨PES原生证据未改、继续复用。

@@ -1,0 +1,752 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 17:12:31 +0000
+Subject: [PATCH] downloads: use native playback and retain actionable mux
+ errors
+
+Phone feedback shows app-fed PCM and downloads both stall while the wake lock remains held. Use a native MediaPlayer silent loop plus a MediaSession; record screen broadcasts, battery exemption and scheduling gaps. Shared playback files/tests are byte-identical to Mihon 0106. Preserve native first/last ERROR separately; perform at most one local AAC filter retry only for the explicit native recommendation. Reuse valid segments and retain unknown failures.
+---
+ .../data/download/DownloadAudioKeepAlive.kt   | 191 ++++++++++++------
+ .../data/download/DownloadAudioPump.kt        |  12 +-
+ .../data/download/DownloadFfmpegLogs.kt       |  44 ++++
+ .../data/download/DownloadFfmpegPolicy.kt     |  30 ++-
+ .../tachiyomi/data/download/DownloadJob.kt    |   4 +-
+ .../data/download/DownloadNotifier.kt         |   2 +-
+ .../data/download/DownloadSilentWave.kt       |  27 +++
+ .../tachiyomi/data/download/Downloader.kt     |  47 ++---
+ .../NavigationChromeDownloadAudioPumpTest.kt  |  10 +-
+ .../NavigationChromeDownloadFfmpegLogsTest.kt |  76 +++++++
+ .../NavigationChromeDownloadSilentWaveTest.kt |  31 +++
+ 11 files changed, 371 insertions(+), 103 deletions(-)
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegLogs.kt
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadSilentWave.kt
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegLogsTest.kt
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadSilentWaveTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadAudioKeepAlive.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadAudioKeepAlive.kt
+index 0bba7df8a..b9566f954 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadAudioKeepAlive.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadAudioKeepAlive.kt
+@@ -1,120 +1,197 @@
+ package eu.kanade.tachiyomi.data.download
+ 
++import android.app.Notification
++import android.content.BroadcastReceiver
+ import android.content.Context
++import android.content.Intent
++import android.content.IntentFilter
+ import android.media.AudioAttributes
+-import android.media.AudioFormat
+-import android.media.AudioTrack
++import android.media.MediaMetadata
++import android.media.MediaPlayer
++import android.media.session.MediaSession
++import android.media.session.PlaybackState
++import android.os.Handler
++import android.os.HandlerThread
+ import android.os.PowerManager
+ import android.os.SystemClock
++import androidx.core.content.ContextCompat
+ import androidx.core.content.getSystemService
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.android.asCoroutineDispatcher
+ import kotlinx.coroutines.cancel
++import kotlinx.coroutines.cancelAndJoin
++import kotlinx.coroutines.delay
+ import kotlinx.coroutines.launch
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlinx.coroutines.withContext
++import kotlinx.coroutines.withTimeoutOrNull
+ import logcat.LogPriority
+ import tachiyomi.core.common.util.system.logcat
++import java.io.File
++import java.io.IOException
+ import java.util.concurrent.atomic.AtomicReference
++import kotlin.coroutines.resume
++import kotlin.coroutines.resumeWithException
+ 
+-/** Download-owned streaming silence, with explicit cancellation and dead-output recovery. */
+-internal class DownloadAudioKeepAlive(context: Context) {
++/** Download-owned system playback: its native loop does not depend on app-side PCM writes. */
++internal class DownloadAudioKeepAlive(context: Context, private val pauseDownloads: suspend () -> Unit) {
+     private val context = context.applicationContext
+     private val power = this.context.getSystemService<PowerManager>()
+     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+-    private val currentTrack = AtomicReference<AudioTrack?>()
+     private var writer: Job? = null
++    private var thread: HandlerThread? = null
+     private var wakeLock: PowerManager.WakeLock? = null
++    private var receiverRegistered = false
++    private val screenReceiver = object : BroadcastReceiver() {
++        override fun onReceive(context: Context?, intent: Intent?) {
++            logcat(LogPriority.INFO) { "Download keep-alive screen action=${intent?.action} interactive=${power?.isInteractive} idle=${power?.isDeviceIdleMode}" }
++        }
++    }
+ 
+     fun start() {
+         if (writer != null) return
+         runCatching {
+-            wakeLock = power?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "${context.packageName}:download-audio")
+-                ?.apply {
+-                    setReferenceCounted(false)
+-                    acquire(WAKE_TIMEOUT)
+-                }
++            wakeLock = power?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "${context.packageName}:download-media")?.apply {
++                setReferenceCounted(false)
++                acquire(WAKE_TIMEOUT)
++            }
+         }.onFailure { logcat(LogPriority.WARN, it) { "Download keep-alive wake lock unavailable" } }
+-        writer = scope.launch {
++        runCatching {
++            val filter = IntentFilter().apply {
++                addAction(Intent.ACTION_SCREEN_OFF)
++                addAction(Intent.ACTION_SCREEN_ON)
++                addAction(Intent.ACTION_USER_PRESENT)
++            }
++            ContextCompat.registerReceiver(context, screenReceiver, filter, ContextCompat.RECEIVER_EXPORTED)
++            receiverRegistered = true
++        }.onFailure { logcat(LogPriority.WARN, it) { "Download keep-alive screen receiver unavailable" } }
++        val playbackThread = HandlerThread("DownloadMedia").also { it.start() }
++        thread = playbackThread
++        val handler = Handler(playbackThread.looper)
++        writer = scope.launch(handler.asCoroutineDispatcher()) {
+             DownloadAudioPump.run(
+-                create = ::createOutput,
+-                onFailure = { error -> logcat(LogPriority.WARN, error) { "Download keep-alive audio rebuilding" } },
++                create = { createOutput(handler) },
++                onFailure = { error -> logcat(LogPriority.WARN, error) { "Download keep-alive media rebuilding" } },
++                zeroWriteLimit = 3,
+             )
+         }
+     }
+ 
+-    private fun createOutput(): DownloadAudioPump.Sink {
+-        var built: AudioTrack? = null
+-        var published = false
++    private suspend fun createOutput(handler: Handler): DownloadAudioPump.Sink {
++        val file = withContext(Dispatchers.IO) { DownloadSilentWave.write(File(context.cacheDir, "download-keepalive.wav")) }
++        val player = MediaPlayer()
++        var session: MediaSession? = null
+         try {
+-            val minimum = AudioTrack.getMinBufferSize(RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+-            check(minimum > 0) { "Audio minimum buffer invalid: $minimum" }
+-            val track = AudioTrack.Builder()
+-                .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+-                .setAudioFormat(AudioFormat.Builder().setSampleRate(RATE).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
+-                .setTransferMode(AudioTrack.MODE_STREAM)
+-                .setBufferSizeInBytes(maxOf(minimum, CHUNK_BYTES * 4))
+-                .build()
+-            built = track
+-            check(track.state == AudioTrack.STATE_INITIALIZED) { "Audio output is not initialized" }
+-            currentTrack.set(track)
+-            published = true
+-            track.play()
++            val failure = AtomicReference<IOException?>()
++            player.setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
++            player.setWakeMode(context, PowerManager.PARTIAL_WAKE_LOCK)
++            player.setDataSource(file.absolutePath)
++            withTimeoutOrNull(15_000) {
++                suspendCancellableCoroutine<Unit> { continuation ->
++                    player.setOnPreparedListener { if (continuation.isActive) continuation.resume(Unit) }
++                    player.setOnErrorListener { _, what, extra ->
++                        val error = IOException("Download media output failed: $what/$extra")
++                        failure.set(error)
++                        if (continuation.isActive) continuation.resumeWithException(error)
++                        true
++                    }
++                    player.prepareAsync()
++                }
++            } ?: throw IOException("Download media preparation timed out")
++            val mediaSession = MediaSession(context, "DownloadKeepAlive")
++            session = mediaSession
++            mediaSession.setCallback(
++                object : MediaSession.Callback() {
++                    override fun onPause() {
++                        scope.launch { pauseDownloads() }
++                    }
++                    override fun onStop() {
++                        scope.launch { pauseDownloads() }
++                    }
++                },
++                handler,
++            )
++            mediaSession.setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS or MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS)
++            mediaSession.setMetadata(MediaMetadata.Builder().putString(MediaMetadata.METADATA_KEY_TITLE, context.applicationInfo.loadLabel(context.packageManager).toString()).build())
++            player.isLooping = true
++            player.start()
++            mediaSession.setPlaybackState(PlaybackState.Builder().setActions(PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_STOP).setState(PlaybackState.STATE_PLAYING, PlaybackState.PLAYBACK_POSITION_UNKNOWN, 1f).build())
++            mediaSession.isActive = true
++            currentToken = mediaSession.sessionToken
+             logcat(LogPriority.INFO) {
+-                "Download keep-alive audio started mode=stream wakeHeld=${wakeLock?.isHeld} interactive=${power?.isInteractive} idle=${power?.isDeviceIdleMode}"
++                "Download keep-alive media started engine=MediaPlayer sessionActive=${mediaSession.isActive} focusRequested=false " +
++                    "wakeHeld=${wakeLock?.isHeld} interactive=${power?.isInteractive} idle=${power?.isDeviceIdleMode} batteryExempt=${power?.isIgnoringBatteryOptimizations(context.packageName)}"
+             }
+             return object : DownloadAudioPump.Sink {
+-                private val silence = ByteArray(CHUNK_BYTES)
+-                private var lastLog = SystemClock.elapsedRealtime()
+-                override suspend fun write(): Int {
+-                    val count = track.write(silence, 0, silence.size, AudioTrack.WRITE_BLOCKING)
++                private var lastCheck = SystemClock.elapsedRealtime()
++                private var lastUptime = SystemClock.uptimeMillis()
++                private var lastLog = lastCheck
++                override suspend fun step(): Int {
++                    delay(1000)
++                    failure.get()?.let { throw it }
+                     val now = SystemClock.elapsedRealtime()
+-                    if (now - lastLog >= 30_000) {
++                    val uptime = SystemClock.uptimeMillis()
++                    val gap = now - lastCheck
++                    if (gap >= 15_000 || now - lastLog >= 30_000) {
+                         lastLog = now
+-                        runCatching { if (wakeLock?.isHeld == false) wakeLock?.acquire(WAKE_TIMEOUT) }
+                         logcat(LogPriority.INFO) {
+-                            "Download keep-alive audio heartbeat written=$count playState=${track.playState} head=${track.playbackHeadPosition} " +
+-                                "wakeHeld=${wakeLock?.isHeld} interactive=${power?.isInteractive} idle=${power?.isDeviceIdleMode}"
++                            "Download keep-alive media heartbeat playing=${player.isPlaying} positionMs=${player.currentPosition} " +
++                                "elapsedGapMs=$gap uptimeGapMs=${uptime - lastUptime} wakeHeld=${wakeLock?.isHeld} " +
++                                "interactive=${power?.isInteractive} idle=${power?.isDeviceIdleMode} sessionActive=${mediaSession.isActive}"
+                         }
+                     }
+-                    return count
++                    lastCheck = now
++                    lastUptime = uptime
++                    return if (player.isPlaying) 1 else 0
+                 }
+                 override fun close() {
+-                    if (currentTrack.compareAndSet(track, null)) release(track)
++                    release(player, mediaSession)
+                 }
+             }
+         } catch (error: Exception) {
+-            built?.let { track ->
+-                // The owner may have already released it while the factory was being cancelled.
+-                if (!published || currentTrack.compareAndSet(track, null)) release(track)
+-            }
++            release(player, session)
+             throw error
+         }
+     }
+ 
+     suspend fun stopAndJoin() {
+-        writer?.cancel()
+-        // Release first: a blocking AudioTrack.write must wake before joining its coroutine.
+-        currentTrack.getAndSet(null)?.let(::release)
+         try {
+-            writer?.join()
++            writer?.cancelAndJoin()
+         } finally {
+             scope.cancel()
++            thread?.quitSafely()
++            thread = null
++            writer = null
++            if (receiverRegistered) runCatching { context.unregisterReceiver(screenReceiver) }
++            receiverRegistered = false
+             runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
+             wakeLock = null
+-            writer = null
+-            logcat(LogPriority.INFO) { "Download keep-alive audio stopped" }
++            logcat(LogPriority.INFO) { "Download keep-alive media stopped" }
+         }
+     }
+ 
+-    private fun release(track: AudioTrack) {
+-        runCatching { track.stop() }
+-        runCatching { track.release() }
++    private fun release(player: MediaPlayer, session: MediaSession?) {
++        if (session != null && currentToken == session.sessionToken) currentToken = null
++        runCatching { session?.isActive = false }
++        runCatching { session?.release() }
++        runCatching { player.setOnPreparedListener(null) }
++        runCatching { player.setOnErrorListener(null) }
++        runCatching { player.stop() }
++        runCatching { player.release() }
+     }
+ 
+-    private companion object {
+-        const val RATE = 8000
+-        const val CHUNK_BYTES = RATE * 2 * 80 / 1000
+-        const val WAKE_TIMEOUT = 12 * 60 * 60 * 1000L
++    companion object {
++        @Volatile
++        private var currentToken: MediaSession.Token? = null
++
++        fun attach(notification: Notification): Notification = notification.apply {
++            val token = currentToken
++            if (token == null) extras.remove(Notification.EXTRA_MEDIA_SESSION) else extras.putParcelable(Notification.EXTRA_MEDIA_SESSION, token)
++        }
++
++        private const val WAKE_TIMEOUT = 12 * 60 * 60 * 1000L
+     }
+ }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadAudioPump.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadAudioPump.kt
+index b94e3f2e3..93b7a4f28 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadAudioPump.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadAudioPump.kt
+@@ -7,14 +7,14 @@ import kotlinx.coroutines.ensureActive
+ import java.io.Closeable
+ import java.io.IOException
+ 
+-/** Feed real PCM writes so that a dead/stalled audio output can be detected and rebuilt. */
++/** Own a native audio output, with cancellation and bounded recovery when it stops. */
+ internal object DownloadAudioPump {
+     interface Sink : Closeable {
+-        suspend fun write(): Int
++        suspend fun step(): Int
+     }
+ 
+     suspend fun run(
+-        create: () -> Sink,
++        create: suspend () -> Sink,
+         onFailure: (Exception) -> Unit,
+         retryDelayMillis: Long = 1000,
+         zeroWriteLimit: Int = 100,
+@@ -29,15 +29,15 @@ internal object DownloadAudioPump {
+                 var successful = 0
+                 while (true) {
+                     currentCoroutineContext().ensureActive()
+-                    val count = sink.write()
+-                    if (count < 0) throw IOException("Audio write failed: $count")
++                    val count = sink.step()
++                    if (count < 0) throw IOException("Audio output failed: $count")
+                     if (count == 0) {
+                         if (++zeros >= zeroWriteLimit.coerceAtLeast(1)) throw IOException("Audio output stalled")
+                     } else {
+                         zeros = 0
+                         if (++successful >= 50) failures = 0
+                     }
+-                    // Even a broken HAL that accepts writes without backpressure must not busy-spin.
++                    // A broken output must not busy-spin between checks.
+                     delay(if (count == 0) 50L else 5L)
+                 }
+             } catch (cancelled: CancellationException) {
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegLogs.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegLogs.kt
+new file mode 100644
+index 000000000..5285e2240
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegLogs.kt
+@@ -0,0 +1,44 @@
++package eu.kanade.tachiyomi.data.download
++
++/** Preserve native error severity separately from the warning tail and ffmpeg's final summary. */
++internal class DownloadFfmpegLogs {
++    class Failure(detail: String, val needsAdtsConversion: Boolean) : java.io.IOException("ffmpeg: $detail")
++
++    private val firstErrors = mutableListOf<String>()
++    private val lastErrors = ArrayDeque<String>()
++    private val warnings = ArrayDeque<String>()
++
++    /** Use FFmpeg's numeric level value, independent of the Java enum's declaration order. */
++    @Synchronized
++    fun record(levelValue: Int, message: String?) {
++        if (message == null || levelValue > 24 || levelValue == -8) return
++        message.lineSequence().forEach { raw ->
++            val line = DownloadFfmpegPolicy.sanitizeLogLine(raw).take(320)
++            if (line.isEmpty()) return@forEach
++            if (levelValue in 0..16) {
++                if (line !in firstErrors && firstErrors.size < 2) firstErrors += line
++                append(lastErrors, line, 2)
++            } else {
++                append(warnings, line, 4)
++            }
++        }
++    }
++
++    @Synchronized
++    fun failureDetail(sessionLogs: String, returnCode: String): String {
++        val errors = (firstErrors + lastErrors).distinct()
++        val context = DownloadFfmpegPolicy.failureDetail(listOf(sessionLogs) + warnings, returnCode)
++        // Numeric ERROR/FATAL records are retained even when their wording lacks a known keyword.
++        return (errors + context.take(300)).distinct().joinToString(" | ").take(1600)
++    }
++
++    @Synchronized
++    fun needsAacAdtsToAsc(sessionLogs: String): Boolean =
++        (firstErrors + lastErrors + warnings + sessionLogs).any(DownloadFfmpegPolicy::needsAacAdtsToAsc)
++
++    private fun append(lines: ArrayDeque<String>, line: String, limit: Int) {
++        if (lines.lastOrNull() == line) return
++        if (lines.size == limit) lines.removeFirst()
++        lines.addLast(line)
++    }
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt
+index 7e8876117..3f1129a77 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt
+@@ -43,18 +43,30 @@ internal object DownloadFfmpegPolicy {
+     }.getOrDefault("<input>")
+ 
+     fun failureDetail(lines: Iterable<String>, returnCode: String): String {
+-        val clean = lines.flatMap { it.lineSequence().toList() }.map { raw ->
+-            raw.replace(URL) { describeInput(it.value) }
+-                .replace(SECRET_HEADER, "$1: <redacted>")
+-                .replace(CONTEXT_PREFIX, "")
+-                .trim()
+-        }.filter(String::isNotEmpty).distinct()
+-        val important = clean.filter { FAILURE_LINE.containsMatchIn(it) }.takeLast(6)
+-        val detail = (important + clean.takeLast(2)).distinct().joinToString(" | ")
++        val clean = lines.flatMap { it.lineSequence().toList() }.map(::sanitizeLogLine)
++            .filter(String::isNotEmpty).distinct()
++        val important = clean.filter { FAILURE_LINE.containsMatchIn(it) && it != "Conversion failed!" }
++        // Keep an early cause as well as late failures; terminal summaries must not replace it.
++        val detail = (important.take(3) + important.takeLast(3) + clean.takeLast(2)).distinct().joinToString(" | ")
+         return detail.take(1600).ifEmpty { "rc=$returnCode" }
+     }
+ 
+-    private val FAILURE_LINE = Regex("(?i)error|invalid|failed|denied|corrupt|timeout|not found|could not|unable")
++    internal fun sanitizeLogLine(raw: String): String = raw
++        .replace(URL) { describeInput(it.value) }
++        .replace(SECRET_HEADER, "$1: <redacted>")
++        .replace(CONTEXT_PREFIX, "")
++        .trim()
++
++    /** Retry only the explicit native recommendation; generic AAC damage is not repaired by this filter. */
++    fun needsAacAdtsToAsc(text: String): Boolean = text.lineSequence().any {
++        AAC_FILTER_RECOMMENDATION.containsMatchIn(it)
++    }
++
++    private val AAC_FILTER_RECOMMENDATION = Regex("(?i)malformed\\s+AAC\\s+bitstream.*\\buse\\b.*\\baac_adtstoasc\\b")
++    private val FAILURE_LINE = Regex(
++        "(?i)error|invalid|failed|denied|corrupt|timeout|not found|could not|unable|malformed|ADTS|bitstream|" +
++            "non.monoton|timestamp|DTS|PTS|PES packet|not implemented|unsupported",
++    )
+     private val URL = Regex("https?://[^\\s\\\"'<>]+")
+     private val SECRET_HEADER = Regex("(?im)\\b(authorization|cookie|set-cookie):[^\\r\\n]*")
+     private val CONTEXT_PREFIX = Regex("\\[[^\\]]* @ 0x[0-9a-fA-F]+\\]\\s*")
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJob.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJob.kt
+index 8e6e99b4a..c451b9952 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJob.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJob.kt
+@@ -45,7 +45,7 @@ class DownloadJob(private val context: Context, workerParams: WorkerParameters)
+         }.build()
+         return ForegroundInfo(
+             Notifications.ID_DOWNLOAD_EPISODE_PROGRESS,
+-            notification,
++            DownloadAudioKeepAlive.attach(notification),
+             // Harmony -->
+             when {
+                 Build.VERSION.SDK_INT < Build.VERSION_CODES.Q -> 0
+@@ -73,7 +73,7 @@ class DownloadJob(private val context: Context, workerParams: WorkerParameters)
+                 val requested = downloadPreferences.keepAliveInBackground().get()
+                 logcat(LogPriority.INFO) { "Download background guard start attached=$wasRunning keepAliveRequested=$requested" }
+                 if (requested) {
+-                    keepAlive = DownloadAudioKeepAlive(applicationContext)
++                    keepAlive = DownloadAudioKeepAlive(applicationContext) { downloadManager.pauseDownloads() }
+                     keepAlive?.start()
+                 }
+             },
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadNotifier.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadNotifier.kt
+index 7c33351a1..1ebec0fb1 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadNotifier.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadNotifier.kt
+@@ -66,7 +66,7 @@ internal class DownloadNotifier(private val context: Context) {
+      * @param id the id of the notification.
+      */
+     private fun NotificationCompat.Builder.show(id: Int) {
+-        context.notify(id, build())
++        context.notify(id, if (id == Notifications.ID_DOWNLOAD_EPISODE_PROGRESS) DownloadAudioKeepAlive.attach(build()) else build())
+     }
+ 
+     /**
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadSilentWave.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadSilentWave.kt
+new file mode 100644
+index 000000000..1aa0521f6
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadSilentWave.kt
+@@ -0,0 +1,27 @@
++package eu.kanade.tachiyomi.data.download
++
++import java.io.File
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++
++/** A local PCM loop for the system player, with no network or encoded-media dependency. */
++internal object DownloadSilentWave {
++    const val RATE = 8000
++    const val DURATION_SECONDS = 30
++
++    fun write(file: File): File {
++        val dataBytes = RATE * 2 * DURATION_SECONDS
++        val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
++            .put("RIFF".toByteArray(Charsets.US_ASCII)).putInt(36 + dataBytes)
++            .put("WAVEfmt ".toByteArray(Charsets.US_ASCII)).putInt(16)
++            .putShort(1).putShort(1).putInt(RATE).putInt(RATE * 2)
++            .putShort(2).putShort(16)
++            .put("data".toByteArray(Charsets.US_ASCII)).putInt(dataBytes).array()
++        file.outputStream().use { output ->
++            output.write(header)
++            val second = ByteArray(RATE * 2)
++            repeat(DURATION_SECONDS) { output.write(second) }
++        }
++        return file
++    }
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index fa0d6e9fa..6594ec593 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -9,7 +9,6 @@ import androidx.core.net.toUri
+ import com.arthenica.ffmpegkit.FFmpegKit
+ import com.arthenica.ffmpegkit.FFmpegKitConfig
+ import com.arthenica.ffmpegkit.FFprobeKit
+-import com.arthenica.ffmpegkit.Level
+ import com.arthenica.ffmpegkit.LogCallback
+ import com.arthenica.ffmpegkit.StatisticsCallback
+ import com.hippo.unifile.UniFile
+@@ -963,11 +962,26 @@ class Downloader(
+         }
+     }
+ 
+-    // ffmpeg is always on safe mode
++    // A native recommendation can repair ADTS framing once, using the same local segments.
+     private suspend fun ffmpegDownload(
+         download: Download,
+         outputFile: File,
+         prepared: DownloadHlsSegments.Prepared? = null,
++    ) {
++        try {
++            ffmpegDownloadOnce(download, outputFile, prepared)
++        } catch (error: DownloadFfmpegLogs.Failure) {
++            if (prepared == null || !error.needsAdtsConversion) throw error
++            logcat(LogPriority.INFO) { "Download local mux retry episode=${download.episode.id} audioFilter=aac_adtstoasc cache=retained" }
++            ffmpegDownloadOnce(download, outputFile, prepared, convertAdts = true)
++        }
++    }
++
++    private suspend fun ffmpegDownloadOnce(
++        download: Download,
++        outputFile: File,
++        prepared: DownloadHlsSegments.Prepared? = null,
++        convertAdts: Boolean = false,
+     ) {
+         val video = download.video!!
+ 
+@@ -984,7 +998,9 @@ class Downloader(
+         } else {
+             arrayOf(
+                 "-hide_banner", "-loglevel", "info", "-protocol_whitelist", "file", "-f", "hls", "-allowed_extensions", "ts", "-i", prepared.input.absolutePath,
+-                "-map", "0:v", "-map", "0:a?", "-f", "matroska", "-c", "copy", outputFile.absolutePath, "-y",
++                "-map", "0:v", "-map", "0:a?", "-f", "matroska", "-c", "copy",
++                *(if (convertAdts) arrayOf("-bsf:a", "aac_adtstoasc") else emptyArray()),
++                outputFile.absolutePath, "-y",
+             )
+         }
+         val startedAt = SystemClock.elapsedRealtime()
+@@ -1042,21 +1058,8 @@ class Downloader(
+             *ffmpegOptions,
+         )
+ 
+-        // Harmony: keep the last few warnings so a failure can say more than "Error in ffmpeg!".
+-        val recentLogs = ArrayDeque<String>()
+-        val logCallback = LogCallback { log ->
+-            if (log.level <= Level.AV_LOG_WARNING) {
+-                log.message?.trim()?.takeIf { it.isNotEmpty() }?.let {
+-                    val readable = DownloadFfmpegPolicy.failureDetail(listOf(it), "unknown")
+-                    logcat(LogPriority.ERROR) { readable }
+-                    synchronized(recentLogs) {
+-                        if (recentLogs.lastOrNull() == readable) return@let
+-                        if (recentLogs.size >= FFMPEG_LOG_TAIL) recentLogs.removeFirst()
+-                        recentLogs.addLast(readable)
+-                    }
+-                }
+-            }
+-        }
++        val nativeLogs = DownloadFfmpegLogs()
++        val logCallback = LogCallback { log -> nativeLogs.record(log.level.value, log.message) }
+ 
+         val statCallback = StatisticsCallback { stats ->
+             nativeReports.incrementAndGet()
+@@ -1084,10 +1087,9 @@ class Downloader(
+                                         if (result.returnCode.isValueSuccess) {
+                                             continuation.resume(Unit)
+                                         } else {
+-                                            val callbackLogs = synchronized(recentLogs) { recentLogs.toList() }
+-                                            val logs = listOf(result.getAllLogsAsString(500)) + callbackLogs
+-                                            val detail = DownloadFfmpegPolicy.failureDetail(logs, result.returnCode.toString())
+-                                            continuation.resumeWithException(Exception("ffmpeg: $detail"))
++                                            val allLogs = result.getAllLogsAsString(500)
++                                            val detail = nativeLogs.failureDetail(allLogs, result.returnCode.toString())
++                                            continuation.resumeWithException(DownloadFfmpegLogs.Failure(detail, nativeLogs.needsAacAdtsToAsc(allLogs)))
+                                         }
+                                     }
+                                 } finally {
+@@ -1539,7 +1541,6 @@ class Downloader(
+         const val TMP_DIR_SUFFIX = "_tmp"
+         // Harmony: sub-directory of Context.cacheDir that holds videos while ffmpeg muxes them.
+         private const val CACHE_DOWNLOAD_DIR = "harmony_download_tmp"
+-        private const val FFMPEG_LOG_TAIL = 4
+         private const val MUXED_MARKER_SUFFIX = ".muxed"
+ 
+         // Harmony: appended to "<name>.mkv" when downloads should stay out of gallery apps.
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadAudioPumpTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadAudioPumpTest.kt
+index c6d849736..a407d1c32 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadAudioPumpTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadAudioPumpTest.kt
+@@ -21,7 +21,7 @@ class NavigationChromeDownloadAudioPumpTest {
+         val job = launch(start = CoroutineStart.UNDISPATCHED) {
+             DownloadAudioPump.run(create = {
+                 object : DownloadAudioPump.Sink {
+-                    override suspend fun write(): Int {
++                    override suspend fun step(): Int {
+                         writes.complete(Unit)
+                         return 1280
+                     }
+@@ -48,7 +48,7 @@ class NavigationChromeDownloadAudioPumpTest {
+                 val generation = opened.incrementAndGet()
+                 if (generation == 2) assertEquals(1, closed.get())
+                 object : DownloadAudioPump.Sink {
+-                    override suspend fun write(): Int {
++                    override suspend fun step(): Int {
+                         if (generation == 1) return -6
+                         recovered.complete(Unit)
+                         return 1280
+@@ -78,7 +78,7 @@ class NavigationChromeDownloadAudioPumpTest {
+             DownloadAudioPump.run(create = {
+                 if (attempts.incrementAndGet() == 1) throw IOException("synthetic audio init failure")
+                 object : DownloadAudioPump.Sink {
+-                    override suspend fun write(): Int {
++                    override suspend fun step(): Int {
+                         recovered.complete(Unit)
+                         return 1280
+                     }
+@@ -98,7 +98,7 @@ class NavigationChromeDownloadAudioPumpTest {
+     }
+ 
+     @Test
+-    fun `repeated zero writes rebuild a stalled output without spinning`() = runBlocking {
++    fun `repeated inactive checks rebuild a stalled output without spinning`() = runBlocking {
+         val opened = AtomicInteger()
+         val failures = AtomicInteger()
+         val recovered = CompletableDeferred<Unit>()
+@@ -106,7 +106,7 @@ class NavigationChromeDownloadAudioPumpTest {
+             DownloadAudioPump.run(create = {
+                 val generation = opened.incrementAndGet()
+                 object : DownloadAudioPump.Sink {
+-                    override suspend fun write(): Int {
++                    override suspend fun step(): Int {
+                         if (generation == 1) return 0
+                         recovered.complete(Unit)
+                         return 1280
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegLogsTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegLogsTest.kt
+new file mode 100644
+index 000000000..ba3e7c9aa
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegLogsTest.kt
+@@ -0,0 +1,76 @@
++package eu.kanade.tachiyomi.data.download
++
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++
++class NavigationChromeDownloadFfmpegLogsTest {
++    @Test
++    fun `native numeric ERROR survives later warnings and info summaries without needing keywords`() {
++        val logs = DownloadFfmpegLogs()
++        logs.record(16, "A native cause without a matching keyword")
++        repeat(20) { logs.record(24, "Later warning $it") }
++        logs.record(32, "Informational output")
++        val detail = logs.failureDetail("Conversion failed!\nvideo:100kB audio:10kB muxing overhead: 1%", "1")
++        assertTrue(detail.contains("A native cause without a matching keyword"))
++        assertFalse(detail.contains("Informational output"))
++    }
++
++    @Test
++    fun `AAC bitstream and timestamp causes precede terminal statistics`() {
++        val cause = "Malformed AAC bitstream detected: use the audio bitstream filter aac_adtstoasc to fix it"
++        val detail = DownloadFfmpegPolicy.failureDetail(
++            listOf(cause, "Conversion failed!", "video:100kB audio:10kB", "muxing overhead: 1%"),
++            "1",
++        )
++        assertTrue(detail.startsWith(cause))
++        assertTrue(DownloadFfmpegPolicy.failureDetail(listOf("Non-monotonous DTS in output stream", "summary", "end"), "1").startsWith("Non-monotonous DTS"))
++    }
++
++    @Test
++    fun `first and latest native errors survive many intermediate error records`() {
++        val logs = DownloadFfmpegLogs()
++        logs.record(8, "Initial fatal cause")
++        repeat(100) { logs.record(16, "Intermediate record $it") }
++        logs.record(0, "Final panic cause")
++        val detail = logs.failureDetail("Conversion failed!", "1")
++        assertTrue(detail.contains("Initial fatal cause"))
++        assertTrue(detail.contains("Final panic cause"))
++        assertTrue(detail.length <= 1600)
++    }
++
++    @Test
++    fun `retained callback diagnostics redact URL credentials query and secret headers`() {
++        val logs = DownloadFfmpegLogs()
++        logs.record(16, "[aac @ 0xABC] Failed https://user:password@cdn.example/segment?token=private\nAuthorization: Bearer private-secret\nCookie: private-cookie")
++        val detail = logs.failureDetail("Conversion failed!", "1")
++        assertTrue(detail.contains("https://cdn.example/segment"))
++        listOf("password", "private", "user:", "0xABC", "token=").forEach { assertFalse(detail.contains(it)) }
++    }
++
++    @Test
++    fun `empty diagnostics retain return code and large records remain bounded`() {
++        assertEquals("rc=-1", DownloadFfmpegLogs().failureDetail("", "-1"))
++        val logs = DownloadFfmpegLogs()
++        repeat(1000) { logs.record(16, "$it " + "x".repeat(2000)) }
++        assertTrue(logs.failureDetail("Conversion failed!", "1").length <= 1600)
++    }
++
++    @Test
++    fun `AAC filter retry requires the explicit native bitstream conversion recommendation`() {
++        val recommendation = "Malformed AAC bitstream detected: use the audio bitstream filter 'aac_adtstoasc' to fix it ('-bsf:a aac_adtstoasc' option with ffmpeg)"
++        assertTrue(DownloadFfmpegPolicy.needsAacAdtsToAsc(recommendation))
++        val logs = DownloadFfmpegLogs()
++        logs.record(16, recommendation)
++        repeat(20) { logs.record(24, "Following warning $it") }
++        assertTrue(logs.needsAacAdtsToAsc("Conversion failed!"))
++        listOf(
++            "Malformed AAC bitstream detected",
++            "Invalid ADTS data",
++            "Error applying aac_adtstoasc filter",
++            "Malformed AAC bitstream\nUse aac_adtstoasc for a different stream",
++            "Conversion failed!",
++        ).forEach { assertFalse(DownloadFfmpegPolicy.needsAacAdtsToAsc(it)) }
++    }
++}
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadSilentWaveTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadSilentWaveTest.kt
+new file mode 100644
+index 000000000..fe32facf1
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadSilentWaveTest.kt
+@@ -0,0 +1,31 @@
++package eu.kanade.tachiyomi.data.download
++
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++import org.junit.jupiter.api.io.TempDir
++import java.io.File
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++
++class NavigationChromeDownloadSilentWaveTest {
++    @TempDir
++    lateinit var directory: File
++
++    @Test
++    fun `system playback loop is a complete standard PCM wave containing only silence`() {
++        val file = File(directory, "silence.wav").apply { writeText("stale incomplete file") }
++        val data = DownloadSilentWave.write(file).readBytes()
++        assertEquals("RIFF", data.copyOfRange(0, 4).toString(Charsets.US_ASCII))
++        assertEquals("WAVEfmt ", data.copyOfRange(8, 16).toString(Charsets.US_ASCII))
++        val header = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
++        assertEquals(data.size - 8, header.getInt(4))
++        assertEquals(1, header.getShort(20).toInt())
++        assertEquals(1, header.getShort(22).toInt())
++        assertEquals(8000, header.getInt(24))
++        assertEquals(16, header.getShort(34).toInt())
++        assertEquals(30, header.getInt(40) / header.getInt(28))
++        assertEquals(header.getInt(40) + 44, data.size)
++        assertTrue(data.drop(44).all { it == 0.toByte() })
++    }
++}
