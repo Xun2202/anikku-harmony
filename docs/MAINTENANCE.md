@@ -943,3 +943,11 @@ gh release list --repo Xun2202/anikku-harmony
 ### 0105：快速返回再续读与恢复宿主
 
 第二轮CI精确日志定位：详情第一次返回后快速再左滑时，兜底delay阻塞settled observer，可能合并掉中间page0而漏第二次完成事件；兜底改独立可取消job，返回/销毁一并取消，原连续两次启动断言保留。恢复三布局并非Paging为空：诊断为source恢复后整个lazy页未组合（presented为空），fixture先把Android根内容清空使宿主可变0尺寸；现在固定宿主视口模拟真实详情承接，来源子树仍完整销毁/保存/新registry重建，显式等layout后精确验anchor。第二轮失败均无Release，原数据回放推测不替代此阶段诊断。
+
+## 2026-11-17：下载存储恢复与本地HLS兼容（0106）
+
+- 用户在Anikku54的MissAV下载失败/反复重试，日志有loopback /m3u8的ffmpeg INVALIDDATA、分片超时/503，以及.mkv.anikku与.mkv (1).anikku双文件后永久重试。原始含链接的日志不入仓。两款共用UniFile在目标删除失败时停止，不继续create同名制造(1)；以真实复制字节数/目标长度验证，元数据0时保留原文件并报错重试。
+- Anikku结构化下载children，保留已取消owner链并等待阻塞copy/原生ffmpeg结束后再启新任务；移除再入队也等待旧写入，防旧owner停止新队列。内部复制完成/ERROR/marker/非零长度绑定，远端Video URL不改成本地路径；完全字节相同的旧副本可自动恢复，不同或未知文件保留并明确失败，不整删既有final目录。外部下载器保留原handoff协议，不套内部mux完成条件。
+- 依native -h输出只为localhost/127.0.0.1/::1的m3u8代理开启支持的extension_picky/segment扩展兼容与分片重试，远端普通playlist及file allowlist保持。HTTP对408/429/部分5xx及网络故障做有界重连，不重试401/403/404；不设置EOF重连。duration读取stdout，移除不兼容-o/共享临时文件/-v quiet，10s可选探测超时不阻下载。下载显式warning级别，回调不足时取session原生日志，URL query/userinfo及认证头脱敏。
+- 本机FFmpeg7.1.5对合成TS的真实/m3u8→/segment?part=0复现InvalidData（未请求分片），兼容后得到完整3s Matroska；连续2次503在第3次成功，未请求真实站点视频。APK内实际native版本以运行时能力检测，仍待用户MissAV真机下载反馈；不声称云端夹具=手机通过。新增app policy4项、存储/取消12项自动接现有NavigationChrome CI。
+- 来源完整恢复测试改两款均支持的旧Compose测试入口，保留固定宿主/来源完全销毁、精确anchor和新Paging身份断言；An第三轮编译发现v2 API不存在，未发布55，本次不再假设两款Compose版本相同。Mihon43浏览修复已通过并发布；最终Mihon44包含共用安全护栏，Anikku55合入浏览与下载修复，APK/回归/签名/索引证据见档案。

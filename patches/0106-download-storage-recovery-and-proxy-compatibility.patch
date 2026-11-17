@@ -1,0 +1,1240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 13:01:20 +0000
+Subject: [PATCH] downloads: preserve recovery files and support local HLS
+ proxy streams
+
+Shared storage deletion and verified-copy guard matches mihon-harmony 0102. Preserve source data when the target cannot be verified. The restore regression uses the older Compose test entry supported by both apps. Anikku additionally serializes canceled download owners, recovers verified duplicate videos, keeps remote retry URLs, and configures supported loopback HLS/HTTP options with redacted native diagnostics.
+---
+ .../data/download/DownloadFfmpegPolicy.kt     |  58 ++++
+ .../data/download/DownloadFfmpegRuntime.kt    |  30 ++
+ .../data/download/DownloadJobSession.kt       |  45 +++
+ .../tachiyomi/data/download/Downloader.kt     | 280 ++++++++---------
+ .../data/download/EpisodeDownloadStorage.kt   | 148 +++++++++
+ ...avigationChromeDownloadFfmpegPolicyTest.kt |  64 ++++
+ .../NavigationChromeDownloadRecoveryTest.kt   | 283 ++++++++++++++++++
+ .../core/common/storage/UniFileExtensions.kt  |  15 +-
+ ...NavigationChromeSourceBrowseRestoreTest.kt |   2 +-
+ 9 files changed, 780 insertions(+), 145 deletions(-)
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegRuntime.kt
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJobSession.kt
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegPolicyTest.kt
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt
+new file mode 100644
+index 000000000..42ba2d4af
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt
+@@ -0,0 +1,58 @@
++package eu.kanade.tachiyomi.data.download
++
++import java.net.URI
++
++/** Runtime capabilities keep older FFmpeg builds usable without assuming their demuxer options. */
++internal object DownloadFfmpegPolicy {
++    fun inputOptions(url: String, hlsHelp: String, httpHelp: String): List<String> {
++        val uri = runCatching { URI(url) }.getOrNull() ?: return emptyList()
++        if (uri.scheme?.lowercase() !in setOf("http", "https")) return emptyList()
++        return buildList {
++            // Short, bounded retries handle a proxy/CDN hiccup without restarting the whole file.
++            addAll(listOf("-rw_timeout", "30000000", "-reconnect", "1", "-reconnect_streamed", "1"))
++            addAll(listOf("-reconnect_on_network_error", "1", "-reconnect_on_http_error", "408,429,500,502,503,504"))
++            addAll(listOf("-reconnect_delay_max", "2"))
++            if (supports(httpHelp, "reconnect_max_retries")) addAll(listOf("-reconnect_max_retries", "3"))
++            if (supports(httpHelp, "reconnect_delay_total_max")) addAll(listOf("-reconnect_delay_total_max", "10"))
++            if (isLocalHlsProxy(uri)) {
++                // The proxy returns TS bytes at /segment?url=..., without a filename extension.
++                // Leave ordinary remote playlists and the file-protocol allowlist unchanged.
++                if (supports(hlsHelp, "extension_picky")) {
++                    addAll(listOf("-extension_picky", "0"))
++                } else if (supports(hlsHelp, "allowed_segment_extensions")) {
++                    addAll(listOf("-allowed_segment_extensions", "ALL"))
++                }
++                if (supports(hlsHelp, "seg_max_retry")) addAll(listOf("-seg_max_retry", "3"))
++            }
++        }
++    }
++
++    private fun isLocalHlsProxy(uri: URI): Boolean {
++        val host = uri.host?.lowercase()?.removeSurrounding("[", "]")
++        val path = uri.path.orEmpty().trimEnd('/').lowercase()
++        return host in setOf("localhost", "127.0.0.1", "::1") &&
++            (path.substringAfterLast('/') == "m3u8" || path.endsWith(".m3u8"))
++    }
++
++    private fun supports(help: String, option: String): Boolean =
++        Regex("(?:^|\\s)-${Regex.escape(option)}(?:\\s|$)").containsMatchIn(help)
++
++    fun describeInput(url: String): String = runCatching {
++        val uri = URI(url)
++        URI(uri.scheme, null, uri.host, uri.port, uri.path, null, null).toASCIIString()
++    }.getOrDefault("<input>")
++
++    fun failureDetail(lines: Iterable<String>, returnCode: String): String {
++        val clean = lines.flatMap { it.lineSequence().toList() }.map { raw ->
++            raw.replace(URL) { describeInput(it.value) }
++                .replace(SECRET_HEADER, "$1: <redacted>")
++                .replace(CONTEXT_PREFIX, "")
++                .trim()
++        }.filter(String::isNotEmpty).distinct().takeLast(8)
++        return clean.joinToString(" | ").takeLast(1600).ifEmpty { "rc=$returnCode" }
++    }
++
++    private val URL = Regex("https?://[^\\s\\\"'<>]+")
++    private val SECRET_HEADER = Regex("(?im)\\b(authorization|cookie|set-cookie):[^\\r\\n]*")
++    private val CONTEXT_PREFIX = Regex("\\[[^\\]]* @ 0x[0-9a-fA-F]+\\]\\s*")
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegRuntime.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegRuntime.kt
+new file mode 100644
+index 000000000..087ba35d6
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegRuntime.kt
+@@ -0,0 +1,30 @@
++package eu.kanade.tachiyomi.data.download
++
++import com.arthenica.ffmpegkit.FFmpegKit
++import com.arthenica.ffmpegkit.FFmpegKitConfig
++import logcat.LogPriority
++import tachiyomi.core.common.util.system.logcat
++
++/** Query the bundled native build once; its supported options can differ from mpv's FFmpeg. */
++internal object DownloadFfmpegRuntime {
++    private val capabilities by lazy {
++        fun help(topic: String): String = runCatching {
++            FFmpegKit.executeWithArguments(arrayOf("-hide_banner", "-loglevel", "info", "-h", topic))
++                .getAllLogsAsString(250)
++        }.getOrDefault("")
++        val hls = help("demuxer=hls")
++        val http = help("protocol=http")
++        logcat(LogPriority.INFO) {
++            "Download FFmpeg ${FFmpegKitConfig.getFFmpegVersion()}: " +
++                "proxyExtensionOption=${hls.contains("-extension_picky") || hls.contains("-allowed_segment_extensions")}, " +
++                "segmentRetry=${hls.contains("-seg_max_retry")}, boundedReconnect=${http.contains("-reconnect_max_retries")}"
++        }
++        hls to http
++    }
++
++    fun inputOptions(url: String): List<String> {
++        if (!url.startsWith("http://", true) && !url.startsWith("https://", true)) return emptyList()
++        val (hls, http) = capabilities
++        return DownloadFfmpegPolicy.inputOptions(url, hls, http)
++    }
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJobSession.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJobSession.kt
+new file mode 100644
+index 000000000..6bd552950
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJobSession.kt
+@@ -0,0 +1,45 @@
++package eu.kanade.tachiyomi.data.download
++
++import kotlinx.coroutines.CompletableDeferred
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.CoroutineStart
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.NonCancellable
++import kotlinx.coroutines.ensureActive
++import kotlinx.coroutines.job
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++
++/** Keep cancelled owners until all their blocking writes and structured children have stopped. */
++internal class DownloadJobSession(private val scope: CoroutineScope) {
++    private val lock = Any()
++
++    @Volatile
++    var job: Job? = null
++        private set
++
++    fun start(block: suspend CoroutineScope.(Job) -> Unit): Boolean = synchronized(lock) {
++        if (job?.isActive == true) return@synchronized false
++        val previous = job
++        val installed = CompletableDeferred<Unit>()
++        // Enter the non-cancellable predecessor wait before start() returns. A dispatcher-queued
++        // coroutine cancelled before its first instruction would otherwise break the wait chain.
++        val next = scope.launch(start = CoroutineStart.UNDISPATCHED) {
++            withContext(NonCancellable) {
++                installed.await()
++                previous?.join()
++            }
++            ensureActive()
++            block(coroutineContext.job)
++        }
++        job = next
++        installed.complete(Unit)
++        true
++    }
++
++    fun cancel() = synchronized(lock) { job?.cancel() }
++
++    fun ifCurrent(owner: Job, action: () -> Unit) = synchronized(lock) {
++        if (job === owner && owner.isActive) action()
++    }
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index c96ed63b7..28ea6c3c5 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -26,17 +26,18 @@ import eu.kanade.tachiyomi.ui.player.loader.EpisodeLoader
+ import eu.kanade.tachiyomi.ui.player.loader.HosterLoader
+ import eu.kanade.tachiyomi.util.storage.DiskUtil
+ import eu.kanade.tachiyomi.util.storage.DiskUtil.NOMEDIA_FILE
+-import eu.kanade.tachiyomi.util.storage.toFFmpegString
+ import eu.kanade.tachiyomi.util.system.copyToClipboard
+-import eu.kanade.tachiyomi.util.system.createFileInCacheDir
+ import kotlinx.collections.immutable.toImmutableList
+ import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.CompletableDeferred
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.Job
++import kotlinx.coroutines.NonCancellable
+ import kotlinx.coroutines.SupervisorJob
+ import kotlinx.coroutines.async
+ import kotlinx.coroutines.delay
++import kotlinx.coroutines.ensureActive
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.asStateFlow
+ import kotlinx.coroutines.flow.collectLatest
+@@ -52,12 +53,12 @@ import kotlinx.coroutines.flow.update
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.supervisorScope
+ import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlinx.coroutines.withContext
++import kotlinx.coroutines.withTimeoutOrNull
+ import logcat.LogPriority
+ import tachiyomi.core.common.i18n.stringResource
+ import tachiyomi.core.common.storage.displayablePath
+-import tachiyomi.core.common.storage.extension
+ import tachiyomi.core.common.storage.renameToOrCopy
+-import tachiyomi.core.common.util.lang.launchIO
+ import tachiyomi.core.common.util.lang.withIOContext
+ import tachiyomi.core.common.util.system.logcat
+ import tachiyomi.domain.anime.model.Anime
+@@ -70,7 +71,6 @@ import tachiyomi.i18n.ank.AMR
+ import uy.kohesive.injekt.Injekt
+ import uy.kohesive.injekt.api.get
+ import uy.kohesive.injekt.injectLazy
+-import java.io.BufferedReader
+ import java.io.File
+ import java.io.IOException
+ import kotlin.coroutines.resume
+@@ -116,7 +116,8 @@ class Downloader(
+     /**
+      * Job object for download queue management
+      */
+-    private var downloaderJob: Job? = null
++    private val downloaderSessions = DownloadJobSession(scope)
++    private val downloaderJob: Job? get() = downloaderSessions.job
+ 
+     /**
+      * Preference for user's choice of external downloader
+@@ -152,7 +153,6 @@ class Downloader(
+         // KMK <--
+ 
+         val pending = queueState.value.filter { it.status != Download.State.DOWNLOADED }
+-        pending.forEach { if (it.status != Download.State.QUEUE) it.status = Download.State.QUEUE }
+ 
+         launchDownloaderJob()
+ 
+@@ -208,7 +208,10 @@ class Downloader(
+     private fun launchDownloaderJob() {
+         if (isRunning) return
+ 
+-        downloaderJob = scope.launch {
++        downloaderSessions.start { owner ->
++            // A cancelled predecessor can finish a blocking write after start() was called.
++            // Reset pending statuses only after the session has waited for that predecessor.
++            queueState.value.filter { it.status != Download.State.DOWNLOADED }.forEach { it.status = Download.State.QUEUE }
+             // Harmony: refresh the notification once a second so the speed and the progress keep
+             // moving while ffmpeg runs. Cancelled together with the downloader job.
+             DownloadSpeedMeter.reset()
+@@ -244,7 +247,9 @@ class Downloader(
+                     activeDownloadsErroredFlow.first()
+                 }
+ 
+-                if (areAllDownloadsFinished()) stop()
++                downloaderSessions.ifCurrent(owner) {
++                    if (areAllDownloadsFinished()) stop()
++                }
+             }
+                 .distinctUntilChanged()
+ 
+@@ -256,12 +261,15 @@ class Downloader(
+                     val downloadJobsToStop = downloadJobs.filter { it.key !in activeDownloads }
+                     downloadJobsToStop.forEach { (download, job) ->
+                         job.cancel()
++                        // A removed/requeued episode can reuse the same directory. Finish its
++                        // blocking copy before this collector starts a replacement child.
++                        withContext(NonCancellable) { job.join() }
+                         downloadJobs.remove(download)
+                     }
+ 
+                     val downloadsToStart = activeDownloads.filter { it !in downloadJobs }
+                     downloadsToStart.forEach { download ->
+-                        downloadJobs[download] = launchDownloadJob(download)
++                        downloadJobs[download] = launchDownloadJob(download, owner)
+                     }
+                 }
+             }
+@@ -271,10 +279,12 @@ class Downloader(
+     /**
+      * Launch the job responsible for download a single video
+      */
+-    private fun CoroutineScope.launchDownloadJob(download: Download) = launchIO {
++    private fun CoroutineScope.launchDownloadJob(download: Download, owner: Job) = launch(Dispatchers.IO) {
+         // This try-catch manages the job cancellation
+         try {
++            if (download !in queueState.value) return@launch
+             downloadEpisode(download)
++            ensureActive()
+ 
+             // Remove successful download from queue
+             if (download.status == Download.State.DOWNLOADED) {
+@@ -284,7 +294,7 @@ class Downloader(
+             if (e is CancellationException) throw e
+             logcat(LogPriority.ERROR, e)
+             notifier.onError(e.message)
+-            stop()
++            downloaderSessions.ifCurrent(owner) { stop() }
+         }
+     }
+ 
+@@ -292,8 +302,7 @@ class Downloader(
+      * Destroys the downloader subscriptions.
+      */
+     private fun cancelDownloaderJob() {
+-        downloaderJob?.cancel()
+-        downloaderJob = null
++        downloaderSessions.cancel()
+     }
+ 
+     /**
+@@ -505,15 +514,9 @@ class Downloader(
+     }
+ 
+     /**
+-     * Harmony: handles an episode folder that already exists on disk although the download
+-     * cache did not list the episode as downloaded.
+-     *
+-     * A video still waiting in the `_tmp` directory means the move into the final folder was
+-     * interrupted; the final copy is then only trusted when it has the same size.
+-     *
+-     * @return true when the existing folder holds a complete video and has been registered as
+-     * downloaded; false when there was nothing on disk or the leftover was removed so the
+-     * download can start from scratch (reusing whatever is left in the `_tmp` directory).
++     * Reconcile an existing final folder without deleting ambiguous videos. Pending copies must
++     * agree byte-for-byte; otherwise preserve both directories and report a recoverable failure.
++     * @return true for a verified existing copy, false for a missing or empty target.
+      */
+     private suspend fun reuseOrRemoveExistingEpisode(download: Download, animeDir: UniFile, episodeDirname: String): Boolean {
+         val existing = provider
+@@ -521,33 +524,32 @@ class Downloader(
+             .firstNotNullOfOrNull { animeDir.findFile(it) }
+             ?: return false
+         val name = existing.name ?: return false
+-
+-        val videos = existing.listFiles().orEmpty().filterNot { it.name == NOMEDIA_FILE || it.extension == "tmp" }
+-        val tmpDir = animeDir.findFile(episodeDirname + TMP_DIR_SUFFIX)
+-        val pendingVideos = tmpDir?.listFiles().orEmpty().filterNot { it.extension == "tmp" }
+-        val video = videos.singleOrNull()
+-        val complete = video != null && video.length() > 0 &&
+-            (pendingVideos.isEmpty() || pendingVideos.any { it.length() == video.length() })
+-
+-        if (complete) {
+-            logcat(LogPriority.INFO) {
+-                "'${download.episode.name}' already on disk as '$name' (${video!!.length()} bytes); registering it as downloaded"
+-            }
+-            DiskUtil.createNoMediaFile(existing, context)
+-            cache.addChapter(name, animeDir, download.anime)
+-            // Whatever an earlier attempt left in the temporary directory is no longer needed.
+-            tmpDir?.delete()
+-            return true
++        val filename = DiskUtil.buildValidFilename(download.episode.name)
++        val cacheFile = cacheOutputFile(download, filename)
++        val completedCache = cacheFile.takeIf { File(it.path + MUXED_MARKER_SUFFIX).isFile }
++        val video = if (usesInternalDownloader(download)) {
++            EpisodeDownloadStorage.recover(existing, filename, completedCache)
++        } else {
++            existing.listFiles().orEmpty().filterNot { it.name == NOMEDIA_FILE || it.extension == "tmp" }
++                .singleOrNull()?.takeIf { it.length() > 0L }
+         }
+-
+-        logcat(LogPriority.WARN) {
+-            "Removing incomplete leftover '$name' of '${download.episode.name}' " +
+-                "(${videos.size} file(s), ${pendingVideos.size} pending in $TMP_DIR_SUFFIX)"
++        if (video == null) {
++            // Empty targets can be merged by renameToOrCopy. Never delete a final folder whose
++            // existing video cannot be proved complete, including differently sized duplicates.
++            if (existing.listFiles()?.all { it.name == NOMEDIA_FILE } == true) return false
++            throw IOException("Existing episode is not verified; files were preserved for recovery")
+         }
+-        if (!existing.delete()) {
+-            throw IOException(context.stringResource(AMR.strings.harmony_download_leftover_delete_failed, name))
++        val tmpDir = animeDir.findFile(episodeDirname + TMP_DIR_SUFFIX)
++        if (usesInternalDownloader(download) && tmpDir != null && tmpDir.listFiles()?.any { it.name != NOMEDIA_FILE } == true) {
++            val pending = EpisodeDownloadStorage.recover(tmpDir, filename, completedCache)
++            if (pending == null || !EpisodeDownloadStorage.sameContents(video, pending)) {
++                throw IOException("Final and pending episode copies differ; files were preserved for recovery")
++            }
+         }
+-        return false
++        DiskUtil.createNoMediaFile(existing, context)
++        cache.addChapter(name, animeDir, download.anime)
++        // Retain any pending copy. Completion must not depend on deleting the only recovery data.
++        return true
+     }
+ 
+     /**
+@@ -567,17 +569,15 @@ class Downloader(
+         // Get filename from download info
+         val filename = DiskUtil.buildValidFilename(download.episode.name)
+ 
+-        // Harmony: "<filename>.tmp" is the "copy in progress" marker written by copyIntoDownloadDir()
+-        // (or the partially copied file itself in builds before preview.8). If it is still there the
+-        // previous attempt was interrupted and the video next to it cannot be trusted.
+-        tmpDir.findFile("$filename.tmp")?.let { marker ->
+-            marker.delete()
+-            tmpDir.listFiles()?.filter { it.name!!.startsWith("$filename.mkv") }?.forEach { it.delete() }
++        val cacheFile = cacheOutputFile(download, filename)
++        val completedCache = cacheFile.takeIf { File(it.path + MUXED_MARKER_SUFFIX).isFile }
++        val internal = usesInternalDownloader(download)
++        val videoFile = if (internal) {
++            EpisodeDownloadStorage.recover(tmpDir, filename, completedCache)
++        } else {
++            tmpDir.listFiles()?.firstOrNull { it.name?.startsWith("$filename.mkv") == true }
+         }
+ 
+-        // Try to find the video file
+-        val videoFile = tmpDir.listFiles()?.firstOrNull { it.name!!.startsWith("$filename.mkv") }
+-
+         try {
+             // If the video is already downloaded, do nothing. Otherwise download from network
+             val file = when {
+@@ -589,7 +589,7 @@ class Downloader(
+                     download.progress = 0
+ 
+                     // If videoFile is not existing then download it
+-                    if (preferences.useExternalDownloader().get() == download.changeDownloader) {
++                    if (internal) {
+                         // Progress and speed are pushed by the 1 Hz ticker in launchDownloaderJob().
+                         downloadVideo(download, tmpDir, filename)
+                     } else {
+@@ -601,9 +601,15 @@ class Downloader(
+                 }
+             }
+ 
+-            video.videoUrl = file.uri.path ?: ""
++            // Keep the original remote URL. A later storage error may require resolving/downloading
++            // again; a document path must never replace the input URL used by ffmpeg on retry.
++            if (internal && file.length() <= 0L) throw IOException("Downloaded video length is not verified")
+             download.progress = 100
+             video.status = Video.State.Ready
++            if (videoFile != null && completedCache != null) {
++                completedCache.delete()
++                File(completedCache.path + MUXED_MARKER_SUFFIX).delete()
++            }
+         } catch (e: Exception) {
+             if (e is CancellationException) throw e
+             logcat(LogPriority.ERROR, e) { "Failed to download ${download.episode.name}" }
+@@ -703,44 +709,8 @@ class Downloader(
+      * application/octet-stream MIME type, so scanners that ignore .nomedia (HarmonyOS) do not treat
+      * it as a video. [DownloadManager.buildVideo] accepts both names.
+      */
+-    private fun copyIntoDownloadDir(cacheFile: File, tmpDir: UniFile, filename: String): UniFile {
+-        if (!cacheFile.isFile || cacheFile.length() == 0L) {
+-            throw IOException("ffmpeg produced no output for $filename")
+-        }
+-
+-        val finalName = if (preferences.hideDownloadedVideosFromGallery().get()) {
+-            "$filename.mkv$HIDDEN_VIDEO_SUFFIX"
+-        } else {
+-            "$filename.mkv"
+-        }
+-
+-        tmpDir.listFiles()?.filter { it.name!!.startsWith("$filename.mkv") }?.forEach { it.delete() }
+-        val marker = tmpDir.findFile("$filename.tmp")
+-            ?: tmpDir.createFile("$filename.tmp")
+-            ?: throw IOException("Failed to create $filename.tmp in ${tmpDir.displayablePath}")
+-        val target = tmpDir.createFile(finalName)
+-            ?: throw IOException("Failed to create $finalName in ${tmpDir.displayablePath}")
+-        try {
+-            cacheFile.inputStream().use { input ->
+-                target.openOutputStream().use { output ->
+-                    input.copyTo(output)
+-                }
+-            }
+-            val copied = target.length()
+-            if (copied > 0 && copied != cacheFile.length()) {
+-                throw IOException("Copied $copied of ${cacheFile.length()} bytes of $finalName")
+-            }
+-        } catch (e: Exception) {
+-            target.delete()
+-            throw e
+-        }
+-
+-        if (!marker.delete() && tmpDir.findFile("$filename.tmp") != null) {
+-            target.delete()
+-            throw IOException("Failed to remove $filename.tmp in ${tmpDir.displayablePath}")
+-        }
+-        return target
+-    }
++    private fun copyIntoDownloadDir(cacheFile: File, tmpDir: UniFile, filename: String): UniFile =
++        EpisodeDownloadStorage.copy(cacheFile, tmpDir, filename, preferences.hideDownloadedVideosFromGallery().get())
+ 
+     /**
+      * Runs a storage operation up to three times, waiting 2 and 4 seconds in between, for providers
+@@ -809,9 +779,8 @@ class Downloader(
+         val logCallback = LogCallback { log ->
+             if (log.level <= Level.AV_LOG_WARNING) {
+                 log.message?.trim()?.takeIf { it.isNotEmpty() }?.let {
+-                    logcat(LogPriority.ERROR) { it }
+-                    // "[tcp @ 0x7dad…] Connection failed" → "Connection failed": the pointer means nothing to users.
+-                    val readable = it.replace(FFMPEG_CONTEXT_PREFIX, "").ifEmpty { it }
++                    val readable = DownloadFfmpegPolicy.failureDetail(listOf(it), "unknown")
++                    logcat(LogPriority.ERROR) { readable }
+                     synchronized(recentLogs) {
+                         if (recentLogs.lastOrNull() == readable) return@let
+                         if (recentLogs.size >= FFMPEG_LOG_TAIL) recentLogs.removeFirst()
+@@ -838,24 +807,39 @@ class Downloader(
+             }
+         }
+ 
+-        suspendCancellableCoroutine { continuation ->
+-            val session = FFmpegKit.executeWithArgumentsAsync(
+-                ffmpegOptions,
+-                {
+-                    if (it.returnCode.isValueSuccess) {
+-                        continuation.resume(it)
+-                    } else {
+-                        val tail = synchronized(recentLogs) { recentLogs.joinToString(" | ") }
+-                        val detail = if (tail.isEmpty()) "rc=${it.returnCode}" else tail
+-                        continuation.resumeWithException(Exception("ffmpeg: $detail"))
+-                    }
+-                },
+-                logCallback,
+-                statCallback,
+-            )
+-            continuation.invokeOnCancellation {
+-                session.cancel()
++        val finished = CompletableDeferred<Unit>()
++        var nativeStarted = false
++        try {
++            suspendCancellableCoroutine<Unit> { continuation ->
++                val session = FFmpegKit.executeWithArgumentsAsync(
++                    ffmpegOptions,
++                    { result ->
++                        try {
++                            if (continuation.isActive) {
++                                if (result.returnCode.isValueSuccess) {
++                                    continuation.resume(Unit)
++                                } else {
++                                    val callbackLogs = synchronized(recentLogs) { recentLogs.toList() }
++                                    val logs = callbackLogs.ifEmpty { listOf(result.getAllLogsAsString(250)) }
++                                    val detail = DownloadFfmpegPolicy.failureDetail(logs, result.returnCode.toString())
++                                    continuation.resumeWithException(Exception("ffmpeg: $detail"))
++                                }
++                            }
++                        } finally {
++                            finished.complete(Unit)
++                        }
++                    },
++                    logCallback,
++                    statCallback,
++                )
++                nativeStarted = true
++                continuation.invokeOnCancellation { session.cancel() }
+             }
++        } catch (cancelled: CancellationException) {
++            // FFmpeg's cancel request is asynchronous. Keep the old owner alive until native
++            // output is closed, before cache cleanup or a restarted job can reuse this path.
++            if (nativeStarted) withContext(NonCancellable) { finished.await() }
++            throw cancelled
+         }
+     }
+ 
+@@ -864,6 +848,7 @@ class Downloader(
+             buildList {
+                 if (it.url.startsWith("http")) {
+                     add(headerOptions)
++                    add(DownloadFfmpegRuntime.inputOptions(it.url).joinToString(" "))
+                 }
+                 add("-i")
+                 add("\"${it.url}\"")
+@@ -908,6 +893,7 @@ class Downloader(
+         val videoInput = buildList {
+             if (video.videoUrl.startsWith("http")) {
+                 add(headerOptions)
++                add(DownloadFfmpegRuntime.inputOptions(video.videoUrl).joinToString(" "))
+             }
+             add(sourceStreamOptions)
+             add("-i")
+@@ -915,6 +901,7 @@ class Downloader(
+         }.joinToString(" ")
+ 
+         val command = listOf(
++            "-hide_banner -loglevel warning",
+             videoInput, subtitleInputs, audioInputs,
+             "-map 0:v", audioMaps, "-map 0:a?", subtitleMaps, "-map 0:s? -map 0:t?",
+             "-f matroska -c:a copy -c:v copy -c:s copy",
+@@ -928,33 +915,39 @@ class Downloader(
+     }
+ 
+     private suspend fun getDuration(videoUrl: String, headerOptions: String): Float? {
+-        val durationFile = context.createFileInCacheDir("ffprobe_duration.txt")
+-        val durationFilePath = durationFile.toUri().toFFmpegString(context)
+-
+-        val ffprobeCommand = FFmpegKitConfig.parseArguments(
++        val options = FFmpegKitConfig.parseArguments(
+             listOf(
+                 headerOptions,
+-                "-v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1",
+-                "-o \"$durationFilePath\"",
++                DownloadFfmpegRuntime.inputOptions(videoUrl).joinToString(" "),
++                "-v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1",
+                 "\"$videoUrl\"",
+             ).joinToString(" "),
+         )
+-
+-        // Harmony: the duration only drives the progress percentage. A failed probe (network hiccup,
+-        // "-v quiet" leaves its output empty) must not abort the download with a blank error; ffmpeg
+-        // itself reports a real message if the stream is actually unreachable.
+-        val probed = suspendCancellableCoroutine { continuation ->
+-            val session = FFprobeKit.executeWithArgumentsAsync(ffprobeCommand) {
+-                continuation.resume(it.returnCode.isValueSuccess)
++        // Duration is optional. Read stdout, without an unsupported -o option, a shared cache
++        // filename, or -v quiet muting the subsequent download's useful native diagnostics.
++        val duration = withTimeoutOrNull(10_000) {
++            suspendCancellableCoroutine<Float?> { continuation ->
++                val session = FFprobeKit.executeWithArgumentsAsync(options) { result ->
++                    if (continuation.isActive) {
++                        val value = if (result.returnCode.isValueSuccess) {
++                            result.getAllLogsAsString(250).lineSequence()
++                                .mapNotNull { it.trim().toFloatOrNull() }
++                                .firstOrNull { it.isFinite() && it > 0f }
++                        } else {
++                            null
++                        }
++                        continuation.resume(value)
++                    }
++                }
++                continuation.invokeOnCancellation { session.cancel() }
+             }
+-            continuation.invokeOnCancellation { session.cancel() }
+         }
+-        if (!probed) {
+-            logcat(LogPriority.WARN) { "ffprobe could not read the duration of $videoUrl" }
+-            return null
++        if (duration == null) {
++            logcat(LogPriority.WARN) {
++                "Optional duration probe unavailable for ${DownloadFfmpegPolicy.describeInput(videoUrl)}"
++            }
+         }
+-
+-        return durationFile.bufferedReader().use(BufferedReader::readText).trim().toFloatOrNull()
++        return duration
+     }
+ 
+     /**
+@@ -1082,10 +1075,22 @@ class Downloader(
+         download: Download,
+         tmpDir: UniFile,
+     ): Boolean {
+-        val downloadedVideo = tmpDir.listFiles().orEmpty().filterNot { it.extension == "tmp" }
+-        return downloadedVideo.size == 1
++        if (!usesInternalDownloader(download)) {
++            // The external application owns completion; retain its established handoff behavior.
++            return tmpDir.listFiles().orEmpty().count { it.extension != "tmp" } == 1
++        }
++
++        return EpisodeDownloadStorage.isComplete(
++            directory = tmpDir,
++            filename = DiskUtil.buildValidFilename(download.episode.name),
++            ready = download.video?.status == Video.State.Ready && download.progress == 100,
++            error = download.error,
++        )
+     }
+ 
++    private fun usesInternalDownloader(download: Download): Boolean =
++        preferences.useExternalDownloader().get() == download.changeDownloader
++
+     /**
+      * Returns true if all the queued downloads are in DOWNLOADED or ERROR state.
+      */
+@@ -1181,7 +1186,6 @@ class Downloader(
+         // Harmony: sub-directory of Context.cacheDir that holds videos while ffmpeg muxes them.
+         private const val CACHE_DOWNLOAD_DIR = "harmony_download_tmp"
+         private const val FFMPEG_LOG_TAIL = 4
+-        private val FFMPEG_CONTEXT_PREFIX = Regex("""^(\[[^\]]*@ 0x[0-9a-fA-F]+\]\s*)+""")
+         private const val MUXED_MARKER_SUFFIX = ".muxed"
+ 
+         // Harmony: appended to "<name>.mkv" when downloads should stay out of gallery apps.
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt
+new file mode 100644
+index 000000000..8f751b15c
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt
+@@ -0,0 +1,148 @@
++package eu.kanade.tachiyomi.data.download
++
++import com.hippo.unifile.UniFile
++import java.io.File
++import java.io.IOException
++import java.io.InputStream
++
++/** Recovery is confined to this episode's known video names; ambiguous files stay on disk. */
++internal object EpisodeDownloadStorage {
++    private const val NO_MEDIA = ".nomedia"
++
++    private fun entries(directory: UniFile): List<UniFile> = directory.listFiles()?.toList()
++        ?: throw IOException("Cannot list download directory; files were preserved, please retry")
++
++    private fun isVideoName(name: String?, filename: String): Boolean {
++        if (name == null) return false
++        val escaped = Regex.escape(filename)
++        return Regex("""^$escaped(?: \(\d+\))?\.mkv(?: \(\d+\))?(?:\.anikku)?$""").matches(name)
++    }
++
++    private fun videos(directory: UniFile, filename: String): List<UniFile> {
++        val files = entries(directory)
++        if (files.any { it.name != NO_MEDIA && it.name != "$filename.tmp" && (!isVideoName(it.name, filename) || it.isDirectory) }) {
++            throw IOException("Unrecognized download files were preserved; inspect the directory before retrying")
++        }
++        return files.filter { isVideoName(it.name, filename) }.sortedBy {
++            if (it.name == "$filename.mkv" || it.name == "$filename.mkv.anikku") 0 else 1
++        }
++    }
++
++    private fun deleteRequired(file: UniFile) {
++        if (!file.delete()) throw IOException("Cannot remove temporary download file ${file.name}; other files were preserved, please retry")
++    }
++
++    /**
++     * Old duplicate files are reusable only when they are byte-identical, or a marked muxed cache
++     * proves the completed copy. A copy marker without such evidence never proves completion.
++     */
++    fun recover(directory: UniFile, filename: String, muxedCache: File? = null): UniFile? {
++        val files = videos(directory, filename)
++        val marker = entries(directory).firstOrNull { it.name == "$filename.tmp" }
++        if (files.isEmpty()) return null
++        val cache = muxedCache?.takeIf { it.isFile && it.length() > 0L }
++        if (marker != null && cache == null) {
++            if (files.size == 1) return null // redownload into private cache before replacing this partial copy
++            throw IOException("Duplicate downloads still have a copy marker; files were preserved for recovery")
++        }
++        val complete = if (cache != null) {
++            files.firstOrNull { sameContents(it, cache) }
++        } else {
++            files.firstOrNull { it.length() > 0L }
++        }
++        if (complete == null) {
++            if (files.all { it.length() == 0L } || (marker != null && cache != null && files.all { it.length() < cache.length() })) {
++                return null
++            }
++            throw IOException("Existing download does not match the completed cache; files were preserved for recovery")
++        }
++        val duplicates = files.filter { it !== complete }
++        // Validate the entire plan before deleting anything. An interrupted marked copy smaller
++        // than the authoritative cache is disposable; otherwise require exact bytes, not size alone.
++        if (duplicates.any {
++                !sameContents(complete, it) && !(marker != null && cache != null && it.length() in 0L until cache.length())
++            }
++        ) {
++            throw IOException("Download copies have different contents; all files were preserved for recovery")
++        }
++        duplicates.forEach(::deleteRequired)
++        marker?.let(::deleteRequired)
++        return complete
++    }
++
++    fun copy(cache: File, directory: UniFile, filename: String, hideFromGallery: Boolean): UniFile {
++        if (!cache.isFile || cache.length() <= 0L) throw IOException("Completed video cache is empty; refusing to copy it")
++        recover(directory, filename, cache)?.let { return it }
++        // Only zero-byte or marked partial files can reach here. A valid cache is already safe
++        // in private storage; failed deletion stops before createFile can manufacture a '(1)'.
++        val old = videos(directory, filename)
++        val marker = entries(directory).firstOrNull { it.name == "$filename.tmp" }
++        if (old.any { it.length() > 0L && marker == null }) {
++            throw IOException("Existing download cannot be safely replaced; files were preserved for recovery")
++        }
++        old.forEach(::deleteRequired)
++        val copyMarker = marker ?: directory.createFile("$filename.tmp")
++            ?: throw IOException("Cannot create video copy marker")
++        val finalName = "$filename.mkv" + if (hideFromGallery) ".anikku" else ""
++        val target = directory.createFile(finalName) ?: throw IOException("Cannot create video download file")
++        try {
++            if (target.name != finalName) throw IOException("Storage provider created a different filename; refusing to create duplicate downloads")
++            cache.inputStream().use { input -> target.openOutputStream().use { output -> input.copyTo(output) } }
++            if (target.length() <= 0L || target.length() != cache.length()) {
++                throw IOException("Copied video length was not verified; completed cache was preserved for retry")
++            }
++        } catch (failure: Exception) {
++            // Preserve the marker if deleting the failed target is refused. Recovery must never
++            // turn that single partial video into a completed episode.
++            try {
++                deleteRequired(target)
++            } catch (cleanup: Exception) {
++                failure.addSuppressed(cleanup)
++            }
++            throw failure
++        }
++        // If removing the marker fails, keep the verified target and muxed cache. The next attempt
++        // verifies and reuses that target, rather than creating another full copy.
++        deleteRequired(copyMarker)
++        return target
++    }
++
++    fun isComplete(directory: UniFile, filename: String, ready: Boolean, error: String?): Boolean {
++        if (!ready || error != null) return false
++        return try {
++            val files = videos(directory, filename)
++            files.size == 1 && files.single().length() > 0L && entries(directory).none { it.name == "$filename.tmp" }
++        } catch (_: IOException) {
++            false
++        }
++    }
++
++    fun sameContents(first: UniFile, second: UniFile): Boolean =
++        first.length() > 0L && first.length() == second.length() &&
++            first.openInputStream().use { a -> second.openInputStream().use { b -> streamsEqual(a, b) } }
++
++    private fun sameContents(first: UniFile, second: File): Boolean =
++        first.length() > 0L && first.length() == second.length() &&
++            first.openInputStream().use { a -> second.inputStream().use { b -> streamsEqual(a, b) } }
++
++    private fun streamsEqual(first: InputStream, second: InputStream): Boolean {
++        val a = ByteArray(DEFAULT_BUFFER_SIZE)
++        val b = ByteArray(DEFAULT_BUFFER_SIZE)
++        fun readChunk(input: InputStream, buffer: ByteArray): Int {
++            var count = 0
++            while (count < buffer.size) {
++                val read = input.read(buffer, count, buffer.size - count)
++                if (read < 0) break
++                if (read == 0) throw IOException("Download comparison could not read data; please retry")
++                count += read
++            }
++            return count
++        }
++        while (true) {
++            val count = readChunk(first, a)
++            if (count != readChunk(second, b)) return false
++            if (count == 0) return true
++            for (index in 0 until count) if (a[index] != b[index]) return false
++        }
++    }
++}
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegPolicyTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegPolicyTest.kt
+new file mode 100644
+index 000000000..8f6add98b
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegPolicyTest.kt
+@@ -0,0 +1,64 @@
++package eu.kanade.tachiyomi.data.download
++
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++
++class NavigationChromeDownloadFfmpegPolicyTest {
++    private val hlsHelp = " -extension_picky <boolean> strict extensions\n -seg_max_retry <int> segment retries"
++    private val httpHelp = " -reconnect_max_retries <int>\n -reconnect_delay_total_max <int>"
++
++    @Test
++    fun `local rewritten HLS works without changing remote playlists or local file policy`() {
++        val local = DownloadFfmpegPolicy.inputOptions("http://localhost:1234/m3u8?url=https%3A%2F%2Fcdn.example%2Findex.m3u8", hlsHelp, httpHelp)
++        assertEquals("0", local[local.indexOf("-extension_picky") + 1])
++        assertEquals("3", local[local.indexOf("-seg_max_retry") + 1])
++        assertFalse("-allowed_extensions" in local)
++        listOf("http://127.0.0.1:1234/m3u8", "http://[::1]:1234/m3u8").forEach {
++            assertTrue("-extension_picky" in DownloadFfmpegPolicy.inputOptions(it, hlsHelp, httpHelp))
++        }
++        listOf("https://cdn.example/movie.m3u8", "https://localhost.example/m3u8", "http://127.0.0.1:1234/movie.mp4").forEach {
++            assertFalse("-extension_picky" in DownloadFfmpegPolicy.inputOptions(it, hlsHelp, httpHelp))
++        }
++        assertTrue(DownloadFfmpegPolicy.inputOptions("file:///movie.mkv", hlsHelp, httpHelp).isEmpty())
++    }
++
++    @Test
++    fun `older native builds receive only options their help advertises`() {
++        val old = DownloadFfmpegPolicy.inputOptions("http://localhost:1234/m3u8", "", "")
++        assertFalse("-extension_picky" in old)
++        assertFalse("-seg_max_retry" in old)
++        assertFalse("-reconnect_max_retries" in old)
++        assertFalse("-reconnect_at_eof" in old)
++        assertEquals("2", old[old.indexOf("-reconnect_delay_max") + 1])
++        val fallback = DownloadFfmpegPolicy.inputOptions("http://localhost:1234/m3u8", " -allowed_segment_extensions <string>", "")
++        assertEquals("ALL", fallback[fallback.indexOf("-allowed_segment_extensions") + 1])
++    }
++
++    @Test
++    fun `network retries are bounded and exclude permanent authentication failures`() {
++        val options = DownloadFfmpegPolicy.inputOptions("https://cdn.example/movie.mp4", hlsHelp, httpHelp)
++        assertEquals("3", options[options.indexOf("-reconnect_max_retries") + 1])
++        assertEquals("10", options[options.indexOf("-reconnect_delay_total_max") + 1])
++        val errors = options[options.indexOf("-reconnect_on_http_error") + 1].split(',')
++        assertTrue("503" in errors)
++        assertFalse("401" in errors || "403" in errors || "404" in errors)
++    }
++
++    @Test
++    fun `failure diagnostics preserve the cause without URL credentials or request secrets`() {
++        val detail = DownloadFfmpegPolicy.failureDetail(
++            listOf(
++                "[http @ 0xABC] HTTP error 503 for https://user:password@cdn.example/segment?token=private&expires=123",
++                "Authorization: Bearer private-secret",
++                "Cookie: private-cookie",
++                "Invalid data found when processing input",
++            ),
++            "-1094995529",
++        )
++        assertTrue("HTTP error 503" in detail && "Invalid data" in detail)
++        listOf("password", "private", "expires", "0xABC").forEach { assertFalse(it in detail) }
++        assertEquals("rc=-1", DownloadFfmpegPolicy.failureDetail(emptyList(), "-1"))
++    }
++}
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt
+new file mode 100644
+index 000000000..a3bf4c2f3
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt
+@@ -0,0 +1,283 @@
++package eu.kanade.tachiyomi.data.download
++
++import com.hippo.unifile.UniFile
++import io.mockk.every
++import io.mockk.mockk
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.runBlocking
++import kotlinx.coroutines.withTimeout
++import org.junit.jupiter.api.Assertions.assertArrayEquals
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertNotNull
++import org.junit.jupiter.api.Assertions.assertNull
++import org.junit.jupiter.api.Assertions.assertSame
++import org.junit.jupiter.api.Assertions.assertThrows
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++import tachiyomi.core.common.storage.renameToOrCopy
++import java.io.ByteArrayInputStream
++import java.io.ByteArrayOutputStream
++import java.io.File
++import java.io.IOException
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicBoolean
++import java.util.concurrent.atomic.AtomicInteger
++
++class NavigationChromeDownloadRecoveryTest {
++    @Test
++    fun `identical legacy SAF duplicate videos recover without network or another copy`() {
++        val dir = FakeDirectory()
++        val original = dir.add("Episode.mkv.anikku", "complete video".toByteArray())
++        dir.add("Episode.mkv (1).anikku", original.bytes.copyOf())
++        val restored = EpisodeDownloadStorage.recover(dir.file, "Episode")
++        assertSame(original.file, restored)
++        assertEquals(setOf("Episode.mkv.anikku"), dir.files.keys)
++        assertTrue(EpisodeDownloadStorage.isComplete(dir.file, "Episode", ready = true, error = null))
++        assertTrue(dir.created.isEmpty())
++    }
++
++    @Test
++    fun `equal lengths with different bytes preserve both final and temporary copies`() {
++        val dir = FakeDirectory()
++        dir.add("Episode.mkv.anikku", "first".toByteArray())
++        dir.add("Episode.mkv (1).anikku", "other".toByteArray())
++        assertThrows(IOException::class.java) { EpisodeDownloadStorage.recover(dir.file, "Episode") }
++        assertEquals(2, dir.files.size)
++        assertTrue(dir.created.isEmpty())
++    }
++
++    @Test
++    fun `a failed duplicate deletion never creates a third video`() = withCache { cache ->
++        val dir = FakeDirectory()
++        dir.add("Episode.mkv.anikku", cache.readBytes())
++        dir.add("Episode.mkv (1).anikku", cache.readBytes(), deleteAllowed = false)
++        assertThrows(IOException::class.java) { EpisodeDownloadStorage.copy(cache, dir.file, "Episode", true) }
++        assertEquals(2, dir.files.size)
++        assertTrue(dir.created.isEmpty())
++    }
++
++    @Test
++    fun `a refused partial deletion stops before creating a replacement`() = withCache { cache ->
++        val dir = FakeDirectory()
++        dir.add("Episode.tmp", byteArrayOf())
++        dir.add("Episode.mkv.anikku", byteArrayOf(1), deleteAllowed = false)
++        assertThrows(IOException::class.java) { EpisodeDownloadStorage.copy(cache, dir.file, "Episode", true) }
++        assertTrue(dir.created.isEmpty())
++        assertEquals(2, dir.files.size)
++    }
++
++    @Test
++    fun `completed copy with a refused marker deletion is verified and reused on retry`() = withCache { cache ->
++        val dir = FakeDirectory()
++        val marker = dir.add("Episode.tmp", byteArrayOf(), deleteAllowed = false)
++        assertThrows(IOException::class.java) { EpisodeDownloadStorage.copy(cache, dir.file, "Episode", true) }
++        val completed = dir.files.getValue("Episode.mkv.anikku")
++        assertArrayEquals(cache.readBytes(), completed.bytes)
++        assertFalse(EpisodeDownloadStorage.isComplete(dir.file, "Episode", true, null))
++        marker.deleteAllowed = true
++        assertSame(completed.file, EpisodeDownloadStorage.copy(cache, dir.file, "Episode", true))
++        assertEquals(listOf("Episode.mkv.anikku"), dir.created)
++        assertTrue(EpisodeDownloadStorage.isComplete(dir.file, "Episode", true, null))
++    }
++
++    @Test
++    fun `a marker Error state and empty video can never pass completion`() {
++        val dir = FakeDirectory()
++        val video = dir.add("Episode.mkv.anikku", "video".toByteArray())
++        assertTrue(EpisodeDownloadStorage.isComplete(dir.file, "Episode", true, null))
++        assertFalse(EpisodeDownloadStorage.isComplete(dir.file, "Episode", false, null))
++        assertFalse(EpisodeDownloadStorage.isComplete(dir.file, "Episode", true, "copy failed"))
++        val marker = dir.add("Episode.tmp", byteArrayOf())
++        assertNull(EpisodeDownloadStorage.recover(dir.file, "Episode"))
++        assertFalse(EpisodeDownloadStorage.isComplete(dir.file, "Episode", true, null))
++        marker.file.delete()
++        video.bytes = byteArrayOf()
++        assertFalse(EpisodeDownloadStorage.isComplete(dir.file, "Episode", true, null))
++    }
++
++    @Test
++    fun `a completed muxed cache repairs marked partial duplicates without trusting their sizes alone`() = withCache { cache ->
++        val dir = FakeDirectory()
++        dir.add("Episode.tmp", byteArrayOf())
++        val complete = dir.add("Episode.mkv.anikku", cache.readBytes())
++        dir.add("Episode.mkv (1).anikku", byteArrayOf(1, 2))
++        assertSame(complete.file, EpisodeDownloadStorage.recover(dir.file, "Episode", cache))
++        assertEquals(setOf("Episode.mkv.anikku"), dir.files.keys)
++        assertTrue(dir.created.isEmpty())
++    }
++
++    @Test
++    fun `zero length provider metadata is a failed copy and leaves the marker`() = withCache { cache ->
++        val dir = FakeDirectory()
++        dir.createdVideoReportsZero = true
++        assertThrows(IOException::class.java) { EpisodeDownloadStorage.copy(cache, dir.file, "Episode", true) }
++        assertNotNull(dir.files["Episode.tmp"])
++        assertFalse(EpisodeDownloadStorage.isComplete(dir.file, "Episode", true, null))
++    }
++
++    @Test
++    fun `unknown user files are preserved rather than removed to make validation pass`() {
++        val dir = FakeDirectory()
++        dir.add("Episode.mkv.anikku", "video".toByteArray())
++        dir.add("notes.txt", "keep me".toByteArray())
++        assertThrows(IOException::class.java) { EpisodeDownloadStorage.recover(dir.file, "Episode") }
++        assertEquals(2, dir.files.size)
++        assertFalse(EpisodeDownloadStorage.isComplete(dir.file, "Episode", true, null))
++    }
++
++    @Test
++    fun `shared directory fallback refuses a duplicate when replacement deletion fails`() {
++        val parent = mockk<UniFile>()
++        val source = mockk<UniFile>()
++        val child = mockk<UniFile>()
++        val target = mockk<UniFile>()
++        val existing = mockk<UniFile>()
++        every { source.renameTo("episode") } returns false
++        every { source.parentFile } returns parent
++        every { source.isDirectory } returns true
++        every { parent.findFile("episode") } returns target
++        every { target.isDirectory } returns true
++        every { source.listFiles() } returns arrayOf(child)
++        every { child.name } returns "Episode.mkv.anikku"
++        every { child.isDirectory } returns false
++        every { child.length() } returns 10L
++        every { target.findFile("Episode.mkv.anikku") } returns existing
++        every { existing.isDirectory } returns false
++        every { existing.length() } returns 5L
++        every { existing.delete() } returns false
++        every { source.filePath } returns "/source"
++        assertThrows(IOException::class.java) { source.renameToOrCopy("episode") }
++        io.mockk.verify(exactly = 0) { target.createFile(any()) }
++        io.mockk.verify(exactly = 0) { source.delete() }
++    }
++
++    @Test
++    fun `shared copy cannot delete a positive source when target metadata still reports zero`() {
++        val parent = mockk<UniFile>()
++        val source = mockk<UniFile>()
++        val target = mockk<UniFile>()
++        every { source.renameTo("video.mkv") } returns false
++        every { source.parentFile } returns parent
++        every { source.isDirectory } returns false
++        every { parent.findFile("video.mkv") } returns null
++        every { parent.createFile("video.mkv") } returns target
++        every { source.openInputStream() } returns ByteArrayInputStream("video".toByteArray())
++        every { target.openOutputStream() } returns ByteArrayOutputStream()
++        every { source.length() } returns 5L
++        every { target.length() } returns 0L
++        every { source.filePath } returns "/source"
++        every { target.filePath } returns "/target"
++        every { target.delete() } returns true
++        assertThrows(IOException::class.java) { source.renameToOrCopy("video.mkv") }
++        io.mockk.verify(exactly = 0) { source.delete() }
++    }
++
++    @Test
++    fun `cancel restart chains wait for structured blocking writes and stale owners cannot stop the new run`() = runBlocking {
++        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
++        val sessions = DownloadJobSession(scope)
++        val firstStarted = CountDownLatch(1)
++        val releaseFirst = CountDownLatch(1)
++        val thirdStarted = CountDownLatch(1)
++        val secondRan = AtomicBoolean(false)
++        val staleStopped = AtomicBoolean(false)
++        val active = AtomicInteger()
++        val maximum = AtomicInteger()
++        try {
++            sessions.start { owner ->
++                launch(Dispatchers.IO) {
++                    maximum.accumulateAndGet(active.incrementAndGet()) { a, b -> maxOf(a, b) }
++                    firstStarted.countDown()
++                    try {
++                        check(releaseFirst.await(5, TimeUnit.SECONDS))
++                    } finally {
++                        sessions.ifCurrent(owner) { staleStopped.set(true) }
++                        active.decrementAndGet()
++                    }
++                }
++            }
++            assertTrue(firstStarted.await(2, TimeUnit.SECONDS))
++            sessions.cancel()
++            sessions.start { secondRan.set(true) }
++            sessions.cancel() // cancelling the waiting restart must not break its predecessor chain
++            sessions.start {
++                maximum.accumulateAndGet(active.incrementAndGet()) { a, b -> maxOf(a, b) }
++                thirdStarted.countDown()
++                active.decrementAndGet()
++            }
++            assertFalse(thirdStarted.await(100, TimeUnit.MILLISECONDS))
++            releaseFirst.countDown()
++            withTimeout(5_000) { sessions.job!!.join() }
++            assertFalse(secondRan.get())
++            assertEquals(0L, thirdStarted.count)
++            assertFalse(staleStopped.get())
++            assertEquals(1, maximum.get())
++        } finally {
++            releaseFirst.countDown()
++            scope.cancel()
++        }
++    }
++
++    private fun withCache(block: (File) -> Unit) {
++        val cache = File.createTempFile("episode-recovery-", ".mkv")
++        try {
++            cache.writeBytes("a verified complete video".toByteArray())
++            block(cache)
++        } finally {
++            cache.delete()
++        }
++    }
++
++    private class FakeDirectory {
++        val files = linkedMapOf<String, Entry>()
++        val created = mutableListOf<String>()
++        var createdVideoReportsZero = false
++        val file = mockk<UniFile>()
++
++        init {
++            every { file.listFiles() } answers { files.values.map { it.file }.toTypedArray() }
++            every { file.createFile(any()) } answers {
++                val name = firstArg<String>()
++                created += name
++                check(name !in files) { "Unexpected duplicate creation: $name" }
++                add(name, byteArrayOf()).also { if (name.endsWith(".anikku")) it.reportZero = createdVideoReportsZero }.file
++            }
++        }
++
++        fun add(name: String, bytes: ByteArray, deleteAllowed: Boolean = true): Entry =
++            Entry(name, bytes, deleteAllowed).also { files[name] = it }
++
++        inner class Entry(val name: String, var bytes: ByteArray, var deleteAllowed: Boolean) {
++            var reportZero = false
++            val file = mockk<UniFile>()
++
++            init {
++                every { file.name } returns name
++                every { file.isDirectory } returns false
++                every { file.length() } answers { if (reportZero) 0L else bytes.size.toLong() }
++                every { file.openInputStream() } answers { ByteArrayInputStream(bytes) }
++                every { file.openOutputStream() } answers {
++                    object : ByteArrayOutputStream() {
++                        override fun close() {
++                            bytes = toByteArray()
++                        }
++                    }
++                }
++                every { file.delete() } answers {
++                    if (deleteAllowed) {
++                        files.remove(name)
++                        true
++                    } else {
++                        false
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/core/common/src/main/kotlin/tachiyomi/core/common/storage/UniFileExtensions.kt b/core/common/src/main/kotlin/tachiyomi/core/common/storage/UniFileExtensions.kt
+index 88343774d..5a7284c60 100644
+--- a/core/common/src/main/kotlin/tachiyomi/core/common/storage/UniFileExtensions.kt
++++ b/core/common/src/main/kotlin/tachiyomi/core/common/storage/UniFileExtensions.kt
+@@ -81,10 +81,12 @@ private fun UniFile.transferContentsTo(target: UniFile, resolver: ContentResolve
+         val existing = target.findFile(childName)
+         if (existing != null) {
+             // Left behind by an interrupted earlier attempt: keep it when it is complete.
+-            if (!child.isDirectory && !existing.isDirectory && existing.length() == child.length()) {
++            if (!child.isDirectory && !existing.isDirectory && existing.length() > 0L && existing.length() == child.length()) {
+                 return@forEach
+             }
+-            existing.deleteSafely()
++            if (!existing.deleteSafely()) {
++                throw IOException("Failed to replace '$childName': existing target could not be deleted")
++            }
+         }
+         if (resolver != null && child.moveInto(target, resolver)) {
+             return@forEach
+@@ -112,15 +114,16 @@ private fun UniFile.moveInto(newParent: UniFile, resolver: ContentResolver): Boo
+ }
+ 
+ private fun UniFile.copyFileTo(target: UniFile) {
+-    openInputStream().use { input ->
++    val copied = openInputStream().use { input ->
+         target.openOutputStream().use { output ->
+             input.copyTo(output)
+         }
+     }
+     val expected = length()
+     val actual = target.length()
+-    // Some providers report 0 / -1 until their metadata is refreshed; only trust a positive size.
+-    if (expected > 0 && actual > 0 && actual != expected) {
+-        throw IOException("Copied ${target.displayablePath} is $actual bytes, expected $expected")
++    // A positive stream must have a positively verified target size before the source is
++    // removed. Providers reporting stale zero metadata can be retried without losing the source.
++    if ((copied > 0 && actual != copied) || (expected > 0 && copied != expected)) {
++        throw IOException("Copied ${target.displayablePath} is $actual bytes, read $copied, expected $expected")
+     }
+ }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseRestoreTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseRestoreTest.kt
+index 327eba703..00671c3ab 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseRestoreTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseRestoreTest.kt
+@@ -18,7 +18,7 @@ import androidx.compose.runtime.saveable.SaveableStateRegistry
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.layout.onSizeChanged
+ import androidx.compose.ui.test.ExperimentalTestApi
+-import androidx.compose.ui.test.v2.runComposeUiTest
++import androidx.compose.ui.test.runComposeUiTest
+ import androidx.compose.ui.unit.IntSize
+ import androidx.compose.ui.unit.dp
+ import androidx.paging.PagingData
