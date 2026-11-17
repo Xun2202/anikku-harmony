@@ -977,3 +977,8 @@ gh release list --repo Xun2202/anikku-harmony
 - 队列同时观察来源数与每源任务数，状态失败会自动补后继，完成任务不占槽。活动写入以稳定episodeId管理；设置调小、移除或暂停先cancel并等待阻塞IO/原生写入结束，再补新任务；调小后的多余任务回QUEUE，既有完成/错误状态保留。重新更新列表、解析Video和修改进度不重复创建同一任务。
 - 并发前按规范化作品名/剧集名避开相同缓存或下载目标文件名，冲突任务顺延，避免不同数据库episodeId同时写同一路径。新限制是视频任务数，MissAV每个任务内部仍最多两个分片，不将分片数误写成可同时下载两部。
 - 针对本轮新增调度/队列测试，包括真实loopback HTTP下两部视频同时取片且各自缓存完整；失败补位、缩限额等待写入退出、再放开、重复更新、输出冲突和来源/任务两个限额分开验证。沿用现有NavigationChrome CI筛选，在发布上传前执行；主机本地mux证据未变复用，手机持续速度、系统后台行为待用户安装反馈。
+
+### 0111：Android可编译的真实HTTP夹具与首次目录创建互斥
+
+- 首轮58的44106186804在app测试编译时发现JDK专属HttpServer不在Android类路径，未创建Release；测试夹具改为标准ServerSocket，不加依赖，保留真实HTTP双任务传输与完整缓存断言。
+- 复核实际UniFile依赖084a54140a的TreeDocumentFile.createDirectory是先find再create且未同步。同源视频并发首次运行会在创建来源/作品父目录时竞态；DownloadProvider.getMangaDir仅将这段短目录操作串行，网络/媒体写入继续并发。新增两线程actual Provider回归验证同一目录不重复创建，共9项新测试；既有DownloadCache.addChapter已经由Mutex保护，不重复改它。

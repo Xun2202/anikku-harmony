@@ -1,0 +1,303 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 14:51:43 +0000
+Subject: [PATCH] downloads: serialize shared parent setup and use portable
+ HTTP tests
+
+UniFile SAF creates directories with an unsynchronized find-then-create sequence. Serialize only source/anime directory resolution on the shared provider, leaving transfers parallel. Exercise the actual provider from two threads.
+
+Replace the JDK-only HttpServer test fixture rejected by Android unit-test compilation with a bounded standard ServerSocket fixture. Preserve real two-video transfer, concurrency, storage isolation and cleanup assertions.
+---
+ .../data/download/DownloadProvider.kt         |   3 +
+ ...ationChromeDownloadQueueConcurrencyTest.kt | 210 ++++++++++++++----
+ 2 files changed, 171 insertions(+), 42 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadProvider.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadProvider.kt
+index 9fedafedb..829bc9ec8 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadProvider.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadProvider.kt
+@@ -42,6 +42,9 @@ class DownloadProvider(
+      * @param mangaTitle the title of the manga to query.
+      * @param source the source of the manga.
+      */
++    // UniFile's SAF find-then-create is not atomic. Share the provider lock only while
++    // resolving/creating parent directories; media transfers remain concurrent.
++    @Synchronized
+     internal fun getMangaDir(mangaTitle: String, source: Source): Result<UniFile> {
+         val downloadsDir = downloadsDir
+         if (downloadsDir == null) {
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt
+index d1d890006..09f829d64 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt
+@@ -1,6 +1,7 @@
+ package eu.kanade.tachiyomi.data.download
+ 
+-import com.sun.net.httpserver.HttpServer
++import android.content.Context
++import com.hippo.unifile.UniFile
+ import eu.kanade.tachiyomi.animesource.model.Video
+ import eu.kanade.tachiyomi.data.download.model.Download
+ import eu.kanade.tachiyomi.source.online.HttpSource
+@@ -23,13 +24,21 @@ import okhttp3.OkHttpClient
+ import org.junit.jupiter.api.Assertions.assertEquals
+ import org.junit.jupiter.api.Assertions.assertFalse
+ import org.junit.jupiter.api.Assertions.assertNotEquals
++import org.junit.jupiter.api.Assertions.assertSame
+ import org.junit.jupiter.api.Assertions.assertTrue
+ import org.junit.jupiter.api.Test
+ import tachiyomi.domain.anime.model.Anime
+ import tachiyomi.domain.episode.model.Episode
++import tachiyomi.domain.storage.service.StorageManager
++import tachiyomi.source.local.io.LocalSourceFileSystem
++import java.io.Closeable
+ import java.io.File
+-import java.net.InetSocketAddress
++import java.net.InetAddress
++import java.net.ServerSocket
++import java.net.Socket
++import java.net.SocketException
+ import java.util.concurrent.ConcurrentHashMap
++import java.util.concurrent.ConcurrentLinkedQueue
+ import java.util.concurrent.CountDownLatch
+ import java.util.concurrent.Executors
+ import java.util.concurrent.TimeUnit
+@@ -220,8 +229,7 @@ class NavigationChromeDownloadQueueConcurrencyTest {
+         val owner = SupervisorJob()
+         val scope = CoroutineScope(owner + Dispatchers.IO)
+         val workers = DownloadQueueConcurrency.Workers()
+-        val executor = Executors.newFixedThreadPool(4)
+-        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
++        val server = LoopbackHttpServer()
+         val activeEpisodes = mutableMapOf<String, Int>()
+         val seenEpisodes = mutableSetOf<String>()
+         val bothEntered = CountDownLatch(2)
+@@ -239,7 +247,7 @@ class NavigationChromeDownloadQueueConcurrencyTest {
+                     val result = DownloadHlsSegments.prepare(
+                         client = client,
+                         sourceName = download.source.name,
+-                        url = "http://127.0.0.1:${server.address.port}/m3u8?episode=${download.episode.id}",
++                        url = "http://127.0.0.1:${server.port}/m3u8?episode=${download.episode.id}",
+                         headers = headersOf(),
+                         cacheRoot = File(root, "episode-${download.episode.id}"),
+                         onProgress = {},
+@@ -252,41 +260,35 @@ class NavigationChromeDownloadQueueConcurrencyTest {
+                 }
+             }.also(jobs::add)
+         }
+-        server.executor = executor
+-        server.createContext("/m3u8") { exchange ->
+-            manifestCalls.incrementAndGet()
+-            val id = exchange.requestURI.rawQuery.substringAfter("episode=")
+-            val body = buildString {
+-                appendLine("#EXTM3U")
+-                repeat(2) { index ->
+-                    appendLine("#EXTINF:1.0,")
+-                    appendLine("/segment?url=$id-$index")
+-                }
+-                appendLine("#EXT-X-ENDLIST")
+-            }.toByteArray()
+-            exchange.use {
+-                it.sendResponseHeaders(200, body.size.toLong())
+-                it.responseBody.use { output -> output.write(body) }
+-            }
+-        }
+-        server.createContext("/segment") { exchange ->
+-            segmentCalls.incrementAndGet()
+-            val episode = exchange.requestURI.rawQuery.substringAfter("url=").substringBefore('-')
+-            synchronized(activeEpisodes) {
+-                activeEpisodes[episode] = activeEpisodes.getOrDefault(episode, 0) + 1
+-                if (seenEpisodes.add(episode)) bothEntered.countDown()
+-                if (activeEpisodes.size == 2) overlap.set(true)
+-            }
+-            try {
+-                bothEntered.await(3, TimeUnit.SECONDS)
+-                exchange.use {
+-                    it.sendResponseHeaders(200, TS.size.toLong())
+-                    it.responseBody.use { output -> output.write(TS) }
+-                }
+-            } finally {
++        server.handler = { target ->
++            if (target.startsWith("/m3u8?")) {
++                manifestCalls.incrementAndGet()
++                val id = target.substringAfter("episode=")
++                buildString {
++                    appendLine("#EXTM3U")
++                    repeat(2) { index ->
++                        appendLine("#EXTINF:1.0,")
++                        appendLine("/segment?url=$id-$index")
++                    }
++                    appendLine("#EXT-X-ENDLIST")
++                }.toByteArray()
++            } else {
++                check(target.startsWith("/segment?"))
++                segmentCalls.incrementAndGet()
++                val episode = target.substringAfter("url=").substringBefore('-')
+                 synchronized(activeEpisodes) {
+-                    val remaining = activeEpisodes.getValue(episode) - 1
+-                    if (remaining == 0) activeEpisodes.remove(episode) else activeEpisodes[episode] = remaining
++                    activeEpisodes[episode] = activeEpisodes.getOrDefault(episode, 0) + 1
++                    if (seenEpisodes.add(episode)) bothEntered.countDown()
++                    if (activeEpisodes.size == 2) overlap.set(true)
++                }
++                try {
++                    bothEntered.await(3, TimeUnit.SECONDS)
++                    TS
++                } finally {
++                    synchronized(activeEpisodes) {
++                        val remaining = activeEpisodes.getValue(episode) - 1
++                        if (remaining == 0) activeEpisodes.remove(episode) else activeEpisodes[episode] = remaining
++                    }
+                 }
+             }
+         }
+@@ -297,6 +299,7 @@ class NavigationChromeDownloadQueueConcurrencyTest {
+             workers.update(DownloadQueueConcurrency.select(queue, 1, 2), start)
+             withTimeout(12_000) { jobs.forEach { it.join() } }
+             assertTrue(failures.isEmpty(), failures.values.joinToString { it.toString() })
++            assertTrue(server.failures.isEmpty(), server.failures.joinToString { it.toString() })
+             assertTrue(overlap.get(), "Two episode jobs must fetch segments at the same time")
+             assertEquals(2, manifestCalls.get())
+             assertEquals(4, segmentCalls.get())
+@@ -315,15 +318,138 @@ class NavigationChromeDownloadQueueConcurrencyTest {
+         } finally {
+             workers.update(emptyList(), start)
+             owner.cancelAndJoin()
+-            server.stop(0)
+-            executor.shutdownNow()
+-            executor.awaitTermination(3, TimeUnit.SECONDS)
++            server.close()
+             client.dispatcher.executorService.shutdownNow()
+             client.connectionPool.evictAll()
+             root.deleteRecursively()
+         }
+     }
+ 
++    @Test
++    fun `concurrent directory setup shares one source and manga directory`() {
++        val root = mockk<UniFile>()
++        val sourceDirectory = mockk<UniFile>()
++        val mangaDirectory = mockk<UniFile>()
++        val storage = mockk<StorageManager> {
++            every { getDownloadsDirectory() } returns root
++        }
++        val provider = DownloadProvider(mockk<Context>(), storage, mockk<LocalSourceFileSystem>())
++        val source = source(1, "Any source")
++        every { source.toString() } returns "Any source"
++        val firstInsideCreate = CountDownLatch(1)
++        val releaseCreate = CountDownLatch(1)
++        val secondCalling = CountDownLatch(1)
++        val duplicateCreate = CountDownLatch(1)
++        val sourceExists = AtomicBoolean()
++        val mangaExists = AtomicBoolean()
++        val sourceCreates = AtomicInteger()
++        val mangaCreates = AtomicInteger()
++        // Model UniFile's unsynchronized find-then-create window, without Android SAF.
++        every { root.createDirectory("Any source") } answers {
++            if (!sourceExists.get()) {
++                val count = sourceCreates.incrementAndGet()
++                if (count == 1) {
++                    firstInsideCreate.countDown()
++                    check(releaseCreate.await(5, TimeUnit.SECONDS))
++                } else {
++                    duplicateCreate.countDown()
++                }
++                sourceExists.set(true)
++            }
++            sourceDirectory
++        }
++        every { sourceDirectory.createDirectory("Same title") } answers {
++            if (!mangaExists.get()) {
++                mangaCreates.incrementAndGet()
++                mangaExists.set(true)
++            }
++            mangaDirectory
++        }
++        val executor = Executors.newFixedThreadPool(2)
++        try {
++            val first = executor.submit<UniFile> { provider.getMangaDir("Same title", source).getOrThrow() }
++            assertTrue(firstInsideCreate.await(3, TimeUnit.SECONDS))
++            val second = executor.submit<UniFile> {
++                secondCalling.countDown()
++                provider.getMangaDir("Same title", source).getOrThrow()
++            }
++            assertTrue(secondCalling.await(3, TimeUnit.SECONDS))
++            assertFalse(duplicateCreate.await(150, TimeUnit.MILLISECONDS))
++            assertFalse(second.isDone)
++            releaseCreate.countDown()
++            assertSame(mangaDirectory, first.get(3, TimeUnit.SECONDS))
++            assertSame(mangaDirectory, second.get(3, TimeUnit.SECONDS))
++            assertEquals(1, sourceCreates.get())
++            assertEquals(1, mangaCreates.get())
++        } finally {
++            releaseCreate.countDown()
++            executor.shutdownNow()
++            executor.awaitTermination(3, TimeUnit.SECONDS)
++        }
++    }
++
++    /** Minimal HTTP/1.1 fixture using only APIs present in Android's unit-test bootclasspath. */
++    private class LoopbackHttpServer : Closeable {
++        private val listener = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
++        private val executor = Executors.newFixedThreadPool(4)
++        private val sockets = ConcurrentHashMap.newKeySet<Socket>()
++        private val closed = AtomicBoolean()
++        val failures = ConcurrentLinkedQueue<Throwable>()
++        val port: Int get() = listener.localPort
++        lateinit var handler: (String) -> ByteArray
++        private val acceptor = Thread {
++            while (!closed.get()) {
++                try {
++                    val socket = listener.accept()
++                    socket.soTimeout = 4000
++                    sockets.add(socket)
++                    executor.execute {
++                        try {
++                            socket.use {
++                                val reader = it.getInputStream().bufferedReader(Charsets.US_ASCII)
++                                val request = reader.readLine() ?: error("Missing HTTP request")
++                                var lines = 0
++                                while (true) {
++                                    val line = reader.readLine() ?: error("Incomplete HTTP headers")
++                                    if (line.isEmpty()) break
++                                    check(++lines <= 100)
++                                }
++                                val body = handler(request.split(' ')[1])
++                                val header = "HTTP/1.1 200 OK\r\nContent-Length: ${body.size}\r\nConnection: close\r\n\r\n"
++                                it.getOutputStream().use { output ->
++                                    output.write(header.toByteArray(Charsets.US_ASCII))
++                                    output.write(body)
++                                    output.flush()
++                                }
++                            }
++                        } catch (error: Exception) {
++                            if (!closed.get()) failures.add(error)
++                        } finally {
++                            sockets.remove(socket)
++                        }
++                    }
++                } catch (error: SocketException) {
++                    if (!closed.get()) failures.add(error)
++                    break
++                }
++            }
++        }.apply {
++            name = "queue-hls-loopback-test"
++            isDaemon = true
++        }
++
++        fun start() = acceptor.start()
++
++        override fun close() {
++            closed.set(true)
++            listener.close()
++            sockets.forEach { runCatching { it.close() } }
++            acceptor.join(3000)
++            executor.shutdownNow()
++            executor.awaitTermination(3, TimeUnit.SECONDS)
++        }
++    }
++
+     private fun source(sourceId: Long, sourceName: String): HttpSource = mockk {
+         every { id } returns sourceId
+         every { name } returns sourceName
