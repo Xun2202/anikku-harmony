@@ -109,3 +109,4 @@
 0109-download-missav-resumable-proxy-segments.patch
 0110-download-configurable-videos-per-source.patch
 0111-download-parent-directory-lock-and-portable-tests.patch
+0112-download-background-and-item-recovery.patch
