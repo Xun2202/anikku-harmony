@@ -951,3 +951,7 @@ gh release list --repo Xun2202/anikku-harmony
 - 依native -h输出只为localhost/127.0.0.1/::1的m3u8代理开启支持的extension_picky/segment扩展兼容与分片重试，远端普通playlist及file allowlist保持。HTTP对408/429/部分5xx及网络故障做有界重连，不重试401/403/404；不设置EOF重连。duration读取stdout，移除不兼容-o/共享临时文件/-v quiet，10s可选探测超时不阻下载。下载显式warning级别，回调不足时取session原生日志，URL query/userinfo及认证头脱敏。
 - 本机FFmpeg7.1.5对合成TS的真实/m3u8→/segment?part=0复现InvalidData（未请求分片），兼容后得到完整3s Matroska；连续2次503在第3次成功，未请求真实站点视频。APK内实际native版本以运行时能力检测，仍待用户MissAV真机下载反馈；不声称云端夹具=手机通过。新增app policy4项、存储/取消12项自动接现有NavigationChrome CI。
 - 来源完整恢复测试改两款均支持的旧Compose测试入口，保留固定宿主/来源完全销毁、精确anchor和新Paging身份断言；An第三轮编译发现v2 API不存在，未发布55，本次不再假设两款Compose版本相同。Mihon43浏览修复已通过并发布；最终Mihon44包含共用安全护栏，Anikku55合入浏览与下载修复，APK/回归/签名/索引证据见档案。
+
+### 0107：外部下载器兼容分支导入补正
+
+下载首轮44088706886已通过来源恢复3/详情10等核心回归，但app编译拦下父整合外部下载器分支时漏补UniFile.extension导入；补齐该导入，原分支与严格内部下载校验均不改。该轮未发布55；Mihon44输入不变，不重复构建。

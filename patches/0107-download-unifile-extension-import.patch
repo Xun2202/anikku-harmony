@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 13:06:43 +0000
+Subject: [PATCH] downloads: restore UniFile extension import for external
+ handoff
+
+---
+ .../main/java/eu/kanade/tachiyomi/data/download/Downloader.kt    | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 28ea6c3c5..5fa5b54fa 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -58,6 +58,7 @@ import kotlinx.coroutines.withTimeoutOrNull
+ import logcat.LogPriority
+ import tachiyomi.core.common.i18n.stringResource
+ import tachiyomi.core.common.storage.displayablePath
++import tachiyomi.core.common.storage.extension
+ import tachiyomi.core.common.storage.renameToOrCopy
+ import tachiyomi.core.common.util.lang.withIOContext
+ import tachiyomi.core.common.util.system.logcat

@@ -104,3 +104,4 @@
 0104-browse-visible-preview-and-restoration-regressions.patch
 0105-browse-reentrant-continuation-and-restored-host.patch
 0106-download-storage-recovery-and-proxy-compatibility.patch
+0107-download-unifile-extension-import.patch
