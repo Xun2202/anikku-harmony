@@ -1,0 +1,376 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 12:30:46 +0000
+Subject: [PATCH] browse: keep loading animation visible-only and model real
+ cached restoration
+
+Avoid an offscreen infinite loading spinner. Exercise a fresh replayed Paging presenter after complete disposal and distinguish successful Activity pause/return from a rejected external launch. Shared with mihon-harmony 0100.
+---
+ .../core/components/DetailContinuePager.kt    |  11 +-
+ ...NavigationChromeDetailContinueSwipeTest.kt |  35 +++
+ ...NavigationChromeSourceBrowseRestoreTest.kt | 231 ++++++++++--------
+ 3 files changed, 176 insertions(+), 101 deletions(-)
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/DetailContinuePager.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/DetailContinuePager.kt
+index 3972aa561..9a21d7e67 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/DetailContinuePager.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/DetailContinuePager.kt
+@@ -11,6 +11,7 @@ import androidx.compose.foundation.pager.PagerState
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+ import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.derivedStateOf
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+@@ -58,6 +59,9 @@ fun DetailContinuePager(
+     BoxWithConstraints(modifier.fillMaxSize().clipToBounds()) {
+         // Half-drags are transient: folding and process restoration must not reopen the reader.
+         val pager = remember(maxWidth) { PagerState { 2 } }
++        val previewVisible by remember(pager) {
++            derivedStateOf { pager.currentPage > 0 || pager.currentPageOffsetFraction > 0f }
++        }
+         val motion = remember(pager) { DetailContinueMotion() }
+         val scope = rememberCoroutineScope()
+ 
+@@ -192,7 +196,12 @@ fun DetailContinuePager(
+                 }
+             },
+         ) { page ->
+-            if (page == 0) content() else previewContent()
++            if (page == 0) {
++                content()
++            } else if (previewVisible) {
++                // Keep the detail alive for return, without an offscreen infinite spinner.
++                previewContent()
++            }
+         }
+     }
+ }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeDetailContinueSwipeTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeDetailContinueSwipeTest.kt
+index dd495d4ea..e44cbb36c 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeDetailContinueSwipeTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeDetailContinueSwipeTest.kt
+@@ -379,6 +379,7 @@ class NavigationChromeDetailContinueSwipeTest {
+                 enabled = true,
+                 onContinue = {
+                     continues++
++                    owner.registry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+                     true
+                 },
+                 lifecycleOwner = owner,
+@@ -421,6 +422,40 @@ class NavigationChromeDetailContinueSwipeTest {
+         }
+     }
+ 
++    @Test
++    fun `an unavailable external activity returns from loading instead of stranding detail`() = runComposeUiTest {
++        lateinit var owner: TestLifecycleOwner
++        var continues = 0
++        var detailX = Float.NaN
++        runOnIdle {
++            owner = TestLifecycleOwner()
++            owner.registry.currentState = Lifecycle.State.RESUMED
++        }
++        setContent {
++            DetailContinuePager(
++                enabled = true,
++                onContinue = {
++                    continues++
++                    true
++                },
++                lifecycleOwner = owner,
++                modifier = Modifier.requiredSize(320.dp, 500.dp).testTag("pager"),
++            ) { Box(Modifier.fillMaxSize().onGloballyPositioned { detailX = it.positionInRoot().x }) }
++        }
++        var initialX = 0f
++        runOnIdle { initialX = detailX }
++        onNodeWithTag("pager").performTouchInput {
++            swipe(start = Offset(250f, 250f), end = Offset(45f, 250f), durationMillis = 250)
++        }
++        waitUntil { continues == 1 }
++        mainClock.advanceTimeBy(1100)
++        waitForIdle()
++        runOnIdle {
++            assertEquals(1, continues)
++            assertEquals(initialX, detailX, 1f)
++        }
++    }
++
+     private class TestLifecycleOwner : LifecycleOwner {
+         val registry = LifecycleRegistry(this)
+         override val lifecycle: Lifecycle get() = registry
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseRestoreTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseRestoreTest.kt
+index bde23ffde..ed1c70262 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseRestoreTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseRestoreTest.kt
+@@ -16,12 +16,12 @@ import androidx.compose.runtime.saveable.LocalSaveableStateRegistry
+ import androidx.compose.runtime.saveable.SaveableStateRegistry
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.test.ExperimentalTestApi
+-import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.test.v2.runComposeUiTest
+ import androidx.compose.ui.unit.dp
+ import androidx.paging.PagingData
+ import androidx.paging.compose.collectAsLazyPagingItems
+ import kotlinx.coroutines.CoroutineScope
+-import kotlinx.coroutines.flow.flowOf
++import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.launch
+ import org.junit.Test
+ import org.junit.jupiter.api.Assertions.assertEquals
+@@ -30,6 +30,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
+ import org.junit.runner.RunWith
+ import org.robolectric.RobolectricTestRunner
+ import org.robolectric.annotation.Config
++import java.util.concurrent.ConcurrentHashMap
+ 
+ @OptIn(ExperimentalTestApi::class)
+ @RunWith(RobolectricTestRunner::class)
+@@ -50,63 +51,75 @@ class NavigationChromeSourceBrowseRestoreTest {
+         val queryRevision = mutableIntStateOf(0)
+         val selected = mutableStateOf(SourceBrowseMode.Popular)
+         val registry = mutableStateOf(SaveableStateRegistry(null) { true })
+-        val positions = mutableMapOf<SourceBrowseMode, () -> Pair<Int, Int>>()
+-        val scrolls = mutableMapOf<SourceBrowseMode, suspend (Int, Int) -> Unit>()
++        val positions = ConcurrentHashMap<SourceBrowseMode, () -> Pair<Int, Int>>()
++        val scrolls = ConcurrentHashMap<SourceBrowseMode, suspend (Int, Int) -> Unit>()
++        val presented = ConcurrentHashMap<SourceBrowseMode, String>()
+         lateinit var scope: CoroutineScope
+         var pagingIdentity: Any? = null
+-        setContent {
+-            if (shown.value) {
+-                CompositionLocalProvider(LocalSaveableStateRegistry provides registry.value) {
+-                    SourceBrowsePager(
+-                        selectedMode = selected.value,
+-                        supportsLatest = true,
+-                        supportsFilters = true,
+-                        enabled = true,
+-                        onSelectMode = {
+-                            selected.value = it
+-                            true
+-                        },
+-                        pageKey = { "source-123:${it.name}:query-${queryRevision.intValue}" },
+-                        modifier = Modifier.requiredSize(320.dp, 500.dp),
+-                    ) { mode ->
++        var phase = "initial composition"
++        try {
++            setContent {
++                if (shown.value) {
++                    CompositionLocalProvider(LocalSaveableStateRegistry provides registry.value) {
++                        // A page's scope is cancelled when that page leaves the viewport. Test scroll
++                        // commands belong to the source-screen host, including after mode switches.
+                         scope = rememberCoroutineScope()
+-                        // Recreated on return, exactly as collectAsLazyPagingItems recreates its
+-                        // presenter. The saveable key continues to describe the same source/query.
+-                        val flow = remember(generation.intValue, mode) { flowOf(PagingData.from((0 until 200).toList())) }
+-                        val paging = flow.collectAsLazyPagingItems()
+-                        if (mode == selected.value) pagingIdentity = paging
+-                        if (paging.itemCount > 0) {
+-                            when (layout) {
+-                                0 -> {
+-                                    val state = rememberLazyListState()
+-                                    positions[mode] = { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset }
+-                                    scrolls[mode] = { index, offset -> state.scrollToItem(index, offset) }
+-                                    FastScrollLazyColumn(state = state, modifier = Modifier.fillMaxSize()) {
+-                                        items(paging.itemCount, key = { paging.peek(it) ?: it }) {
+-                                            Box(Modifier.fillMaxSize().height(64.dp))
++                        SourceBrowsePager(
++                            selectedMode = selected.value,
++                            supportsLatest = true,
++                            supportsFilters = true,
++                            enabled = true,
++                            onSelectMode = {
++                                selected.value = it
++                                true
++                            },
++                            pageKey = { "source-123:${it.name}:query-${queryRevision.intValue}" },
++                            modifier = Modifier.requiredSize(320.dp, 500.dp),
++                        ) { mode ->
++                            // Recreated on return, exactly as collectAsLazyPagingItems recreates its
++                            // presenter. The saveable key continues to describe the same source/query.
++                            // Production uses a replaying cachedIn flow. Seed a fresh replaying flow
++                            // per generation so presentation does not depend on cold-flow scheduling
++                            // during Robolectric's first layout or saved-state restoration.
++                            val flow = remember(generation.intValue, mode) {
++                                MutableStateFlow(PagingData.from((0 until 200).toList()))
++                            }
++                            val paging = flow.collectAsLazyPagingItems()
++                            if (mode == selected.value) pagingIdentity = paging
++                            presented[mode] = "generation=${generation.intValue}, count=${paging.itemCount}, refresh=${paging.loadState.refresh}"
++                            if (paging.itemCount > 0) {
++                                when (layout) {
++                                    0 -> {
++                                        val state = rememberLazyListState()
++                                        positions[mode] = { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset }
++                                        scrolls[mode] = { index, offset -> state.scrollToItem(index, offset) }
++                                        FastScrollLazyColumn(state = state, modifier = Modifier.fillMaxSize()) {
++                                            items(paging.itemCount, key = { paging.peek(it) ?: it }) {
++                                                Box(Modifier.fillMaxSize().height(64.dp))
++                                            }
+                                         }
+                                     }
+-                                }
+-                                1 -> {
+-                                    val state = rememberLazyGridState()
+-                                    positions[mode] = { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset }
+-                                    scrolls[mode] = { index, offset -> state.scrollToItem(index, offset) }
+-                                    FastScrollLazyVerticalGrid(state = state, columns = GridCells.Fixed(2)) {
+-                                        items(paging.itemCount, key = { paging.peek(it) ?: it }) {
+-                                            Box(Modifier.fillMaxSize().height(64.dp))
++                                    1 -> {
++                                        val state = rememberLazyGridState()
++                                        positions[mode] = { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset }
++                                        scrolls[mode] = { index, offset -> state.scrollToItem(index, offset) }
++                                        FastScrollLazyVerticalGrid(state = state, columns = GridCells.Fixed(2)) {
++                                            items(paging.itemCount, key = { paging.peek(it) ?: it }) {
++                                                Box(Modifier.fillMaxSize().height(64.dp))
++                                            }
+                                         }
+                                     }
+-                                }
+-                                else -> {
+-                                    val state = rememberPanoramaMasonryState()
+-                                    positions[mode] = { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset }
+-                                    scrolls[mode] = { index, offset -> state.scrollToItem(index, offset) }
+-                                    FastScrollPanoramaMasonry(state = state, columns = PanoramaColumns.Fixed(2)) {
+-                                        items(
+-                                            count = paging.itemCount,
+-                                            key = { paging.peek(it) ?: it },
+-                                            height = { PanoramaCellHeight.Fixed(if (it % 3 == 0) 100.dp else 150.dp) },
+-                                        ) { Box(Modifier.fillMaxSize()) }
++                                    else -> {
++                                        val state = rememberPanoramaMasonryState()
++                                        positions[mode] = { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset }
++                                        scrolls[mode] = { index, offset -> state.scrollToItem(index, offset) }
++                                        FastScrollPanoramaMasonry(state = state, columns = PanoramaColumns.Fixed(2)) {
++                                            items(
++                                                count = paging.itemCount,
++                                                key = { paging.peek(it) ?: it },
++                                                height = { PanoramaCellHeight.Fixed(if (it % 3 == 0) 100.dp else 150.dp) },
++                                            ) { Box(Modifier.fillMaxSize()) }
++                                        }
+                                     }
+                                 }
+                             }
+@@ -114,54 +127,72 @@ class NavigationChromeSourceBrowseRestoreTest {
+                     }
+                 }
+             }
++            phase = "initial popular page presentation"
++            waitUntil(timeoutMillis = 5_000) { positions[SourceBrowseMode.Popular] != null }
++            phase = "initial popular scroll"
++            runOnIdle { scope.launch { scrolls.getValue(SourceBrowseMode.Popular)(60, 17) } }
++            waitForIdle()
++            var expected = 0 to 0
++            var oldPaging: Any? = null
++            var saved: Map<String, List<Any?>> = emptyMap()
++            runOnIdle {
++                expected = positions.getValue(SourceBrowseMode.Popular)()
++                assertTrue(expected.first > 0)
++                oldPaging = pagingIdentity
++                saved = registry.value.performSave()
++                phase = "complete source disposal after save"
++                shown.value = false // source screen completely disposed while detail is shown
++            }
++            waitForIdle()
++            runOnIdle {
++                positions.clear()
++                scrolls.clear()
++                presented.clear()
++                registry.value = SaveableStateRegistry(saved) { true }
++                generation.intValue++
++                shown.value = true
++            }
++            phase = "restored popular page presentation with a new paging object"
++            waitUntil(timeoutMillis = 5_000) { positions[SourceBrowseMode.Popular] != null }
++            waitForIdle()
++            phase = "exact restored popular anchor and switch to latest"
++            runOnIdle {
++                assertNotSame(oldPaging, pagingIdentity)
++                assertEquals(expected, positions.getValue(SourceBrowseMode.Popular)(), "layout=$layout")
++                selected.value = SourceBrowseMode.Latest
++            }
++            waitForIdle()
++            phase = "latest page presentation and scroll"
++            waitUntil(timeoutMillis = 5_000) { positions[SourceBrowseMode.Latest] != null }
++            runOnIdle { scope.launch { scrolls.getValue(SourceBrowseMode.Latest)(30, 9) } }
++            waitForIdle()
++            var latest = 0 to 0
++            runOnIdle {
++                latest = positions.getValue(SourceBrowseMode.Latest)()
++                assertTrue(latest.first > 0, "Latest must actually scroll before testing per-mode restoration")
++                phase = "return to saved popular position"
++                selected.value = SourceBrowseMode.Popular
++            }
++            waitForIdle()
++            runOnIdle {
++                assertEquals(expected, positions.getValue(SourceBrowseMode.Popular)())
++                phase = "return to saved latest position"
++                selected.value = SourceBrowseMode.Latest
++            }
++            waitForIdle()
++            runOnIdle {
++                assertEquals(latest, positions.getValue(SourceBrowseMode.Latest)())
++                phase = "fresh query revision resets the lazy anchor"
++                queryRevision.intValue++ // only a genuinely new query receives a fresh scroll state
++            }
++            waitForIdle()
++            runOnIdle { assertEquals(0 to 0, positions.getValue(SourceBrowseMode.Latest)()) }
++        } catch (failure: Throwable) {
++            throw AssertionError(
++                "Source restore layout=$layout phase=$phase, shown=${shown.value}, generation=${generation.intValue}, " +
++                    "selected=${selected.value}, presented=$presented, statePages=${positions.keys}",
++                failure,
++            )
+         }
+-        waitUntil { positions[SourceBrowseMode.Popular] != null }
+-        runOnIdle { scope.launch { scrolls.getValue(SourceBrowseMode.Popular)(60, 17) } }
+-        waitForIdle()
+-        var expected = 0 to 0
+-        var oldPaging: Any? = null
+-        var saved: Map<String, List<Any?>> = emptyMap()
+-        runOnIdle {
+-            expected = positions.getValue(SourceBrowseMode.Popular)()
+-            assertTrue(expected.first > 0)
+-            oldPaging = pagingIdentity
+-            saved = registry.value.performSave()
+-            shown.value = false // source screen completely disposed while detail is shown
+-        }
+-        waitForIdle()
+-        runOnIdle {
+-            positions.clear()
+-            scrolls.clear()
+-            registry.value = SaveableStateRegistry(saved) { true }
+-            generation.intValue++
+-            shown.value = true
+-        }
+-        waitUntil { positions[SourceBrowseMode.Popular] != null }
+-        waitForIdle()
+-        runOnIdle {
+-            assertNotSame(oldPaging, pagingIdentity)
+-            assertEquals(expected, positions.getValue(SourceBrowseMode.Popular)(), "layout=$layout")
+-            selected.value = SourceBrowseMode.Latest
+-        }
+-        waitForIdle()
+-        runOnIdle { scope.launch { scrolls.getValue(SourceBrowseMode.Latest)(30, 9) } }
+-        waitForIdle()
+-        var latest = 0 to 0
+-        runOnIdle {
+-            latest = positions.getValue(SourceBrowseMode.Latest)()
+-            selected.value = SourceBrowseMode.Popular
+-        }
+-        waitForIdle()
+-        runOnIdle {
+-            assertEquals(expected, positions.getValue(SourceBrowseMode.Popular)())
+-            selected.value = SourceBrowseMode.Latest
+-        }
+-        waitForIdle()
+-        runOnIdle {
+-            assertEquals(latest, positions.getValue(SourceBrowseMode.Latest)())
+-            queryRevision.intValue++ // only a genuinely new query receives a fresh scroll state
+-        }
+-        waitForIdle()
+-        runOnIdle { assertEquals(0 to 0, positions.getValue(SourceBrowseMode.Latest)()) }
+     }
+ }

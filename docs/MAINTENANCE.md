@@ -935,3 +935,7 @@ gh release list --repo Xun2202/anikku-harmony
 - 详情改真实双页滑动：详情/既有LoadingScreen一起跟手，短拖、取消回弹，落位后才异步选取有效最近历史/首未读并进入原Reader或播放器。保留两侧系统返回边缘、章节行/横向条/长按/多选优先；Activity接管后在stop/return复位，失败不滞留加载页；宽度变化取消半拖。FAB策略不变。
 - 与Mihon 0099的共用组件和真实Compose位移/生命周期回归保持逐字节一致。Anikku仅Episodes续播，保留saved searches/metadata/内外播放器；Mihon沿原ReaderActivity转场。Animeko独立KMP架构沿前轮实查，不套用本实现。
 - 检查聚焦真实持指位移、松手/取消/筛选以及list/grid/panorama完全离开重建且Paging身份变化后的精确位置恢复。格式检查本地完成，Android编译与回归由现有CI执行，真机手感待安装反馈；版本、run、签名和SHA以档案现状/本轮核验记录为准。
+
+### 0104：可见加载页与完整恢复回归
+
+详情保留原页供返回，但只有邻页确实可见时才绘制既有加载动画，避免屏外无限spinner；可见性用derivedStateOf，不因每个拖动像素重组内容。首轮CI已编译核心，真实来源持指/松手/筛选与详情主要手势通过；为这处修正主动取消且未发版。新增恢复测试三项曾超时，使用与生产cachedIn相同的回放语义重建Paging presenter并加阶段诊断，保留完全销毁/重建和精确index/offset、每模式/新查询断言；生命周期测试显式模拟真实Activity pause接管，另测外部启动没有离开时回到详情，不放宽位移断言。最终以通过CI/签名APK和公开更新索引为准。

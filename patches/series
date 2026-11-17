@@ -101,3 +101,4 @@
 0101-browse-swipe-resume-and-soft-navigation.patch
 0102-navigation-spring-and-restored-intent-regressions.patch
 0103-browse-real-pager-position-restore-and-detail-transition.patch
+0104-browse-visible-preview-and-restoration-regressions.patch
