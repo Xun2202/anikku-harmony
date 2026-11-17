@@ -1,0 +1,234 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 12:38:00 +0000
+Subject: [PATCH] browse: allow immediate repeated continuation and preserve
+ the restore test viewport
+
+Run the rejected-Activity watchdog separately from settled page observation, cancel it on reset, and observe quick reentry. The restore fixture disposes the complete source subtree while its fixed host remains measured, as detail navigation does. Shared with mihon-harmony 0101.
+---
+ .../core/components/DetailContinuePager.kt    |  11 +-
+ ...NavigationChromeSourceBrowseRestoreTest.kt | 130 ++++++++++--------
+ 2 files changed, 82 insertions(+), 59 deletions(-)
+
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/DetailContinuePager.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/DetailContinuePager.kt
+index 9a21d7e67..82dbea414 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/DetailContinuePager.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/DetailContinuePager.kt
+@@ -68,6 +68,7 @@ fun DetailContinuePager(
+         fun reset() {
+             motion.generation++
+             motion.settleJob?.cancel()
++            motion.handoffJob?.cancel()
+             pager.requestScrollToPage(0)
+             motion.phase = DetailContinuePhase.Idle
+             motion.launched = false
+@@ -99,6 +100,7 @@ fun DetailContinuePager(
+                 lifecycleOwner?.lifecycle?.removeObserver(observer)
+                 motion.generation++
+                 motion.settleJob?.cancel()
++                motion.handoffJob?.cancel()
+             }
+         }
+ 
+@@ -125,8 +127,12 @@ fun DetailContinuePager(
+                             if (!lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                                 reset()
+                             } else {
+-                                delay(1000)
+-                                if (motion.launched && lifecycleOwner.lifecycle.currentState == Lifecycle.State.RESUMED) reset()
++                                // Do not block the settled-page observer with this watchdog: a
++                                // quick return and second swipe must observe the intervening page 0.
++                                motion.handoffJob = scope.launch {
++                                    delay(1000)
++                                    if (motion.launched && lifecycleOwner.lifecycle.currentState == Lifecycle.State.RESUMED) reset()
++                                }
+                             }
+                         }
+                     }
+@@ -214,4 +220,5 @@ private class DetailContinueMotion {
+     var launched by mutableStateOf(false)
+     var generation = 0L
+     var settleJob: Job? = null
++    var handoffJob: Job? = null
+ }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseRestoreTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseRestoreTest.kt
+index ed1c70262..327eba703 100644
+--- a/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseRestoreTest.kt
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/NavigationChromeSourceBrowseRestoreTest.kt
+@@ -8,6 +8,7 @@ import androidx.compose.foundation.lazy.grid.GridCells
+ import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+ import androidx.compose.foundation.lazy.rememberLazyListState
+ import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.SideEffect
+ import androidx.compose.runtime.mutableIntStateOf
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+@@ -15,8 +16,10 @@ import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.runtime.saveable.LocalSaveableStateRegistry
+ import androidx.compose.runtime.saveable.SaveableStateRegistry
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.layout.onSizeChanged
+ import androidx.compose.ui.test.ExperimentalTestApi
+ import androidx.compose.ui.test.v2.runComposeUiTest
++import androidx.compose.ui.unit.IntSize
+ import androidx.compose.ui.unit.dp
+ import androidx.paging.PagingData
+ import androidx.paging.compose.collectAsLazyPagingItems
+@@ -57,68 +60,77 @@ class NavigationChromeSourceBrowseRestoreTest {
+         lateinit var scope: CoroutineScope
+         var pagingIdentity: Any? = null
+         var phase = "initial composition"
++        var hostGeneration = -1
++        var viewportSize = IntSize.Zero
++        var pagerSize = IntSize.Zero
+         try {
+             setContent {
+-                if (shown.value) {
+-                    CompositionLocalProvider(LocalSaveableStateRegistry provides registry.value) {
+-                        // A page's scope is cancelled when that page leaves the viewport. Test scroll
+-                        // commands belong to the source-screen host, including after mode switches.
+-                        scope = rememberCoroutineScope()
+-                        SourceBrowsePager(
+-                            selectedMode = selected.value,
+-                            supportsLatest = true,
+-                            supportsFilters = true,
+-                            enabled = true,
+-                            onSelectMode = {
+-                                selected.value = it
+-                                true
+-                            },
+-                            pageKey = { "source-123:${it.name}:query-${queryRevision.intValue}" },
+-                            modifier = Modifier.requiredSize(320.dp, 500.dp),
+-                        ) { mode ->
+-                            // Recreated on return, exactly as collectAsLazyPagingItems recreates its
+-                            // presenter. The saveable key continues to describe the same source/query.
+-                            // Production uses a replaying cachedIn flow. Seed a fresh replaying flow
+-                            // per generation so presentation does not depend on cold-flow scheduling
+-                            // during Robolectric's first layout or saved-state restoration.
+-                            val flow = remember(generation.intValue, mode) {
+-                                MutableStateFlow(PagingData.from((0 until 200).toList()))
+-                            }
+-                            val paging = flow.collectAsLazyPagingItems()
+-                            if (mode == selected.value) pagingIdentity = paging
+-                            presented[mode] = "generation=${generation.intValue}, count=${paging.itemCount}, refresh=${paging.loadState.refresh}"
+-                            if (paging.itemCount > 0) {
+-                                when (layout) {
+-                                    0 -> {
+-                                        val state = rememberLazyListState()
+-                                        positions[mode] = { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset }
+-                                        scrolls[mode] = { index, offset -> state.scrollToItem(index, offset) }
+-                                        FastScrollLazyColumn(state = state, modifier = Modifier.fillMaxSize()) {
+-                                            items(paging.itemCount, key = { paging.peek(it) ?: it }) {
+-                                                Box(Modifier.fillMaxSize().height(64.dp))
++                // A real detail screen occupies the same Android viewport while the source
++                // subtree is absent. Keep that host measured; an entirely empty test root may
++                // shrink its AndroidComposeView to zero and never remeasure via clock ticks.
++                Box(Modifier.requiredSize(320.dp, 500.dp).onSizeChanged { viewportSize = it }) {
++                    if (shown.value) {
++                        SideEffect { hostGeneration = generation.intValue }
++                        CompositionLocalProvider(LocalSaveableStateRegistry provides registry.value) {
++                            // A page's scope is cancelled when that page leaves the viewport. Test scroll
++                            // commands belong to the source-screen host, including after mode switches.
++                            scope = rememberCoroutineScope()
++                            SourceBrowsePager(
++                                selectedMode = selected.value,
++                                supportsLatest = true,
++                                supportsFilters = true,
++                                enabled = true,
++                                onSelectMode = {
++                                    selected.value = it
++                                    true
++                                },
++                                pageKey = { "source-123:${it.name}:query-${queryRevision.intValue}" },
++                                modifier = Modifier.fillMaxSize().onSizeChanged { pagerSize = it },
++                            ) { mode ->
++                                // Recreated on return, exactly as collectAsLazyPagingItems recreates its
++                                // presenter. The saveable key continues to describe the same source/query.
++                                // Production uses a replaying cachedIn flow. Seed a fresh replaying flow
++                                // per generation so presentation does not depend on cold-flow scheduling
++                                // during Robolectric's first layout or saved-state restoration.
++                                val flow = remember(generation.intValue, mode) {
++                                    MutableStateFlow(PagingData.from((0 until 200).toList()))
++                                }
++                                val paging = flow.collectAsLazyPagingItems()
++                                if (mode == selected.value) pagingIdentity = paging
++                                presented[mode] = "generation=${generation.intValue}, count=${paging.itemCount}, refresh=${paging.loadState.refresh}"
++                                if (paging.itemCount > 0) {
++                                    when (layout) {
++                                        0 -> {
++                                            val state = rememberLazyListState()
++                                            positions[mode] = { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset }
++                                            scrolls[mode] = { index, offset -> state.scrollToItem(index, offset) }
++                                            FastScrollLazyColumn(state = state, modifier = Modifier.fillMaxSize()) {
++                                                items(paging.itemCount, key = { paging.peek(it) ?: it }) {
++                                                    Box(Modifier.fillMaxSize().height(64.dp))
++                                                }
+                                             }
+                                         }
+-                                    }
+-                                    1 -> {
+-                                        val state = rememberLazyGridState()
+-                                        positions[mode] = { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset }
+-                                        scrolls[mode] = { index, offset -> state.scrollToItem(index, offset) }
+-                                        FastScrollLazyVerticalGrid(state = state, columns = GridCells.Fixed(2)) {
+-                                            items(paging.itemCount, key = { paging.peek(it) ?: it }) {
+-                                                Box(Modifier.fillMaxSize().height(64.dp))
++                                        1 -> {
++                                            val state = rememberLazyGridState()
++                                            positions[mode] = { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset }
++                                            scrolls[mode] = { index, offset -> state.scrollToItem(index, offset) }
++                                            FastScrollLazyVerticalGrid(state = state, columns = GridCells.Fixed(2)) {
++                                                items(paging.itemCount, key = { paging.peek(it) ?: it }) {
++                                                    Box(Modifier.fillMaxSize().height(64.dp))
++                                                }
+                                             }
+                                         }
+-                                    }
+-                                    else -> {
+-                                        val state = rememberPanoramaMasonryState()
+-                                        positions[mode] = { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset }
+-                                        scrolls[mode] = { index, offset -> state.scrollToItem(index, offset) }
+-                                        FastScrollPanoramaMasonry(state = state, columns = PanoramaColumns.Fixed(2)) {
+-                                            items(
+-                                                count = paging.itemCount,
+-                                                key = { paging.peek(it) ?: it },
+-                                                height = { PanoramaCellHeight.Fixed(if (it % 3 == 0) 100.dp else 150.dp) },
+-                                            ) { Box(Modifier.fillMaxSize()) }
++                                        else -> {
++                                            val state = rememberPanoramaMasonryState()
++                                            positions[mode] = { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset }
++                                            scrolls[mode] = { index, offset -> state.scrollToItem(index, offset) }
++                                            FastScrollPanoramaMasonry(state = state, columns = PanoramaColumns.Fixed(2)) {
++                                                items(
++                                                    count = paging.itemCount,
++                                                    key = { paging.peek(it) ?: it },
++                                                    height = { PanoramaCellHeight.Fixed(if (it % 3 == 0) 100.dp else 150.dp) },
++                                                ) { Box(Modifier.fillMaxSize()) }
++                                            }
+                                         }
+                                     }
+                                 }
+@@ -148,10 +160,13 @@ class NavigationChromeSourceBrowseRestoreTest {
+                 positions.clear()
+                 scrolls.clear()
+                 presented.clear()
++                pagerSize = IntSize.Zero
+                 registry.value = SaveableStateRegistry(saved) { true }
+                 generation.intValue++
+                 shown.value = true
+             }
++            phase = "restored Android viewport measure and layout"
++            waitForIdle()
+             phase = "restored popular page presentation with a new paging object"
+             waitUntil(timeoutMillis = 5_000) { positions[SourceBrowseMode.Popular] != null }
+             waitForIdle()
+@@ -190,7 +205,8 @@ class NavigationChromeSourceBrowseRestoreTest {
+         } catch (failure: Throwable) {
+             throw AssertionError(
+                 "Source restore layout=$layout phase=$phase, shown=${shown.value}, generation=${generation.intValue}, " +
+-                    "selected=${selected.value}, presented=$presented, statePages=${positions.keys}",
++                    "selected=${selected.value}, hostGeneration=$hostGeneration, viewportSize=$viewportSize, " +
++                    "pagerSize=$pagerSize, presented=$presented, statePages=${positions.keys}",
+                 failure,
+             )
+         }

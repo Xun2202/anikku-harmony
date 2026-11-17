@@ -939,3 +939,7 @@ gh release list --repo Xun2202/anikku-harmony
 ### 0104：可见加载页与完整恢复回归
 
 详情保留原页供返回，但只有邻页确实可见时才绘制既有加载动画，避免屏外无限spinner；可见性用derivedStateOf，不因每个拖动像素重组内容。首轮CI已编译核心，真实来源持指/松手/筛选与详情主要手势通过；为这处修正主动取消且未发版。新增恢复测试三项曾超时，使用与生产cachedIn相同的回放语义重建Paging presenter并加阶段诊断，保留完全销毁/重建和精确index/offset、每模式/新查询断言；生命周期测试显式模拟真实Activity pause接管，另测外部启动没有离开时回到详情，不放宽位移断言。最终以通过CI/签名APK和公开更新索引为准。
+
+### 0105：快速返回再续读与恢复宿主
+
+第二轮CI精确日志定位：详情第一次返回后快速再左滑时，兜底delay阻塞settled observer，可能合并掉中间page0而漏第二次完成事件；兜底改独立可取消job，返回/销毁一并取消，原连续两次启动断言保留。恢复三布局并非Paging为空：诊断为source恢复后整个lazy页未组合（presented为空），fixture先把Android根内容清空使宿主可变0尺寸；现在固定宿主视口模拟真实详情承接，来源子树仍完整销毁/保存/新registry重建，显式等layout后精确验anchor。第二轮失败均无Release，原数据回放推测不替代此阶段诊断。

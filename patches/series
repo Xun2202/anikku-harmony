@@ -102,3 +102,4 @@
 0102-navigation-spring-and-restored-intent-regressions.patch
 0103-browse-real-pager-position-restore-and-detail-transition.patch
 0104-browse-visible-preview-and-restoration-regressions.patch
+0105-browse-reentrant-continuation-and-restored-host.patch
