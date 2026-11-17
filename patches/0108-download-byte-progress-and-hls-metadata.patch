@@ -1,0 +1,880 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 13:42:49 +0000
+Subject: [PATCH] downloads: report byte progress and avoid repeated HLS media
+ probing
+
+Keep queue progress observable at zero percent, merge native and machine reports without duplicate byte counts, parse VOD duration from a bounded manifest request, and retain sparse first-data/stall diagnostics. Key active video jobs by stable episode ids instead of mutable Download hashes. Video-only Anikku path; Mihon pages are outside its data-class key and Animeko uses an independent engine.
+---
+ .../data/download/DownloadHlsManifest.kt      |  74 +++++++
+ .../data/download/DownloadManager.kt          |   2 +-
+ .../data/download/DownloadNotifier.kt         |   7 +-
+ .../data/download/DownloadTransferProgress.kt |  52 +++++
+ .../tachiyomi/data/download/Downloader.kt     | 200 +++++++++++++-----
+ .../tachiyomi/data/download/model/Download.kt |  21 ++
+ .../tachiyomi/ui/download/DownloadHolder.kt   |  13 +-
+ .../ui/download/DownloadQueueScreenModel.kt   |  17 +-
+ ...NavigationChromeDownloadHlsManifestTest.kt | 105 +++++++++
+ ...igationChromeDownloadProgressEventsTest.kt |  51 +++++
+ ...ationChromeDownloadTransferProgressTest.kt |  56 +++++
+ 11 files changed, 528 insertions(+), 70 deletions(-)
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsManifest.kt
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadTransferProgress.kt
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsManifestTest.kt
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadProgressEventsTest.kt
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadTransferProgressTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsManifest.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsManifest.kt
+new file mode 100644
+index 000000000..7d16c8149
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsManifest.kt
+@@ -0,0 +1,74 @@
++package eu.kanade.tachiyomi.data.download
++
++import okhttp3.Headers
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import java.io.IOException
++import java.math.BigDecimal
++import java.math.RoundingMode
++import java.net.URI
++
++internal object DownloadHlsManifest {
++    data class Metadata(val durationMillis: Long?, val segments: Int)
++
++    class InvalidManifestException(message: String) : IOException(message)
++
++    fun isHlsInput(url: String): Boolean {
++        val uri = runCatching { URI(url) }.getOrNull() ?: return false
++        if (uri.scheme?.lowercase() !in setOf("http", "https")) return false
++        val path = uri.path.orEmpty().lowercase()
++        val host = uri.host?.lowercase()?.removeSurrounding("[", "]")
++        return path.endsWith(".m3u8") ||
++            (host in setOf("localhost", "127.0.0.1", "::1") && path == "/m3u8")
++    }
++
++    fun read(client: OkHttpClient, url: String, headers: Headers): Metadata {
++        val request = Request.Builder().url(url).headers(headers).get().build()
++        return client.newCall(request).execute().use { response ->
++            if (!response.isSuccessful) throw InvalidManifestException("HLS manifest HTTP ${response.code}")
++            val body = response.body
++            if (body.contentLength() > MAX_BYTES) throw InvalidManifestException("HLS manifest exceeds size limit")
++            val source = body.source()
++            source.request(MAX_BYTES + 1)
++            if (source.buffer.size > MAX_BYTES) throw InvalidManifestException("HLS manifest exceeds size limit")
++            parse(source.readUtf8()) ?: throw InvalidManifestException("Invalid HLS manifest header")
++        }
++    }
++
++    fun parse(text: String): Metadata? {
++        val lines = text.removePrefix("\uFEFF").lineSequence().iterator()
++        if (!lines.hasNext() || lines.next().trim() != "#EXTM3U") return null
++        var segments = 0
++        var duration = BigDecimal.ZERO
++        var valid = true
++        var ended = false
++        var master = false
++        lines.forEach { raw ->
++            val line = raw.trim()
++            when {
++                line == "#EXT-X-ENDLIST" -> ended = true
++                line.startsWith("#EXT-X-STREAM-INF:") || line.startsWith("#EXT-X-I-FRAME-STREAM-INF:") -> master = true
++                line == "#EXTINF" || line.startsWith("#EXTINF:") -> {
++                    segments++
++                    val seconds = line.substringAfter(':', "").substringBefore(',').trim()
++                    val value = seconds.takeIf { DECIMAL.matches(it) }?.toBigDecimalOrNull()
++                    if (value == null) {
++                        valid = false
++                    } else {
++                        duration += value
++                    }
++                }
++            }
++        }
++        val millis = if (ended && !master && valid && duration.signum() > 0) {
++            runCatching { duration.movePointRight(3).setScale(0, RoundingMode.HALF_UP).longValueExact() }
++                .getOrNull()?.takeIf { it > 0 }
++        } else {
++            null
++        }
++        return Metadata(millis, segments)
++    }
++
++    private const val MAX_BYTES = 1024L * 1024
++    private val DECIMAL = Regex("[0-9]+(?:\\.[0-9]*)?")
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
+index f6ba89e9c..2b6b1690a 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
+@@ -728,7 +728,7 @@ class DownloadManager(
+         .flatMapLatest { downloads ->
+             downloads
+                 .map { download ->
+-                    download.progressFlow.drop(1).map { download }
++                    download.progressUpdates().map { download }
+                 }
+                 .merge()
+         }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadNotifier.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadNotifier.kt
+index 9256d279c..7c33351a1 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadNotifier.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadNotifier.kt
+@@ -20,8 +20,8 @@ import eu.kanade.tachiyomi.util.system.notify
+ import tachiyomi.core.common.i18n.pluralStringResource
+ import tachiyomi.core.common.i18n.stringResource
+ import tachiyomi.i18n.MR
+-import tachiyomi.i18n.ank.AMR
+ import tachiyomi.i18n.aniyomi.AYMR
++import tachiyomi.i18n.ank.AMR
+ import uy.kohesive.injekt.injectLazy
+ import java.util.regex.Pattern
+ 
+@@ -129,12 +129,15 @@ internal class DownloadNotifier(private val context: Context) {
+             val speed = Formatter.formatFileSize(context, DownloadSpeedMeter.bytesPerSecond())
+             // ffmpeg reports no progress until it has probed the stream (or when the duration is
+             // unknown); show the speed alone and an indeterminate bar until the first percent arrives.
+-            val statusText = if (progress == 0) {
++            val status = if (progress == 0) {
+                 context.stringResource(AMR.strings.download_notifier_speed, speed)
+             } else {
+                 context.stringResource(AMR.strings.download_notifier_speed_progress, speed, progress)
+             }
+ 
++            val bytes = download.downloadedBytes.takeIf { it > 0 }?.let { Formatter.formatFileSize(context, it) }
++            val statusText = if (bytes == null) status else "$status · $bytes"
++
+             setContentTitle(
+                 context.pluralStringResource(AMR.plurals.download_notifier_downloading_count, remaining, remaining),
+             )
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadTransferProgress.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadTransferProgress.kt
+new file mode 100644
+index 000000000..7097f3f0b
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadTransferProgress.kt
+@@ -0,0 +1,52 @@
++package eu.kanade.tachiyomi.data.download
++
++/** Merges native statistics and file samples without counting the same bytes twice. */
++internal class DownloadTransferProgress(private val durationMillis: Long?) {
++    private var bytes = 0L
++    private var mediaMillis = 0L
++
++    @Synchronized
++    fun update(bytes: Long, mediaMillis: Long = 0): Snapshot {
++        val previousBytes = this.bytes
++        this.bytes = maxOf(this.bytes, bytes)
++        this.mediaMillis = maxOf(this.mediaMillis, mediaMillis)
++        val percent = durationMillis?.takeIf { it > 0 }?.let {
++            (this.mediaMillis.toDouble() / it.toDouble() * 100).toInt().coerceIn(0, 99)
++        } ?: 0
++        return Snapshot(this.bytes, this.mediaMillis, percent, this.bytes - previousBytes)
++    }
++
++    data class Snapshot(val bytes: Long, val mediaMillis: Long, val percent: Int, val addedBytes: Long)
++
++    data class Report(val bytes: Long, val mediaMillis: Long)
++
++    companion object {
++        /** A report is published only once its newline-terminated progress marker is present. */
++        fun parseReport(text: String): Report? {
++            var result: Report? = null
++            var bytes: Long? = null
++            var micros: Long? = null
++            var legacyMicros: Long? = null
++            text.substringBeforeLast('\n', "").lineSequence().forEach { line ->
++                val key = line.substringBefore('=').trim()
++                val value = line.substringAfter('=', "").trim()
++                val number = value.toLongOrNull()?.takeIf { it >= 0 }
++                when (key) {
++                    "total_size" -> bytes = number ?: bytes
++                    "out_time_us" -> micros = number ?: micros
++                    // FFmpeg's historical out_time_ms field is also measured in microseconds.
++                    "out_time_ms" -> legacyMicros = number ?: legacyMicros
++                    "progress" -> {
++                        if ((value == "continue" || value == "end") && (bytes != null || micros != null || legacyMicros != null)) {
++                            result = Report(bytes ?: 0, (micros ?: legacyMicros ?: 0) / 1000)
++                        }
++                        bytes = null
++                        micros = null
++                        legacyMicros = null
++                    }
++                }
++            }
++            return result
++        }
++    }
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 5fa5b54fa..3be444c6f 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -4,6 +4,7 @@ import android.content.ComponentName
+ import android.content.Context
+ import android.content.Intent
+ import android.os.Bundle
++import android.os.SystemClock
+ import androidx.core.net.toUri
+ import com.arthenica.ffmpegkit.FFmpegKit
+ import com.arthenica.ffmpegkit.FFmpegKitConfig
+@@ -19,6 +20,7 @@ import eu.kanade.tachiyomi.data.download.model.Download
+ import eu.kanade.tachiyomi.data.library.LibraryUpdateNotifier
+ import eu.kanade.tachiyomi.data.notification.NotificationHandler
+ import eu.kanade.tachiyomi.data.torrentServer.service.TorrentServerService
++import eu.kanade.tachiyomi.network.NetworkHelper
+ import eu.kanade.tachiyomi.source.online.HttpSource
+ import eu.kanade.tachiyomi.torrentServer.TorrentServerApi
+ import eu.kanade.tachiyomi.torrentServer.TorrentServerUtils
+@@ -36,6 +38,8 @@ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.NonCancellable
+ import kotlinx.coroutines.SupervisorJob
+ import kotlinx.coroutines.async
++import kotlinx.coroutines.cancelAndJoin
++import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.ensureActive
+ import kotlinx.coroutines.flow.MutableStateFlow
+@@ -56,6 +60,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
+ import kotlinx.coroutines.withContext
+ import kotlinx.coroutines.withTimeoutOrNull
+ import logcat.LogPriority
++import okhttp3.Headers
+ import tachiyomi.core.common.i18n.stringResource
+ import tachiyomi.core.common.storage.displayablePath
+ import tachiyomi.core.common.storage.extension
+@@ -74,6 +79,9 @@ import uy.kohesive.injekt.api.get
+ import uy.kohesive.injekt.injectLazy
+ import java.io.File
+ import java.io.IOException
++import java.io.RandomAccessFile
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicInteger
+ import kotlin.coroutines.resume
+ import kotlin.coroutines.resumeWithException
+ 
+@@ -256,10 +264,12 @@ class Downloader(
+ 
+             // Use supervisorScope to cancel child jobs when the downloader job is cancelled
+             supervisorScope {
+-                val downloadJobs = mutableMapOf<Download, Job>()
++                // Download.video changes during resolution; it must never be part of a map key.
++                val downloadJobs = mutableMapOf<Long, Job>()
+ 
+                 activeDownloadsFlow.collectLatest { activeDownloads ->
+-                    val downloadJobsToStop = downloadJobs.filter { it.key !in activeDownloads }
++                    val activeIds = activeDownloads.mapTo(mutableSetOf()) { it.episode.id }
++                    val downloadJobsToStop = downloadJobs.filter { it.key !in activeIds }
+                     downloadJobsToStop.forEach { (download, job) ->
+                         job.cancel()
+                         // A removed/requeued episode can reuse the same directory. Finish its
+@@ -268,9 +278,9 @@ class Downloader(
+                         downloadJobs.remove(download)
+                     }
+ 
+-                    val downloadsToStart = activeDownloads.filter { it !in downloadJobs }
++                    val downloadsToStart = activeDownloads.filter { it.episode.id !in downloadJobs }
+                     downloadsToStart.forEach { download ->
+-                        downloadJobs[download] = launchDownloadJob(download, owner)
++                        downloadJobs[download.episode.id] = launchDownloadJob(download, owner)
+                     }
+                 }
+             }
+@@ -605,6 +615,7 @@ class Downloader(
+             // Keep the original remote URL. A later storage error may require resolving/downloading
+             // again; a document path must never replace the input URL used by ffmpeg on retry.
+             if (internal && file.length() <= 0L) throw IOException("Downloaded video length is not verified")
++            if (internal) download.downloadedBytes = file.length()
+             download.progress = 100
+             video.status = Video.State.Ready
+             if (videoFile != null && completedCache != null) {
+@@ -773,7 +784,57 @@ class Downloader(
+         }
+ 
+         val ffmpegOptions = getFFmpegOptions(video, headerOptions, ffmpegFilename)
+-        val duration = getDuration(video.videoUrl, headerOptions)?.toLong() ?: 0L
++        val startedAt = SystemClock.elapsedRealtime()
++        val duration = getDuration(video.videoUrl, headers, headerOptions)
++        val progressFile = File.createTempFile("download-progress-", ".txt", context.cacheDir)
++        val tracker = DownloadTransferProgress(duration)
++        val nativeReports = AtomicInteger()
++        val progressLock = Any()
++        var firstDataAt: Long? = null
++        var progressClosed = false
++        download.downloadedBytes = 0
++        logcat(LogPriority.INFO) {
++            "Download transfer start episode=${download.episode.id} durationMs=$duration metadataMs=${SystemClock.elapsedRealtime() - startedAt}"
++        }
++        fun publish(bytes: Long, mediaMillis: Long) = synchronized(progressLock) {
++            if (progressClosed) return@synchronized
++            val next = tracker.update(bytes, mediaMillis)
++            if (next.bytes > 0 && firstDataAt == null) {
++                firstDataAt = SystemClock.elapsedRealtime() - startedAt
++                logcat(LogPriority.INFO) { "Download first data episode=${download.episode.id} elapsedMs=$firstDataAt" }
++            }
++            download.downloadedBytes = next.bytes
++            download.progress = next.percent
++            if (next.addedBytes > 0) DownloadSpeedMeter.addBytes(next.addedBytes)
++        }
++        fun sample() {
++            val report = runCatching {
++                RandomAccessFile(progressFile, "r").use { file ->
++                    val length = file.length()
++                    val count = minOf(length, 8192L).toInt()
++                    file.seek(length - count)
++                    val bytes = ByteArray(count)
++                    file.readFully(bytes)
++                    DownloadTransferProgress.parseReport(bytes.toString(Charsets.UTF_8))
++                }
++            }.getOrNull()
++            publish(maxOf(outputFile.length(), report?.bytes ?: 0L), report?.mediaMillis ?: 0L)
++        }
++        fun logMetrics(stage: String) {
++            val state = synchronized(progressLock) { tracker.update(0) }
++            logcat(LogPriority.INFO) {
++                "Download transfer $stage episode=${download.episode.id} elapsedMs=${SystemClock.elapsedRealtime() - startedAt} " +
++                    "bytes=${state.bytes} mediaMs=${state.mediaMillis} percent=${state.percent} nativeReports=${nativeReports.get()} firstDataMs=$firstDataAt"
++            }
++        }
++        val nativeOptions = arrayOf(
++            "-progress",
++            progressFile.absolutePath,
++            "-stats_period",
++            "1",
++            "-nostats",
++            *ffmpegOptions,
++        )
+ 
+         // Harmony: keep the last few warnings so a failure can say more than "Error in ffmpeg!".
+         val recentLogs = ArrayDeque<String>()
+@@ -791,56 +852,63 @@ class Downloader(
+             }
+         }
+ 
+-        var muxedBytes = 0L
+-        val statCallback = StatisticsCallback { s ->
+-            val outTime = (s.time / 1000.0).toLong()
+-
+-            if (duration != 0L && outTime > 0) {
+-                download.progress = (100 * outTime / duration).toInt()
+-            }
+-
+-            // Harmony: ffmpeg copies the streams, so bytes muxed ≈ bytes downloaded. The delta feeds
+-            // the speed shown in the notification.
+-            val size = s.size.toLong()
+-            if (size > muxedBytes) {
+-                DownloadSpeedMeter.addBytes(size - muxedBytes)
+-                muxedBytes = size
+-            }
++        val statCallback = StatisticsCallback { stats ->
++            nativeReports.incrementAndGet()
++            publish(stats.size.toLong(), stats.time.toLong())
+         }
+ 
+-        val finished = CompletableDeferred<Unit>()
+-        var nativeStarted = false
+-        try {
+-            suspendCancellableCoroutine<Unit> { continuation ->
+-                val session = FFmpegKit.executeWithArgumentsAsync(
+-                    ffmpegOptions,
+-                    { result ->
+-                        try {
+-                            if (continuation.isActive) {
+-                                if (result.returnCode.isValueSuccess) {
+-                                    continuation.resume(Unit)
+-                                } else {
+-                                    val callbackLogs = synchronized(recentLogs) { recentLogs.toList() }
+-                                    val logs = callbackLogs.ifEmpty { listOf(result.getAllLogsAsString(250)) }
+-                                    val detail = DownloadFfmpegPolicy.failureDetail(logs, result.returnCode.toString())
+-                                    continuation.resumeWithException(Exception("ffmpeg: $detail"))
++        coroutineScope {
++            val sampler = launch(Dispatchers.IO) {
++                while (true) {
++                    delay(1000)
++                    sample()
++                    if ((SystemClock.elapsedRealtime() - startedAt) / 1000 % 15 == 0L) logMetrics("sample")
++                }
++            }
++            try {
++                val finished = CompletableDeferred<Unit>()
++                var nativeStarted = false
++                try {
++                    suspendCancellableCoroutine<Unit> { continuation ->
++                        val session = FFmpegKit.executeWithArgumentsAsync(
++                            nativeOptions,
++                            { result ->
++                                try {
++                                    if (continuation.isActive) {
++                                        if (result.returnCode.isValueSuccess) {
++                                            continuation.resume(Unit)
++                                        } else {
++                                            val callbackLogs = synchronized(recentLogs) { recentLogs.toList() }
++                                            val logs = listOf(result.getAllLogsAsString(500)) + callbackLogs
++                                            val detail = DownloadFfmpegPolicy.failureDetail(logs, result.returnCode.toString())
++                                            continuation.resumeWithException(Exception("ffmpeg: $detail"))
++                                        }
++                                    }
++                                } finally {
++                                    finished.complete(Unit)
+                                 }
+-                            }
+-                        } finally {
+-                            finished.complete(Unit)
+-                        }
+-                    },
+-                    logCallback,
+-                    statCallback,
+-                )
+-                nativeStarted = true
+-                continuation.invokeOnCancellation { session.cancel() }
++                            },
++                            logCallback,
++                            statCallback,
++                        )
++                        nativeStarted = true
++                        continuation.invokeOnCancellation { session.cancel() }
++                    }
++                } catch (cancelled: CancellationException) {
++                    // FFmpeg's cancel request is asynchronous. Keep the old owner alive until native
++                    // output is closed, before cache cleanup or a restarted job can reuse this path.
++                    if (nativeStarted) withContext(NonCancellable) { finished.await() }
++                    throw cancelled
++                }
++            } finally {
++                withContext(NonCancellable) {
++                    sampler.cancelAndJoin()
++                    sample()
++                    synchronized(progressLock) { progressClosed = true }
++                }
++                logMetrics("end")
++                progressFile.delete()
+             }
+-        } catch (cancelled: CancellationException) {
+-            // FFmpeg's cancel request is asynchronous. Keep the old owner alive until native
+-            // output is closed, before cache cleanup or a restarted job can reuse this path.
+-            if (nativeStarted) withContext(NonCancellable) { finished.await() }
+-            throw cancelled
+         }
+     }
+ 
+@@ -902,7 +970,7 @@ class Downloader(
+         }.joinToString(" ")
+ 
+         val command = listOf(
+-            "-hide_banner -loglevel warning",
++            "-hide_banner -loglevel info",
+             videoInput, subtitleInputs, audioInputs,
+             "-map 0:v", audioMaps, "-map 0:a?", subtitleMaps, "-map 0:s? -map 0:t?",
+             "-f matroska -c:a copy -c:v copy -c:s copy",
+@@ -915,7 +983,31 @@ class Downloader(
+         return FFmpegKitConfig.parseArguments(command)
+     }
+ 
+-    private suspend fun getDuration(videoUrl: String, headerOptions: String): Float? {
++    private val manifestClient by lazy {
++        Injekt.get<NetworkHelper>().nonCloudflareClient.newBuilder()
++            .callTimeout(5, TimeUnit.SECONDS).build()
++    }
++
++    private suspend fun getDuration(videoUrl: String, headers: Headers, headerOptions: String): Long? {
++        if (DownloadHlsManifest.isHlsInput(videoUrl)) {
++            val start = SystemClock.elapsedRealtime()
++            try {
++                val manifest = withContext(Dispatchers.IO) { DownloadHlsManifest.read(manifestClient, videoUrl, headers) }
++                logcat(LogPriority.INFO) {
++                    "Download HLS metadata segments=${manifest.segments} durationMs=${manifest.durationMillis} elapsedMs=${SystemClock.elapsedRealtime() - start}"
++                }
++                return manifest.durationMillis
++            } catch (invalid: DownloadHlsManifest.InvalidManifestException) {
++                // An explicit invalid/HTTP-error response is useful immediately; avoid spending
++                // minutes probing that same error page as if it were a media segment.
++                throw invalid
++            } catch (failed: IOException) {
++                logcat(LogPriority.WARN) {
++                    "Download HLS metadata unavailable elapsedMs=${SystemClock.elapsedRealtime() - start} reason=${failed.javaClass.simpleName}"
++                }
++                return null // show bytes without a fabricated percentage; proceed with the download
++            }
++        }
+         val options = FFmpegKitConfig.parseArguments(
+             listOf(
+                 headerOptions,
+@@ -948,7 +1040,7 @@ class Downloader(
+                 "Optional duration probe unavailable for ${DownloadFfmpegPolicy.describeInput(videoUrl)}"
+             }
+         }
+-        return duration
++        return duration?.let { (it.toDouble() * 1000).toLong().takeIf { value -> value > 0L } }
+     }
+ 
+     /**
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt
+index dfa37d74b..2874a47a4 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt
+@@ -3,8 +3,12 @@ package eu.kanade.tachiyomi.data.download.model
+ import eu.kanade.tachiyomi.animesource.model.Video
+ import eu.kanade.tachiyomi.network.ProgressListener
+ import eu.kanade.tachiyomi.source.online.HttpSource
++import kotlinx.coroutines.flow.Flow
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.drop
++import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.flow.merge
+ import tachiyomi.domain.anime.model.Anime
+ import tachiyomi.domain.chapter.interactor.GetChapter
+ import tachiyomi.domain.episode.model.Episode
+@@ -58,6 +62,23 @@ data class Download(
+             progressStateFlow.value = value
+         }
+ 
++    @Transient
++    private val downloadedBytesStateFlow = MutableStateFlow(0L)
++
++    @Transient
++    val downloadedBytesFlow = downloadedBytesStateFlow.asStateFlow()
++    var downloadedBytes: Long
++        get() = downloadedBytesStateFlow.value
++        set(value) {
++            downloadedBytesStateFlow.value = value.coerceAtLeast(0)
++        }
++
++    /** Byte updates remain observable even when a stream has no known percentage. */
++    fun progressUpdates(): Flow<Unit> = merge(
++        progressFlow.drop(1).map { },
++        downloadedBytesFlow.drop(1).map { },
++    )
++
+     /**
+      * Updates the status of the download
+      *
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
+index 336cba222..9ecd9088c 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
+@@ -1,5 +1,6 @@
+ package eu.kanade.tachiyomi.ui.download
+ 
++import android.text.format.Formatter
+ import android.view.View
+ import androidx.recyclerview.widget.ItemTouchHelper
+ import eu.davidea.viewholders.FlexibleViewHolder
+@@ -69,7 +70,7 @@ class DownloadHolder(private val view: View, val adapter: DownloadAdapter) :
+         if (binding.downloadProgress.max == 1) {
+             binding.downloadProgress.max = 100
+         }
+-        if (download.progress == 0) {
++        if (download.progress <= 0) {
+             binding.downloadProgress.isIndeterminate = true
+         } else {
+             binding.downloadProgress.isIndeterminate = false
+@@ -81,14 +82,18 @@ class DownloadHolder(private val view: View, val adapter: DownloadAdapter) :
+      * Updates the text field of the number of downloaded pages.
+      */
+     fun notifyDownloadedPages() {
++        val bytes = download.downloadedBytes.takeIf { it > 0 }?.let { Formatter.formatFileSize(view.context, it) }
+         binding.downloadProgressText.text = when {
+             download.status == Download.State.ERROR -> {
+                 view.context.stringResource(MR.strings.download_notifier_title_error)
+             }
+-            download.progress == 0 -> {
+-                view.context.stringResource(MR.strings.update_check_notification_download_in_progress)
++            download.progress <= 0 -> {
++                bytes ?: view.context.stringResource(MR.strings.update_check_notification_download_in_progress)
++            }
++            else -> {
++                val percent = view.context.stringResource(AYMR.strings.episode_download_progress, download.progress)
++                if (bytes == null) percent else "$percent · $bytes"
+             }
+-            else -> view.context.stringResource(AYMR.strings.episode_download_progress, download.progress)
+         }
+         // Harmony: error notifications are not shown inside 卓易通, so put the reason in the row itself.
+         val error = download.error.takeIf { download.status == Download.State.ERROR }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreenModel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreenModel.kt
+index a07917bcc..a49639ada 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreenModel.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreenModel.kt
+@@ -43,7 +43,7 @@ class DownloadQueueScreenModel(
+     /**
+      * Map of jobs for active downloads.
+      */
+-    private val progressJobs = mutableMapOf<Download, Job>()
++    private val progressJobs = mutableMapOf<Long, Job>()
+ 
+     val listener = object : DownloadAdapter.DownloadItemListener {
+         /**
+@@ -228,10 +228,6 @@ class DownloadQueueScreenModel(
+      */
+     private fun launchProgressJob(download: Download) {
+         val job = screenModelScope.launch {
+-            while (download.progress == 0) {
+-                delay(50)
+-            }
+-
+             download.progressFlow
+                 .debounce(50)
+                 .collectLatest {
+@@ -240,9 +236,9 @@ class DownloadQueueScreenModel(
+         }
+ 
+         // Avoid leaking jobs
+-        progressJobs.remove(download)?.cancel()
++        progressJobs.remove(download.episode.id)?.cancel()
+ 
+-        progressJobs[download] = job
++        progressJobs[download.episode.id] = job
+     }
+ 
+     /**
+@@ -251,7 +247,7 @@ class DownloadQueueScreenModel(
+      * @param download the download to unsubscribe.
+      */
+     private fun cancelProgressJob(download: Download) {
+-        progressJobs.remove(download)?.cancel()
++        progressJobs.remove(download.episode.id)?.cancel()
+     }
+ 
+     /**
+@@ -269,7 +265,10 @@ class DownloadQueueScreenModel(
+      * @param download the download whose page has been downloaded.
+      */
+     fun onUpdateDownloadedPages(download: Download) {
+-        getHolder(download)?.notifyDownloadedPages()
++        getHolder(download)?.apply {
++            notifyProgress()
++            notifyDownloadedPages()
++        }
+     }
+ 
+     /**
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsManifestTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsManifestTest.kt
+new file mode 100644
+index 000000000..c5e6d8bf8
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsManifestTest.kt
+@@ -0,0 +1,105 @@
++package eu.kanade.tachiyomi.data.download
++
++import okhttp3.Headers.Companion.headersOf
++import okhttp3.Interceptor
++import okhttp3.OkHttpClient
++import okhttp3.Protocol
++import okhttp3.Response
++import okhttp3.ResponseBody.Companion.toResponseBody
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertNull
++import org.junit.jupiter.api.Assertions.assertSame
++import org.junit.jupiter.api.Assertions.assertThrows
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++import java.io.IOException
++
++class NavigationChromeDownloadHlsManifestTest {
++    @Test
++    fun `VOD sums decimal segment times precisely with BOM and CRLF`() {
++        val text = "\uFEFF#EXTM3U\r\n#EXTINF:0.1,one\r\none.ts\r\n#EXTINF:0.2,two\r\ntwo.ts\r\n#EXT-X-ENDLIST\r\n"
++        assertEquals(DownloadHlsManifest.Metadata(300, 2), DownloadHlsManifest.parse(text))
++    }
++
++    @Test
++    fun `live and master playlists never imply a duration`() {
++        assertEquals(DownloadHlsManifest.Metadata(null, 1), DownloadHlsManifest.parse("#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:3,\na.ts\n"))
++        assertEquals(DownloadHlsManifest.Metadata(null, 0), DownloadHlsManifest.parse("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nchild.m3u8\n#EXT-X-ENDLIST\n"))
++    }
++
++    @Test
++    fun `invalid durations and overflow remain unknown while non HLS is rejected`() {
++        listOf("N/A", "NaN", "Infinity", "-1", "", "999999999999999999999999", "0").forEach {
++            assertEquals(DownloadHlsManifest.Metadata(null, 1), DownloadHlsManifest.parse("#EXTM3U\n#EXTINF:$it,\na.ts\n#EXT-X-ENDLIST\n"))
++        }
++        assertNull(DownloadHlsManifest.parse("<html>not a playlist</html>"))
++        assertNull(DownloadHlsManifest.parse("#EXTM3U forged\n"))
++    }
++
++    @Test
++    fun `input recognition uses the URL path and exact local host`() {
++        listOf("https://cdn.example/movie.M3U8?token=x", "http://localhost:123/m3u8?url=x", "http://127.0.0.1/m3u8", "http://[::1]/m3u8").forEach {
++            assertTrue(DownloadHlsManifest.isHlsInput(it), it)
++        }
++        listOf("https://cdn.example/movie.mp4?url=https://x/a.m3u8", "https://cdn.example/m3u8", "http://localhost.example/m3u8", "http://localhost/segment?url=a.m3u8", "file:///a.m3u8", "not a URL").forEach {
++            assertFalse(DownloadHlsManifest.isHlsInput(it), it)
++        }
++    }
++
++    @Test
++    fun `read fetches only manifest once and forwards headers without requesting key or segments`() {
++        var calls = 0
++        val client = client { chain ->
++            calls++
++            assertEquals("GET", chain.request().method)
++            assertEquals("/index.m3u8", chain.request().url.encodedPath)
++            assertEquals("test-cookie", chain.request().header("Cookie"))
++            assertEquals("test-referer", chain.request().header("Referer"))
++            response(chain, "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:1.25,\nsegment.ts\n#EXT-X-ENDLIST\n")
++        }
++        assertEquals(DownloadHlsManifest.Metadata(1250, 1), DownloadHlsManifest.read(client, URL, headersOf("Cookie", "test-cookie", "Referer", "test-referer")))
++        assertEquals(1, calls)
++    }
++
++    @Test
++    fun `read rejects HTTP errors invalid content and oversized bodies without leaking URL`() {
++        listOf(403 to "denied", 200 to "<html>not HLS</html>", 200 to ("#EXTM3U\n" + "x".repeat(1024 * 1024))).forEach { (code, body) ->
++            var calls = 0
++            val client = client { chain ->
++                calls++
++                response(chain, body, code)
++            }
++            val error = assertThrows(DownloadHlsManifest.InvalidManifestException::class.java) {
++                DownloadHlsManifest.read(client, URL, headersOf())
++            }
++            assertFalse(error.message.orEmpty().contains("private"))
++            assertFalse(error.message.orEmpty().contains("example"))
++            assertEquals(1, calls)
++        }
++    }
++
++    @Test
++    fun `network failure remains available to the caller without wrapping`() {
++        val failure = IOException("network unavailable")
++        val client = client { throw failure }
++        val actual = assertThrows(IOException::class.java) {
++            DownloadHlsManifest.read(client, URL, headersOf())
++        }
++        assertSame(failure, actual)
++    }
++
++    private fun client(interceptor: Interceptor): OkHttpClient = OkHttpClient.Builder().addInterceptor(interceptor).build()
++
++    private fun response(chain: Interceptor.Chain, text: String, code: Int = 200): Response = Response.Builder()
++        .request(chain.request())
++        .protocol(Protocol.HTTP_1_1)
++        .code(code)
++        .message("test")
++        .body(text.toResponseBody())
++        .build()
++
++    private companion object {
++        const val URL = "https://cdn.example/index.m3u8?token=private"
++    }
++}
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadProgressEventsTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadProgressEventsTest.kt
+new file mode 100644
+index 000000000..fa9748c51
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadProgressEventsTest.kt
+@@ -0,0 +1,51 @@
++package eu.kanade.tachiyomi.data.download
++
++import eu.kanade.tachiyomi.data.download.model.Download
++import io.mockk.mockk
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.cancelAndJoin
++import kotlinx.coroutines.flow.collect
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.test.runCurrent
++import kotlinx.coroutines.test.runTest
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Test
++
++@OptIn(ExperimentalCoroutinesApi::class)
++class NavigationChromeDownloadProgressEventsTest {
++    @Test
++    fun `bytes refresh a zero percent row and repeated samples produce no extra events`() = runTest {
++        val download = Download(mockk(), mockk(), mockk())
++        var events = 0
++        val observer = launch { download.progressUpdates().collect { events++ } }
++        runCurrent()
++        assertEquals(0, events)
++        download.downloadedBytes = 4096
++        runCurrent()
++        assertEquals(1, events)
++        assertEquals(0, download.progress)
++        download.downloadedBytes = 4096
++        runCurrent()
++        assertEquals(1, events)
++        download.progress = 10
++        runCurrent()
++        assertEquals(2, events)
++        observer.cancelAndJoin()
++    }
++
++    @Test
++    fun `queue observers keep receiving bytes after a retry resets the percentage`() = runTest {
++        val download = Download(mockk(), mockk(), mockk())
++        download.progress = 30
++        val samples = mutableListOf<Pair<Int, Long>>()
++        val observer = launch { download.progressUpdates().collect { samples += download.progress to download.downloadedBytes } }
++        runCurrent()
++        download.progress = 0
++        download.downloadedBytes = 0
++        runCurrent()
++        download.downloadedBytes = 1024
++        runCurrent()
++        assertEquals(0 to 1024L, samples.last())
++        observer.cancelAndJoin()
++    }
++}
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadTransferProgressTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadTransferProgressTest.kt
+new file mode 100644
+index 000000000..5a34ea15a
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadTransferProgressTest.kt
+@@ -0,0 +1,56 @@
++package eu.kanade.tachiyomi.data.download
++
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertNull
++import org.junit.jupiter.api.Test
++
++class NavigationChromeDownloadTransferProgressTest {
++    @Test
++    fun `native statistics and file samples count each byte once and never move backwards`() {
++        val progress = DownloadTransferProgress(10_000)
++        assertEquals(DownloadTransferProgress.Snapshot(100, 1000, 10, 100), progress.update(100, 1000))
++        assertEquals(0L, progress.update(100, 1000).addedBytes)
++        assertEquals(DownloadTransferProgress.Snapshot(150, 1000, 10, 50), progress.update(150))
++        assertEquals(DownloadTransferProgress.Snapshot(150, 2000, 20, 0), progress.update(120, 2000))
++        assertEquals(DownloadTransferProgress.Snapshot(150, 2000, 20, 0), progress.update(-1, -1))
++    }
++
++    @Test
++    fun `known duration reserves completion for verified output and handles large timestamps`() {
++        val progress = DownloadTransferProgress(1000)
++        assertEquals(50, progress.update(1, 500).percent)
++        assertEquals(99, progress.update(2, 1000).percent)
++        assertEquals(99, progress.update(3, Long.MAX_VALUE).percent)
++        assertEquals(50, DownloadTransferProgress(Long.MAX_VALUE).update(1, Long.MAX_VALUE / 2).percent)
++    }
++
++    @Test
++    fun `unknown or invalid duration keeps bytes without inventing a percentage`() {
++        listOf(null, 0L, -1L).forEach { duration ->
++            assertEquals(DownloadTransferProgress.Snapshot(1234, 5000, 0, 1234), DownloadTransferProgress(duration).update(1234, 5000))
++        }
++    }
++
++    @Test
++    fun `both FFmpeg time fields use microseconds and modern field takes precedence`() {
++        assertEquals(DownloadTransferProgress.Report(100, 2500), DownloadTransferProgress.parseReport("total_size=100\nout_time_us=2500000\nprogress=continue\n"))
++        assertEquals(DownloadTransferProgress.Report(100, 2500), DownloadTransferProgress.parseReport("total_size=100\nout_time_ms=2500000\nprogress=end\n"))
++        assertEquals(DownloadTransferProgress.Report(0, 2500), DownloadTransferProgress.parseReport("out_time_us=2500000\nout_time_ms=9999999\nprogress=end\n"))
++    }
++
++    @Test
++    fun `last complete report survives an incomplete trailing record`() {
++        val reports = "total_size=100\nout_time_us=1000000\nprogress=continue\ntotal_size=200\nout_time_us=2000000\nprogress=continue\n"
++        val expected = DownloadTransferProgress.Report(200, 2000)
++        assertEquals(expected, DownloadTransferProgress.parseReport(reports + "total_size=300\nout_time_us=3000000\n"))
++        assertEquals(expected, DownloadTransferProgress.parseReport(reports + "total_size=300\nprogress=end"))
++    }
++
++    @Test
++    fun `unknown time preserves bytes and malformed input is ignored`() {
++        assertEquals(DownloadTransferProgress.Report(123, 0), DownloadTransferProgress.parseReport("total_size=123\nout_time_us=N/A\nprogress=end\n"))
++        listOf("", "garbage", "total_size=10\n", "total_size=-1\nout_time_us=N/A\nprogress=end\n", "total_size=999999999999999999999999999\nprogress=end\n").forEach {
++            assertNull(DownloadTransferProgress.parseReport(it))
++        }
++    }
++}

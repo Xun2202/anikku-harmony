@@ -955,3 +955,11 @@ gh release list --repo Xun2202/anikku-harmony
 ### 0107：外部下载器兼容分支导入补正
 
 下载首轮44088706886已通过来源恢复3/详情10等核心回归，但app编译拦下父整合外部下载器分支时漏补UniFile.extension导入；补齐该导入，原分支与严格内部下载校验均不改。该轮未发布55；Mihon44输入不变，不重复构建。
+
+## 2026-11-17：MissAV进度与启动等待（0108）
+
+- 用户确认进度不动/偏慢在55前已有。新55日志仍约119s后INVALIDDATA，native n7.1能力显示proxyExtensionOption=false；前轮云端后缀限制夹具不能当手机根因已确定。持续下载限速仍需真实首数据/写入/媒体时间诊断，不能直接归罪新版重试。
+- 旧百分比依赖duration/native统计，队列还while等待非零才刷新。新增可观察字节量，0%也刷新MB；原生回调+每秒机器-progress/输出大小采样用同一单调tracker，不重复计速、不倒退，完成前最多99%。Native退出后关闭采样输入，迟到回调不覆盖复制完成的100%；私有临时机器文件随会话清理，保持异步cancel真正结束后再重用输出路径。
+- HLS时长只GET一次最多1MiB清单，精确累加EXTINF且仅ENDLIST VOD给百分比，不再为统计时长额外拉媒体分片；无时长显示字节，不编造总量。HTTP/非HLS错误明确报出；网络失败允许无时长继续。非HLS保留原可选probe。稀疏日志记录元数据耗时、首数据、字节/媒体ms/统计回调数；失败取info级会话尾部+警告且继续脱敏URL query和认证头，不复制原始日志入仓。
+- Download.dataClass的Video主构造值会在解析时改变，活动job/progress观察器改以episodeId作键，避免队列变化后旧键查找失效而重复取同一视频。Mihon pages位于构造体外，键无此变化，也不走视频FFmpeg进度；Animeko独立mediamp/KMP链，不套本补丁。本次不重建这两款。
+- 一个worker负责纯进度/清单helper及13项测试，主代理复核集成和2项进度事件回归；仍用原CI NavigationChrome筛选。主机FFmpeg实时合成流在低日志/nostats下运行中输出多条continue及end，证明机器进度不依赖Java回调；真机速度与首分片仍待用户新日志闭环。最终版本/签名/索引及CI证据见档案现状。
