@@ -1,0 +1,714 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 14:09:02 +0000
+Subject: [PATCH] downloads: resume MissAV proxy segments with two bounded
+ workers
+
+Use the existing MissAV loopback proxy for TS processing, cache completed segments, retry only missing pieces, and mux locally without transcoding. Gate by the exact source name and supported track/manifest shape; other extensions retain their existing downloader. Preserve completed segments on pause and wait for canceled IO before a replacement writes.
+
+Anikku-specific video path; Mihon downloads image pages and Animeko uses a separate mediamp/KMP pipeline. Eight focused tests cover scope isolation, bounded concurrency, resume, failure integrity and cancellation.
+---
+ .../data/download/DownloadHlsSegments.kt      | 277 ++++++++++++++++++
+ .../tachiyomi/data/download/Downloader.kt     |  93 +++++-
+ ...NavigationChromeDownloadHlsSegmentsTest.kt | 249 ++++++++++++++++
+ 3 files changed, 609 insertions(+), 10 deletions(-)
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsSegmentsTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+new file mode 100644
+index 000000000..94ad245e5
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+@@ -0,0 +1,277 @@
++package eu.kanade.tachiyomi.data.download
++
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.ensureActive
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlinx.coroutines.withContext
++import okhttp3.Headers
++import okhttp3.HttpUrl
++import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.Response
++import java.io.File
++import java.io.IOException
++import java.math.BigDecimal
++import java.math.RoundingMode
++import java.security.MessageDigest
++import java.util.Locale
++import kotlin.coroutines.resume
++import kotlin.coroutines.resumeWithException
++
++/** Bounded, resumable TS fetches through the extension's existing loopback proxy. */
++internal object DownloadHlsSegments {
++    data class Progress(val bytes: Long, val networkBytes: Long, val completedMillis: Long, val totalMillis: Long)
++
++    data class Prepared(val input: File, val directory: File, val bytes: Long, val durationMillis: Long)
++
++    class Failure(message: String) : IOException(message)
++
++    private data class Segment(val url: HttpUrl, val seconds: BigDecimal, val millis: Long)
++
++    suspend fun prepare(
++        client: OkHttpClient,
++        sourceName: String,
++        url: String,
++        headers: Headers,
++        cacheRoot: File,
++        onProgress: (Progress) -> Unit,
++    ): Prepared? = try {
++        withContext(Dispatchers.IO) {
++            // Other extensions can expose the same proxy endpoints. This rollout is MissAV only.
++            if (!sourceName.equals("MissAV", ignoreCase = true)) return@withContext null
++            val manifestUrl = url.toHttpUrlOrNull()?.takeIf { isProxy(it) && it.encodedPath == "/m3u8" }
++                ?: return@withContext null
++            val text = fetch(client, Request.Builder().url(manifestUrl).headers(headers).build()) { response ->
++                if (!response.isSuccessful) throw Failure("HLS manifest HTTP ${response.code}")
++                val source = response.body.source()
++                source.request(MAX_MANIFEST_BYTES + 1)
++                if (source.buffer.size > MAX_MANIFEST_BYTES) throw Failure("HLS manifest exceeds size limit")
++                source.readUtf8()
++            }
++            val segments = parse(text, manifestUrl) ?: return@withContext null
++            val totalMillis = try {
++                segments.fold(BigDecimal.ZERO) { sum, segment -> sum + segment.seconds }
++                    .movePointRight(3).setScale(0, RoundingMode.HALF_UP).longValueExact()
++            } catch (_: ArithmeticException) {
++                return@withContext null
++            }
++            val fingerprint = MessageDigest.getInstance("SHA-256").digest(
++                buildString {
++                    segments.forEach { segment ->
++                        append(segment.seconds.stripTrailingZeros().toPlainString()).append('\n')
++                        segment.url.queryParameterNames.sorted().forEach { name ->
++                            segment.url.queryParameterValues(name).forEach { value ->
++                                append(name.length).append(':').append(name)
++                                append(value?.length ?: -1).append(':').append(value.orEmpty()).append('\n')
++                            }
++                        }
++                        append('\n')
++                    }
++                }.toByteArray(Charsets.UTF_8),
++            ).joinToString("") { "%02x".format(Locale.ROOT, it) }
++            val directory = File(cacheRoot, fingerprint)
++            if (!directory.isDirectory && !directory.mkdirs()) throw Failure("Cannot create segment cache")
++            val state = ProgressState(totalMillis, onProgress)
++            val pending = mutableListOf<Int>()
++            segments.forEachIndexed { index, segment ->
++                val file = segmentFile(directory, index)
++                if (validTs(file)) {
++                    state.complete(file.length(), segment.millis)
++                } else {
++                    pending += index
++                }
++            }
++            var next = 0
++            coroutineScope {
++                repeat(minOf(2, pending.size)) {
++                    launch {
++                        while (true) {
++                            val index = synchronized(pending) {
++                                if (next < pending.size) pending[next++] else null
++                            } ?: break
++                            val segment = segments[index]
++                            val file = segmentFile(directory, index)
++                            var failure: IOException? = null
++                            for (attempt in 0..2) {
++                                ensureActive()
++                                val partial = File(directory, "${file.name}.part")
++                                try {
++                                    fetch(client, Request.Builder().url(segment.url).headers(headers).build()) { response ->
++                                        if (!response.isSuccessful) throw Failure("HLS segment HTTP ${response.code}")
++                                        val expected = response.body.contentLength()
++                                        var count = 0L
++                                        partial.outputStream().use { output ->
++                                            response.body.byteStream().use { input ->
++                                                val buffer = ByteArray(32 * 1024)
++                                                while (true) {
++                                                    ensureActive()
++                                                    val read = input.read(buffer)
++                                                    if (read < 0) break
++                                                    count += read
++                                                    state.received(read.toLong())
++                                                    output.write(buffer, 0, read)
++                                                }
++                                            }
++                                        }
++                                        if (count == 0L || (expected >= 0 && expected != count) || !validTs(partial)) {
++                                            throw Failure("Invalid or incomplete HLS TS segment")
++                                        }
++                                        ensureActive()
++                                        if (!partial.renameTo(file)) throw Failure("Cannot finalize HLS segment cache")
++                                    }
++                                    state.complete(file.length(), segment.millis)
++                                    failure = null
++                                    break
++                                } catch (cancelled: CancellationException) {
++                                    throw cancelled
++                                } catch (error: IOException) {
++                                    ensureActive()
++                                    failure = error
++                                    if (attempt < 2) delay((attempt + 1) * 1000L)
++                                }
++                            }
++                            failure?.let {
++                                val detail = if (it is Failure) it.message else it.javaClass.simpleName
++                                throw Failure("HLS segment ${index + 1}/${segments.size} failed after 3 attempts: $detail")
++                            }
++                        }
++                    }
++                }
++            }
++            ensureActive()
++            val input = File(directory, "input.ffconcat")
++            File(directory, "input.ffconcat.part").let { partial ->
++                partial.bufferedWriter().use { writer ->
++                    writer.appendLine("ffconcat version 1.0")
++                    segments.forEachIndexed { index, segment ->
++                        writer.appendLine("file '${segmentFile(directory, index).name}'")
++                        writer.appendLine("duration ${segment.seconds.toPlainString()}")
++                    }
++                }
++                if (!partial.renameTo(input)) throw Failure("Cannot finalize local HLS plan")
++            }
++            Prepared(input, directory, state.snapshot().bytes, totalMillis)
++        }
++    } catch (cancelled: CancellationException) {
++        throw cancelled
++    } catch (error: IOException) {
++        throw if (error is Failure) error else Failure("HLS segment preparation failed: ${error.javaClass.simpleName}")
++    }
++
++    /** Cancellation cancels the call immediately; synchronous IO must exit before this block returns. */
++    private suspend fun <T> fetch(client: OkHttpClient, request: Request, read: (Response) -> T): T =
++        suspendCancellableCoroutine { continuation ->
++            val call = client.newCall(request)
++            continuation.invokeOnCancellation { call.cancel() }
++            try {
++                val result = call.execute().use(read)
++                continuation.resume(result)
++            } catch (error: Exception) {
++                continuation.resumeWithException(error)
++            }
++        }
++
++    private fun parse(text: String, base: HttpUrl): List<Segment>? {
++        val lines = text.removePrefix("\uFEFF").lineSequence().iterator()
++        if (!lines.hasNext() || lines.next().trim() != "#EXTM3U") return null
++        val result = mutableListOf<Segment>()
++        var seconds: BigDecimal? = null
++        var ended = false
++        for (raw in lines) {
++            val line = raw.trim()
++            when {
++                line.isEmpty() -> Unit
++                line == "#EXT-X-ENDLIST" -> ended = true
++                line.startsWith("#EXTINF:") -> {
++                    if (ended || seconds != null) return null
++                    val value = line.substringAfter(':').substringBefore(',').trim()
++                    if (!DECIMAL.matches(value)) return null
++                    seconds = value.toBigDecimalOrNull()?.takeIf { it.signum() > 0 } ?: return null
++                }
++                line == "#EXT-X-KEY:METHOD=NONE" -> Unit
++                line.startsWith("#EXT-X-VERSION:") || line.startsWith("#EXT-X-TARGETDURATION:") ||
++                    line.startsWith("#EXT-X-MEDIA-SEQUENCE:") || line.startsWith("#EXT-X-PLAYLIST-TYPE:") ||
++                    line.startsWith("#EXT-X-PROGRAM-DATE-TIME:") || line.startsWith("#EXT-X-TOKEN=") ||
++                    line == "#EXT-X-INDEPENDENT-SEGMENTS" -> Unit
++                line.startsWith('#') -> return null
++                else -> {
++                    if (ended) return null
++                    val duration = seconds ?: return null
++                    val segmentUrl = base.resolve(line) ?: return null
++                    if (!isProxy(segmentUrl) || segmentUrl.host != base.host || segmentUrl.port != base.port ||
++                        segmentUrl.scheme != base.scheme || segmentUrl.encodedPath != "/segment" || segmentUrl.queryParameter("url").isNullOrBlank()
++                    ) {
++                        return null
++                    }
++                    val millis = runCatching {
++                        duration.movePointRight(3).setScale(0, RoundingMode.HALF_UP).longValueExact()
++                    }.getOrNull()?.takeIf { it > 0 } ?: return null
++                    result += Segment(segmentUrl, duration, millis)
++                    if (result.size > 20_000) return null
++                    seconds = null
++                }
++            }
++        }
++        return result.takeIf { ended && seconds == null && it.isNotEmpty() }
++    }
++
++    private fun isProxy(url: HttpUrl): Boolean = url.scheme == "http" && url.host in setOf("localhost", "127.0.0.1", "::1")
++
++    private fun segmentFile(directory: File, index: Int): File = File(directory, "%05d.ts".format(Locale.ROOT, index))
++
++    private fun validTs(file: File): Boolean {
++        if (!file.isFile || file.length() == 0L) return false
++        return try {
++            file.inputStream().use { input ->
++                val head = ByteArray(4096)
++                var size = 0
++                while (size < head.size) {
++                    val count = input.read(head, size, head.size - size)
++                    if (count < 0) break
++                    size += count
++                }
++                (0 until size - 376).any { offset ->
++                    head[offset] == 0x47.toByte() && head[offset + 188] == 0x47.toByte() && head[offset + 376] == 0x47.toByte()
++                }
++            }
++        } catch (_: IOException) {
++            false
++        }
++    }
++
++    private class ProgressState(private val total: Long, private val callback: (Progress) -> Unit) {
++        private var bytes = 0L
++        private var network = 0L
++        private var millis = 0L
++        private var lastReport = 0L
++
++        @Synchronized
++        fun received(count: Long) {
++            network += count
++            val now = System.nanoTime()
++            if (now - lastReport >= 250_000_000L) {
++                lastReport = now
++                callback(snapshot())
++            }
++        }
++
++        @Synchronized
++        fun complete(count: Long, duration: Long) {
++            bytes += count
++            millis += duration
++            lastReport = System.nanoTime()
++            callback(snapshot())
++        }
++
++        @Synchronized
++        fun snapshot(): Progress = Progress(bytes, network, minOf(millis, total), total)
++    }
++
++    private const val MAX_MANIFEST_BYTES = 1024L * 1024
++    private val DECIMAL = Regex("[0-9]+(?:\\.[0-9]*)?")
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 3be444c6f..54c10999c 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -652,6 +652,7 @@ class Downloader(
+         // Written next to the cache file once ffmpeg finished, so a muxed video whose copy into the
+         // download directory failed is reused by the next attempt instead of being downloaded again.
+         val muxedMarker = File(cacheFile.path + MUXED_MARKER_SUFFIX)
++        val hlsCache = File(cacheFile.parentFile, "hls-${download.episode.id}")
+         var muxed = muxedMarker.isFile && cacheFile.isFile && cacheFile.length() > 0L
+         var copied = false
+         try {
+@@ -663,17 +664,41 @@ class Downloader(
+                     if (isTor(download.video!!)) {
+                         torrentDownload(download, cacheFile)
+                     } else {
+-                        ffmpegDownload(download, cacheFile)
++                        val video = download.video!!
++                        // Keep external tracks and extension-supplied FFmpeg options on their
++                        // existing path. The helper also checks MissAV and the loopback manifest.
++                        val prepared = if (download.source.name.equals("MissAV", ignoreCase = true) &&
++                            video.subtitleTracks.isEmpty() && video.audioTracks.isEmpty() &&
++                            video.ffmpegStreamArgs.isEmpty() && video.ffmpegVideoArgs.isEmpty()
++                        ) {
++                            prepareHlsSegments(download, hlsCache)
++                        } else {
++                            null
++                        }
++                        try {
++                            ffmpegDownload(download, cacheFile, prepared)
++                        } catch (cancelled: CancellationException) {
++                            throw cancelled
++                        } catch (failed: Exception) {
++                            if (prepared != null) {
++                                // Per-segment retries already ran. Preserve their cache instead of
++                                // silently restarting the entire video using the legacy downloader.
++                                throw DownloadHlsSegments.Failure("Local HLS mux failed: ${failed.message}")
++                            }
++                            throw failed
++                        }
+                     }
++                    if (!cacheFile.isFile || cacheFile.length() <= 0L) throw IOException("Downloaded video is empty")
+                     muxedMarker.createNewFile()
+                     muxed = true
++                    hlsCache.deleteRecursively()
+                 }
+ 
+                 emit(copyIntoDownloadDir(cacheFile, tmpDir, filename))
+             }
+                 // Retry 3 times, waiting 2, 4 and 8 seconds between attempts.
+-                .retryWhen { _, attempt ->
+-                    if (attempt < 3) {
++                .retryWhen { error, attempt ->
++                    if (error !is DownloadHlsSegments.Failure && attempt < 3) {
+                         delay((2L shl attempt.toInt()) * 1000)
+                         true
+                     } else {
+@@ -692,6 +717,8 @@ class Downloader(
+                 cacheFile.delete()
+                 muxedMarker.delete()
+             }
++            // A pause keeps completed segments. An actively removed item no longer needs them.
++            if (queueState.value.none { it.episode.id == download.episode.id }) hlsCache.deleteRecursively()
+             // Only succeeds when no other download of the same anime is in progress.
+             cacheFile.parentFile?.delete()
+         }
+@@ -768,10 +795,49 @@ class Downloader(
+         return ffmpegDownload(download, outputFile)
+     }
+ 
++    private val segmentClient by lazy {
++        Injekt.get<NetworkHelper>().nonCloudflareClient.newBuilder()
++            .connectTimeout(10, TimeUnit.SECONDS)
++            .readTimeout(30, TimeUnit.SECONDS)
++            .callTimeout(45, TimeUnit.SECONDS)
++            .followRedirects(false)
++            .followSslRedirects(false)
++            .cache(null)
++            .build()
++    }
++
++    private suspend fun prepareHlsSegments(download: Download, cacheRoot: File): DownloadHlsSegments.Prepared? {
++        val video = download.video!!
++        var networkBytes = 0L
++        var lastLogAt = 0L
++        return DownloadHlsSegments.prepare(
++            segmentClient,
++            download.source.name,
++            video.videoUrl,
++            video.headers ?: download.source.headers,
++            cacheRoot,
++        ) { state ->
++            // Cached segments advance completion, but never count as network speed.
++            DownloadSpeedMeter.addBytes((state.networkBytes - networkBytes).coerceAtLeast(0))
++            networkBytes = state.networkBytes
++            download.downloadedBytes = state.bytes
++            download.progress = (state.completedMillis.toDouble() / state.totalMillis * 95).toInt().coerceIn(0, 95)
++            val now = SystemClock.elapsedRealtime()
++            if (now - lastLogAt >= 15_000L || state.completedMillis == state.totalMillis) {
++                lastLogAt = now
++                logcat(LogPriority.INFO) {
++                    "Download HLS segments episode=${download.episode.id} bytes=${state.bytes} networkBytes=${state.networkBytes} " +
++                        "mediaMs=${state.completedMillis} totalMs=${state.totalMillis} workers=2"
++                }
++            }
++        }
++    }
++
+     // ffmpeg is always on safe mode
+     private suspend fun ffmpegDownload(
+         download: Download,
+         outputFile: File,
++        prepared: DownloadHlsSegments.Prepared? = null,
+     ) {
+         val video = download.video!!
+ 
+@@ -783,18 +849,25 @@ class Downloader(
+             "${it.first}: ${it.second}\r\n"
+         }
+ 
+-        val ffmpegOptions = getFFmpegOptions(video, headerOptions, ffmpegFilename)
++        val ffmpegOptions = if (prepared == null) {
++            getFFmpegOptions(video, headerOptions, ffmpegFilename)
++        } else {
++            arrayOf(
++                "-hide_banner", "-loglevel", "info", "-f", "concat", "-safe", "1", "-i", prepared.input.absolutePath,
++                "-map", "0:v", "-map", "0:a?", "-f", "matroska", "-c", "copy", outputFile.absolutePath, "-y",
++            )
++        }
+         val startedAt = SystemClock.elapsedRealtime()
+-        val duration = getDuration(video.videoUrl, headers, headerOptions)
++        val duration = prepared?.durationMillis ?: getDuration(video.videoUrl, headers, headerOptions)
+         val progressFile = File.createTempFile("download-progress-", ".txt", context.cacheDir)
+         val tracker = DownloadTransferProgress(duration)
+         val nativeReports = AtomicInteger()
+         val progressLock = Any()
+         var firstDataAt: Long? = null
+         var progressClosed = false
+-        download.downloadedBytes = 0
++        download.downloadedBytes = prepared?.bytes ?: 0
+         logcat(LogPriority.INFO) {
+-            "Download transfer start episode=${download.episode.id} durationMs=$duration metadataMs=${SystemClock.elapsedRealtime() - startedAt}"
++            "Download transfer start episode=${download.episode.id} localMux=${prepared != null} durationMs=$duration metadataMs=${SystemClock.elapsedRealtime() - startedAt}"
+         }
+         fun publish(bytes: Long, mediaMillis: Long) = synchronized(progressLock) {
+             if (progressClosed) return@synchronized
+@@ -803,9 +876,9 @@ class Downloader(
+                 firstDataAt = SystemClock.elapsedRealtime() - startedAt
+                 logcat(LogPriority.INFO) { "Download first data episode=${download.episode.id} elapsedMs=$firstDataAt" }
+             }
+-            download.downloadedBytes = next.bytes
+-            download.progress = next.percent
+-            if (next.addedBytes > 0) DownloadSpeedMeter.addBytes(next.addedBytes)
++            download.downloadedBytes = prepared?.bytes ?: next.bytes
++            download.progress = if (prepared != null) 95 + next.percent * 4 / 99 else next.percent
++            if (prepared == null && next.addedBytes > 0) DownloadSpeedMeter.addBytes(next.addedBytes)
+         }
+         fun sample() {
+             val report = runCatching {
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsSegmentsTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsSegmentsTest.kt
+new file mode 100644
+index 000000000..6de4201dd
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsSegmentsTest.kt
+@@ -0,0 +1,249 @@
++package eu.kanade.tachiyomi.data.download
++
++import kotlinx.coroutines.cancelAndJoin
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.runBlocking
++import okhttp3.Headers.Companion.headersOf
++import okhttp3.Interceptor
++import okhttp3.OkHttpClient
++import okhttp3.Protocol
++import okhttp3.Response
++import okhttp3.ResponseBody
++import okhttp3.ResponseBody.Companion.toResponseBody
++import okio.Buffer
++import okio.Source
++import okio.Timeout
++import okio.buffer
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertNotNull
++import org.junit.jupiter.api.Assertions.assertNull
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++import java.io.File
++import java.io.IOException
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicInteger
++import kotlin.io.path.createTempDirectory
++
++class NavigationChromeDownloadHlsSegmentsTest {
++    @Test
++    fun `two workers fetch TS through proxy with headers and write only relative concat entries`() = withCache { cache ->
++        val active = AtomicInteger()
++        val maximum = AtomicInteger()
++        val calls = AtomicInteger()
++        val client = client { chain ->
++            if (chain.request().url.encodedPath == "/m3u8") {
++                response(chain, manifest(4).toByteArray())
++            } else {
++                assertEquals("test", chain.request().header("Cookie"))
++                calls.incrementAndGet()
++                val current = active.incrementAndGet()
++                maximum.updateAndGet { maxOf(it, current) }
++                Thread.sleep(40)
++                active.decrementAndGet()
++                response(chain, TS)
++            }
++        }
++        val progress = mutableListOf<DownloadHlsSegments.Progress>()
++        val prepared = DownloadHlsSegments.prepare(client, "MissAV", URL, headersOf("Cookie", "test"), cache, progress::add)!!
++        assertEquals(4, calls.get())
++        assertEquals(2, maximum.get())
++        assertEquals(4L * TS.size, prepared.bytes)
++        assertEquals(4000L, prepared.durationMillis)
++        assertEquals(prepared.bytes, progress.last().networkBytes)
++        assertEquals(4000L, progress.last().completedMillis)
++        val concat = prepared.input.readText()
++        assertTrue(concat.startsWith("ffconcat version 1.0\n"))
++        assertTrue(concat.contains("file '00000.ts'"))
++        assertFalse(concat.contains("http") || concat.contains("token"))
++    }
++
++    @Test
++    fun `completed files resume without segment traffic after localhost port changes`() = withCache { cache ->
++        val segmentCalls = AtomicInteger()
++        val client = client { chain ->
++            if (chain.request().url.encodedPath == "/m3u8") {
++                response(chain, manifest(2).toByteArray())
++            } else {
++                segmentCalls.incrementAndGet()
++                response(chain, TS)
++            }
++        }
++        val first = DownloadHlsSegments.prepare(client, "MissAV", URL, headersOf(), cache) {}!!
++        var last: DownloadHlsSegments.Progress? = null
++        val second = DownloadHlsSegments.prepare(client, "MissAV", URL.replace("1234", "9876"), headersOf(), cache) { last = it }!!
++        assertEquals(first.directory, second.directory)
++        assertEquals(2, segmentCalls.get())
++        assertEquals(0L, last!!.networkBytes)
++        assertEquals(first.bytes, second.bytes)
++    }
++
++    @Test
++    fun `a single transient failure retries just that segment`() = withCache { cache ->
++        val segmentCalls = AtomicInteger()
++        val client = client { chain ->
++            if (chain.request().url.encodedPath == "/m3u8") {
++                response(chain, manifest(1).toByteArray())
++            } else if (segmentCalls.incrementAndGet() == 1) {
++                response(chain, byteArrayOf(), 503)
++            } else {
++                response(chain, TS)
++            }
++        }
++        assertNotNull(DownloadHlsSegments.prepare(client, "MissAV", URL, headersOf(), cache) {})
++        assertEquals(2, segmentCalls.get())
++    }
++
++    @Test
++    fun `permanent failure does not skip a segment or discard completed neighbours`() = withCache { cache ->
++        val badCalls = AtomicInteger()
++        val client = client { chain ->
++            when {
++                chain.request().url.encodedPath == "/m3u8" -> response(chain, manifest(2).toByteArray())
++                chain.request().url.queryParameter("url") == "0" -> response(chain, TS)
++                else -> {
++                    badCalls.incrementAndGet()
++                    response(chain, byteArrayOf(), 503)
++                }
++            }
++        }
++        val failure = runCatching { DownloadHlsSegments.prepare(client, "MissAV", URL, headersOf(), cache) {} }.exceptionOrNull()
++        assertTrue(failure is DownloadHlsSegments.Failure)
++        assertEquals(3, badCalls.get())
++        assertEquals(1, cache.walkTopDown().count { it.name == "00000.ts" })
++        assertFalse(cache.walkTopDown().any { it.name == "input.ffconcat" })
++    }
++
++    @Test
++    fun `cancellation waits for blocking call and never promotes a partial file`() = withCache { cache ->
++        val entered = CountDownLatch(1)
++        val exited = CountDownLatch(1)
++        val client = client { chain ->
++            if (chain.request().url.encodedPath == "/m3u8") {
++                response(chain, manifest(1).toByteArray())
++            } else {
++                var sent = false
++                val source = object : Source {
++                    override fun read(sink: Buffer, byteCount: Long): Long {
++                        if (!sent) {
++                            sent = true
++                            sink.write(TS, 0, 100)
++                            return 100
++                        }
++                        entered.countDown()
++                        while (!chain.call().isCanceled()) Thread.sleep(5)
++                        throw IOException("cancelled")
++                    }
++
++                    override fun timeout(): Timeout = Timeout.NONE
++
++                    override fun close() {
++                        exited.countDown()
++                    }
++                }.buffer()
++                response(chain, byteArrayOf()).newBuilder().body(object : ResponseBody() {
++                    override fun contentType() = null
++                    override fun contentLength(): Long = -1
++                    override fun source() = source
++                }).build()
++            }
++        }
++        kotlinx.coroutines.coroutineScope {
++            val job = launch { DownloadHlsSegments.prepare(client, "MissAV", URL, headersOf(), cache) {} }
++            // IO workers must be able to start while the test thread is waiting.
++            kotlinx.coroutines.yield()
++            assertTrue(entered.await(5, TimeUnit.SECONDS))
++            job.cancelAndJoin()
++            assertEquals(0L, exited.count)
++        }
++        assertFalse(cache.walkTopDown().any { it.extension == "ts" || it.name == "input.ffconcat" })
++        assertTrue(cache.walkTopDown().any { it.name == "00000.ts.part" && it.length() == 100L })
++        val resumedClient = client { chain ->
++            response(chain, if (chain.request().url.encodedPath == "/m3u8") manifest(1).toByteArray() else TS)
++        }
++        assertNotNull(DownloadHlsSegments.prepare(resumedClient, "MissAV", URL, headersOf(), cache) {})
++    }
++
++    @Test
++    fun `invalid TS fails rather than producing a merged plan`() = withCache { cache ->
++        val calls = AtomicInteger()
++        val client = client { chain ->
++            if (chain.request().url.encodedPath == "/m3u8") {
++                response(chain, manifest(1).toByteArray())
++            } else {
++                calls.incrementAndGet()
++                response(chain, "<html>not TS</html>".toByteArray())
++            }
++        }
++        assertTrue(runCatching { DownloadHlsSegments.prepare(client, "MissAV", URL, headersOf(), cache) {} }.exceptionOrNull() is DownloadHlsSegments.Failure)
++        assertEquals(3, calls.get())
++        assertFalse(cache.walkTopDown().any { it.extension == "ts" || it.name == "input.ffconcat" })
++    }
++
++    @Test
++    fun `encrypted ranged mapped live and remote manifests fall back without segment requests`() = withCache { cache ->
++        val unsupported = listOf(
++            manifest(1).replace("#EXTINF", "#EXT-X-KEY:METHOD=AES-128,URI=\"key\"\n#EXTINF"),
++            manifest(1).replace("#EXTINF", "#EXT-X-BYTERANGE:188\n#EXTINF"),
++            manifest(1).replace("#EXTINF", "#EXT-X-MAP:URI=\"init\"\n#EXTINF"),
++            manifest(1).replace("#EXT-X-ENDLIST", ""),
++            manifest(1).replace("/segment?url=0", "https://cdn.example/segment.ts"),
++            "not HLS",
++        )
++        unsupported.forEach { text ->
++            var calls = 0
++            val client = client { chain ->
++                calls++
++                assertEquals("/m3u8", chain.request().url.encodedPath)
++                response(chain, text.toByteArray())
++            }
++            assertNull(DownloadHlsSegments.prepare(client, "MissAV", URL, headersOf(), cache) {})
++            assertEquals(1, calls)
++        }
++        assertTrue(cache.listFiles().orEmpty().isEmpty())
++    }
++
++    @Test
++    fun `other sources sharing the proxy and non proxy inputs never enter this downloader`() = withCache { cache ->
++        val client = client { error("Ineligible source must not make any network request") }
++        listOf("RouXun", "XNXX Xun", "MissAV Xun", "Other").forEach { source ->
++            assertNull(DownloadHlsSegments.prepare(client, source, URL, headersOf(), cache) {})
++        }
++        listOf("https://cdn.example/video.m3u8", "http://localhost:1234/other", "https://localhost:1234/m3u8").forEach { url ->
++            assertNull(DownloadHlsSegments.prepare(client, "MissAV", url, headersOf(), cache) {})
++        }
++        assertTrue(cache.listFiles().orEmpty().isEmpty())
++    }
++
++    private fun withCache(block: suspend (File) -> Unit) = runBlocking {
++        val cache = createTempDirectory("hls-segments-test").toFile()
++        try {
++            block(cache)
++        } finally {
++            cache.deleteRecursively()
++        }
++    }
++
++    private fun manifest(count: Int): String = buildString {
++        appendLine("#EXTM3U")
++        appendLine("#EXT-X-TOKEN=ignored-fixture")
++        repeat(count) { index ->
++            appendLine("#EXTINF:1.0,")
++            appendLine("/segment?url=$index")
++        }
++        appendLine("#EXT-X-ENDLIST")
++    }
++
++    private fun client(interceptor: Interceptor): OkHttpClient = OkHttpClient.Builder().addInterceptor(interceptor).build()
++
++    private fun response(chain: Interceptor.Chain, bytes: ByteArray, code: Int = 200): Response = Response.Builder()
++        .request(chain.request()).protocol(Protocol.HTTP_1_1).code(code).message("test")
++        .body(bytes.toResponseBody()).build()
++
++    private companion object {
++        const val URL = "http://localhost:1234/m3u8?url=private"
++        val TS = ByteArray(188 * 4) { if (it % 188 == 0) 0x47 else 0 }
++    }
++}
