@@ -1,0 +1,284 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 01:30:32 +0000
+Subject: [PATCH] downloads: recover broken AAC framing from cached HLS
+
+Phone logs show the Matroska AAC filter failing inside an FFmpeg worker whose error does not reach the session callback. A completed local HLS plan can retry once with AAC audio recovery and stream-copy video. Verify both stream durations before recording a complete file, and keep verified local output when the queued task is paused. Mihon and Animeko use different media paths.
+---
+ .../data/download/DownloadFfmpegLogs.kt       |  6 +-
+ .../data/download/DownloadFfmpegPolicy.kt     | 52 ++++++++++++++--
+ .../tachiyomi/data/download/Downloader.kt     | 61 +++++++++++++------
+ .../NavigationChromeDownloadFfmpegLogsTest.kt | 41 ++++++++-----
+ 4 files changed, 120 insertions(+), 40 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegLogs.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegLogs.kt
+index 5285e2240..04522d747 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegLogs.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegLogs.kt
+@@ -2,7 +2,7 @@ package eu.kanade.tachiyomi.data.download
+ 
+ /** Preserve native error severity separately from the warning tail and ffmpeg's final summary. */
+ internal class DownloadFfmpegLogs {
+-    class Failure(detail: String, val needsAdtsConversion: Boolean) : java.io.IOException("ffmpeg: $detail")
++    class Failure(val returnCode: Int?, val detail: String) : java.io.IOException("ffmpeg (rc=$returnCode): $detail")
+ 
+     private val firstErrors = mutableListOf<String>()
+     private val lastErrors = ArrayDeque<String>()
+@@ -32,10 +32,6 @@ internal class DownloadFfmpegLogs {
+         return (errors + context.take(300)).distinct().joinToString(" | ").take(1600)
+     }
+ 
+-    @Synchronized
+-    fun needsAacAdtsToAsc(sessionLogs: String): Boolean =
+-        (firstErrors + lastErrors + warnings + sessionLogs).any(DownloadFfmpegPolicy::needsAacAdtsToAsc)
+-
+     private fun append(lines: ArrayDeque<String>, line: String, limit: Int) {
+         if (lines.lastOrNull() == line) return
+         if (lines.size == limit) lines.removeFirst()
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt
+index 3f1129a77..8353f3567 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt
+@@ -1,6 +1,11 @@
+ package eu.kanade.tachiyomi.data.download
+ 
++import kotlinx.serialization.json.Json
++import kotlinx.serialization.json.jsonArray
++import kotlinx.serialization.json.jsonObject
++import kotlinx.serialization.json.jsonPrimitive
+ import java.net.URI
++import kotlin.math.abs
+ 
+ /** Runtime capabilities keep older FFmpeg builds usable without assuming their demuxer options. */
+ internal object DownloadFfmpegPolicy {
+@@ -57,12 +62,51 @@ internal object DownloadFfmpegPolicy {
+         .replace(CONTEXT_PREFIX, "")
+         .trim()
+ 
+-    /** Retry only the explicit native recommendation; generic AAC damage is not repaired by this filter. */
+-    fun needsAacAdtsToAsc(text: String): Boolean = text.lineSequence().any {
+-        AAC_FILTER_RECOMMENDATION.containsMatchIn(it)
++    /** FFmpegKit can report child-thread mux errors outside the session, leaving only exit 1. */
++    fun shouldRecoverLocalAudio(returnCode: Int?, partialBytes: Long, detail: String): Boolean {
++        if (returnCode != 1 && returnCode != INVALID_DATA) return false
++        if (NON_MEDIA_FAILURE.containsMatchIn(detail)) return false
++        return partialBytes > 0 || AAC_FRAMING_FAILURE.containsMatchIn(detail)
+     }
+ 
+-    private val AAC_FILTER_RECOMMENDATION = Regex("(?i)malformed\\s+AAC\\s+bitstream.*\\buse\\b.*\\baac_adtstoasc\\b")
++    /** The fallback must finish with audio and video covering the full local playlist. */
++    fun isCompleteAudioRecovery(probeOutput: String, expectedMillis: Long): Boolean {
++        if (expectedMillis <= 0) return false
++        val tolerance = (expectedMillis / 100).coerceIn(400L, 5000L)
++        fun coversPlaylist(seconds: Double?): Boolean = seconds != null && seconds.isFinite() &&
++            abs(seconds * 1000 - expectedMillis) <= tolerance
++
++        return runCatching {
++            val root = Json.parseToJsonElement(probeOutput).jsonObject
++            val duration = root.getValue("format").jsonObject.getValue("duration").jsonPrimitive.content.toDoubleOrNull()
++            if (!coversPlaylist(duration)) return false
++            val streams = root.getValue("streams").jsonArray.map { it.jsonObject }
++            val video = streams.filter { it.getValue("codec_type").jsonPrimitive.content == "video" }
++            val audio = streams.filter { it.getValue("codec_type").jsonPrimitive.content == "audio" }
++            if (video.isEmpty() || audio.isEmpty()) return false
++            if (audio.any { it.getValue("codec_name").jsonPrimitive.content != "aac" }) return false
++            (video + audio).all { stream ->
++                val timestamp = stream.getValue("tags").jsonObject.getValue("DURATION").jsonPrimitive.content
++                coversPlaylist(timestampSeconds(timestamp))
++            }
++        }.getOrDefault(false)
++    }
++
++    private fun timestampSeconds(value: String): Double? {
++        val parts = value.split(':')
++        if (parts.size != 3) return null
++        val hours = parts[0].toLongOrNull()?.takeIf { it >= 0 } ?: return null
++        val minutes = parts[1].toIntOrNull()?.takeIf { it in 0..59 } ?: return null
++        val seconds = parts[2].toDoubleOrNull()?.takeIf { it >= 0 && it < 60 } ?: return null
++        return hours * 3600.0 + minutes * 60 + seconds
++    }
++
++    private const val INVALID_DATA = -1094995529
++    private val AAC_FRAMING_FAILURE = Regex("(?i)malformed AAC bitstream|error parsing ADTS frame header|aac_adtstoasc")
++    private val NON_MEDIA_FAILURE = Regex(
++        "(?i)no space left|disk quota exceeded|permission denied|read-only file system|input/output error|" +
++            "no such file or directory|operation canceled|unrecognized option|encoder .* not found",
++    )
+     private val FAILURE_LINE = Regex(
+         "(?i)error|invalid|failed|denied|corrupt|timeout|not found|could not|unable|malformed|ADTS|bitstream|" +
+             "non.monoton|timestamp|DTS|PTS|PES packet|not implemented|unsupported",
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 6594ec593..ec68e87da 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -130,6 +130,7 @@ class Downloader(
+     private val downloaderSessions = DownloadJobSession(scope)
+     private val queueReady = CompletableDeferred<Unit>()
+     private val itemControls = Mutex()
++    private val localAudioRecovery = Mutex()
+     private val controlledIds = ConcurrentHashMap.newKeySet<Long>()
+     private val controlEpoch = MutableStateFlow(0L)
+ 
+@@ -835,17 +836,14 @@ class Downloader(
+                 .flowOn(Dispatchers.IO)
+                 .first()
+                 .also { copied = true }
+-        } catch (e: CancellationException) {
+-            // The user gave up on this episode; do not keep a video nobody will ask for again.
+-            muxed = false
+-            throw e
+         } finally {
+-            if (copied || !muxed) {
++            val stillQueued = queueState.value.any { it.episode.id == download.episode.id }
++            if (copied || !muxed || !stillQueued) {
+                 cacheFile.delete()
+                 muxedMarker.delete()
+             }
+             // A pause keeps completed segments. An actively removed item no longer needs them.
+-            if (queueState.value.none { it.episode.id == download.episode.id }) hlsCache.deleteRecursively()
++            if (!stillQueued) hlsCache.deleteRecursively()
+             // Only succeeds when no other download of the same anime is in progress.
+             cacheFile.parentFile?.delete()
+         }
+@@ -962,7 +960,6 @@ class Downloader(
+         }
+     }
+ 
+-    // A native recommendation can repair ADTS framing once, using the same local segments.
+     private suspend fun ffmpegDownload(
+         download: Download,
+         outputFile: File,
+@@ -971,17 +968,42 @@ class Downloader(
+         try {
+             ffmpegDownloadOnce(download, outputFile, prepared)
+         } catch (error: DownloadFfmpegLogs.Failure) {
+-            if (prepared == null || !error.needsAdtsConversion) throw error
+-            logcat(LogPriority.INFO) { "Download local mux retry episode=${download.episode.id} audioFilter=aac_adtstoasc cache=retained" }
+-            ffmpegDownloadOnce(download, outputFile, prepared, convertAdts = true)
++            if (prepared == null || !DownloadFfmpegPolicy.shouldRecoverLocalAudio(error.returnCode, outputFile.length(), error.detail)) throw error
++            localAudioRecovery.withLock {
++                logcat(LogPriority.INFO) { "Download local audio recovery episode=${download.episode.id} firstRc=${error.returnCode} cachedBytes=${prepared.bytes}" }
++                ffmpegDownloadOnce(download, outputFile, prepared, recoverAudio = true)
++                verifyLocalAudioRecovery(outputFile, prepared.durationMillis)
++                logcat(LogPriority.INFO) { "Download local audio recovery verified episode=${download.episode.id}" }
++            }
++        }
++    }
++
++    private suspend fun verifyLocalAudioRecovery(outputFile: File, expectedMillis: Long) {
++        val options = arrayOf(
++            "-v", "error", "-protocol_whitelist", "file",
++            "-show_entries", "format=duration:stream=codec_type,codec_name:stream_tags=DURATION",
++            "-of", "json", outputFile.absolutePath,
++        )
++        val verified = withTimeoutOrNull(10_000) {
++            suspendCancellableCoroutine<Boolean> { continuation ->
++                val session = FFprobeKit.executeWithArgumentsAsync(options) { result ->
++                    if (continuation.isActive) {
++                        val valid = result.returnCode?.value == 0 &&
++                            DownloadFfmpegPolicy.isCompleteAudioRecovery(result.getAllLogsAsString(500), expectedMillis)
++                        continuation.resume(valid)
++                    }
++                }
++                continuation.invokeOnCancellation { session.cancel() }
++            }
+         }
++        if (verified != true) throw IOException("Recovered audio and video could not be verified for the full duration")
+     }
+ 
+     private suspend fun ffmpegDownloadOnce(
+         download: Download,
+         outputFile: File,
+         prepared: DownloadHlsSegments.Prepared? = null,
+-        convertAdts: Boolean = false,
++        recoverAudio: Boolean = false,
+     ) {
+         val video = download.video!!
+ 
+@@ -996,11 +1018,15 @@ class Downloader(
+         val ffmpegOptions = if (prepared == null) {
+             getFFmpegOptions(video, headerOptions, ffmpegFilename)
+         } else {
++            val codecs = if (recoverAudio) {
++                // The decoder can resync past damaged AAC frames. Keep video intact and bound decoding errors.
++                arrayOf("-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-af", "aresample=async=1", "-max_error_rate", "0.01")
++            } else {
++                arrayOf("-c", "copy")
++            }
+             arrayOf(
+                 "-hide_banner", "-loglevel", "info", "-protocol_whitelist", "file", "-f", "hls", "-allowed_extensions", "ts", "-i", prepared.input.absolutePath,
+-                "-map", "0:v", "-map", "0:a?", "-f", "matroska", "-c", "copy",
+-                *(if (convertAdts) arrayOf("-bsf:a", "aac_adtstoasc") else emptyArray()),
+-                outputFile.absolutePath, "-y",
++                "-map", "0:v", "-map", "0:a?", "-f", "matroska", *codecs, outputFile.absolutePath, "-y",
+             )
+         }
+         val startedAt = SystemClock.elapsedRealtime()
+@@ -1084,12 +1110,13 @@ class Downloader(
+                             { result ->
+                                 try {
+                                     if (continuation.isActive) {
+-                                        if (result.returnCode.isValueSuccess) {
++                                        val returnCode = result.returnCode?.value
++                                        if (returnCode == 0) {
+                                             continuation.resume(Unit)
+                                         } else {
+                                             val allLogs = result.getAllLogsAsString(500)
+-                                            val detail = nativeLogs.failureDetail(allLogs, result.returnCode.toString())
+-                                            continuation.resumeWithException(DownloadFfmpegLogs.Failure(detail, nativeLogs.needsAacAdtsToAsc(allLogs)))
++                                            val detail = nativeLogs.failureDetail(allLogs, returnCode.toString())
++                                            continuation.resumeWithException(DownloadFfmpegLogs.Failure(returnCode, detail))
+                                         }
+                                     }
+                                 } finally {
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegLogsTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegLogsTest.kt
+index ba3e7c9aa..21c284275 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegLogsTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegLogsTest.kt
+@@ -58,19 +58,32 @@ class NavigationChromeDownloadFfmpegLogsTest {
+     }
+ 
+     @Test
+-    fun `AAC filter retry requires the explicit native bitstream conversion recommendation`() {
+-        val recommendation = "Malformed AAC bitstream detected: use the audio bitstream filter 'aac_adtstoasc' to fix it ('-bsf:a aac_adtstoasc' option with ffmpeg)"
+-        assertTrue(DownloadFfmpegPolicy.needsAacAdtsToAsc(recommendation))
+-        val logs = DownloadFfmpegLogs()
+-        logs.record(16, recommendation)
+-        repeat(20) { logs.record(24, "Following warning $it") }
+-        assertTrue(logs.needsAacAdtsToAsc("Conversion failed!"))
+-        listOf(
+-            "Malformed AAC bitstream detected",
+-            "Invalid ADTS data",
+-            "Error applying aac_adtstoasc filter",
+-            "Malformed AAC bitstream\nUse aac_adtstoasc for a different stream",
+-            "Conversion failed!",
+-        ).forEach { assertFalse(DownloadFfmpegPolicy.needsAacAdtsToAsc(it)) }
++    fun `local audio recovery accepts a partial mux failure even when the native error was unscoped`() {
++        val summary = "video:83452kB audio:10883kB muxing overhead: 0.096407% | Conversion failed!"
++        assertTrue(DownloadFfmpegPolicy.shouldRecoverLocalAudio(1, 96_692_153, summary))
++        assertTrue(DownloadFfmpegPolicy.shouldRecoverLocalAudio(-1094995529, 0, "Error parsing ADTS frame header!"))
++        assertFalse(DownloadFfmpegPolicy.shouldRecoverLocalAudio(1, 0, summary))
++        assertFalse(DownloadFfmpegPolicy.shouldRecoverLocalAudio(255, 96_692_153, summary))
++        assertFalse(DownloadFfmpegPolicy.shouldRecoverLocalAudio(1, 96_692_153, "No space left on device"))
++        assertFalse(DownloadFfmpegPolicy.shouldRecoverLocalAudio(1, 96_692_153, "Permission denied"))
++    }
++
++    @Test
++    fun `completed recovery requires both streams to cover the playlist rather than just a valid header`() {
++        val output = """
++            {
++              "streams": [
++                {"codec_name":"h264","codec_type":"video","tags":{"DURATION":"00:00:06.021000000"}},
++                {"codec_name":"aac","codec_type":"audio","tags":{"DURATION":"00:00:06.058000000"}}
++              ],
++              "format":{"duration":"6.058000"}
++            }
++        """.trimIndent()
++
++        assertTrue(DownloadFfmpegPolicy.isCompleteAudioRecovery(output, 6000))
++        assertFalse(DownloadFfmpegPolicy.isCompleteAudioRecovery(output.replace("00:00:06.058000000", "00:00:02.837000000"), 6000))
++        assertFalse(DownloadFfmpegPolicy.isCompleteAudioRecovery(output.replace("\"audio\"", "\"data\""), 6000))
++        assertFalse(DownloadFfmpegPolicy.isCompleteAudioRecovery(output.replace("\"6.058000\"", "\"3.121000\""), 6000))
++        assertFalse(DownloadFfmpegPolicy.isCompleteAudioRecovery("{\"streams\": []}", 6000))
+     }
+ }
