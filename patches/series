@@ -112,3 +112,5 @@
 0112-download-background-and-item-recovery.patch
 0113-download-native-playback-and-mux-diagnostics.patch
 0114-download-recover-aac-after-local-mux-failure.patch
+0115-download-preserve-complete-local-transport.patch
+0116-source-preference-dialog-restore.patch
