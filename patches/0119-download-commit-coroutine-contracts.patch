@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 17:40:09 +0000
+Subject: [PATCH] downloads: use suspend storage registration and explicit job
+ keys
+
+---
+ .../tachiyomi/data/download/DownloadQueueConcurrency.kt       | 2 +-
+ .../main/java/eu/kanade/tachiyomi/data/download/Downloader.kt | 4 ++--
+ .../kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt  | 2 +-
+ 3 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt
+index 6b48ed402..3e045be8b 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt
+@@ -40,7 +40,7 @@ internal object DownloadQueueConcurrency {
+             jobs.keys.filter { it !in activeIds || jobs[it]?.second?.isActive != true }.forEach { stopLocked(it) }
+             currentCoroutineContext().ensureActive()
+             eligible.forEach { download ->
+-                if (download.status.value <= Download.State.DOWNLOADING.value && canStart(download) && download.episode.id !in jobs) {
++                if (download.status.value <= Download.State.DOWNLOADING.value && canStart(download) && !jobs.containsKey(download.episode.id)) {
+                     jobs[download.episode.id] = download to launch(download)
+                 }
+             }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 0c89edba1..23340df04 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -627,7 +627,7 @@ class Downloader(
+                 tmpDir.renameToOrCopy(episodeDirname, context.contentResolver)
+             }
+ 
+-            fun registerDirectory(directory: UniFile) {
++            suspend fun registerDirectory(directory: UniFile) {
+                 cache.addChapter(episodeDirname, animeDir, download.anime)
+                 DiskUtil.createNoMediaFile(directory, context)
+             }
+@@ -709,7 +709,7 @@ class Downloader(
+             video.ffmpegStreamArgs.isEmpty() && video.ffmpegVideoArgs.isEmpty() &&
+             DownloadHlsSegments.isLocalManifest(video.videoUrl)
+ 
+-    private fun reuseSavedEpisode(
++    private suspend fun reuseSavedEpisode(
+         download: Download,
+         animeDir: UniFile,
+         episodeDirname: String,
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt
+index ac6b7fdb3..9170094b8 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt
+@@ -111,7 +111,7 @@ internal object EpisodeDownloadStorage {
+         stagedVideo: UniFile,
+         filename: String,
+         placeDirectory: suspend () -> UniFile,
+-        registerDirectory: (UniFile) -> Unit,
++        registerDirectory: suspend (UniFile) -> Unit,
+     ) {
+         val name = stagedVideo.name ?: throw IOException("Staged video has no filename")
+         val bytes = stagedVideo.length()
