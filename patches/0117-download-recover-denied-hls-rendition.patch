@@ -1,0 +1,396 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 16:38:21 +0000
+Subject: [PATCH] download: recover repeated HLS segment denial with a source
+ rendition
+
+The device log shows the complete-cache TS path applies, while a different 1080p transfer keeps failing at segment 169 after re-resolution. Revalidate the proxy once and, if the same segment is still forbidden, try the highest eligible lower variant exposed by the same source. Keep variant caches isolated and require a complete save.
+---
+ .../data/download/DownloadHlsSegments.kt      | 49 +++++++++++--
+ .../data/download/DownloadQualitySelector.kt  | 26 ++++++-
+ .../tachiyomi/data/download/Downloader.kt     | 60 +++++++++++-----
+ ...NavigationChromeDownloadHlsRecoveryTest.kt | 69 ++++++++++++++++++-
+ ...NavigationChromeDownloadHlsSegmentsTest.kt |  2 +-
+ 5 files changed, 179 insertions(+), 27 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+index 5174381c6..389c44c9e 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+@@ -30,24 +30,55 @@ internal object DownloadHlsSegments {
+ 
+     data class Prepared(val input: File, val directory: File, val bytes: Long, val durationMillis: Long, val segments: Int)
+ 
+-    class Failure(message: String, val httpStatus: Int? = null) : IOException(message)
++    class Failure(
++        message: String,
++        val httpStatus: Int? = null,
++        val segmentNumber: Int? = null,
++    ) : IOException(message)
+ 
+     private data class Segment(val url: HttpUrl, val seconds: BigDecimal, val millis: Long)
+ 
++    suspend fun <T> withAuthorizationRecovery(
++        transfer: suspend (forceNetwork: Boolean) -> T,
++        refresh: suspend (Failure) -> Unit,
++        selectAlternate: suspend (Failure) -> Boolean,
++    ): T {
++        val first = try {
++            return transfer(false)
++        } catch (failure: Failure) {
++            if (failure.httpStatus != 401 && failure.httpStatus != 403) throw failure
++            failure
++        }
++        refresh(first)
++        try {
++            return transfer(true)
++        } catch (failure: Failure) {
++            if (failure.httpStatus != 403 || failure.segmentNumber == null ||
++                failure.segmentNumber != first.segmentNumber || !selectAlternate(failure)
++            ) {
++                throw failure
++            }
++        }
++        return transfer(false)
++    }
++
++    fun isLocalManifest(url: String): Boolean = localManifest(url) != null
++
+     suspend fun prepare(
+         client: OkHttpClient,
+         sourceName: String,
+         url: String,
+         headers: Headers,
+         cacheRoot: File,
++        forceNetwork: Boolean = false,
+         onProgress: (Progress) -> Unit,
+     ): Prepared? = try {
+         withContext(Dispatchers.IO) {
+             // Other extensions can expose the same proxy endpoints. This rollout is MissAV only.
+             if (!sourceName.equals("MissAV", ignoreCase = true)) return@withContext null
+-            val manifestUrl = url.toHttpUrlOrNull()?.takeIf { isProxy(it) && it.encodedPath == "/m3u8" }
+-                ?: return@withContext null
+-            val text = readManifest(client, manifestUrl, headers)
++            val manifestUrl = localManifest(url) ?: return@withContext null
++            val requestHeaders = if (forceNetwork) headers.newBuilder().set("Cache-Control", "no-cache").build() else headers
++            val text = readManifest(client, manifestUrl, requestHeaders)
+             val segments = parse(text, manifestUrl) ?: return@withContext null
+             val totalMillis = try {
+                 segments.fold(BigDecimal.ZERO) { sum, segment -> sum + segment.seconds }
+@@ -99,7 +130,7 @@ internal object DownloadHlsSegments {
+                                 ensureActive()
+                                 val partial = File(directory, "${file.name}.part")
+                                 try {
+-                                    fetch(client, Request.Builder().url(segment.url).headers(headers).build()) { response ->
++                                    fetch(client, Request.Builder().url(segment.url).headers(requestHeaders).build()) { response ->
+                                         if (!response.isSuccessful) throw Failure("HLS segment HTTP ${response.code}", response.code)
+                                         val expected = response.body.contentLength()
+                                         var count = 0L
+@@ -136,7 +167,11 @@ internal object DownloadHlsSegments {
+                             }
+                             failure?.let {
+                                 val detail = if (it is Failure) it.message else it.javaClass.simpleName
+-                                throw Failure("HLS segment ${index + 1}/${segments.size} failed after $attempts attempts: $detail", (it as? Failure)?.httpStatus)
++                                throw Failure(
++                                    "HLS segment ${index + 1}/${segments.size} failed after $attempts attempts: $detail",
++                                    (it as? Failure)?.httpStatus,
++                                    segmentNumber = index + 1,
++                                )
+                             }
+                         }
+                     }
+@@ -273,6 +308,8 @@ internal object DownloadHlsSegments {
+ 
+     private fun isProxy(url: HttpUrl): Boolean = url.scheme == "http" && url.host in setOf("localhost", "127.0.0.1", "::1")
+ 
++    private fun localManifest(url: String): HttpUrl? = url.toHttpUrlOrNull()?.takeIf { isProxy(it) && it.encodedPath == "/m3u8" }
++
+     private fun segmentFile(directory: File, index: Int): File = File(directory, "%05d.ts".format(Locale.ROOT, index))
+ 
+     private fun validTs(file: File): Boolean {
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQualitySelector.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQualitySelector.kt
+index dbc762131..51a8c283e 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQualitySelector.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQualitySelector.kt
+@@ -27,7 +27,29 @@ object DownloadQualitySelector {
+     val HEIGHTS = listOf(2160, 1440, 1080, 720, 480, 360)
+ 
+     /** @return the resolved video, or null to fall back to [HosterLoader.getBestVideo]. */
+-    suspend fun pick(source: AnimeSource, hosters: List<Hoster>, quality: String): Video? {
++    suspend fun pick(source: AnimeSource, hosters: List<Hoster>, quality: String): Video? =
++        pickMatching(source, hosters, quality) { true }
++
++    internal suspend fun pickLower(
++        source: AnimeSource,
++        hosters: List<Hoster>,
++        blocked: Video,
++        accept: (Video) -> Boolean,
++    ): Video? {
++        val height = heightOf(blocked) ?: return null
++        return pickMatching(source, hosters, (height - 1).toString()) { video ->
++            val candidateHeight = heightOf(video)
++            candidateHeight != null && candidateHeight < height &&
++                video.videoUrl != blocked.videoUrl && accept(video)
++        }
++    }
++
++    private suspend fun pickMatching(
++        source: AnimeSource,
++        hosters: List<Hoster>,
++        quality: String,
++        accept: (Video) -> Boolean,
++    ): Video? {
+         val limit = when (quality) {
+             FOLLOW_SOURCE -> return null
+             HIGHEST -> Int.MAX_VALUE
+@@ -42,7 +64,7 @@ object DownloadQualitySelector {
+ 
+         for (video in rank(candidates, limit)) {
+             val resolved = HosterLoader.getResolvedVideo(source, video)
+-            if (resolved?.videoUrl?.isNotEmpty() == true) {
++            if (resolved?.videoUrl?.isNotEmpty() == true && accept(resolved)) {
+                 logcat(LogPriority.INFO) { "Download quality $quality: picked '${video.videoTitle}'" }
+                 return resolved
+             }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 163813abb..ce5ce1b3b 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -13,6 +13,7 @@ import com.arthenica.ffmpegkit.LogCallback
+ import com.arthenica.ffmpegkit.StatisticsCallback
+ import com.hippo.unifile.UniFile
+ import eu.kanade.tachiyomi.animesource.UnmeteredSource
++import eu.kanade.tachiyomi.animesource.model.Hoster
+ import eu.kanade.tachiyomi.animesource.model.Track
+ import eu.kanade.tachiyomi.animesource.model.Video
+ import eu.kanade.tachiyomi.data.download.model.Download
+@@ -579,7 +580,7 @@ class Downloader(
+ 
+             if (download.video == null) {
+                 // Pull video from network and add them to download object
+-                download.video = resolveVideo(download)
++                download.video = resolveVideo(download, EpisodeLoader.getHosters(download.episode, download.anime, download.source))
+             }
+ 
+             withIOContext {
+@@ -618,6 +619,9 @@ class Downloader(
+             DiskUtil.createNoMediaFile(episodeDir, context)
+ 
+             download.status = Download.State.DOWNLOADED
++            if (usesInternalDownloader(download)) {
++                logcat(LogPriority.INFO) { "Download saved episode=${download.episode.id} bytes=${download.downloadedBytes}" }
++            }
+         } catch (error: Throwable) {
+             if (error is CancellationException) throw error
+             // If the video threw, it will resume here
+@@ -632,8 +636,7 @@ class Downloader(
+         }
+     }
+ 
+-    private suspend fun resolveVideo(download: Download): Video {
+-        val hosters = EpisodeLoader.getHosters(download.episode, download.anime, download.source)
++    private suspend fun resolveVideo(download: Download, hosters: List<Hoster>): Video {
+         if (hosters.isEmpty()) throw IOException(context.stringResource(AYMR.strings.video_list_empty_error))
+         return DownloadQualitySelector.pick(download.source, hosters, downloadPreferences.downloadQuality().get())
+             ?: HosterLoader.getBestVideo(download.source, hosters)
+@@ -641,16 +644,40 @@ class Downloader(
+     }
+ 
+     private suspend fun downloadWithFreshAddress(download: Download, directory: UniFile, filename: String): UniFile {
+-        try {
+-            return downloadVideo(download, directory, filename)
+-        } catch (failure: DownloadHlsSegments.Failure) {
+-            if (failure.httpStatus != 401 && failure.httpStatus != 403) throw failure
+-            logcat(LogPriority.INFO) { "Download authorization refresh episode=${download.episode.id} status=${failure.httpStatus} cache=retained" }
+-            download.video = resolveVideo(download).apply { status = Video.State.LoadVideo }
+-            return downloadVideo(download, directory, filename) // exactly one fresh resolution, no infinite retry
+-        }
++        var freshHosters = emptyList<Hoster>()
++        return DownloadHlsSegments.withAuthorizationRecovery(
++            transfer = { forceNetwork -> downloadVideo(download, directory, filename, forceNetwork) },
++            refresh = { failure ->
++                logcat(LogPriority.INFO) {
++                    "Download authorization refresh episode=${download.episode.id} status=${failure.httpStatus} segment=${failure.segmentNumber} cache=retained"
++                }
++                freshHosters = EpisodeLoader.getHosters(download.episode, download.anime, download.source)
++                download.video = resolveVideo(download, freshHosters).apply { status = Video.State.LoadVideo }
++            },
++            selectAlternate = { denied ->
++                val failed = checkNotNull(download.video)
++                val alternate = DownloadQualitySelector.pickLower(download.source, freshHosters, failed) { video ->
++                    canResumeHlsSegments(download, video)
++                } ?: return@withAuthorizationRecovery false
++                download.resetSpeed()
++                download.downloadedBytes = 0L
++                download.progress = 0
++                download.video = alternate.apply { status = Video.State.LoadVideo }
++                logcat(LogPriority.INFO) {
++                    "Download alternate rendition episode=${download.episode.id} segment=${denied.segmentNumber} " +
++                        "from=${DownloadQualitySelector.heightOf(failed)} to=${DownloadQualitySelector.heightOf(alternate)} cache=retained"
++                }
++                true
++            },
++        )
+     }
+ 
++    private fun canResumeHlsSegments(download: Download, video: Video): Boolean =
++        download.source.name.equals("MissAV", ignoreCase = true) &&
++            video.subtitleTracks.isEmpty() && video.audioTracks.isEmpty() &&
++            video.ffmpegStreamArgs.isEmpty() && video.ffmpegVideoArgs.isEmpty() &&
++            DownloadHlsSegments.isLocalManifest(video.videoUrl)
++
+     /**
+      * Reconcile an existing final folder without deleting ambiguous videos. Pending copies must
+      * agree byte-for-byte; otherwise preserve both directories and report a recoverable failure.
+@@ -767,6 +794,7 @@ class Downloader(
+         download: Download,
+         tmpDir: UniFile,
+         filename: String,
++        forceNetwork: Boolean,
+     ): UniFile {
+         // Harmony: ffmpeg-kit reaches SAF documents through its "saf:<id>" protocol, which fails on
+         // several devices (HarmonyOS ZhuoyiTong, some Motorola/Samsung firmwares) because the
+@@ -792,11 +820,8 @@ class Downloader(
+                         val video = download.video!!
+                         // Keep external tracks and extension-supplied FFmpeg options on their
+                         // existing path. The helper also checks MissAV and the loopback manifest.
+-                        val prepared = if (download.source.name.equals("MissAV", ignoreCase = true) &&
+-                            video.subtitleTracks.isEmpty() && video.audioTracks.isEmpty() &&
+-                            video.ffmpegStreamArgs.isEmpty() && video.ffmpegVideoArgs.isEmpty()
+-                        ) {
+-                            prepareHlsSegments(download, hlsCache)
++                        val prepared = if (canResumeHlsSegments(download, video)) {
++                            prepareHlsSegments(download, hlsCache, forceNetwork)
+                         } else {
+                             null
+                         }
+@@ -934,7 +959,7 @@ class Downloader(
+             .build()
+     }
+ 
+-    private suspend fun prepareHlsSegments(download: Download, cacheRoot: File): DownloadHlsSegments.Prepared? {
++    private suspend fun prepareHlsSegments(download: Download, cacheRoot: File, forceNetwork: Boolean): DownloadHlsSegments.Prepared? {
+         val video = download.video!!
+         var networkBytes = 0L
+         var lastLogAt = 0L
+@@ -944,6 +969,7 @@ class Downloader(
+             video.videoUrl,
+             video.headers ?: download.source.headers,
+             cacheRoot,
++            forceNetwork = forceNetwork,
+         ) { state ->
+             // Cached segments advance completion, but never count as network speed.
+             val addedBytes = (state.networkBytes - networkBytes).coerceAtLeast(0)
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRecoveryTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRecoveryTest.kt
+index b64e24fd1..c872c396d 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRecoveryTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRecoveryTest.kt
+@@ -1,5 +1,9 @@
+ package eu.kanade.tachiyomi.data.download
+ 
++import eu.kanade.tachiyomi.animesource.AnimeSource
++import eu.kanade.tachiyomi.animesource.model.Hoster
++import eu.kanade.tachiyomi.animesource.model.Video
++import io.mockk.mockk
+ import kotlinx.coroutines.runBlocking
+ import okhttp3.Headers.Companion.headersOf
+ import okhttp3.Interceptor
+@@ -12,6 +16,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
+ import org.junit.jupiter.api.Assertions.assertTrue
+ import org.junit.jupiter.api.Test
+ import java.io.File
++import java.util.Collections
+ import java.util.concurrent.atomic.AtomicInteger
+ import kotlin.io.path.createTempDirectory
+ 
+@@ -51,7 +56,7 @@ class NavigationChromeDownloadHlsRecoveryTest {
+             response(chain, MANIFEST.toByteArray())
+         }.build()
+         val snapshots = mutableListOf<DownloadHlsSegments.Progress>()
+-        val resumed = DownloadHlsSegments.prepare(resumedClient, "MissAV", URL, headersOf(), cache, snapshots::add)!!
++        val resumed = DownloadHlsSegments.prepare(resumedClient, "MissAV", URL, headersOf(), cache, onProgress = snapshots::add)!!
+         assertEquals(initial.directory, resumed.directory)
+         assertEquals(1, requests.get())
+         assertEquals(1, snapshots.size)
+@@ -66,6 +71,68 @@ class NavigationChromeDownloadHlsRecoveryTest {
+         assertTrue(localPaths.all { File(resumed.directory, it).isFile && !File(it).isAbsolute })
+     }
+ 
++    @Test
++    fun `repeated segment 169 denial retries uncached then completes a separate lower rendition`() = withCache { cache ->
++        val deniedRequests = Collections.synchronizedList(mutableListOf<String?>())
++        val alternateTs = TS.copyOf().apply { this[1] = 1 }
++        val client = OkHttpClient.Builder().addInterceptor { chain ->
++            val request = chain.request()
++            val route = request.url.queryParameter("url").orEmpty()
++            if (request.url.encodedPath == "/m3u8") {
++                val manifest = buildString {
++                    appendLine("#EXTM3U")
++                    repeat(170) { index ->
++                        appendLine("#EXTINF:4,")
++                        appendLine("/segment?url=$route-${index + 1}")
++                    }
++                    appendLine("#EXT-X-ENDLIST")
++                }
++                response(chain, manifest.toByteArray())
++            } else if (route == "1080-169") {
++                deniedRequests += request.header("Cache-Control")
++                response(chain, byteArrayOf(), 403)
++            } else {
++                response(chain, if (route.startsWith("720-")) alternateTs else TS)
++            }
++        }.build()
++        val source = mockk<AnimeSource>()
++        val highest = Video(videoUrl = "$URL&quality=1080", videoTitle = "1080p", initialized = true)
++        val lower = Video(videoUrl = "$URL&quality=720", videoTitle = "720p", initialized = true)
++        val unavailable = Video(videoUrl = highest.videoUrl, videoTitle = "900p", initialized = true)
++        val hosters = listOf(Hoster(videoList = listOf(highest, lower, unavailable)))
++        var rendition = "1080"
++        var refreshes = 0
++        val complete = DownloadHlsSegments.withAuthorizationRecovery(
++            transfer = { forceNetwork ->
++                DownloadHlsSegments.prepare(client, "MissAV", "http://localhost:1234/m3u8?url=$rendition", headersOf(), cache, forceNetwork) {}!!
++            },
++            refresh = {
++                assertEquals(169, it.segmentNumber)
++                refreshes++
++            },
++            selectAlternate = {
++                assertEquals(169, it.segmentNumber)
++                val next = DownloadQualitySelector.pickLower(source, hosters, highest) { candidate ->
++                    DownloadHlsSegments.isLocalManifest(candidate.videoUrl)
++                }!!
++                assertEquals(lower.videoUrl, next.videoUrl)
++                rendition = checkNotNull(DownloadQualitySelector.heightOf(next)).toString()
++                true
++            },
++        )
++
++        assertEquals(1, refreshes)
++        assertEquals(listOf(null, "no-cache"), deniedRequests)
++        assertEquals(170, complete.segments)
++        assertEquals(680_000L, complete.durationMillis)
++        val original = cache.listFiles()!!.single { it != complete.directory }
++        assertTrue(File(original, "00000.ts").readBytes().contentEquals(TS))
++        assertFalse(File(original, "00168.ts").exists())
++        val output = File(cache, "offline.ts")
++        DownloadHlsSegments.writeTransportStream(complete, output) {}
++        assertTrue(output.readBytes().contentEquals(ByteArray(170 * alternateTs.size) { alternateTs[it % alternateTs.size] }))
++    }
++
+     private fun client(): OkHttpClient = OkHttpClient.Builder().addInterceptor { chain ->
+         response(chain, if (chain.request().url.encodedPath == "/m3u8") MANIFEST.toByteArray() else TS)
+     }.build()
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsSegmentsTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsSegmentsTest.kt
+index dbd24c48f..ef28eb681 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsSegmentsTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsSegmentsTest.kt
+@@ -67,7 +67,7 @@ class NavigationChromeDownloadHlsSegmentsTest {
+             }
+         }
+         val progress = mutableListOf<DownloadHlsSegments.Progress>()
+-        val prepared = DownloadHlsSegments.prepare(client, "MissAV", URL, headersOf("Cookie", "test"), cache, progress::add)!!
++        val prepared = DownloadHlsSegments.prepare(client, "MissAV", URL, headersOf("Cookie", "test"), cache, onProgress = progress::add)!!
+         assertEquals(4, calls.get())
+         assertEquals(2, maximum.get())
+         assertEquals(4L * TS.size, prepared.bytes)
