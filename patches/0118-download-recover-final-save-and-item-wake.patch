@@ -1,0 +1,872 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 17:31:00 +0000
+Subject: [PATCH] downloads: recover interrupted final saves and wake resumed
+ episodes
+
+Recover an existing partial final document only when it matches the verified staged prefix. Reuse staging without resolving a stream and expose completion only after validating and registering the saved file. Deliver individual pause requests without waiting on unrelated writers, replace inactive worker entries, and log scheduler/save decisions with episode IDs.
+---
+ .../data/download/DownloadNotifier.kt         |   8 +-
+ .../data/download/DownloadQueueConcurrency.kt |   7 +-
+ .../tachiyomi/data/download/Downloader.kt     | 282 ++++++++----------
+ .../data/download/EpisodeDownloadStorage.kt   |  77 ++++-
+ .../tachiyomi/data/download/model/Download.kt |  24 +-
+ .../tachiyomi/ui/download/DownloadHolder.kt   |  10 +-
+ ...NavigationChromeDownloadItemControlTest.kt |   6 +
+ .../NavigationChromeDownloadRecoveryTest.kt   |  65 ++++
+ 8 files changed, 305 insertions(+), 174 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadNotifier.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadNotifier.kt
+index 1ebec0fb1..e8a55588b 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadNotifier.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadNotifier.kt
+@@ -129,10 +129,10 @@ internal class DownloadNotifier(private val context: Context) {
+             val speed = Formatter.formatFileSize(context, DownloadSpeedMeter.bytesPerSecond())
+             // ffmpeg reports no progress until it has probed the stream (or when the duration is
+             // unknown); show the speed alone and an indeterminate bar until the first percent arrives.
+-            val status = if (progress == 0) {
+-                context.stringResource(AMR.strings.download_notifier_speed, speed)
+-            } else {
+-                context.stringResource(AMR.strings.download_notifier_speed_progress, speed, progress)
++            val status = when {
++                download.isSaving -> "${context.stringResource(MR.strings.action_save)}…"
++                progress == 0 -> context.stringResource(AMR.strings.download_notifier_speed, speed)
++                else -> context.stringResource(AMR.strings.download_notifier_speed_progress, speed, progress)
+             }
+ 
+             val bytes = download.downloadedBytes.takeIf { it > 0 }?.let { Formatter.formatFileSize(context, it) }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt
+index 067a8b8e1..6b48ed402 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt
+@@ -9,6 +9,7 @@ import kotlinx.coroutines.ensureActive
+ import kotlinx.coroutines.sync.Mutex
+ import kotlinx.coroutines.sync.withLock
+ import kotlinx.coroutines.withContext
++import java.util.concurrent.ConcurrentHashMap
+ 
+ /** Source slots and per-source video slots are separate limits. */
+ internal object DownloadQueueConcurrency {
+@@ -31,12 +32,12 @@ internal object DownloadQueueConcurrency {
+     /** Reconcile by immutable episode id; a reduced limit pauses excess jobs before replacements. */
+     class Workers(private val canStart: (Download) -> Boolean = { true }) {
+         private val mutex = Mutex()
+-        private val jobs = mutableMapOf<Long, Pair<Download, Job>>()
++        private val jobs = ConcurrentHashMap<Long, Pair<Download, Job>>()
+ 
+         suspend fun update(active: List<Download>, launch: (Download) -> Job) = mutex.withLock {
+             val eligible = active.filter { it.status.value <= Download.State.DOWNLOADING.value && canStart(it) }
+             val activeIds = eligible.mapTo(mutableSetOf()) { it.episode.id }
+-            jobs.keys.filter { it !in activeIds }.toList().forEach { stopLocked(it) }
++            jobs.keys.filter { it !in activeIds || jobs[it]?.second?.isActive != true }.forEach { stopLocked(it) }
+             currentCoroutineContext().ensureActive()
+             eligible.forEach { download ->
+                 if (download.status.value <= Download.State.DOWNLOADING.value && canStart(download) && download.episode.id !in jobs) {
+@@ -47,6 +48,8 @@ internal object DownloadQueueConcurrency {
+ 
+         suspend fun stop(episodeId: Long) = mutex.withLock { stopLocked(episodeId) }
+ 
++        fun requestStop(episodeId: Long): Job? = jobs[episodeId]?.second?.also { it.cancel() }
++
+         private suspend fun stopLocked(id: Long) {
+             val running = jobs[id] ?: return
+             running.second.cancel()
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index ce5ce1b3b..0c89edba1 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -40,13 +40,13 @@ import kotlinx.coroutines.SupervisorJob
+ import kotlinx.coroutines.async
+ import kotlinx.coroutines.cancelAndJoin
+ import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.currentCoroutineContext
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.ensureActive
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.asStateFlow
+ import kotlinx.coroutines.flow.collectLatest
+ import kotlinx.coroutines.flow.combine
+-import kotlinx.coroutines.flow.distinctUntilChanged
+ import kotlinx.coroutines.flow.filter
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.flow.flow
+@@ -54,6 +54,7 @@ import kotlinx.coroutines.flow.flowOn
+ import kotlinx.coroutines.flow.retryWhen
+ import kotlinx.coroutines.flow.transformLatest
+ import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.job
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.supervisorScope
+ import kotlinx.coroutines.suspendCancellableCoroutine
+@@ -67,7 +68,6 @@ import tachiyomi.core.common.i18n.stringResource
+ import tachiyomi.core.common.storage.displayablePath
+ import tachiyomi.core.common.storage.extension
+ import tachiyomi.core.common.storage.renameToOrCopy
+-import tachiyomi.core.common.util.lang.withIOContext
+ import tachiyomi.core.common.util.system.logcat
+ import tachiyomi.domain.anime.model.Anime
+ import tachiyomi.domain.download.service.DownloadPreferences
+@@ -131,6 +131,7 @@ class Downloader(
+     private val downloaderSessions = DownloadJobSession(scope)
+     private val queueReady = CompletableDeferred<Unit>()
+     private val itemControls = Mutex()
++    private val pendingResumes = ConcurrentHashMap<Long, Job>()
+     private val controlledIds = ConcurrentHashMap.newKeySet<Long>()
+     private val controlEpoch = MutableStateFlow(0L)
+ 
+@@ -208,6 +209,7 @@ class Downloader(
+      * Pauses the downloader
+      */
+     fun pause() {
++        pendingResumes.clear()
+         cancelDownloaderJob()
+         queueState.value.filter { it.status.value <= Download.State.DOWNLOADING.value }.forEach {
+             it.status = Download.State.PAUSED
+@@ -224,26 +226,41 @@ class Downloader(
+             awaitQueueReady()
+             val current = queueState.value.firstOrNull { it.episode.id == download.episode.id } ?: return@withLock
+             if (current.status == Download.State.DOWNLOADED) return@withLock
++            pendingResumes.remove(current.episode.id)
+             current.status = Download.State.PAUSED
+             store.update(current)
++            activeWorkers?.requestStop(current.episode.id)
+             controlEpoch.update { it + 1 }
+-            activeWorkers?.stop(current.episode.id)
++            logcat(LogPriority.INFO) { "Download paused episode=${current.episode.id}" }
+         }
+     }
+ 
+     fun resumeDownload(download: Download) = scope.launch {
+-        itemControls.withLock {
++        val id = download.episode.id
++        val request = currentCoroutineContext().job
++        val (downloadToResume, stopping) = itemControls.withLock {
+             awaitQueueReady()
+-            val current = queueState.value.firstOrNull { it.episode.id == download.episode.id } ?: return@withLock
+-            if (current.status == Download.State.DOWNLOADING || current.status == Download.State.DOWNLOADED) return@withLock
+-            activeWorkers?.stop(current.episode.id)
+-            if (queueState.value.none { it.episode.id == current.episode.id }) return@withLock
+-            current.video = null // Re-resolve expiring source URLs; keep verified segments on disk.
+-            current.resetSpeed()
+-            current.status = Download.State.QUEUE
+-            store.update(current)
+-            controlEpoch.update { it + 1 }
+-            DownloadJob.start(context)
++            val current = queueState.value.firstOrNull { it.episode.id == id } ?: return@launch
++            if (current.status != Download.State.PAUSED && current.status != Download.State.ERROR) return@launch
++            if (pendingResumes.putIfAbsent(id, request) != null) return@launch
++            current to activeWorkers?.requestStop(id)
++        }
++        try {
++            logcat(LogPriority.INFO) { "Download resume requested episode=$id waitingForWorker=${stopping?.isCompleted == false}" }
++            stopping?.join()
++            itemControls.withLock {
++                if (pendingResumes[id] != request || queueState.value.none { it === downloadToResume }) return@withLock
++                if (downloadToResume.status != Download.State.PAUSED && downloadToResume.status != Download.State.ERROR) return@withLock
++                downloadToResume.video = null
++                downloadToResume.resetSpeed()
++                downloadToResume.status = Download.State.QUEUE
++                store.update(downloadToResume)
++                controlEpoch.update { it + 1 }
++                logcat(LogPriority.INFO) { "Download resumed episode=$id state=queued" }
++                DownloadJob.start(context)
++            }
++        } finally {
++            pendingResumes.remove(id, request)
+         }
+     }
+ 
+@@ -252,6 +269,7 @@ class Downloader(
+             awaitQueueReady()
+             queueState.value.filter { it.status != Download.State.DOWNLOADED }.forEach {
+                 if (it.status == Download.State.PAUSED || it.status == Download.State.ERROR) {
++                    pendingResumes.remove(it.episode.id)
+                     activeWorkers?.stop(it.episode.id)
+                     it.video = null
+                     it.resetSpeed()
+@@ -270,6 +288,7 @@ class Downloader(
+             val current = queueState.value.firstOrNull { it.episode.id == download.episode.id } ?: return@withLock
+             if (current.status == Download.State.DOWNLOADED) return@withLock
+             val id = current.episode.id
++            pendingResumes.remove(id)
+             controlledIds.add(id)
+             current.status = Download.State.PAUSED
+             store.update(current)
+@@ -355,6 +374,10 @@ class Downloader(
+                 .transformLatest { (queue, parallelCount, perSourceCount) ->
+                     while (true) {
+                         val activeDownloads = DownloadQueueConcurrency.select(queue.filter { it.episode.id !in controlledIds }, parallelCount, perSourceCount)
++                        logcat(LogPriority.DEBUG) {
++                            "Download queue selection sources=$parallelCount perSource=$perSourceCount pending=${queue.count { it.status.value <= Download.State.DOWNLOADING.value }} " +
++                                "selected=${activeDownloads.joinToString(",") { it.episode.id.toString() }}"
++                        }
+                         emit(activeDownloads)
+ 
+                         if (activeDownloads.isEmpty()) break
+@@ -376,7 +399,6 @@ class Downloader(
+                         }
+                     }
+                 }
+-                .distinctUntilChanged()
+ 
+             // Use supervisorScope to cancel child jobs when the downloader job is cancelled
+             val workers = DownloadQueueConcurrency.Workers { it.episode.id !in controlledIds }
+@@ -399,7 +421,8 @@ class Downloader(
+     private fun CoroutineScope.launchDownloadJob(download: Download, owner: Job) = launch(Dispatchers.IO) {
+         // This try-catch manages the job cancellation
+         try {
+-            if (download !in queueState.value) return@launch
++            if (download !in queueState.value || download.status.value > Download.State.DOWNLOADING.value) return@launch
++            logcat(LogPriority.INFO) { "Download worker started episode=${download.episode.id}" }
+             downloadEpisode(download)
+             ensureActive()
+ 
+@@ -565,67 +588,65 @@ class Downloader(
+         }
+ 
+         val episodeDirname = provider.getChapterDirName(download.episode.name, download.episode.scanlator)
++        val filename = DiskUtil.buildValidFilename(download.episode.name)
++        val internal = usesInternalDownloader(download)
+ 
+         try {
+-            // Harmony: the episode may already be on disk without the cache knowing
+-            // (finalisation interrupted by a process kill, stale cache). Reuse a complete
+-            // copy, remove an incomplete one; never skip silently.
+-            if (reuseOrRemoveExistingEpisode(download, animeDir, episodeDirname)) {
+-                download.status = Download.State.DOWNLOADED
++            if (reuseSavedEpisode(download, animeDir, episodeDirname, filename, internal)) {
++                currentCoroutineContext().ensureActive()
++                download.finishSaving()
+                 return
+             }
+ 
+             val tmpDir = animeDir.createDirectory(episodeDirname + TMP_DIR_SUFFIX)
+                 ?: throw IOException("Failed to create '$episodeDirname$TMP_DIR_SUFFIX'")
+ 
+-            if (download.video == null) {
+-                // Pull video from network and add them to download object
+-                download.video = resolveVideo(download, EpisodeLoader.getHosters(download.episode, download.anime, download.source))
+-            }
+-
+-            withIOContext {
+-                getOrDownloadVideoFile(download, tmpDir)
++            currentCoroutineContext().ensureActive()
++            download.status = Download.State.DOWNLOADING
++            val stagedVideo = getOrDownloadVideoFile(download, tmpDir, filename, internal)
++            if (!internal && download.status == Download.State.DOWNLOADED) return
++            val staged = if (internal) {
++                EpisodeDownloadStorage.isComplete(tmpDir, filename, ready = true, error = download.error)
++            } else {
++                // The external application owns completion; retain its established handoff behavior.
++                tmpDir.listFiles().orEmpty().count { it.extension != "tmp" } == 1
+             }
+-
+-            if (!isDownloadSuccessful(download, tmpDir)) {
+-                // The video step already reported why it failed; otherwise describe what is there.
+-                val alreadyReported = download.error != null
+-                val message = download.error
+-                    ?: context.stringResource(
++            if (!staged) {
++                throw IOException(
++                    context.stringResource(
+                         AMR.strings.harmony_download_unexpected_files,
+                         tmpDir.listFiles().orEmpty().mapNotNull { it.name }.joinToString(", ").ifEmpty { "-" },
+-                    )
+-                logcat(LogPriority.ERROR) { "Download of ${download.episode.name} failed: $message" }
+-                download.fail(message)
+-                if (!alreadyReported) {
+-                    notifier.onError(message, download.episode.name, download.anime.title, download.anime.id)
+-                }
+-                return
++                    ),
++                )
+             }
+ 
+-            // Only rename the directory if it's downloaded
+-            val filename = DiskUtil.buildValidFilename("${/* SY --> */ download.anime.ogTitle /* SY <-- */} - ${download.episode.name}")
+-            tmpDir.findFile("$filename.tmp")?.delete()
+-            tmpDir.findFile("${filename}_tmp.mkv")?.delete()
+-            // Harmony: on SAF without renameDocument this is a move or copy of the finished video,
+-            // which can fail transiently (provider restarted while the app was frozen in the
+-            // background). The video stays in the _tmp directory, so retrying is cheap.
+-            val episodeDir = retryStorageOperation {
++            val legacyName = DiskUtil.buildValidFilename("${/* SY --> */ download.anime.ogTitle /* SY <-- */} - ${download.episode.name}")
++            tmpDir.findFile("$legacyName.tmp")?.delete()
++            tmpDir.findFile("${legacyName}_tmp.mkv")?.delete()
++            suspend fun placeDirectory() = retryStorageOperation {
+                 tmpDir.renameToOrCopy(episodeDirname, context.contentResolver)
+             }
+ 
+-            cache.addChapter(episodeDirname, animeDir, download.anime)
+-
+-            DiskUtil.createNoMediaFile(episodeDir, context)
++            fun registerDirectory(directory: UniFile) {
++                cache.addChapter(episodeDirname, animeDir, download.anime)
++                DiskUtil.createNoMediaFile(directory, context)
++            }
+ 
+-            download.status = Download.State.DOWNLOADED
+-            if (usesInternalDownloader(download)) {
+-                logcat(LogPriority.INFO) { "Download saved episode=${download.episode.id} bytes=${download.downloadedBytes}" }
++            if (internal) {
++                val saveStarted = SystemClock.elapsedRealtime()
++                logcat(LogPriority.INFO) { "Download final save start episode=${download.episode.id} bytes=${stagedVideo.length()}" }
++                EpisodeDownloadStorage.commit(download, stagedVideo, filename, ::placeDirectory, ::registerDirectory)
++                logcat(LogPriority.INFO) {
++                    "Download saved episode=${download.episode.id} bytes=${download.downloadedBytes} elapsedMs=${SystemClock.elapsedRealtime() - saveStarted}"
++                }
++            } else {
++                registerDirectory(placeDirectory())
++                download.finishSaving()
+             }
+         } catch (error: Throwable) {
+             if (error is CancellationException) throw error
+-            // If the video threw, it will resume here
+-            logcat(LogPriority.ERROR, error)
++            logcat(LogPriority.ERROR, error) { "Download failed episode=${download.episode.id} saving=${download.isSaving}" }
++            download.video?.status = Video.State.Error(error)
+             download.fail(error.message ?: error.javaClass.simpleName)
+             notifier.onError(
+                 error.message,
+@@ -643,6 +664,16 @@ class Downloader(
+             ?: throw IOException(context.stringResource(AYMR.strings.video_list_empty_error))
+     }
+ 
++    private suspend fun requireDownloadVideo(download: Download): Video {
++        val video = download.video ?: run {
++            logcat(LogPriority.INFO) { "Download resolving video episode=${download.episode.id}" }
++            resolveVideo(download, EpisodeLoader.getHosters(download.episode, download.anime, download.source))
++        }
++        video.status = Video.State.LoadVideo
++        download.video = video
++        return video
++    }
++
+     private suspend fun downloadWithFreshAddress(download: Download, directory: UniFile, filename: String): UniFile {
+         var freshHosters = emptyList<Hoster>()
+         return DownloadHlsSegments.withAuthorizationRecovery(
+@@ -678,109 +709,63 @@ class Downloader(
+             video.ffmpegStreamArgs.isEmpty() && video.ffmpegVideoArgs.isEmpty() &&
+             DownloadHlsSegments.isLocalManifest(video.videoUrl)
+ 
+-    /**
+-     * Reconcile an existing final folder without deleting ambiguous videos. Pending copies must
+-     * agree byte-for-byte; otherwise preserve both directories and report a recoverable failure.
+-     * @return true for a verified existing copy, false for a missing or empty target.
+-     */
+-    private suspend fun reuseOrRemoveExistingEpisode(download: Download, animeDir: UniFile, episodeDirname: String): Boolean {
++    private fun reuseSavedEpisode(
++        download: Download,
++        animeDir: UniFile,
++        episodeDirname: String,
++        filename: String,
++        internal: Boolean,
++    ): Boolean {
+         val existing = provider
+             .getValidChapterDirNames(download.episode.name, download.episode.scanlator)
+             .firstNotNullOfOrNull { animeDir.findFile(it) }
+             ?: return false
+         val name = existing.name ?: return false
+-        val filename = DiskUtil.buildValidFilename(download.episode.name)
+-        val completedCache = completedCache(cacheOutputFiles(download, filename))
+-        val video = if (usesInternalDownloader(download)) {
+-            EpisodeDownloadStorage.recover(existing, filename, completedCache)
++        val video = if (internal) {
++            val completed = completedCache(cacheOutputFiles(download, filename))
++            val pending = animeDir.findFile(episodeDirname + TMP_DIR_SUFFIX)
++            EpisodeDownloadStorage.recoverFinal(existing, pending, filename, completed, repairIntoExisting = name == episodeDirname)
+         } else {
+-            existing.listFiles().orEmpty().filterNot { it.name == NOMEDIA_FILE || it.extension == "tmp" }
++            val video = existing.listFiles().orEmpty().filterNot { it.name == NOMEDIA_FILE || it.extension == "tmp" }
+                 .singleOrNull()?.takeIf { it.length() > 0L }
+-        }
+-        if (video == null) {
+-            // Empty targets can be merged by renameToOrCopy. Never delete a final folder whose
+-            // existing video cannot be proved complete, including differently sized duplicates.
+-            if (existing.listFiles()?.all { it.name == NOMEDIA_FILE } == true) return false
+-            throw IOException("Existing episode is not verified; files were preserved for recovery")
+-        }
+-        val tmpDir = animeDir.findFile(episodeDirname + TMP_DIR_SUFFIX)
+-        if (usesInternalDownloader(download) && tmpDir != null && tmpDir.listFiles()?.any { it.name != NOMEDIA_FILE } == true) {
+-            val pending = EpisodeDownloadStorage.recover(tmpDir, filename, completedCache)
+-            if (pending == null || !EpisodeDownloadStorage.sameContents(video, pending)) {
+-                throw IOException("Final and pending episode copies differ; files were preserved for recovery")
++            if (video == null && existing.listFiles()?.all { it.name == NOMEDIA_FILE } != true) {
++                throw IOException("Existing episode is not verified; files were preserved for recovery")
+             }
+-        }
++            video
++        } ?: return false
++        if (internal) download.downloadedBytes = video.length()
+         DiskUtil.createNoMediaFile(existing, context)
+         cache.addChapter(name, animeDir, download.anime)
+-        // Retain any pending copy. Completion must not depend on deleting the only recovery data.
+         return true
+     }
+ 
+-    /**
+-     * Gets the video file if already downloaded, otherwise downloads it
+-     *
+-     * @param download the download of the video.
+-     * @param tmpDir the temporary directory of the download.
+-     */
+     private suspend fun getOrDownloadVideoFile(
+         download: Download,
+         tmpDir: UniFile,
+-    ) {
+-        val video = download.video!!
+-
+-        video.status = Video.State.LoadVideo
+-
+-        // Get filename from download info
+-        val filename = DiskUtil.buildValidFilename(download.episode.name)
+-
++        filename: String,
++        internal: Boolean,
++    ): UniFile {
+         val completedCache = completedCache(cacheOutputFiles(download, filename))
+-        val internal = usesInternalDownloader(download)
+         val videoFile = if (internal) {
+             EpisodeDownloadStorage.recover(tmpDir, filename, completedCache)
+         } else {
+             tmpDir.listFiles()?.firstOrNull { it.name?.startsWith("$filename.mkv") == true }
+         }
+ 
+-        try {
+-            // If the video is already downloaded, do nothing. Otherwise download from network
+-            val file = when {
+-                videoFile != null -> videoFile
+-                else -> {
+-                    notifier.onProgressChange(download, remainingDownloads())
+-
+-                    download.status = Download.State.DOWNLOADING
+-                    download.progress = 0
+-
+-                    // If videoFile is not existing then download it
+-                    if (internal) {
+-                        // Progress and speed are pushed by the 1 Hz ticker in launchDownloaderJob().
+-                        downloadWithFreshAddress(download, tmpDir, filename)
+-                    } else {
+-                        val betterFileName = DiskUtil.buildValidFilename(
+-                            "${/* SY --> */ download.anime.ogTitle /* SY <-- */} - ${download.episode.name}",
+-                        )
+-                        downloadVideoExternal(download.video!!, download.source, tmpDir, betterFileName)
+-                    }
+-                }
+-            }
+-
+-            // Keep the original remote URL. A later storage error may require resolving/downloading
+-            // again; a document path must never replace the input URL used by ffmpeg on retry.
+-            if (internal && file.length() <= 0L) throw IOException("Downloaded video length is not verified")
+-            if (internal) download.downloadedBytes = file.length()
+-            download.progress = 100
+-            download.video?.status = Video.State.Ready
+-            if (videoFile != null && completedCache != null) {
++        if (videoFile != null) {
++            if (completedCache != null) {
+                 completedCache.delete()
+                 completionMarker(completedCache).delete()
+             }
+-        } catch (e: Exception) {
+-            if (e is CancellationException) throw e
+-            logcat(LogPriority.ERROR, e) { "Failed to download ${download.episode.name}" }
+-            download.video?.status = Video.State.Error(e)
+-            download.error = e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
+-            notifier.onError(e.message, download.episode.name, /* SY --> */ download.anime.ogTitle /* SY <-- */, download.anime.id)
++            return videoFile
+         }
++
++        download.progress = 0
++        notifier.onProgressChange(download, remainingDownloads())
++        if (internal) return downloadWithFreshAddress(download, tmpDir, filename)
++
++        val name = DiskUtil.buildValidFilename("${/* SY --> */ download.anime.ogTitle /* SY <-- */} - ${download.episode.name}")
++        return downloadVideoExternal(requireDownloadVideo(download), download.source, tmpDir, name)
+     }
+ 
+     /**
+@@ -807,17 +792,18 @@ class Downloader(
+         var completed = completedCache(cacheFiles)
+         var copied = false
+         try {
++            val selectedVideo = if (completed == null) requireDownloadVideo(download) else null
+             return flow {
+                 val ready = completed ?: run {
+                     cacheFiles.forEach {
+                         it.delete()
+                         completionMarker(it).delete()
+                     }
+-                    val output = if (isTor(download.video!!)) {
++                    val video = checkNotNull(selectedVideo)
++                    val output = if (isTor(video)) {
+                         torrentDownload(download, matroska)
+                         matroska
+                     } else {
+-                        val video = download.video!!
+                         // Keep external tracks and extension-supplied FFmpeg options on their
+                         // existing path. The helper also checks MissAV and the loopback manifest.
+                         val prepared = if (canResumeHlsSegments(download, video)) {
+@@ -845,6 +831,8 @@ class Downloader(
+                     output
+                 }
+ 
++                download.beginSaving()
++                logcat(LogPriority.INFO) { "Download temporary save start episode=${download.episode.id} bytes=${ready.length()}" }
+                 emit(copyIntoDownloadDir(ready, tmpDir, filename))
+             }
+                 // Retry 3 times, waiting 2, 4 and 8 seconds between attempts.
+@@ -1420,29 +1408,6 @@ class Downloader(
+         }
+     }
+ 
+-    /**
+-     * Checks if the download was successful.
+-     *
+-     * @param download the download to check.
+-     * @param tmpDir the directory where the download is currently stored.
+-     */
+-    private fun isDownloadSuccessful(
+-        download: Download,
+-        tmpDir: UniFile,
+-    ): Boolean {
+-        if (!usesInternalDownloader(download)) {
+-            // The external application owns completion; retain its established handoff behavior.
+-            return tmpDir.listFiles().orEmpty().count { it.extension != "tmp" } == 1
+-        }
+-
+-        return EpisodeDownloadStorage.isComplete(
+-            directory = tmpDir,
+-            filename = DiskUtil.buildValidFilename(download.episode.name),
+-            ready = download.video?.status == Video.State.Ready && download.progress == 100,
+-            error = download.error,
+-        )
+-    }
+-
+     private fun usesInternalDownloader(download: Download): Boolean =
+         preferences.useExternalDownloader().get() == download.changeDownloader
+ 
+@@ -1538,6 +1503,7 @@ class Downloader(
+             val selected = downloads.map { byId[it.episode.id] ?: it }.distinctBy { it.episode.id }
+             selected.forEach {
+                 if (it.status == Download.State.PAUSED || it.status == Download.State.ERROR) {
++                    pendingResumes.remove(it.episode.id)
+                     activeWorkers?.stop(it.episode.id)
+                     it.video = null
+                 }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt
+index 0c4799dcd..ac6b7fdb3 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt
+@@ -1,6 +1,9 @@
+ package eu.kanade.tachiyomi.data.download
+ 
+ import com.hippo.unifile.UniFile
++import eu.kanade.tachiyomi.data.download.model.Download
++import kotlinx.coroutines.currentCoroutineContext
++import kotlinx.coroutines.ensureActive
+ import java.io.File
+ import java.io.IOException
+ import java.io.InputStream
+@@ -69,6 +72,64 @@ internal object EpisodeDownloadStorage {
+         return complete
+     }
+ 
++    /**
++     * A verified staged file is authoritative when the same destination contains only a prefix
++     * of it. Keep both in place so the caller can retry the normal final move with proven data.
++     */
++    fun recoverFinal(
++        directory: UniFile,
++        pending: UniFile?,
++        filename: String,
++        muxedCache: File?,
++        repairIntoExisting: Boolean,
++    ): UniFile? {
++        val hasPending = pending != null && entries(pending).any { it.name != NO_MEDIA }
++        val staged = if (hasPending) recover(checkNotNull(pending), filename, muxedCache) else null
++        val finalVideo = videos(directory, filename).singleOrNull()
++        if (repairIntoExisting && staged != null && finalVideo != null && finalVideo.name == staged.name) {
++            val bytes = finalVideo.length()
++            if (bytes in 0L until staged.length() &&
++                finalVideo.openInputStream().use { a -> staged.openInputStream().use { b -> streamsEqual(a, b, prefixBytes = bytes) } }
++            ) {
++                return null
++            }
++        }
++
++        val completed = recover(directory, filename, muxedCache)
++        if (completed == null) {
++            if (entries(directory).all { it.name == NO_MEDIA }) return null
++            throw IOException("Existing episode is not verified; files were preserved for recovery")
++        }
++        if (hasPending && (staged == null || !sameContents(completed, staged))) {
++            throw IOException("Final and pending episode copies differ; files were preserved for recovery")
++        }
++        return completed
++    }
++
++    suspend fun commit(
++        download: Download,
++        stagedVideo: UniFile,
++        filename: String,
++        placeDirectory: suspend () -> UniFile,
++        registerDirectory: (UniFile) -> Unit,
++    ) {
++        val name = stagedVideo.name ?: throw IOException("Staged video has no filename")
++        val bytes = stagedVideo.length()
++        if (bytes <= 0) throw IOException("Staged video length was not verified")
++        download.downloadedBytes = bytes
++        download.beginSaving()
++
++        val directory = placeDirectory()
++        val savedVideo = videos(directory, filename).singleOrNull()
++        if (savedVideo == null || savedVideo.name != name || savedVideo.length() != bytes) {
++            throw IOException("Final video length was not verified; retry saving the episode")
++        }
++        entries(directory).firstOrNull { it.name == "$filename.tmp" }?.let(::deleteRequired)
++        currentCoroutineContext().ensureActive()
++        registerDirectory(directory)
++        download.finishSaving()
++    }
++
+     fun copy(cache: File, directory: UniFile, filename: String, hideFromGallery: Boolean): UniFile {
+         if (!cache.isFile || cache.length() <= 0L) throw IOException("Completed video cache is empty; refusing to copy it")
+         recover(directory, filename, cache)?.let { return it }
+@@ -133,24 +194,26 @@ internal object EpisodeDownloadStorage {
+         first.length() > 0L && first.length() == second.length() &&
+             first.openInputStream().use { a -> second.inputStream().use { b -> streamsEqual(a, b) } }
+ 
+-    private fun streamsEqual(first: InputStream, second: InputStream): Boolean {
++    private fun streamsEqual(first: InputStream, second: InputStream, prefixBytes: Long? = null): Boolean {
+         val a = ByteArray(DEFAULT_BUFFER_SIZE)
+         val b = ByteArray(DEFAULT_BUFFER_SIZE)
+-        fun readChunk(input: InputStream, buffer: ByteArray): Int {
++        fun readChunk(input: InputStream, buffer: ByteArray, limit: Int): Int {
+             var count = 0
+-            while (count < buffer.size) {
+-                val read = input.read(buffer, count, buffer.size - count)
++            while (count < limit) {
++                val read = input.read(buffer, count, limit - count)
+                 if (read < 0) break
+                 if (read == 0) throw IOException("Download comparison could not read data; please retry")
+                 count += read
+             }
+             return count
+         }
++        var compared = 0L
+         while (true) {
+-            val count = readChunk(first, a)
+-            if (count != readChunk(second, b)) return false
+-            if (count == 0) return true
++            val count = readChunk(first, a, a.size)
++            if (count == 0) return prefixBytes?.let { compared == it } ?: (second.read() == -1)
++            if (count != readChunk(second, b, count)) return false
+             for (index in 0 until count) if (a[index] != b[index]) return false
++            compared += count
+         }
+     }
+ }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt
+index 97c8dd707..396ffc5ec 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt
+@@ -39,6 +39,7 @@ data class Download(
+         @Synchronized
+         set(status) {
+             if (status != State.ERROR) error = null
++            if (status != State.DOWNLOADING) savingStateFlow.value = false
+             if (status == State.PAUSED || status == State.ERROR || status == State.DOWNLOADED) resetSpeed()
+             _statusFlow.value = status
+         }
+@@ -53,6 +54,7 @@ data class Download(
+     @Synchronized
+     fun fail(message: String?) {
+         error = message?.takeIf { it.isNotBlank() }
++        savingStateFlow.value = false
+         resetSpeed()
+         _statusFlow.value = State.ERROR
+     }
+@@ -65,9 +67,26 @@ data class Download(
+     var progress: Int
+         get() = progressStateFlow.value
+         set(value) {
+-            progressStateFlow.value = value
++            progressStateFlow.value = value.coerceAtMost(if (status == State.DOWNLOADED) 100 else 99)
+         }
+ 
++    @Transient
++    private val savingStateFlow = MutableStateFlow(false)
++
++    val isSaving: Boolean get() = savingStateFlow.value
++
++    fun beginSaving() {
++        savingStateFlow.value = true
++        progress = 99
++        resetSpeed()
++    }
++
++    fun finishSaving() {
++        video?.status = Video.State.Ready
++        status = State.DOWNLOADED
++        progress = 100
++    }
++
+     @Transient
+     private val downloadedBytesStateFlow = MutableStateFlow(0L)
+ 
+@@ -95,7 +114,7 @@ data class Download(
+ 
+     @Synchronized
+     fun refreshSpeed() {
+-        speedBytesPerSecondStateFlow.value = if (status == State.DOWNLOADING) itemSpeed.bytesPerSecond() else 0L
++        speedBytesPerSecondStateFlow.value = if (status == State.DOWNLOADING && !isSaving) itemSpeed.bytesPerSecond() else 0L
+     }
+ 
+     @Synchronized
+@@ -107,6 +126,7 @@ data class Download(
+     /** Byte and speed updates remain observable even when a stream has no known percentage. */
+     fun progressUpdates(): Flow<Unit> = merge(
+         progressFlow.drop(1).map { },
++        savingStateFlow.drop(1).map { },
+         downloadedBytesFlow.drop(1).map { },
+         speedBytesPerSecondFlow.drop(1).map { },
+     )
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
+index 69b7cca20..6a5c8243c 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
+@@ -95,11 +95,19 @@ class DownloadHolder(private val view: View, val adapter: DownloadAdapter) :
+                 listOf(view.context.stringResource(AMR.strings.harmony_download_paused), saved)
+                     .filter(String::isNotEmpty).joinToString(" · ")
+             }
++            download.status == Download.State.QUEUE -> {
++                listOf(view.context.stringResource(MR.strings.ext_pending), saved)
++                    .filter(String::isNotEmpty).joinToString(" · ")
++            }
++            download.isSaving -> {
++                val label = "${view.context.stringResource(MR.strings.action_save)}…"
++                listOfNotNull(label, bytes).joinToString(" · ")
++            }
+             else -> {
+                 saved.ifEmpty { view.context.stringResource(MR.strings.update_check_notification_download_in_progress) }
+             }
+         }
+-        binding.downloadProgressText.text = if (download.status == Download.State.DOWNLOADING) {
++        binding.downloadProgressText.text = if (download.status == Download.State.DOWNLOADING && !download.isSaving) {
+             val speed = Formatter.formatFileSize(view.context, download.speedBytesPerSecond.coerceAtLeast(0))
+             "$text · $speed/s"
+         } else {
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadItemControlTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadItemControlTest.kt
+index 893ddde6a..f78dc12a4 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadItemControlTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadItemControlTest.kt
+@@ -18,6 +18,7 @@ import kotlinx.coroutines.withTimeout
+ import kotlinx.coroutines.yield
+ import org.junit.jupiter.api.Assertions.assertEquals
+ import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertSame
+ import org.junit.jupiter.api.Assertions.assertThrows
+ import org.junit.jupiter.api.Assertions.assertTrue
+ import org.junit.jupiter.api.Test
+@@ -76,6 +77,11 @@ class NavigationChromeDownloadItemControlTest {
+             withTimeout(3000) { while (!writer.isCancelled) yield() }
+             assertFalse(stopping.isCompleted)
+             assertTrue(siblingJob.isActive)
++            val cancelledSibling = siblingJob
++            assertSame(cancelledSibling, workers.requestStop(sibling.episode.id))
++            withTimeout(3000) { cancelledSibling.join() }
++            assertTrue(cancelledSibling.isCancelled)
++            assertFalse(stopping.isCompleted)
+             release.countDown()
+             withTimeout(3000) { stopping.join() }
+             assertEquals(Download.State.PAUSED, first.status)
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt
+index f0109dc4c..1748f4551 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt
+@@ -1,6 +1,7 @@
+ package eu.kanade.tachiyomi.data.download
+ 
+ import com.hippo.unifile.UniFile
++import eu.kanade.tachiyomi.data.download.model.Download
+ import io.mockk.every
+ import io.mockk.mockk
+ import kotlinx.coroutines.CoroutineScope
+@@ -30,6 +31,68 @@ import java.util.concurrent.atomic.AtomicBoolean
+ import java.util.concurrent.atomic.AtomicInteger
+ 
+ class NavigationChromeDownloadRecoveryTest {
++    @Test
++    fun `an interrupted final copy is recovered from staging and reaches 100 after registration`() = runBlocking {
++        for (extension in listOf("ts", "mkv")) {
++            val name = "Episode.$extension.anikku"
++            val bytes = "a complete staged video".toByteArray()
++            val pending = FakeDirectory()
++            val final = FakeDirectory()
++            val staged = pending.add(name, bytes)
++            final.add(name, bytes.copyOf(7))
++            val parent = mockk<UniFile>()
++            every { pending.file.parentFile } returns parent
++            every { pending.file.renameTo("episode") } returns false
++            every { pending.file.delete() } returns true
++            every { parent.findFile("episode") } returns final.file
++
++            val download = Download(mockk(), mockk(), mockk()).apply { status = Download.State.DOWNLOADING }
++            download.progress = 100
++            assertEquals(99, download.progress)
++            assertNull(EpisodeDownloadStorage.recoverFinal(final.file, pending.file, "Episode", null, repairIntoExisting = true))
++
++            val failed = runCatching {
++                EpisodeDownloadStorage.commit(download, staged.file, "Episode", { throw IOException("Provider disconnected") }) {
++                    error("A failed save cannot be registered")
++                }
++            }.exceptionOrNull()
++            assertTrue(failed is IOException)
++            assertTrue(download.isSaving)
++            assertEquals(99, download.progress)
++            assertArrayEquals(bytes, pending.files.getValue(name).bytes)
++            assertArrayEquals(bytes.copyOf(7), final.files.getValue(name).bytes)
++
++            EpisodeDownloadStorage.commit(download, staged.file, "Episode", { pending.file.renameToOrCopy("episode") }) {
++                assertTrue(download.isSaving)
++                assertEquals(Download.State.DOWNLOADING, download.status)
++                assertEquals(99, download.progress)
++                assertSame(final.file, it)
++                assertArrayEquals(bytes, final.files.getValue(name).bytes)
++            }
++            assertEquals(100, download.progress)
++            assertFalse(download.isSaving)
++            assertEquals(Download.State.DOWNLOADED, download.status)
++            assertEquals(1, final.files.size)
++        }
++    }
++
++    @Test
++    fun `a smaller final video with different bytes remains a conflict`() {
++        val pending = FakeDirectory()
++        val final = FakeDirectory()
++        val video = pending.add("Episode.ts", byteArrayOf(1, 2, 3))
++        val conflict = final.add("Episode.ts", byteArrayOf(1, 9))
++
++        assertThrows(IOException::class.java) {
++            EpisodeDownloadStorage.recoverFinal(final.file, pending.file, "Episode", null, repairIntoExisting = true)
++        }
++
++        assertArrayEquals(byteArrayOf(1, 2, 3), video.bytes)
++        assertArrayEquals(byteArrayOf(1, 9), conflict.bytes)
++        assertSame(video.file, pending.files.getValue("Episode.ts").file)
++        assertSame(conflict.file, final.files.getValue("Episode.ts").file)
++    }
++
+     @Test
+     fun `identical legacy SAF duplicate videos recover without network or another copy`() {
+         val dir = FakeDirectory()
+@@ -256,6 +319,8 @@ class NavigationChromeDownloadRecoveryTest {
+ 
+         init {
+             every { file.listFiles() } answers { files.values.map { it.file }.toTypedArray() }
++            every { file.isDirectory } returns true
++            every { file.findFile(any()) } answers { files[firstArg<String>()]?.file }
+             every { file.createFile(any()) } answers {
+                 val name = firstArg<String>()
+                 created += name

@@ -115,3 +115,4 @@
 0115-download-preserve-complete-local-transport.patch
 0116-source-preference-dialog-restore.patch
 0117-download-recover-denied-hls-rendition.patch
+0118-download-recover-final-save-and-item-wake.patch
