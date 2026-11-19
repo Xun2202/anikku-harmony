@@ -1,0 +1,744 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 06:58:19 +0000
+Subject: [PATCH] downloads: release transfer capacity during local saves
+
+Give storage a bounded independent slot. Stream marked SAF outputs with progress and retain the verified staging file until publication. Preserve WorkManager rescheduling after a system stop and export independent scheduler and network measurements.
+---
+ .../tachiyomi/data/download/DownloadCache.kt  |  2 +-
+ .../tachiyomi/data/download/DownloadJob.kt    | 60 ++++++++++++-
+ .../data/download/DownloadManager.kt          |  1 +
+ .../data/download/DownloadProvider.kt         |  2 +-
+ .../data/download/DownloadQueueConcurrency.kt | 27 +++---
+ .../tachiyomi/data/download/Downloader.kt     | 86 ++++++++++++++-----
+ .../data/download/EpisodeDownloadStorage.kt   | 83 +++++++++++++++---
+ .../tachiyomi/data/download/model/Download.kt | 11 +++
+ .../tachiyomi/ui/download/DownloadHolder.kt   |  4 +-
+ .../eu/kanade/tachiyomi/util/CrashLogUtil.kt  |  4 +
+ .../tachiyomi/util/system/HarmonyLogBuffer.kt | 10 +++
+ .../util/system/NetworkStateTracker.kt        |  2 +
+ ...ationChromeDownloadQueueConcurrencyTest.kt | 39 +++++++++
+ .../NavigationChromeDownloadRecoveryTest.kt   | 36 ++++++++
+ 14 files changed, 317 insertions(+), 50 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadCache.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadCache.kt
+index 880344390..99fff1cfd 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadCache.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadCache.kt
+@@ -472,7 +472,7 @@ class DownloadCache(
+                                         // Ignore incomplete downloads
+                                         it.name?.endsWith(Downloader.TMP_DIR_SUFFIX) == true -> null
+                                         // Folder of videos
+-                                        it.isDirectory -> it.name
++                                        it.isDirectory -> if (EpisodeDownloadStorage.isFinalCopyPending(it)) null else it.name
+                                         // MP4 files
+                                         it.isFile && it.extension == "mp4" -> it.nameWithoutExtension
+                                         // MKV files
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJob.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJob.kt
+index b1ce072cd..7769acfce 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJob.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJob.kt
+@@ -4,6 +4,7 @@ import android.content.Context
+ import android.content.pm.ServiceInfo
+ import android.graphics.BitmapFactory
+ import android.os.Build
++import android.os.SystemClock
+ import androidx.core.content.ContextCompat
+ import androidx.lifecycle.asFlow
+ import androidx.work.CoroutineWorker
+@@ -14,13 +15,21 @@ import androidx.work.WorkInfo
+ import androidx.work.WorkManager
+ import androidx.work.WorkerParameters
+ import eu.kanade.tachiyomi.R
++import eu.kanade.tachiyomi.data.download.model.Download
+ import eu.kanade.tachiyomi.data.notification.Notifications
+ import eu.kanade.tachiyomi.util.system.NetworkState
+ import eu.kanade.tachiyomi.util.system.activeNetworkState
++import eu.kanade.tachiyomi.util.system.networkStateFlow
+ import eu.kanade.tachiyomi.util.system.notificationBuilder
+ import eu.kanade.tachiyomi.util.system.setForegroundSafely
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.cancelAndJoin
++import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.catch
++import kotlinx.coroutines.flow.distinctUntilChanged
+ import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.launch
+ import logcat.LogPriority
+ import tachiyomi.core.common.util.system.logcat
+ import tachiyomi.domain.download.service.DownloadPreferences
+@@ -58,20 +67,46 @@ class DownloadJob(private val context: Context, workerParams: WorkerParameters)
+         )
+     }
+ 
+-    override suspend fun doWork(): Result {
++    override suspend fun doWork(): Result = coroutineScope {
+         downloadManager.awaitQueueReady()
+         var keepAlive: DownloadAudioKeepAlive? = null
++        var networkMonitor: Job? = null
++        var lastElapsed = SystemClock.elapsedRealtime()
++        var lastUptime = SystemClock.uptimeMillis()
++        var lastSaveReport = lastElapsed
+         val wasRunning = downloadManager.isRunning
+         val active = DownloadForegroundLifecycle.run(
+             start = downloadManager::downloaderStart,
+             isRunning = { downloadManager.isRunning },
+             checkNetwork = {
+-                checkNetworkState(applicationContext.activeNetworkState(), downloadPreferences.downloadOnlyOverWifi().get())
++                val state = applicationContext.activeNetworkState()
++                val now = SystemClock.elapsedRealtime()
++                val uptime = SystemClock.uptimeMillis()
++                val gap = now - lastElapsed
++                if (gap >= 5_000) {
++                    logcat(LogPriority.INFO) {
++                        "Download guard scheduling gap elapsedGapMs=$gap uptimeGapMs=${uptime - lastUptime} $state active=${activeDownloads()}"
++                    }
++                }
++                if (now - lastSaveReport >= 15_000) {
++                    if (downloadManager.queueState.value.any { it.isSaving }) {
++                        logcat(LogPriority.INFO) { "Download guard save progress active=${activeDownloads()}" }
++                    }
++                    lastSaveReport = now
++                }
++                lastElapsed = now
++                lastUptime = uptime
++                checkNetworkState(state, downloadPreferences.downloadOnlyOverWifi().get())
+             },
+             onStarted = {
+                 setForegroundSafely()
+                 val requested = downloadPreferences.keepAliveInBackground().get()
+                 logcat(LogPriority.INFO) { "Download background guard start attached=$wasRunning keepAliveRequested=$requested" }
++                networkMonitor = launch {
++                    applicationContext.networkStateFlow().distinctUntilChanged()
++                        .catch { error -> logcat(LogPriority.WARN) { "Download network callback unavailable ${error.javaClass.simpleName}" } }
++                        .collect { state -> logcat(LogPriority.INFO) { "Download network changed $state active=${activeDownloads()}" } }
++                }
+                 if (requested) {
+                     keepAlive = DownloadAudioKeepAlive(applicationContext) { downloadManager.pauseDownloads() }
+                     keepAlive?.start()
+@@ -81,8 +116,18 @@ class DownloadJob(private val context: Context, workerParams: WorkerParameters)
+                 val stoppedBeforeCleanup = isStopped
+                 val reason = if (stoppedBeforeCleanup && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) stopReason else null
+                 try {
+-                    if (downloadManager.isRunning) downloadManager.downloaderStop()
++                    if (downloadManager.isRunning) {
++                        if (stoppedBeforeCleanup && reason != WorkInfo.STOP_REASON_CANCELLED_BY_APP) {
++                            // WorkManager may reschedule this job. Cancelling the unique work here
++                            // would also remove its retry and any successor the queue appended.
++                            logcat(LogPriority.INFO) { "Download guard leaving interrupted tasks queued stopReason=$reason" }
++                            downloadManager.downloaderInterrupted()
++                        } else {
++                            downloadManager.downloaderStop()
++                        }
++                    }
+                 } finally {
++                    networkMonitor?.cancelAndJoin()
+                     keepAlive?.stopAndJoin()
+                     logcat(LogPriority.INFO) {
+                         "Download background guard end stoppedBeforeCleanup=$stoppedBeforeCleanup stopReason=$reason stopped=$isStopped running=${downloadManager.isRunning}"
+@@ -92,9 +137,16 @@ class DownloadJob(private val context: Context, workerParams: WorkerParameters)
+         )
+         // A request appended just as this owner became idle must not inherit a failed dependency.
+         if (!active) logcat(LogPriority.INFO) { "Download background guard idle" }
+-        return Result.success()
++        Result.success()
+     }
+ 
++    private fun activeDownloads(): String = downloadManager.queueState.value
++        .filter { it.status == Download.State.DOWNLOADING }
++        .joinToString(",") {
++            val stage = if (it.isSaving) "save" else "transfer"
++            "${it.episode.id}:$stage:${it.downloadedBytes}:${it.savedBytes}"
++        }
++
+     private fun checkNetworkState(state: NetworkState, requireWifi: Boolean): Boolean {
+         if (!state.isOnline || (requireWifi && !state.isWifi && !state.isEthernet)) {
+             logcat(LogPriority.INFO) {
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
+index eedff5ec1..5c083c114 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
+@@ -78,6 +78,7 @@ class DownloadManager(
+     suspend fun awaitQueueReady() = downloader.awaitQueueReady()
+     fun downloaderStart() = downloader.start()
+     fun downloaderStop(reason: String? = null) = downloader.stop(reason)
++    fun downloaderInterrupted() = downloader.interruptForReschedule()
+ 
+     val isDownloaderRunning
+         get() = DownloadJob.isRunningFlow(context)
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadProvider.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadProvider.kt
+index b1010c5f0..fe415e059 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadProvider.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadProvider.kt
+@@ -128,7 +128,7 @@ class DownloadProvider(
+         val mangaDir = findMangaDir(mangaTitle, source)
+         return getValidChapterDirNames(chapterName, chapterScanlator).asSequence()
+             .mapNotNull { mangaDir?.findFile(it) }
+-            .firstOrNull()
++            .firstOrNull { !it.isDirectory || !EpisodeDownloadStorage.isFinalCopyPending(it) }
+     }
+ 
+     /**
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt
+index 3e045be8b..3287dccee 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt
+@@ -15,19 +15,22 @@ import java.util.concurrent.ConcurrentHashMap
+ internal object DownloadQueueConcurrency {
+     fun outputKey(download: Download) = DiskUtil.buildValidFilename(download.anime.ogTitle) to DiskUtil.buildValidFilename(download.episode.name)
+ 
+-    fun select(queue: List<Download>, sourceLimit: Int, perSourceLimit: Int): List<Download> = queue
+-        .filter { it.status.value <= Download.State.DOWNLOADING.value }
+-        .groupBy { it.source }
+-        .values
+-        .take(sourceLimit.coerceIn(1, 10))
+-        .flatMap { downloads ->
+-            val count = perSourceLimit.coerceIn(1, 3)
+-            // Distinct database episodes can resolve to the same storage/cache filename.
+-            downloads.asSequence()
+-                .distinctBy(::outputKey)
+-                .take(count)
+-                .toList()
++    fun select(queue: List<Download>, sourceLimit: Int, perSourceLimit: Int): List<Download> {
++        val pending = queue.filter { it.status.value <= Download.State.DOWNLOADING.value }
++        val saving = pending.filter(Download::isSaving)
++        val savingOutputs = saving.mapTo(hashSetOf()) { it.source to outputKey(it) }
++        // Storage writes run one at a time. Reserve one extra job for that work and retain the
++        // network allowance of writers waiting their turn, bounding the amount of pending media.
++        val waitingForStorage = saving.drop(1).groupingBy { it.source }.eachCount()
++        val transfers = pending.filter { !it.isSaving && (savingOutputs.isEmpty() || (it.source to outputKey(it)) !in savingOutputs) }.groupBy { it.source }
++        val freeSourceSlots = (sourceLimit.coerceIn(1, 10) - waitingForStorage.size).coerceAtLeast(0)
++        val allowedSources = waitingForStorage.keys + transfers.keys.filterNot { it in waitingForStorage }.take(freeSourceSlots)
++        val perSource = perSourceLimit.coerceIn(1, 3)
++        return saving + transfers.filterKeys { it in allowedSources }.flatMap { (source, downloads) ->
++            val available = (perSource - waitingForStorage.getOrDefault(source, 0)).coerceAtLeast(0)
++            downloads.asSequence().distinctBy(::outputKey).take(available).toList()
+         }
++    }
+ 
+     /** Reconcile by immutable episode id; a reduced limit pauses excess jobs before replacements. */
+     class Workers(private val canStart: (Download) -> Boolean = { true }) {
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 3b97cc0b2..b60ae420e 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -1,6 +1,7 @@
+ package eu.kanade.tachiyomi.data.download
+ 
+ import android.content.ComponentName
++import android.content.ContentResolver
+ import android.content.Context
+ import android.content.Intent
+ import android.os.Bundle
+@@ -134,6 +135,7 @@ class Downloader(
+     private val pendingResumes = ConcurrentHashMap<Long, Job>()
+     private val controlledIds = ConcurrentHashMap.newKeySet<Long>()
+     private val controlEpoch = MutableStateFlow(0L)
++    private val saveMutex = Mutex()
+ 
+     @Volatile private var activeWorkers: DownloadQueueConcurrency.Workers? = null
+ 
+@@ -205,6 +207,15 @@ class Downloader(
+         DownloadJob.stop(context)
+     }
+ 
++    fun interruptForReschedule() {
++        cancelDownloaderJob()
++        queueState.value.filter { it.status == Download.State.DOWNLOADING }.forEach {
++            it.status = Download.State.QUEUE
++            it.resetSpeed()
++        }
++        notifier.onPaused()
++    }
++
+     /**
+      * Pauses the downloader
+      */
+@@ -448,6 +459,13 @@ class Downloader(
+         downloaderSessions.cancel()
+     }
+ 
++    private fun beginLocalSave(download: Download) {
++        if (!download.isSaving) {
++            download.beginSaving()
++            controlEpoch.update { it + 1 }
++        }
++    }
++
+     /**
+      * Creates a download object for every episode and adds them to the downloads queue.
+      *
+@@ -626,20 +644,30 @@ class Downloader(
+             val legacyName = DiskUtil.buildValidFilename("${/* SY --> */ download.anime.ogTitle /* SY <-- */} - ${download.episode.name}")
+             tmpDir.findFile("$legacyName.tmp")?.delete()
+             tmpDir.findFile("${legacyName}_tmp.mkv")?.delete()
++            val directCopy = internal && tmpDir.uri.scheme == ContentResolver.SCHEME_CONTENT
+             suspend fun placeDirectory() = retryStorageOperation {
+-                if (internal) {
+-                    animeDir.findFile(episodeDirname)?.let { destination ->
+-                        EpisodeDownloadStorage.prepareFinalTarget(destination, stagedVideo, filename) { old ->
+-                            val id = download.episode.id
+-                            val bytes = old.length()
+-                            logcat(LogPriority.INFO) { "Download conflicting final copy episode=$id previousBytes=$bytes stagedBytes=${stagedVideo.length()}" }
+-                            EpisodeDownloadStorage.preserveConflictingVideo(old, provider.getRecoveryDir(animeDir, id))
+-                            logcat(LogPriority.INFO) { "Download conflicting copy preserved episode=$id bytes=$bytes" }
+-                        }
++                val destination = if (internal) animeDir.findFile(episodeDirname) else null
++                if (destination != null) {
++                    EpisodeDownloadStorage.prepareFinalTarget(destination, stagedVideo, filename) { old ->
++                        val id = download.episode.id
++                        val bytes = old.length()
++                        logcat(LogPriority.INFO) { "Download conflicting final copy episode=$id previousBytes=$bytes stagedBytes=${stagedVideo.length()}" }
++                        EpisodeDownloadStorage.preserveConflictingVideo(old, provider.getRecoveryDir(animeDir, id))
++                        logcat(LogPriority.INFO) { "Download conflicting copy preserved episode=$id bytes=$bytes" }
+                     }
+                 }
+                 currentCoroutineContext().ensureActive()
+-                tmpDir.renameToOrCopy(episodeDirname, context.contentResolver)
++                if (directCopy) {
++                    val finalDirectory = destination ?: animeDir.createDirectory(episodeDirname)
++                        ?: throw IOException("Cannot create the final video directory")
++                    if (finalDirectory.name != episodeDirname || !finalDirectory.isDirectory) throw IOException("Cannot create the final video directory")
++                    logcat(LogPriority.INFO) { "Download SAF copy started episode=${download.episode.id} bytes=${stagedVideo.length()}" }
++                    EpisodeDownloadStorage.copyStagedVideo(stagedVideo, finalDirectory) { download.savedBytes = it }
++                    logcat(LogPriority.INFO) { "Download SAF copy verified episode=${download.episode.id} bytes=${download.savedBytes}" }
++                    finalDirectory
++                } else {
++                    tmpDir.renameToOrCopy(episodeDirname, context.contentResolver)
++                }
+             }
+ 
+             suspend fun registerDirectory(directory: UniFile) {
+@@ -648,11 +676,16 @@ class Downloader(
+             }
+ 
+             if (internal) {
+-                val saveStarted = SystemClock.elapsedRealtime()
+-                logcat(LogPriority.INFO) { "Download final save start episode=${download.episode.id} bytes=${stagedVideo.length()}" }
+-                EpisodeDownloadStorage.commit(download, stagedVideo, filename, ::placeDirectory, ::registerDirectory)
+-                logcat(LogPriority.INFO) {
+-                    "Download saved episode=${download.episode.id} bytes=${download.downloadedBytes} elapsedMs=${SystemClock.elapsedRealtime() - saveStarted}"
++                beginLocalSave(download)
++                saveMutex.withLock {
++                    download.savedBytes = 0
++                    val saveStarted = SystemClock.elapsedRealtime()
++                    logcat(LogPriority.INFO) { "Download final save start episode=${download.episode.id} bytes=${stagedVideo.length()}" }
++                    EpisodeDownloadStorage.commit(download, stagedVideo, filename, ::placeDirectory, ::registerDirectory)
++                    logcat(LogPriority.INFO) {
++                        "Download saved episode=${download.episode.id} bytes=${download.downloadedBytes} elapsedMs=${SystemClock.elapsedRealtime() - saveStarted}"
++                    }
++                    if (directCopy) runCatching { tmpDir.delete() }
+                 }
+             } else {
+                 registerDirectory(placeDirectory())
+@@ -846,9 +879,13 @@ class Downloader(
+                     output
+                 }
+ 
+-                download.beginSaving()
+-                logcat(LogPriority.INFO) { "Download temporary save start episode=${download.episode.id} bytes=${ready.length()}" }
+-                emit(copyIntoDownloadDir(ready, tmpDir, filename))
++                beginLocalSave(download)
++                val staged = saveMutex.withLock {
++                    download.savedBytes = 0
++                    logcat(LogPriority.INFO) { "Download temporary save start episode=${download.episode.id} bytes=${ready.length()}" }
++                    copyIntoDownloadDir(download, ready, tmpDir, filename)
++                }
++                emit(staged)
+             }
+                 // Retry 3 times, waiting 2, 4 and 8 seconds between attempts.
+                 .retryWhen { error, attempt ->
+@@ -904,8 +941,17 @@ class Downloader(
+      * application/octet-stream MIME type, so scanners that ignore .nomedia (HarmonyOS) do not treat
+      * it as a video. [DownloadManager.buildVideo] accepts both names.
+      */
+-    private fun copyIntoDownloadDir(cacheFile: File, tmpDir: UniFile, filename: String): UniFile =
+-        EpisodeDownloadStorage.copy(cacheFile, tmpDir, filename, preferences.hideDownloadedVideosFromGallery().get())
++    private suspend fun copyIntoDownloadDir(download: Download, cacheFile: File, tmpDir: UniFile, filename: String): UniFile {
++        val coroutine = currentCoroutineContext()
++        return EpisodeDownloadStorage.copy(
++            cacheFile,
++            tmpDir,
++            filename,
++            preferences.hideDownloadedVideosFromGallery().get(),
++            checkActive = { coroutine.ensureActive() },
++            onProgress = { download.savedBytes = it },
++        )
++    }
+ 
+     /**
+      * Runs a storage operation up to three times, waiting 2 and 4 seconds in between, for providers
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt
+index e313291d7..31bb3e82d 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt
+@@ -11,6 +11,11 @@ import java.io.InputStream
+ /** Recovery is confined to this episode's known video names; ambiguous files stay on disk. */
+ internal object EpisodeDownloadStorage {
+     private const val NO_MEDIA = ".nomedia"
++    private const val FINAL_COPY_MARKER = ".anikku-saving"
++
++    fun isFinalCopyPending(directory: UniFile): Boolean = directory.findFile(FINAL_COPY_MARKER) != null
++
++    private fun isCopyMarker(name: String?, filename: String): Boolean = name == "$filename.tmp" || name == FINAL_COPY_MARKER
+ 
+     private fun entries(directory: UniFile): List<UniFile> = directory.listFiles()?.toList()
+         ?: throw IOException("Cannot list download directory; files were preserved, please retry")
+@@ -23,7 +28,7 @@ internal object EpisodeDownloadStorage {
+ 
+     private fun videos(directory: UniFile, filename: String): List<UniFile> {
+         val files = entries(directory)
+-        if (files.any { it.name != NO_MEDIA && it.name != "$filename.tmp" && (!isVideoName(it.name, filename) || it.isDirectory) }) {
++        if (files.any { it.isDirectory || (it.name != NO_MEDIA && !isCopyMarker(it.name, filename) && !isVideoName(it.name, filename)) }) {
+             throw IOException("Unrecognized download files were preserved; inspect the directory before retrying")
+         }
+         val preferred = setOf("$filename.mkv", "$filename.mkv.anikku", "$filename.ts", "$filename.ts.anikku")
+@@ -40,10 +45,11 @@ internal object EpisodeDownloadStorage {
+      */
+     fun recover(directory: UniFile, filename: String, muxedCache: File? = null): UniFile? {
+         val files = videos(directory, filename)
+-        val marker = entries(directory).firstOrNull { it.name == "$filename.tmp" }
++        val markers = entries(directory).filter { isCopyMarker(it.name, filename) }
++        val hasMarker = markers.isNotEmpty()
+         if (files.isEmpty()) return null
+         val cache = muxedCache?.takeIf { it.isFile && it.length() > 0L }
+-        if (marker != null && cache == null) {
++        if (hasMarker && cache == null) {
+             if (files.size == 1) return null // redownload into private cache before replacing this partial copy
+             throw IOException("Duplicate downloads still have a copy marker; files were preserved for recovery")
+         }
+@@ -53,7 +59,7 @@ internal object EpisodeDownloadStorage {
+             files.firstOrNull { it.length() > 0L }
+         }
+         if (complete == null) {
+-            if (files.all { it.length() == 0L } || (marker != null && cache != null && files.all { it.length() < cache.length() })) {
++            if (files.all { it.length() == 0L } || (hasMarker && cache != null && files.all { it.length() < cache.length() })) {
+                 return null
+             }
+             throw IOException("Existing download does not match the completed cache; files were preserved for recovery")
+@@ -62,13 +68,13 @@ internal object EpisodeDownloadStorage {
+         // Validate the entire plan before deleting anything. An interrupted marked copy smaller
+         // than the authoritative cache is disposable; otherwise require exact bytes, not size alone.
+         if (duplicates.any {
+-                !sameContents(complete, it) && !(marker != null && cache != null && it.length() in 0L until cache.length())
++                !sameContents(complete, it) && !(hasMarker && cache != null && it.length() in 0L until cache.length())
+             }
+         ) {
+             throw IOException("Download copies have different contents; all files were preserved for recovery")
+         }
+         duplicates.forEach(::deleteRequired)
+-        marker?.let(::deleteRequired)
++        markers.forEach(::deleteRequired)
+         return complete
+     }
+ 
+@@ -121,6 +127,53 @@ internal object EpisodeDownloadStorage {
+         preserveConflict(video)
+     }
+ 
++    /** The caller has already checked every existing file with [prepareFinalTarget]. */
++    suspend fun copyStagedVideo(staged: UniFile, directory: UniFile, onProgress: (Long) -> Unit) {
++        val name = staged.name ?: throw IOException("Staged video has no filename")
++        val bytes = staged.length()
++        if (bytes <= 0L) throw IOException("Staged video length cannot be verified")
++        val previous = directory.findFile(name)
++        if (previous?.length() == bytes) {
++            onProgress(bytes)
++            return
++        }
++        val marker = directory.findFile(FINAL_COPY_MARKER) ?: directory.createFile(FINAL_COPY_MARKER)
++            ?: throw IOException("Cannot mark the video as still saving")
++        if (marker.name != FINAL_COPY_MARKER || marker.isDirectory) throw IOException("Cannot mark the video as still saving")
++
++        // A partial prefix can be recreated from the staged file. The staged file remains until
++        // final verification and registration, including when the provider stops partway through.
++        previous?.let(::deleteRequired)
++        val target = directory.createFile(name) ?: throw IOException("Cannot create final video")
++        if (target.name != name || target.length() != 0L) throw IOException("Storage provider returned an unexpected final video")
++
++        val coroutine = currentCoroutineContext()
++        val copied = staged.openInputStream().use { input -> streamCopy(input, target, { coroutine.ensureActive() }, onProgress) }
++        if (copied != bytes || target.length() != bytes) throw IOException("Final video length could not be verified. The staged video was preserved")
++        onProgress(copied)
++    }
++
++    private fun streamCopy(input: InputStream, target: UniFile, checkActive: () -> Unit, onProgress: (Long) -> Unit): Long {
++        val buffer = ByteArray(256 * 1024)
++        var copied = 0L
++        var reported = 0L
++        target.openOutputStream().use { output ->
++            while (true) {
++                checkActive()
++                val count = input.read(buffer)
++                if (count < 0) break
++                if (count == 0) throw IOException("Could not read staged video")
++                output.write(buffer, 0, count)
++                copied += count
++                if (copied - reported >= 16 * 1024 * 1024) {
++                    reported = copied
++                    onProgress(copied)
++                }
++            }
++        }
++        return copied
++    }
++
+     /** Keep the previous bytes in a recovery directory outside the indexed downloads. */
+     suspend fun preserveConflictingVideo(video: UniFile, recovery: UniFile) {
+         val name = video.name ?: throw IOException("Existing video has no filename")
+@@ -173,13 +226,20 @@ internal object EpisodeDownloadStorage {
+         if (savedVideo == null || savedVideo.name != name || savedVideo.length() != bytes) {
+             throw IOException("Final video length was not verified; retry saving the episode")
+         }
+-        entries(directory).firstOrNull { it.name == "$filename.tmp" }?.let(::deleteRequired)
+         currentCoroutineContext().ensureActive()
++        entries(directory).filter { isCopyMarker(it.name, filename) }.forEach(::deleteRequired)
+         registerDirectory(directory)
+         download.finishSaving()
+     }
+ 
+-    fun copy(cache: File, directory: UniFile, filename: String, hideFromGallery: Boolean): UniFile {
++    fun copy(
++        cache: File,
++        directory: UniFile,
++        filename: String,
++        hideFromGallery: Boolean,
++        checkActive: () -> Unit = {},
++        onProgress: (Long) -> Unit = {},
++    ): UniFile {
+         if (!cache.isFile || cache.length() <= 0L) throw IOException("Completed video cache is empty; refusing to copy it")
+         recover(directory, filename, cache)?.let { return it }
+         // Only zero-byte or marked partial files can reach here. A valid cache is already safe
+@@ -197,10 +257,11 @@ internal object EpisodeDownloadStorage {
+         val target = directory.createFile(finalName) ?: throw IOException("Cannot create video download file")
+         try {
+             if (target.name != finalName) throw IOException("Storage provider created a different filename; refusing to create duplicate downloads")
+-            cache.inputStream().use { input -> target.openOutputStream().use { output -> input.copyTo(output) } }
+-            if (target.length() <= 0L || target.length() != cache.length()) {
++            val copied = cache.inputStream().use { input -> streamCopy(input, target, checkActive, onProgress) }
++            if (copied != cache.length() || target.length() <= 0L || target.length() != copied) {
+                 throw IOException("Copied video length was not verified; completed cache was preserved for retry")
+             }
++            onProgress(copied)
+         } catch (failure: Exception) {
+             // Preserve the marker if deleting the failed target is refused. Recovery must never
+             // turn that single partial video into a completed episode.
+@@ -229,7 +290,7 @@ internal object EpisodeDownloadStorage {
+         if (!ready || error != null) return false
+         return try {
+             val files = videos(directory, filename)
+-            files.size == 1 && files.single().length() > 0L && entries(directory).none { it.name == "$filename.tmp" }
++            files.size == 1 && files.single().length() > 0L && entries(directory).none { isCopyMarker(it.name, filename) }
+         } catch (_: IOException) {
+             false
+         }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt
+index 396ffc5ec..ee2978d62 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt
+@@ -75,7 +75,17 @@ data class Download(
+ 
+     val isSaving: Boolean get() = savingStateFlow.value
+ 
++    @Transient
++    private val savedBytesStateFlow = MutableStateFlow(0L)
++
++    var savedBytes: Long
++        get() = savedBytesStateFlow.value
++        set(bytes) {
++            savedBytesStateFlow.value = bytes
++        }
++
+     fun beginSaving() {
++        if (!isSaving) savedBytes = 0L
+         savingStateFlow.value = true
+         progress = 99
+         resetSpeed()
+@@ -127,6 +137,7 @@ data class Download(
+     fun progressUpdates(): Flow<Unit> = merge(
+         progressFlow.drop(1).map { },
+         savingStateFlow.drop(1).map { },
++        savedBytesStateFlow.drop(1).map { },
+         downloadedBytesFlow.drop(1).map { },
+         speedBytesPerSecondFlow.drop(1).map { },
+     )
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
+index 6a5c8243c..bad465155 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
+@@ -101,7 +101,9 @@ class DownloadHolder(private val view: View, val adapter: DownloadAdapter) :
+             }
+             download.isSaving -> {
+                 val label = "${view.context.stringResource(MR.strings.action_save)}…"
+-                listOfNotNull(label, bytes).joinToString(" · ")
++                val written = download.savedBytes.takeIf { bytes != null && it > 0 }?.let { Formatter.formatFileSize(view.context, it) }
++                val size = if (written != null) "$written / $bytes" else bytes
++                listOfNotNull(label, size).joinToString(" · ")
+             }
+             else -> {
+                 saved.ifEmpty { view.context.stringResource(MR.strings.update_check_notification_download_in_progress) }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/util/CrashLogUtil.kt b/app/src/main/java/eu/kanade/tachiyomi/util/CrashLogUtil.kt
+index dee27c775..52cd184fc 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/util/CrashLogUtil.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/util/CrashLogUtil.kt
+@@ -44,6 +44,10 @@ class CrashLogUtil(
+             file.appendText("--- App log (last ${appLines.size} lines logged by Anikku itself) ---\n")
+             file.appendText(appLines.joinToString("\n", postfix = "\n"))
+ 
++            val downloadLines = HarmonyLogBuffer.downloadSnapshot()
++            file.appendText("\n--- Download activity (last ${downloadLines.size} events) ---\n")
++            file.appendText(downloadLines.joinToString("\n", postfix = "\n"))
++
+             val scrollLines = PanoramaScrollTrace.snapshot()
+             file.appendText("\n--- Panorama scroll trace (last ${scrollLines.size} events) ---\n")
+             file.appendText(scrollLines.joinToString("\n", postfix = "\n"))
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyLogBuffer.kt b/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyLogBuffer.kt
+index c98b2c4ab..4327bd245 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyLogBuffer.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/util/system/HarmonyLogBuffer.kt
+@@ -17,8 +17,10 @@ import java.util.Locale
+ object HarmonyLogBuffer : LogcatLogger {
+ 
+     private const val CAPACITY = 600
++    private const val DOWNLOAD_CAPACITY = 240
+ 
+     private val lines = ArrayDeque<String>(CAPACITY)
++    private val downloadLines = ArrayDeque<String>(DOWNLOAD_CAPACITY)
+     private val lock = Any()
+     private val timeFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+ 
+@@ -30,8 +32,16 @@ object HarmonyLogBuffer : LogcatLogger {
+         synchronized(lock) {
+             if (lines.size >= CAPACITY) lines.removeFirst()
+             lines.addLast(entry)
++            if (message.startsWith("Download ")) {
++                val summary = entry.substringBefore('\n')
++                if ("://" !in summary) {
++                    if (downloadLines.size >= DOWNLOAD_CAPACITY) downloadLines.removeFirst()
++                    downloadLines.addLast(summary)
++                }
++            }
+         }
+     }
+ 
+     fun snapshot(): List<String> = synchronized(lock) { lines.toList() }
++    fun downloadSnapshot(): List<String> = synchronized(lock) { downloadLines.toList() }
+ }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/util/system/NetworkStateTracker.kt b/app/src/main/java/eu/kanade/tachiyomi/util/system/NetworkStateTracker.kt
+index bb27a1098..93f2ad7b1 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/util/system/NetworkStateTracker.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/util/system/NetworkStateTracker.kt
+@@ -12,6 +12,7 @@ data class NetworkState(
+     val isValidated: Boolean,
+     val isWifi: Boolean,
+     val isEthernet: Boolean,
++    val isVpn: Boolean = false,
+ ) {
+     val isOnline = isConnected && isValidated
+ }
+@@ -24,6 +25,7 @@ fun Context.activeNetworkState(): NetworkState {
+         isValidated = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ?: false,
+         isWifi = wifiManager.isWifiEnabled && capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ?: false,
+         isEthernet = capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) ?: false,
++        isVpn = capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) ?: false,
+     )
+ }
+ 
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt
+index 37971d75f..c4f4bb117 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt
+@@ -79,6 +79,45 @@ class NavigationChromeDownloadQueueConcurrencyTest {
+         assertEquals(queue.take(3), DownloadQueueConcurrency.select(queue, 99, 99))
+     }
+ 
++    @Test
++    fun `waiting on storage admits one additional transfer and protects the current output`() = runBlocking {
++        val source = source(1, "Source")
++        val first = download(source, 1, "Anime", "Episode")
++        val alias = download(source, 2, "Anime", "Episode")
++        val next = download(source, 3)
++        val last = download(source, 4)
++        val queue = listOf(first, alias, next, last)
++        val workers = DownloadQueueConcurrency.Workers()
++        val started = mutableListOf<Download>()
++        val start: (Download) -> Job = { item ->
++            item.status = Download.State.DOWNLOADING
++            launch(start = CoroutineStart.UNDISPATCHED) {
++                started += item
++                awaitCancellation()
++            }
++        }
++        try {
++            workers.update(DownloadQueueConcurrency.select(queue, 1, 1), start)
++            assertEquals(listOf(first), started)
++            first.beginSaving()
++            workers.update(DownloadQueueConcurrency.select(queue, 1, 1), start)
++            assertEquals(listOf(first, next), started)
++            assertTrue(first.isSaving)
++
++            next.beginSaving()
++            workers.update(DownloadQueueConcurrency.select(queue, 1, 1), start)
++            assertEquals(listOf(first, next), started)
++            assertEquals(Download.State.QUEUE, alias.status)
++            assertEquals(Download.State.QUEUE, last.status)
++
++            first.finishSaving()
++            workers.update(DownloadQueueConcurrency.select(listOf(next, last), 1, 1), start)
++            assertEquals(listOf(first, next, last), started)
++        } finally {
++            workers.update(emptyList(), start)
++        }
++    }
++
+     @Test
+     fun `repeated updates and mutable Video changes never launch an episode twice`() = runBlocking {
+         val owner = SupervisorJob()
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt
+index c8e3d6373..0b8dfb97d 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt
+@@ -31,6 +31,42 @@ import java.util.concurrent.atomic.AtomicBoolean
+ import java.util.concurrent.atomic.AtomicInteger
+ 
+ class NavigationChromeDownloadRecoveryTest {
++    @Test
++    fun `SAF stream copy keeps its staged source after a failed verification and clears the pending marker only on completion`() = runBlocking {
++        val pending = FakeDirectory()
++        val final = FakeDirectory()
++        val name = "Episode.ts.anikku"
++        val bytes = "complete staged video".toByteArray()
++        val staged = pending.add(name, bytes)
++        val download = Download(mockk(), mockk(), mockk()).apply { status = Download.State.DOWNLOADING }
++        suspend fun placeDirectory(): UniFile {
++            EpisodeDownloadStorage.prepareFinalTarget(final.file, staged.file, "Episode") { error("Matching video should not be backed up") }
++            EpisodeDownloadStorage.copyStagedVideo(staged.file, final.file) { download.savedBytes = it }
++            return final.file
++        }
++
++        final.createdVideoReportsZero = true
++        val failure = runCatching {
++            EpisodeDownloadStorage.commit(download, staged.file, "Episode", ::placeDirectory) { error("Failed copy was registered") }
++        }.exceptionOrNull()
++        assertTrue(failure is IOException)
++        assertTrue(EpisodeDownloadStorage.isFinalCopyPending(final.file))
++        assertEquals(99, download.progress)
++        assertArrayEquals(bytes, staged.bytes)
++
++        final.files.getValue(name).apply {
++            reportZero = false
++            this.bytes = bytes.copyOf(5)
++        }
++        final.createdVideoReportsZero = false
++        EpisodeDownloadStorage.commit(download, staged.file, "Episode", ::placeDirectory) {
++            assertFalse(EpisodeDownloadStorage.isFinalCopyPending(it))
++            assertArrayEquals(bytes, final.files.getValue(name).bytes)
++            assertEquals(bytes.size.toLong(), download.savedBytes)
++        }
++        assertEquals(100, download.progress)
++    }
++
+     @Test
+     fun `an interrupted final copy is recovered from staging and reaches 100 after registration`() = runBlocking {
+         for (extension in listOf("ts", "mkv")) {
