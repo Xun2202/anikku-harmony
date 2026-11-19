@@ -1,0 +1,593 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 22:32:23 +0800
+Subject: [PATCH] webview: confirm private server certificates for one visit
+
+Show the origin and leaf fingerprint when an explicitly opened HTTPS server has an unknown issuer. Bind confirmation to the current WebView, origin and leaf. Cancel other certificate errors and clear native SSL decisions. Cover the shared Anikku screen and activity entry points.
+---
+ app/build.gradle.kts                          |   1 +
+ .../webview/WebViewCertificateSession.kt      | 177 ++++++++++++++++++
+ .../webview/WebViewScreenContent.kt           |  85 ++++++++-
+ .../webview/WebViewCertificateSessionTest.kt  | 167 +++++++++++++++++
+ gradle/libs.versions.toml                     |   1 +
+ .../moko-resources/base/strings.xml           |   4 +
+ .../moko-resources/zh-rCN/strings.xml         |   4 +
+ 7 files changed, 438 insertions(+), 1 deletion(-)
+ create mode 100644 app/src/main/java/eu/kanade/presentation/webview/WebViewCertificateSession.kt
+ create mode 100644 app/src/test/java/eu/kanade/presentation/webview/WebViewCertificateSessionTest.kt
+
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 0b4bd4322aefd6f7c28cbb16f510785e61f23f0a..e9fd6bdf7f86b85d2f5d410191e8744a364c65f5 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -339,6 +339,7 @@ dependencies {
+ 
+     // Tests
+     testImplementation(libs.bundles.test)
++    testImplementation(libs.okhttp.tls)
+     testRuntimeOnly(libs.junit.platform.launcher)
+ 
+     // For detecting memory leaks; see https://square.github.io/leakcanary/
+diff --git a/app/src/main/java/eu/kanade/presentation/webview/WebViewCertificateSession.kt b/app/src/main/java/eu/kanade/presentation/webview/WebViewCertificateSession.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..58fa967ba030604089df00afbe9558665a5ffbb7
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/presentation/webview/WebViewCertificateSession.kt
+@@ -0,0 +1,177 @@
++package eu.kanade.presentation.webview
++
++import android.net.http.SslCertificate
++import android.net.http.SslError
++import android.os.Build
++import android.webkit.SslErrorHandler
++import android.webkit.WebView
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import okhttp3.HttpUrl
++import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
++import okio.ByteString.Companion.toByteString
++import java.security.cert.CertificateException
++import java.security.cert.CertificateFactory
++import java.security.cert.X509Certificate
++
++internal class WebViewCertificateSession(initialUrl: String) {
++    class Notice(val origin: HttpUrl, val fingerprint: String?)
++
++    private val launchOrigin = httpsOrigin(initialUrl)
++    private var owner: WebView? = null
++    private var atLaunchOrigin = false
++    private var approvedFingerprint: String? = null
++    private val pending = mutableListOf<SslErrorHandler>()
++    var notice by mutableStateOf<Notice?>(null)
++        private set
++
++    fun attach(view: WebView) {
++        owner?.let(::detach)
++        owner = view
++        atLaunchOrigin = launchOrigin != null && (view.url == null || httpsOrigin(view.url) == launchOrigin)
++    }
++
++    fun navigating(view: WebView, url: String?) {
++        if (view !== owner) return
++        atLaunchOrigin = launchOrigin != null && httpsOrigin(url) == launchOrigin
++        if (!atLaunchOrigin) reset(view)
++    }
++
++    fun detach(view: WebView) {
++        if (view !== owner) return
++        owner = null
++        atLaunchOrigin = false
++        reset(view)
++    }
++
++    fun received(view: WebView, handler: SslErrorHandler, error: SslError) {
++        val origin = launchOrigin
++        if (view !== owner || !atLaunchOrigin || origin == null || httpsOrigin(error.url) != origin) {
++            handler.cancel()
++            return
++        }
++        val fingerprint = reviewableFingerprint(error, origin.host)
++        if (fingerprint == null || (approvedFingerprint != null && approvedFingerprint != fingerprint)) {
++            handler.cancel()
++            block(view, origin)
++            return
++        }
++        if (approvedFingerprint == fingerprint) {
++            proceed(view, listOf(handler))
++            return
++        }
++        val previous = notice
++        if (previous != null && previous.fingerprint != fingerprint) {
++            handler.cancel()
++            block(view, origin)
++            return
++        }
++        pending.add(handler)
++        if (previous == null) notice = Notice(origin, fingerprint)
++    }
++
++    fun handshakeFailed(view: WebView, url: String) {
++        val origin = launchOrigin ?: return
++        if (view === owner && atLaunchOrigin && httpsOrigin(url) == origin && notice == null) {
++            block(view, origin)
++        }
++    }
++
++    fun accept(expected: Notice) {
++        val view = owner ?: return
++        val fingerprint = expected.fingerprint ?: return
++        if (notice !== expected || !atLaunchOrigin || pending.isEmpty()) return
++        approvedFingerprint = fingerprint
++        proceed(view, takePending())
++    }
++
++    fun dismiss(expected: Notice): Boolean {
++        if (notice !== expected) return false
++        owner?.let(::reset)
++        return true
++    }
++
++    private fun proceed(view: WebView, requests: List<SslErrorHandler>) {
++        try {
++            requests.forEach { it.proceed() }
++        } finally {
++            // Harmony: WebView may cache proceed() across windows. Keep the exception in this session only.
++            view.clearSslPreferences()
++        }
++    }
++
++    private fun takePending(): List<SslErrorHandler> {
++        val requests = pending.toList()
++        pending.clear()
++        notice = null
++        return requests
++    }
++
++    private fun reset(view: WebView) {
++        val wasApproved = approvedFingerprint != null
++        approvedFingerprint = null
++        takePending().forEach { it.cancel() }
++        if (wasApproved) view.clearSslPreferences()
++    }
++
++    private fun block(view: WebView, origin: HttpUrl) {
++        reset(view)
++        notice = Notice(origin, null)
++    }
++}
++
++private fun httpsOrigin(url: String?): HttpUrl? {
++    val parsed = url?.toHttpUrlOrNull() ?: return null
++    if (!parsed.isHttps || parsed.username.isNotEmpty() || parsed.password.isNotEmpty()) return null
++    return parsed.resolve("/")
++}
++
++private fun reviewableFingerprint(error: SslError, host: String): String? {
++    if (error.primaryError != SslError.SSL_UNTRUSTED ||
++        (SslError.SSL_NOTYETVALID..SslError.SSL_INVALID).any { it != SslError.SSL_UNTRUSTED && error.hasError(it) }
++    ) {
++        return null
++    }
++    return try {
++        val certificate = error.certificate?.toX509() ?: return null
++        certificate.checkValidity()
++        val purposes = certificate.extendedKeyUsage
++        if (certificate.hasUnsupportedCriticalExtension() || !certificate.matchesServer(host) ||
++            (purposes != null && purposes.none { it == "1.3.6.1.5.5.7.3.1" || it == "2.5.29.37.0" })
++        ) {
++            return null
++        }
++        certificate.encoded.toByteString().sha256().hex().uppercase().chunked(2).joinToString(":")
++    } catch (_: CertificateException) {
++        null
++    }
++}
++
++private fun SslCertificate.toX509(): X509Certificate? {
++    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) return x509Certificate
++    val der = SslCertificate.saveState(this)?.getByteArray("x509-certificate") ?: return null
++    return CertificateFactory.getInstance("X.509").generateCertificate(der.inputStream()) as? X509Certificate
++}
++
++private fun X509Certificate.matchesServer(host: String): Boolean {
++    val address = ':' in host || host.all { it in '0'..'9' || it == '.' }
++    val names = subjectAlternativeNames ?: return false
++    return names.any { entry ->
++        val name = entry.getOrNull(1) as? String ?: return@any false
++        when (entry.firstOrNull()) {
++            7 -> address && runCatching { HttpUrl.Builder().scheme("https").host(name).build().host }.getOrNull() == host
++            2 -> !address && matchesDnsName(host, name)
++            else -> false
++        }
++    }
++}
++
++private fun matchesDnsName(host: String, name: String): Boolean {
++    val dnsHost = host.removeSuffix(".")
++    val dnsName = name.removeSuffix(".")
++    if ('*' !in dnsName) return dnsHost.equals(dnsName, ignoreCase = true)
++    val suffix = dnsName.removePrefix("*.")
++    return dnsName.startsWith("*.") && '*' !in suffix && '.' in suffix && '.' in dnsHost &&
++        dnsHost.substringAfter('.').equals(suffix, ignoreCase = true)
++}
+diff --git a/app/src/main/java/eu/kanade/presentation/webview/WebViewScreenContent.kt b/app/src/main/java/eu/kanade/presentation/webview/WebViewScreenContent.kt
+index 745d5ab0ae6d8733c0a3be9eeb2e71d32a1df7ad..a81ae62999b5b0f60f23783e25f6d56cce868b85 100644
+--- a/app/src/main/java/eu/kanade/presentation/webview/WebViewScreenContent.kt
++++ b/app/src/main/java/eu/kanade/presentation/webview/WebViewScreenContent.kt
+@@ -2,23 +2,34 @@ package eu.kanade.presentation.webview
+ 
+ import android.content.pm.ApplicationInfo
+ import android.graphics.Bitmap
++import android.net.http.SslError
+ import android.os.Message
++import android.webkit.SslErrorHandler
++import android.webkit.WebResourceError
+ import android.webkit.WebResourceRequest
+ import android.webkit.WebView
++import android.webkit.WebViewClient
+ import androidx.activity.compose.BackHandler
+ import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.text.selection.SelectionContainer
++import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+ import androidx.compose.material.icons.automirrored.outlined.ArrowForward
+ import androidx.compose.material.icons.outlined.Close
++import androidx.compose.material3.AlertDialog
+ import androidx.compose.material3.LinearProgressIndicator
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Surface
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.key
+@@ -32,6 +43,7 @@ import androidx.compose.ui.draw.clip
+ import androidx.compose.ui.graphics.vector.ImageVector
+ import androidx.compose.ui.platform.LocalUriHandler
+ import androidx.compose.ui.res.vectorResource
++import androidx.compose.ui.text.font.FontFamily
+ import androidx.compose.ui.unit.dp
+ import cafe.adriel.voyager.core.stack.mutableStateStackOf
+ import com.kevinnzou.web.AccompanistWebChromeClient
+@@ -51,6 +63,7 @@ import eu.kanade.tachiyomi.util.system.setDefaultSettings
+ import kotlinx.collections.immutable.persistentListOf
+ import kotlinx.coroutines.launch
+ import tachiyomi.i18n.MR
++import tachiyomi.i18n.ank.AMR
+ import tachiyomi.presentation.core.components.material.Scaffold
+ import tachiyomi.presentation.core.i18n.stringResource
+ 
+@@ -95,10 +108,23 @@ fun WebViewScreenContent(
+ 
+     var currentUrl by remember { mutableStateOf(url) }
+     var showCloudflareHelp by remember { mutableStateOf(false) }
++    val certificates = remember(url) { WebViewCertificateSession(url) }
+ 
+-    val webClient = remember {
++    val webClient = remember(certificates) {
+         object : AccompanistWebViewClient() {
++            override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
++                certificates.received(view, handler, error)
++            }
++
++            override fun onReceivedError(view: WebView, request: WebResourceRequest?, error: WebResourceError?) {
++                super.onReceivedError(view, request, error)
++                if (request?.isForMainFrame == true && error?.errorCode == WebViewClient.ERROR_FAILED_SSL_HANDSHAKE) {
++                    certificates.handshakeFailed(view, request.url.toString())
++                }
++            }
++
+             override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
++                certificates.navigating(view, url)
+                 super.onPageStarted(view, url, favicon)
+                 url?.let {
+                     currentUrl = it
+@@ -137,6 +163,7 @@ fun WebViewScreenContent(
+ 
+                 // Only open valid web urls
+                 if (url.startsWith("http") || url.startsWith("https")) {
++                    if (request.isForMainFrame && view != null) certificates.navigating(view, url)
+                     if (url != view?.url) {
+                         view?.loadUrl(url, headers)
+                         return true
+@@ -185,6 +212,14 @@ fun WebViewScreenContent(
+ 
+     BackHandler(windowStack.size > 1, popState)
+ 
++    certificates.notice?.let { notice ->
++        CertificateReviewDialog(
++            notice = notice,
++            onAccept = { certificates.accept(notice) },
++            onDismiss = { if (certificates.dismiss(notice)) onNavigateUp() },
++        )
++    }
++
+     Scaffold(
+         topBar = {
+             Box {
+@@ -294,6 +329,7 @@ fun WebViewScreenContent(
+                     .padding(contentPadding),
+                 navigator = navigator,
+                 onCreated = { webView ->
++                    if (currentWindow.popupMessage == null) certificates.attach(webView)
+                     webView.setDefaultSettings()
+ 
+                     // Debug mode (chrome://inspect/#devices)
+@@ -308,6 +344,7 @@ fun WebViewScreenContent(
+                     }
+                 },
+                 onDispose = { webView ->
++                    certificates.detach(webView)
+                     val window = windowStack.items.find { it.webView == webView }
+                     if (window == null) {
+                         // If we couldn't find any window on the stack that owns this WebView, it means that we can
+@@ -335,3 +372,49 @@ fun WebViewScreenContent(
+         }
+     }
+ }
++
++@Composable
++private fun CertificateReviewDialog(
++    notice: WebViewCertificateSession.Notice,
++    onAccept: () -> Unit,
++    onDismiss: () -> Unit,
++) {
++    val site = notice.origin.toString().removeSuffix("/")
++    val fingerprint = notice.fingerprint
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        title = { Text(stringResource(AMR.strings.harmony_webview_certificate_title)) },
++        text = {
++            Column(
++                modifier = Modifier.verticalScroll(rememberScrollState()),
++                verticalArrangement = Arrangement.spacedBy(12.dp),
++            ) {
++                SelectionContainer { Text(site, style = MaterialTheme.typography.titleSmall) }
++                if (fingerprint == null) {
++                    Text(stringResource(AMR.strings.harmony_webview_certificate_blocked))
++                } else {
++                    Text(stringResource(AMR.strings.harmony_webview_certificate_review))
++                    SelectionContainer {
++                        Text(
++                            text = fingerprint.split(':').chunked(8).joinToString("\n") { it.joinToString(":") },
++                            style = MaterialTheme.typography.bodySmall,
++                            fontFamily = FontFamily.Monospace,
++                        )
++                    }
++                }
++            }
++        },
++        confirmButton = {
++            if (fingerprint != null) {
++                TextButton(onClick = onAccept) { Text(stringResource(AMR.strings.harmony_webview_continue_once)) }
++            } else {
++                TextButton(onClick = onDismiss) { Text(stringResource(MR.strings.action_close)) }
++            }
++        },
++        dismissButton = {
++            if (fingerprint != null) {
++                TextButton(onClick = onDismiss) { Text(stringResource(MR.strings.action_cancel)) }
++            }
++        },
++    )
++}
+diff --git a/app/src/test/java/eu/kanade/presentation/webview/WebViewCertificateSessionTest.kt b/app/src/test/java/eu/kanade/presentation/webview/WebViewCertificateSessionTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..3dc6cf780a06d100507a39e3ef65865cb3fe1581
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/presentation/webview/WebViewCertificateSessionTest.kt
+@@ -0,0 +1,167 @@
++package eu.kanade.presentation.webview
++
++import android.net.http.SslCertificate
++import android.net.http.SslError
++import android.os.Bundle
++import android.webkit.SslErrorHandler
++import android.webkit.WebView
++import io.mockk.every
++import io.mockk.mockk
++import io.mockk.mockkStatic
++import io.mockk.unmockkStatic
++import io.mockk.verify
++import okhttp3.tls.HeldCertificate
++import org.junit.jupiter.api.AfterEach
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertNotNull
++import org.junit.jupiter.api.Assertions.assertNull
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.BeforeEach
++import org.junit.jupiter.api.Test
++import java.security.cert.X509Certificate
++
++class WebViewCertificateSessionTest {
++    private val host = "192.0.2.42"
++    private val address = "https://192.0.2.42:8443/web/"
++    private val leaf = HeldCertificate.Builder().addSubjectAlternativeName(host).build().certificate
++    private val view = mockk<WebView>(relaxUnitFun = true)
++    private val session = WebViewCertificateSession(address)
++
++    @BeforeEach
++    fun open() {
++        mockkStatic(SslCertificate::class)
++        every { view.url } returns null
++        session.attach(view)
++    }
++
++    @AfterEach
++    fun close() {
++        session.detach(view)
++        unmockkStatic(SslCertificate::class)
++    }
++
++    private fun error(
++        target: String = address,
++        certificate: X509Certificate = leaf,
++        errors: Set<Int> = setOf(SslError.SSL_UNTRUSTED),
++    ): SslError {
++        val info = mockk<SslCertificate>()
++        val state = mockk<Bundle>()
++        every { info.x509Certificate } returns certificate
++        every { SslCertificate.saveState(info) } returns state
++        every { state.getByteArray("x509-certificate") } returns certificate.encoded
++        val result = mockk<SslError>()
++        every { result.url } returns target
++        every { result.certificate } returns info
++        every { result.primaryError } returns errors.max()
++        every { result.hasError(any()) } answers { firstArg<Int>() in errors }
++        return result
++    }
++
++    private fun handler(): SslErrorHandler = mockk(relaxUnitFun = true)
++
++    @Test
++    fun `explicit confirmation releases only this sites waiting requests and clears framework decisions`() {
++        val main = handler()
++        val asset = handler()
++        session.received(view, main, error(target = address + "?token=test-only#section"))
++        val notice = requireNotNull(session.notice)
++        session.received(view, asset, error(target = address + "script.js"))
++        assertEquals("https://192.0.2.42:8443/", notice.origin.toString())
++        assertEquals(32, notice.fingerprint?.split(':')?.size)
++        verify(exactly = 0) { main.proceed() }
++        verify(exactly = 0) { asset.proceed() }
++
++        session.accept(notice)
++        verify(exactly = 1) { main.proceed() }
++        verify(exactly = 1) { asset.proceed() }
++        verify(exactly = 1) { view.clearSslPreferences() }
++        val next = handler()
++        session.received(view, next, error())
++        verify(exactly = 1) { next.proceed() }
++        assertNull(session.notice)
++    }
++
++    @Test
++    fun `dismiss and disposal cancel unanswered handlers and invalidate a stale click`() {
++        val first = handler()
++        session.received(view, first, error())
++        val dismissed = requireNotNull(session.notice)
++        assertTrue(session.dismiss(dismissed))
++        val second = handler()
++        session.received(view, second, error())
++        val disposed = requireNotNull(session.notice)
++        session.accept(dismissed)
++        session.detach(view)
++        session.accept(disposed)
++        verify(exactly = 1) { first.cancel() }
++        verify(exactly = 1) { second.cancel() }
++        verify(exactly = 0) { first.proceed() }
++        verify(exactly = 0) { second.proceed() }
++    }
++
++    @Test
++    fun `other hosts ports schemes and popup windows cannot obtain an exception`() {
++        for (target in listOf("https://other.example/", "https://192.0.2.42/", "http://192.0.2.42:8443/")) {
++            val rejected = handler()
++            session.received(view, rejected, error(target))
++            verify(exactly = 1) { rejected.cancel() }
++        }
++        val popup = handler()
++        session.received(mockk(), popup, error())
++        verify(exactly = 1) { popup.cancel() }
++        assertNull(session.notice)
++    }
++
++    @Test
++    fun `leaving the launch origin forgets consent and disallows embedded callbacks there`() {
++        session.received(view, handler(), error())
++        session.accept(requireNotNull(session.notice))
++        session.navigating(view, "https://other.example/")
++        val embedded = handler()
++        session.received(view, embedded, error())
++        verify(exactly = 1) { embedded.cancel() }
++        session.navigating(view, address)
++        val returned = handler()
++        session.received(view, returned, error())
++        assertNotNull(session.notice?.fingerprint)
++        verify(exactly = 0) { returned.proceed() }
++    }
++
++    @Test
++    fun `an expired leaf a different subject name and combined errors cannot be accepted`() {
++        val expired = HeldCertificate.Builder().addSubjectAlternativeName(host).validityInterval(1000L, 2000L)
++            .build().certificate
++        val other = HeldCertificate.Builder().addSubjectAlternativeName("other.example").build().certificate
++        for (failure in listOf(
++            error(certificate = expired),
++            error(certificate = other),
++            error(errors = setOf(SslError.SSL_IDMISMATCH, SslError.SSL_UNTRUSTED)),
++            error(errors = setOf(SslError.SSL_DATE_INVALID)),
++        )) {
++            val rejected = handler()
++            session.received(view, rejected, failure)
++            val blocked = requireNotNull(session.notice)
++            assertNull(blocked.fingerprint)
++            session.accept(blocked)
++            verify(exactly = 1) { rejected.cancel() }
++            verify(exactly = 0) { rejected.proceed() }
++            session.dismiss(blocked)
++        }
++    }
++
++    @Test
++    fun `a changed certificate during an approved visit and a fatal handshake have no continue action`() {
++        session.received(view, handler(), error())
++        session.accept(requireNotNull(session.notice))
++        val changed = HeldCertificate.Builder().addSubjectAlternativeName(host).build().certificate
++        val rejected = handler()
++        session.received(view, rejected, error(certificate = changed))
++        val blocked = requireNotNull(session.notice)
++        assertNull(blocked.fingerprint)
++        verify(exactly = 1) { rejected.cancel() }
++        session.dismiss(blocked)
++        session.handshakeFailed(view, address)
++        assertNull(requireNotNull(session.notice).fingerprint)
++    }
++}
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index d43eadddcb04f230d42fcb9ff599514ff096d8be..f66964b3ea3ffd9b782e48a41071a815fd923866 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -21,6 +21,7 @@ android-shortcut-gradle = "com.github.komikku-app:android-shortcut-gradle-plugin
+ rxjava = "io.reactivex:rxjava:1.3.8"
+ 
+ okhttp-core = { module = "com.squareup.okhttp3:okhttp", version.ref = "okhttp_version" }
++okhttp-tls = { module = "com.squareup.okhttp3:okhttp-tls", version.ref = "okhttp_version" }
+ okhttp-logging = { module = "com.squareup.okhttp3:logging-interceptor", version.ref = "okhttp_version" }
+ okhttp-brotli = { module = "com.squareup.okhttp3:okhttp-brotli", version.ref = "okhttp_version" }
+ okhttp-dnsoverhttps = { module = "com.squareup.okhttp3:okhttp-dnsoverhttps", version.ref = "okhttp_version" }
+diff --git a/i18n-ank/src/commonMain/moko-resources/base/strings.xml b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+index 540677eb8f6724a41be281d4c6b87c798fa4bfc6..0f484dc35e71b09af18ba842767b32fdd9d8f559 100644
+--- a/i18n-ank/src/commonMain/moko-resources/base/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+@@ -295,4 +295,8 @@
+     <string name="harmony_download_resume">继续下载</string>
+     <string name="harmony_download_pause">暂停下载</string>
+     <string name="harmony_download_restart">重新下载</string>
++    <string name="harmony_webview_certificate_title">Check the server certificate</string>
++    <string name="harmony_webview_certificate_review">This device does not trust the issuer. Compare this SHA-256 fingerprint with the one supplied by the server owner before continuing.</string>
++    <string name="harmony_webview_certificate_blocked">The secure connection could not be verified. Check the server address, certificate and expiry date before opening the page again.</string>
++    <string name="harmony_webview_continue_once">Continue this time</string>
+ </resources>
+diff --git a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+index 8f40cec9709c4138768216863c63291b08e4db52..4ab6cfdf3195e89132feaf961d38fcabe783a3a9 100644
+--- a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+@@ -282,4 +282,8 @@
+     <!-- Harmony fork: scroll performance recorder shared with Mihon -->
+     <string name="pref_harmony_scroll_perf_recorder">滚动性能记录（调试）</string>
+     <string name="pref_harmony_scroll_perf_recorder_summary">开启后左下角出现「记录」按钮。觉得卡时点一下，生成不含书名和网址的性能日志并分享。</string>
++    <string name="harmony_webview_certificate_title">核对服务器证书</string>
++    <string name="harmony_webview_certificate_review">此设备不信任证书的签发机构。请与服务器所有者提供的 SHA-256 指纹核对，一致后再继续。</string>
++    <string name="harmony_webview_certificate_blocked">无法验证这次安全连接。请检查服务器地址、证书及有效期，然后重新打开页面。</string>
++    <string name="harmony_webview_continue_once">仅本次继续</string>
+ </resources>
