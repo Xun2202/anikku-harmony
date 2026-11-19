@@ -1,0 +1,810 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 15:45:31 +0000
+Subject: [PATCH] downloads: delegate direct MP4 transfers to the system during
+ screen-off
+
+Recover provider-owned transfers after process or worker replacement, verify the local video before saving, and keep private, multi-track and streaming inputs on their existing transport. Handoffs and gallery visibility use the normal offline queue.
+---
+ app/src/main/AndroidManifest.xml              |   9 +
+ .../tachiyomi/data/download/DownloadJob.kt    |   4 +-
+ .../data/download/DownloadManager.kt          |   4 +-
+ .../tachiyomi/data/download/Downloader.kt     |  71 ++++-
+ .../data/download/EpisodeDownloadStorage.kt   |   6 +-
+ .../download/SystemVideoCompleteReceiver.kt   |  33 ++
+ .../data/download/SystemVideoTransfers.kt     | 291 ++++++++++++++++++
+ .../NavigationChromeDownloadRecoveryTest.kt   |  30 ++
+ ...avigationChromeSystemVideoTransfersTest.kt | 141 +++++++++
+ 9 files changed, 576 insertions(+), 13 deletions(-)
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/data/download/SystemVideoCompleteReceiver.kt
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/data/download/SystemVideoTransfers.kt
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeSystemVideoTransfersTest.kt
+
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index b73b6b372..91c5677e8 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -340,6 +340,15 @@
+             android:foregroundServiceType="dataSync">
+         </service>
+ 
++        <receiver
++            android:name=".data.download.SystemVideoCompleteReceiver"
++            android:exported="true"
++            android:permission="android.permission.SEND_DOWNLOAD_COMPLETED_INTENTS">
++            <intent-filter>
++                <action android:name="android.intent.action.DOWNLOAD_COMPLETE" />
++            </intent-filter>
++        </receiver>
++
+         <receiver
+             android:name=".data.notification.NotificationReceiver"
+             android:exported="false" />
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJob.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJob.kt
+index 7769acfce..cf228eae0 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJob.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJob.kt
+@@ -170,12 +170,12 @@ class DownloadJob(private val context: Context, workerParams: WorkerParameters)
+     companion object {
+         private const val TAG = "Downloader"
+ 
+-        fun start(context: Context) {
++        fun start(context: Context, policy: ExistingWorkPolicy = ExistingWorkPolicy.APPEND_OR_REPLACE) {
+             val request = OneTimeWorkRequestBuilder<DownloadJob>()
+                 .addTag(TAG)
+                 .build()
+             WorkManager.getInstance(context)
+-                .enqueueUniqueWork(TAG, ExistingWorkPolicy.APPEND_OR_REPLACE, request)
++                .enqueueUniqueWork(TAG, policy, request)
+         }
+ 
+         fun stop(context: Context) {
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
+index 5c083c114..6da008def 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
+@@ -200,7 +200,7 @@ class DownloadManager(
+             // rather than `endsWith` so a provider that insists on appending its own extension still matches.
+             .filter {
+                 "video" in it.type.orEmpty() || Downloader.HIDDEN_VIDEO_SUFFIX in it.name.orEmpty() ||
+-                    (it.isFile && it.name.orEmpty().endsWith(".ts", ignoreCase = true))
++                    (it.isFile && (it.name.orEmpty().endsWith(".ts", true) || it.name.orEmpty().endsWith(".mp4", true)))
+             }
+ 
+         if (files.isEmpty()) {
+@@ -661,7 +661,7 @@ class DownloadManager(
+                     for (file in chapterDir.listFiles().orEmpty().filter { it.isFile }) {
+                         val name = file.name ?: continue
+                         val newName = when {
+-                            hide && suffix !in name && "video" in file.type.orEmpty() -> name + suffix
++                            hide && suffix !in name && ("video" in file.type.orEmpty() || name.endsWith(".mp4", true)) -> name + suffix
+                             !hide && name.endsWith(suffix) -> name.removeSuffix(suffix)
+                             else -> continue
+                         }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index b60ae420e..84073a499 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -29,6 +29,7 @@ import eu.kanade.tachiyomi.ui.player.loader.EpisodeLoader
+ import eu.kanade.tachiyomi.ui.player.loader.HosterLoader
+ import eu.kanade.tachiyomi.util.storage.DiskUtil
+ import eu.kanade.tachiyomi.util.storage.DiskUtil.NOMEDIA_FILE
++import eu.kanade.tachiyomi.util.system.activeNetworkState
+ import eu.kanade.tachiyomi.util.system.copyToClipboard
+ import kotlinx.collections.immutable.toImmutableList
+ import kotlinx.coroutines.CancellationException
+@@ -38,7 +39,6 @@ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.NonCancellable
+ import kotlinx.coroutines.SupervisorJob
+-import kotlinx.coroutines.async
+ import kotlinx.coroutines.cancelAndJoin
+ import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.currentCoroutineContext
+@@ -109,6 +109,7 @@ class Downloader(
+      * Store for persisting downloads across restarts.
+      */
+     private val store = DownloadStore(context)
++    private val systemTransfers = SystemVideoTransfers(AndroidVideoTransferProvider(context))
+ 
+     /**
+      * Queue where active downloads are kept.
+@@ -155,8 +156,12 @@ class Downloader(
+     init {
+         scope.launch {
+             try {
+-                val episodes = async { store.restore() }
+-                addAllToQueue(episodes.await())
++                val episodes = store.restore()
++                addAllToQueue(episodes)
++                systemTransfers.restore(
++                    episodes.mapTo(mutableSetOf()) { it.episode.id },
++                    episodes.filter { it.status == Download.State.PAUSED }.mapTo(mutableSetOf()) { it.episode.id },
++                )
+             } finally {
+                 queueReady.complete(Unit)
+             }
+@@ -208,11 +213,11 @@ class Downloader(
+     }
+ 
+     fun interruptForReschedule() {
+-        cancelDownloaderJob()
+         queueState.value.filter { it.status == Download.State.DOWNLOADING }.forEach {
+             it.status = Download.State.QUEUE
+             it.resetSpeed()
+         }
++        cancelDownloaderJob()
+         notifier.onPaused()
+     }
+ 
+@@ -227,6 +232,16 @@ class Downloader(
+             it.resetSpeed()
+             store.update(it)
+         }
++        val tickets = queueState.value.mapNotNull { systemTransfers.ticket(it.episode.id) }
++        scope.launch {
++            itemControls.withLock {
++                for (ticket in tickets) {
++                    if (queueState.value.any { it.episode.id == ticket.episode && it.status == Download.State.PAUSED }) {
++                        systemTransfers.cleanup(ticket, keepComplete = true)
++                    }
++                }
++            }
++        }
+         controlEpoch.update { it + 1 }
+     }
+ 
+@@ -241,6 +256,7 @@ class Downloader(
+             current.status = Download.State.PAUSED
+             store.update(current)
+             activeWorkers?.requestStop(current.episode.id)
++            systemTransfers.ticket(current.episode.id)?.let { systemTransfers.cleanup(it, keepComplete = true) }
+             controlEpoch.update { it + 1 }
+             logcat(LogPriority.INFO) { "Download paused episode=${current.episode.id}" }
+         }
+@@ -314,6 +330,7 @@ class Downloader(
+                 ) {
+                     throw IOException("Another queued download uses this output file; remove the duplicate before restarting")
+                 }
++                systemTransfers.ticket(id)?.let { systemTransfers.discard(it) }
+                 val filename = DiskUtil.buildValidFilename(current.episode.name)
+                 val cacheFiles = cacheOutputFiles(current, filename)
+                 val hls = File(cacheFiles.first().parentFile, "hls-$id")
+@@ -345,9 +362,11 @@ class Downloader(
+      * Removes everything from the queue.
+      */
+     fun clearQueue() {
++        val tickets = queueState.value.mapNotNull { systemTransfers.detach(it.episode.id) }
+         cancelDownloaderJob()
+ 
+         internalClearQueue()
++        scope.launch { tickets.forEach { systemTransfers.cleanup(it) } }
+         notifier.dismissProgress()
+     }
+ 
+@@ -439,7 +458,9 @@ class Downloader(
+ 
+             // Remove successful download from queue
+             if (download.status == Download.State.DOWNLOADED) {
++                val ticket = systemTransfers.ticket(download.episode.id)
+                 removeFromQueue(download)
++                if (ticket != null) systemTransfers.cleanup(ticket)
+             }
+         } catch (e: Throwable) {
+             if (e is CancellationException) {
+@@ -810,12 +831,47 @@ class Downloader(
+ 
+         download.progress = 0
+         notifier.onProgressChange(download, remainingDownloads())
+-        if (internal) return downloadWithFreshAddress(download, tmpDir, filename)
++        if (internal) {
++            if (completedCache == null) {
++                val managed = fetchSystemVideo(download)
++                if (managed != null) {
++                    beginLocalSave(download)
++                    return saveMutex.withLock {
++                        retryStorageOperation { copyIntoDownloadDir(download, managed, tmpDir, filename) }
++                    }
++                }
++            }
++            return downloadWithFreshAddress(download, tmpDir, filename)
++        }
+ 
+         val name = DiskUtil.buildValidFilename("${/* SY --> */ download.anime.ogTitle /* SY <-- */} - ${download.episode.name}")
+         return downloadVideoExternal(requireDownloadVideo(download), download.source, tmpDir, name)
+     }
+ 
++    private suspend fun fetchSystemVideo(download: Download): File? {
++        val episode = download.episode.id
++        val wifiOnly = preferences.downloadOnlyOverWifi().get()
++        val network = context.activeNetworkState()
++        // The platform service has its own UID. Keep app-scoped VPN routing and wired-only sessions intact.
++        val allowNew = preferences.keepAliveInBackground().get() && !network.isVpn && !(wifiOnly && network.isEthernet && !network.isWifi)
++        return systemTransfers.fetch(
++            episode,
++            wifiOnly,
++            allowNew,
++            media = {
++                val video = requireDownloadVideo(download)
++                SystemVideoTransfers.media(video, video.headers ?: download.source.headers)
++            },
++            rescheduling = { download.status == Download.State.QUEUE },
++            onBytes = { bytes, total, increment ->
++                download.downloadedBytes = bytes
++                if (total > 0) download.progress = (bytes.toDouble() / total * 99).toInt().coerceIn(0, 99)
++                download.recordNetworkBytes(increment)
++                if (increment > 0) DownloadSpeedMeter.addBytes(increment)
++            },
++        )
++    }
++
+     /**
+      * Define a retry routine in order to accommodate some errors that can be raised
+      *
+@@ -1532,7 +1588,10 @@ class Downloader(
+             store.removeAll(selected)
+             controlEpoch.update { it + 1 }
+             try {
+-                selected.forEach { activeWorkers?.stop(it.episode.id) }
++                selected.forEach { item ->
++                    activeWorkers?.stop(item.episode.id)
++                    systemTransfers.ticket(item.episode.id)?.let { systemTransfers.cleanup(it) }
++                }
+                 removeFromQueueIf { it.episode.id in ids }
+                 selected.forEach {
+                     val directory = File(context.cacheDir, "$CACHE_DOWNLOAD_DIR/${it.anime.id}")
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt
+index 31bb3e82d..3c00453a5 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt
+@@ -23,7 +23,7 @@ internal object EpisodeDownloadStorage {
+     private fun isVideoName(name: String?, filename: String): Boolean {
+         if (name == null) return false
+         val escaped = Regex.escape(filename)
+-        return Regex("""^$escaped(?: \(\d+\))?\.(?:mkv|ts)(?: \(\d+\))?(?:\.anikku)?$""").matches(name)
++        return Regex("""^$escaped(?: \(\d+\))?\.(?:mkv|ts|mp4)(?: \(\d+\))?(?:\.anikku)?$""").matches(name)
+     }
+ 
+     private fun videos(directory: UniFile, filename: String): List<UniFile> {
+@@ -31,7 +31,7 @@ internal object EpisodeDownloadStorage {
+         if (files.any { it.isDirectory || (it.name != NO_MEDIA && !isCopyMarker(it.name, filename) && !isVideoName(it.name, filename)) }) {
+             throw IOException("Unrecognized download files were preserved; inspect the directory before retrying")
+         }
+-        val preferred = setOf("$filename.mkv", "$filename.mkv.anikku", "$filename.ts", "$filename.ts.anikku")
++        val preferred = setOf("$filename.mkv", "$filename.mkv.anikku", "$filename.ts", "$filename.ts.anikku", "$filename.mp4", "$filename.mp4.anikku")
+         return files.filter { isVideoName(it.name, filename) }.sortedBy { it.name !in preferred }
+     }
+ 
+@@ -252,7 +252,7 @@ internal object EpisodeDownloadStorage {
+         old.forEach(::deleteRequired)
+         val copyMarker = marker ?: directory.createFile("$filename.tmp")
+             ?: throw IOException("Cannot create video copy marker")
+-        val extension = if (cache.extension == "ts") "ts" else "mkv"
++        val extension = cache.extension.takeIf { it == "ts" || it == "mp4" } ?: "mkv"
+         val finalName = "$filename.$extension" + if (hideFromGallery) ".anikku" else ""
+         val target = directory.createFile(finalName) ?: throw IOException("Cannot create video download file")
+         try {
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/SystemVideoCompleteReceiver.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/SystemVideoCompleteReceiver.kt
+new file mode 100644
+index 000000000..a668939e0
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/SystemVideoCompleteReceiver.kt
+@@ -0,0 +1,33 @@
++package eu.kanade.tachiyomi.data.download
++
++import android.content.BroadcastReceiver
++import android.content.Context
++import android.content.Intent
++import androidx.work.ExistingWorkPolicy
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import logcat.LogPriority
++import tachiyomi.core.common.util.system.logcat
++import android.app.DownloadManager as PlatformDownloads
++
++class SystemVideoCompleteReceiver : BroadcastReceiver() {
++    override fun onReceive(context: Context, intent: Intent) {
++        if (intent.action != PlatformDownloads.ACTION_DOWNLOAD_COMPLETE) return
++        val id = intent.getLongExtra(PlatformDownloads.EXTRA_DOWNLOAD_ID, -1L)
++        if (id < 0) return
++        val result = goAsync()
++        CoroutineScope(Dispatchers.IO).launch {
++            try {
++                if (AndroidVideoTransferProvider(context).owns(id)) {
++                    logcat(LogPriority.INFO) { "Download system completion broadcast request=$id" }
++                    DownloadJob.start(context.applicationContext, ExistingWorkPolicy.KEEP)
++                }
++            } catch (failure: Exception) {
++                logcat(LogPriority.WARN) { "Download system completion deferred request=$id reason=${failure.javaClass.simpleName}" }
++            } finally {
++                result.finish()
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/SystemVideoTransfers.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/SystemVideoTransfers.kt
+new file mode 100644
+index 000000000..8afbdd143
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/SystemVideoTransfers.kt
+@@ -0,0 +1,291 @@
++package eu.kanade.tachiyomi.data.download
++
++import android.content.Context
++import android.net.Uri
++import android.os.Environment
++import android.os.PowerManager
++import android.os.SystemClock
++import android.system.Os
++import eu.kanade.tachiyomi.animesource.model.Video
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.currentCoroutineContext
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.ensureActive
++import logcat.LogPriority
++import okhttp3.Headers
++import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
++import tachiyomi.core.common.util.system.logcat
++import java.io.File
++import java.io.IOException
++import java.io.RandomAccessFile
++import java.util.UUID
++import java.util.concurrent.ConcurrentHashMap
++import android.app.DownloadManager as PlatformDownloads
++
++/** Owns only episode requests created by Anikku. The provider keeps transferring while our process sleeps. */
++internal class SystemVideoTransfers(
++    private val provider: Provider,
++    private val elapsed: () -> Long = SystemClock::elapsedRealtime,
++    private val waitForSample: suspend () -> Unit = { delay(1000) },
++    private val report: (String) -> Unit = { message -> SystemVideoTransfers::class.java.logcat(LogPriority.INFO) { message } },
++) {
++    data class Ticket(val episode: Long, val id: Long, val wifiOnly: Boolean)
++    data class Sample(val status: Int, val reason: Int, val bytes: Long, val total: Long, val file: File? = null)
++    data class Media(val url: String, val headers: Headers)
++
++    interface Provider {
++        fun owned(): List<Ticket>
++        fun enqueue(episode: Long, media: Media, wifiOnly: Boolean): Ticket
++        fun sample(ticket: Ticket): Sample?
++        fun remove(ticket: Ticket)
++        fun isInteractive(): Boolean
++        fun isVideo(file: File): Boolean
++    }
++
++    private val tickets = ConcurrentHashMap<Long, Ticket>()
++    private var available = false
++
++    fun restore(queued: Set<Long>, paused: Set<Long>) {
++        try {
++            for (ticket in provider.owned().sortedByDescending { it.id }) {
++                if (ticket.episode !in queued || tickets.putIfAbsent(ticket.episode, ticket) != null) {
++                    provider.remove(ticket)
++                } else if (ticket.episode in paused) {
++                    discard(ticket, keepComplete = true)
++                }
++            }
++            available = true
++        } catch (failure: Exception) {
++            report("Download system provider unavailable reason=${failure.javaClass.simpleName}")
++        }
++    }
++
++    fun ticket(episode: Long) = tickets[episode]
++
++    fun detach(episode: Long) = tickets.remove(episode)
++
++    fun discard(ticket: Ticket, keepComplete: Boolean = false) {
++        if (keepComplete && provider.sample(ticket)?.status == PlatformDownloads.STATUS_SUCCESSFUL) return
++        // A fresh request always has a different provider id and destination, also after a quick requeue.
++        provider.remove(ticket)
++        tickets.remove(ticket.episode, ticket)
++    }
++
++    fun cleanup(ticket: Ticket, keepComplete: Boolean = false) {
++        try {
++            discard(ticket, keepComplete)
++        } catch (failure: Exception) {
++            report("Download system cleanup pending episode=${ticket.episode} request=${ticket.id} reason=${failure.javaClass.simpleName}")
++        }
++    }
++
++    suspend fun fetch(
++        episode: Long,
++        wifiOnly: Boolean,
++        allowNew: Boolean,
++        media: suspend () -> Media?,
++        rescheduling: () -> Boolean = { false },
++        onBytes: (bytes: Long, total: Long, increment: Long) -> Unit,
++    ): File? {
++        if (!available) return null
++        var ticket = tickets[episode]
++        if (ticket != null && (!allowNew || wifiOnly != ticket.wifiOnly)) {
++            discard(ticket, keepComplete = true)
++            ticket = tickets[episode]
++        }
++        if (ticket == null) {
++            if (!allowNew) return null
++            val selected = media() ?: return null
++            currentCoroutineContext().ensureActive()
++            ticket = try {
++                provider.enqueue(episode, selected, wifiOnly)
++            } catch (error: Exception) {
++                if (error is CancellationException) throw error
++                report("Download system fallback episode=$episode reason=enqueue-${error.javaClass.simpleName}")
++                return null
++            }
++            tickets[episode] = ticket
++            report("Download system enqueued episode=$episode request=${ticket.id} wifiOnly=$wifiOnly")
++        } else {
++            report("Download system reattached episode=$episode request=${ticket.id}")
++        }
++
++        var previousBytes = -1L
++        var previousTime = elapsed()
++        var lastStatus = -1
++        var visibleStall = 0L
++        try {
++            while (true) {
++                currentCoroutineContext().ensureActive()
++                val sample = provider.sample(ticket) ?: throw IOException("missing")
++                val now = elapsed()
++                val gap = (now - previousTime).coerceAtLeast(0)
++                val increment = if (previousBytes < 0) 0 else (sample.bytes - previousBytes).coerceAtLeast(0)
++                val pausedForNetwork = sample.status == PlatformDownloads.STATUS_PAUSED &&
++                    sample.reason in listOf(PlatformDownloads.PAUSED_WAITING_FOR_NETWORK, PlatformDownloads.PAUSED_QUEUED_FOR_WIFI)
++                if (lastStatus != sample.status || gap >= 5000) {
++                    report(
++                        "Download system sample episode=$episode request=${ticket.id} status=${sample.status} reason=${sample.reason} " +
++                            "bytes=${sample.bytes} total=${sample.total} previousBytes=$previousBytes gapMs=$gap",
++                    )
++                }
++                // Bytes already present when reattaching or accrued across a sleep aren't an instantaneous speed.
++                onBytes(sample.bytes, sample.total, if (gap < 5000) increment else 0)
++                if (sample.status == PlatformDownloads.STATUS_SUCCESSFUL) {
++                    val file = sample.file
++                    if (file == null || !file.isFile || file.length() <= 0 ||
++                        file.length() != sample.bytes || (sample.total > 0 && sample.total != sample.bytes) || !provider.isVideo(file)
++                    ) {
++                        throw IOException("unverified-video")
++                    }
++                    return file
++                }
++                if (sample.status == PlatformDownloads.STATUS_FAILED) throw IOException("provider-${sample.reason}")
++                visibleStall = if (sample.bytes == previousBytes && !pausedForNetwork && provider.isInteractive()) {
++                    visibleStall + gap.coerceAtMost(1500)
++                } else {
++                    0L
++                }
++                if (visibleStall >= 90_000) throw IOException("no-progress-while-awake")
++                previousBytes = sample.bytes
++                previousTime = now
++                lastStatus = sample.status
++                waitForSample()
++            }
++        } catch (cancelled: CancellationException) {
++            // Keep a finished file for the next save. A cancelled live transfer must release its slot.
++            if (!rescheduling()) cleanup(ticket, keepComplete = true)
++            throw cancelled
++        } catch (failure: Exception) {
++            val reason = if (failure.javaClass == IOException::class.java) {
++                failure.message?.takeIf { it.matches(Regex("[a-z0-9-]+")) }
++            } else {
++                null
++            }
++            report("Download system fallback episode=$episode request=${ticket.id} reason=${reason ?: failure.javaClass.simpleName}")
++            // Confirm removal before letting the other downloader start.
++            discard(ticket)
++            return null
++        }
++    }
++
++    companion object {
++        private val portableHeaders = setOf("user-agent", "accept", "accept-language", "referer", "origin")
++
++        fun media(video: Video, headers: Headers): Media? {
++            if (video.subtitleTracks.isNotEmpty() || video.audioTracks.isNotEmpty() ||
++                video.ffmpegStreamArgs.isNotEmpty() || video.ffmpegVideoArgs.isNotEmpty() || video.mpvArgs.isNotEmpty()
++            ) {
++                return null
++            }
++            val url = video.videoUrl.toHttpUrlOrNull() ?: return null
++            val host = url.host
++            if (!url.isHttps || url.username.isNotEmpty() || url.password.isNotEmpty() ||
++                '.' !in host || host.all { it.isDigit() || it == '.' } || ':' in host ||
++                host.endsWith(".localhost") || host.endsWith(".local") ||
++                !url.encodedPath.endsWith(".mp4", ignoreCase = true) || headers.names().any { it.lowercase() !in portableHeaders }
++            ) {
++                return null
++            }
++            return Media(video.videoUrl, headers)
++        }
++    }
++}
++
++/** Provider descriptions let us recover the enqueue/process-death boundary without persisting signed URLs. */
++internal class AndroidVideoTransferProvider(context: Context) : SystemVideoTransfers.Provider {
++    private val app = context.applicationContext
++    private val service get() = checkNotNull(app.getSystemService(PlatformDownloads::class.java))
++    private val description = Regex("""Anikku · (Wi-Fi|HTTP) #(\d+)""")
++    private val directory get() = File(checkNotNull(app.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)), ".anikku-transfers")
++
++    override fun owned() = owned(PlatformDownloads.Query())
++
++    fun owns(request: Long) = owned(PlatformDownloads.Query().setFilterById(request)).isNotEmpty()
++
++    private fun owned(query: PlatformDownloads.Query): List<SystemVideoTransfers.Ticket> = buildList {
++        checkNotNull(service.query(query)).use { cursor ->
++            val desc = cursor.getColumnIndexOrThrow(PlatformDownloads.COLUMN_DESCRIPTION)
++            val id = cursor.getColumnIndexOrThrow(PlatformDownloads.COLUMN_ID)
++            while (cursor.moveToNext()) {
++                val match = description.matchEntire(cursor.getString(desc).orEmpty()) ?: continue
++                val episode = match.groupValues[2].toLongOrNull() ?: continue
++                add(SystemVideoTransfers.Ticket(episode, cursor.getLong(id), match.groupValues[1] == "Wi-Fi"))
++            }
++        }
++    }
++
++    override fun enqueue(episode: Long, media: SystemVideoTransfers.Media, wifiOnly: Boolean): SystemVideoTransfers.Ticket {
++        val dir = directory
++        if (!dir.isDirectory && !dir.mkdirs() && !dir.isDirectory) throw IOException("directory-unavailable")
++        val destination = File(dir, "$episode-${UUID.randomUUID()}.mp4")
++        val type = if (wifiOnly) "Wi-Fi" else "HTTP"
++        val request = PlatformDownloads.Request(Uri.parse(media.url))
++            .setTitle("Anikku")
++            .setDescription("Anikku · $type #$episode")
++            .setMimeType("video/mp4")
++            .setDestinationUri(Uri.fromFile(destination))
++            .setNotificationVisibility(PlatformDownloads.Request.VISIBILITY_VISIBLE)
++        if (wifiOnly) request.setAllowedNetworkTypes(PlatformDownloads.Request.NETWORK_WIFI)
++        media.headers.forEach { (name, value) -> request.addRequestHeader(name, value) }
++        return SystemVideoTransfers.Ticket(episode, service.enqueue(request), wifiOnly)
++    }
++
++    override fun sample(ticket: SystemVideoTransfers.Ticket): SystemVideoTransfers.Sample? {
++        return checkNotNull(service.query(PlatformDownloads.Query().setFilterById(ticket.id))).use { cursor ->
++            if (!cursor.moveToFirst()) return null
++            val status = cursor.getInt(cursor.getColumnIndexOrThrow(PlatformDownloads.COLUMN_STATUS))
++            val file = if (status == PlatformDownloads.STATUS_SUCCESSFUL) {
++                completedFile(ticket, cursor.getString(cursor.getColumnIndexOrThrow(PlatformDownloads.COLUMN_LOCAL_URI)))
++            } else {
++                null
++            }
++            SystemVideoTransfers.Sample(
++                status,
++                cursor.getInt(cursor.getColumnIndexOrThrow(PlatformDownloads.COLUMN_REASON)),
++                cursor.getLong(cursor.getColumnIndexOrThrow(PlatformDownloads.COLUMN_BYTES_DOWNLOADED_SO_FAR)),
++                cursor.getLong(cursor.getColumnIndexOrThrow(PlatformDownloads.COLUMN_TOTAL_SIZE_BYTES)),
++                file,
++            )
++        }
++    }
++
++    private fun completedFile(ticket: SystemVideoTransfers.Ticket, localUri: String?): File? {
++        val dir = directory.canonicalFile
++        val prefix = "${ticket.episode}-"
++        val path = localUri?.let(Uri::parse)?.takeIf { it.scheme == "file" }?.path
++        path?.let(::File)?.canonicalFile?.takeIf { it.parentFile == dir && it.name.startsWith(prefix) && it.isFile }?.let { return it }
++        // Some providers expose a content URI. Match its open descriptor to our private destination.
++        return service.openDownloadedFile(ticket.id).use { fd ->
++            val source = Os.fstat(fd.fileDescriptor)
++            dir.listFiles()?.firstOrNull { file ->
++                file.name.startsWith(prefix) && file.isFile && Os.stat(file.path).let { it.st_dev == source.st_dev && it.st_ino == source.st_ino }
++            }
++        }
++    }
++
++    override fun remove(ticket: SystemVideoTransfers.Ticket) {
++        service.remove(ticket.id)
++    }
++
++    override fun isInteractive() = app.getSystemService(PowerManager::class.java)?.isInteractive != false
++
++    override fun isVideo(file: File): Boolean {
++        // A successful HTTP response can still be an HTML error page or disposable playlist.
++        if (file.length() < 12) return false
++        val type = RandomAccessFile(file, "r").use {
++            it.seek(4)
++            it.readInt()
++        }
++        if (type != 0x66747970) return false // ftyp
++        val extractor = android.media.MediaExtractor()
++        try {
++            extractor.setDataSource(file.absolutePath)
++            return (0 until extractor.trackCount).any {
++                extractor.getTrackFormat(it).getString(android.media.MediaFormat.KEY_MIME)?.startsWith("video/") == true
++            }
++        } finally {
++            extractor.release()
++        }
++    }
++}
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt
+index 0b8dfb97d..92c7d9dba 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt
+@@ -386,6 +386,36 @@ class NavigationChromeDownloadRecoveryTest {
+         }
+     }
+ 
++    @Test
++    fun `a verified platform MP4 reaches the hidden offline folder and registers only after a successful retry`() {
++        withCache(".mp4") { file ->
++            val pending = FakeDirectory()
++            val final = FakeDirectory()
++            val name = "Episode.mp4.anikku"
++            val staged = EpisodeDownloadStorage.copy(file, pending.file, "Episode", true)
++            val download = Download(mockk(), mockk(), mockk()).apply { status = Download.State.DOWNLOADING }
++            var registered = 0
++            runBlocking {
++                suspend fun place(): UniFile {
++                    EpisodeDownloadStorage.prepareFinalTarget(final.file, staged, "Episode") { error("unexpected conflict") }
++                    EpisodeDownloadStorage.copyStagedVideo(staged, final.file) {}
++                    return final.file
++                }
++                final.createdVideoReportsZero = true
++                assertTrue(runCatching { EpisodeDownloadStorage.commit(download, staged, "Episode", ::place) { registered++ } }.isFailure)
++                assertEquals(0, registered)
++                assertTrue(file.exists())
++                final.createdVideoReportsZero = false
++                final.files[name]?.reportZero = false
++                EpisodeDownloadStorage.commit(download, staged, "Episode", ::place) { registered++ }
++            }
++            assertEquals(1, registered)
++            assertEquals(setOf(name), final.files.keys)
++            assertArrayEquals(file.readBytes(), final.files.getValue(name).bytes)
++            assertTrue(EpisodeDownloadStorage.isComplete(final.file, "Episode", ready = true, error = null))
++        }
++    }
++
+     private fun withCache(extension: String = ".mkv", block: (File) -> Unit) {
+         val cache = File.createTempFile("episode-recovery-", extension)
+         try {
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeSystemVideoTransfersTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeSystemVideoTransfersTest.kt
+new file mode 100644
+index 000000000..44c17fb52
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeSystemVideoTransfersTest.kt
+@@ -0,0 +1,141 @@
++package eu.kanade.tachiyomi.data.download
++
++import eu.kanade.tachiyomi.animesource.model.Track
++import eu.kanade.tachiyomi.animesource.model.Video
++import kotlinx.coroutines.CompletableDeferred
++import kotlinx.coroutines.awaitCancellation
++import kotlinx.coroutines.cancelAndJoin
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.runBlocking
++import okhttp3.Headers
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertNotNull
++import org.junit.jupiter.api.Assertions.assertNull
++import org.junit.jupiter.api.Assertions.assertSame
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++import org.junit.jupiter.api.io.TempDir
++import java.io.File
++import android.app.DownloadManager as PlatformDownloads
++
++class NavigationChromeSystemVideoTransfersTest {
++    @TempDir lateinit var directory: File
++    private val headers = Headers.headersOf("User-Agent", "Anikku", "Referer", "https://example.org/")
++    private val url = "https://cdn.example.org/video.MP4?version=1"
++    private val media = SystemVideoTransfers.Media(url, headers)
++
++    @Test
++    fun `only portable direct files can leave the app`() {
++        val video = Video(videoUrl = url)
++        assertNotNull(SystemVideoTransfers.media(video, headers))
++        for (address in listOf("http://127.0.0.1/x.mp4", "https://127.0.0.1/x.mp4", "https://user:pw@example.org/v.mp4", "https://cdn.example.org/a.m3u8")) {
++            assertNull(SystemVideoTransfers.media(video.copy(videoUrl = address), headers))
++        }
++        assertNull(SystemVideoTransfers.media(video.copy(audioTracks = listOf(Track(url, "en"))), headers))
++        assertNull(SystemVideoTransfers.media(video.copy(ffmpegVideoArgs = listOf("codec" to "copy")), headers))
++        assertNull(SystemVideoTransfers.media(video, Headers.headersOf("Authorization", "test-value")))
++    }
++
++    @Test
++    fun `provider bytes advance while polling sleeps then a new process reattaches without resolving or enqueueing again`() = runBlocking {
++        val file = File(directory, "finished.mp4").apply { writeBytes(ByteArray(80)) }
++        val backend = Fake()
++        var now = 0L
++        val log = mutableListOf<String>()
++        val deltas = mutableListOf<Long>()
++        val system = SystemVideoTransfers(backend, { now }, {
++            now += 32_000
++            backend.latest = SystemVideoTransfers.Sample(PlatformDownloads.STATUS_SUCCESSFUL, 0, 80, 80, file)
++        }, log::add)
++        system.restore(setOf(9), emptySet())
++        assertSame(file, system.fetch(9, true, true, { media }) { _, _, delta -> deltas += delta })
++        assertEquals(listOf(0L, 0L), deltas)
++        assertTrue(log.any { "previousBytes=10 gapMs=32000" in it && "bytes=80" in it })
++        val afterDeath = SystemVideoTransfers(backend, { now }, { error("completed") }, {})
++        afterDeath.restore(setOf(9), emptySet())
++        assertSame(file, afterDeath.fetch(9, true, true, { error("must reuse original rendition") }) { _, _, _ -> })
++        assertEquals(1, backend.starts)
++        afterDeath.discard(checkNotNull(afterDeath.ticket(9)))
++        assertTrue(backend.owned().isEmpty())
++    }
++
++    @Test
++    fun `an explicit pause cancels a live writer and does not revive paused or removed requests after death`() = runBlocking {
++        val backend = Fake()
++        val entered = CompletableDeferred<Unit>()
++        val system = SystemVideoTransfers(backend, { 0 }, {
++            entered.complete(Unit)
++            awaitCancellation()
++        }, {})
++        system.restore(setOf(7), emptySet())
++        val owner = launch { system.fetch(7, true, true, { media }) { _, _, _ -> } }
++        entered.await()
++        owner.cancelAndJoin()
++        assertTrue(backend.owned().isEmpty())
++        val paused = backend.enqueue(7, media, true)
++        val orphan = backend.enqueue(4, media, true)
++        val active = backend.enqueue(8, media, true)
++        system.restore(setOf(7, 8), setOf(7))
++        assertFalse(paused in backend.owned() || orphan in backend.owned())
++        assertEquals(active, system.ticket(8))
++    }
++
++    @Test
++    fun `a rescheduled worker leaves its transfer with the provider for the successor`() = runBlocking {
++        val backend = Fake()
++        val polling = CompletableDeferred<Unit>()
++        val system = SystemVideoTransfers(backend, { 0 }, {
++            polling.complete(Unit)
++            awaitCancellation()
++        }, {})
++        system.restore(setOf(5), emptySet())
++        val worker = launch { system.fetch(5, true, true, { media }, rescheduling = { true }) { _, _, _ -> } }
++        polling.await()
++        worker.cancelAndJoin()
++        assertEquals(5L, backend.owned().single().episode)
++        val next = SystemVideoTransfers(backend, { 0 }, { error("terminal") }, {})
++        backend.latest = SystemVideoTransfers.Sample(PlatformDownloads.STATUS_FAILED, 403, 0, 0)
++        next.restore(setOf(5), emptySet())
++        assertNull(next.fetch(5, true, true, { error("already submitted") }) { _, _, _ -> })
++        assertEquals(1, backend.starts)
++    }
++
++    @Test
++    fun `failed and truncated successes are removed before the internal transport takes over`() = runBlocking {
++        val partial = File(directory, "bad.mp4").apply { writeBytes(ByteArray(5)) }
++        val complete = SystemVideoTransfers.Sample(PlatformDownloads.STATUS_SUCCESSFUL, 0, 5, 5, partial)
++        for (sample in listOf(
++            SystemVideoTransfers.Sample(PlatformDownloads.STATUS_FAILED, 403, 0, 0),
++            complete.copy(total = 20),
++            complete.copy(bytes = 20),
++            complete,
++        )) {
++            val backend = Fake().apply {
++                latest = sample
++                validVideo = false
++            }
++            val system = SystemVideoTransfers(backend, { 0 }, { error("terminal") }, {})
++            system.restore(setOf(1), emptySet())
++            assertNull(system.fetch(1, false, true, { media }) { _, _, _ -> })
++            assertTrue(backend.owned().isEmpty())
++            assertNull(system.ticket(1))
++        }
++    }
++
++    private class Fake : SystemVideoTransfers.Provider {
++        private val rows = mutableSetOf<SystemVideoTransfers.Ticket>()
++        var latest = SystemVideoTransfers.Sample(PlatformDownloads.STATUS_RUNNING, 0, 10, 80)
++        var starts = 0
++        var validVideo = true
++        override fun owned() = rows.toList()
++        override fun enqueue(episode: Long, media: SystemVideoTransfers.Media, wifiOnly: Boolean) =
++            SystemVideoTransfers.Ticket(episode, (++starts).toLong(), wifiOnly).also { rows += it }
++        override fun sample(ticket: SystemVideoTransfers.Ticket) = latest.takeIf { ticket in rows }
++        override fun remove(ticket: SystemVideoTransfers.Ticket) {
++            rows.remove(ticket)
++        }
++        override fun isInteractive() = true
++        override fun isVideo(file: File) = validVideo
++    }
++}
