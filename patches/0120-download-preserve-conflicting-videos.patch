@@ -1,0 +1,305 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 06:18:52 +0000
+Subject: [PATCH] downloads: preserve conflicting videos before final save
+
+Prepare canonical destinations only after a staged video is ready. Keep a verified recovery copy outside indexed downloads before removing the original file. Record the download worker stop reason before foreground cleanup.
+---
+ .../tachiyomi/data/download/DownloadJob.kt    |  6 +-
+ .../data/download/DownloadProvider.kt         | 13 +++
+ .../tachiyomi/data/download/Downloader.kt     | 19 ++++-
+ .../data/download/EpisodeDownloadStorage.kt   | 83 +++++++++++++++----
+ .../NavigationChromeDownloadRecoveryTest.kt   | 69 ++++++++++++---
+ 5 files changed, 160 insertions(+), 30 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJob.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJob.kt
+index c451b9952..b1ce072cd 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJob.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJob.kt
+@@ -78,11 +78,15 @@ class DownloadJob(private val context: Context, workerParams: WorkerParameters)
+                 }
+             },
+             onFinished = {
++                val stoppedBeforeCleanup = isStopped
++                val reason = if (stoppedBeforeCleanup && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) stopReason else null
+                 try {
+                     if (downloadManager.isRunning) downloadManager.downloaderStop()
+                 } finally {
+                     keepAlive?.stopAndJoin()
+-                    logcat(LogPriority.INFO) { "Download background guard end stopped=$isStopped running=${downloadManager.isRunning}" }
++                    logcat(LogPriority.INFO) {
++                        "Download background guard end stoppedBeforeCleanup=$stoppedBeforeCleanup stopReason=$reason stopped=$isStopped running=${downloadManager.isRunning}"
++                    }
+                 }
+             },
+         )
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadProvider.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadProvider.kt
+index 829bc9ec8..b1010c5f0 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadProvider.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadProvider.kt
+@@ -77,6 +77,19 @@ class DownloadProvider(
+         return Result.success(mangaDir)
+     }
+ 
++    @Synchronized
++    internal fun getRecoveryDir(mangaDir: UniFile, episodeId: Long): UniFile {
++        val root = mangaDir.parentFile?.parentFile
++            ?: throw IOException("Cannot locate the download root for the recovery copy")
++        val backupRoot = root.createDirectory(".anikku-recovery")
++            ?.takeIf { it.isDirectory && it.name == ".anikku-recovery" }
++            ?: throw IOException("Cannot create the download recovery directory")
++        DiskUtil.createNoMediaFile(backupRoot, null)
++        val name = episodeId.toString()
++        return backupRoot.createDirectory(name)?.takeIf { it.isDirectory && it.name == name }
++            ?: throw IOException("Cannot create the episode recovery directory")
++    }
++
+     /**
+      * Returns the download directory for a source if it exists.
+      *
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 23340df04..3b97cc0b2 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -431,7 +431,10 @@ class Downloader(
+                 removeFromQueue(download)
+             }
+         } catch (e: Throwable) {
+-            if (e is CancellationException) throw e
++            if (e is CancellationException) {
++                logcat(LogPriority.INFO) { "Download worker cancelled episode=${download.episode.id} state=${download.status} bytes=${download.downloadedBytes}" }
++                throw e
++            }
+             logcat(LogPriority.ERROR, e)
+             notifier.onError(e.message)
+             downloaderSessions.ifCurrent(owner) { stop() }
+@@ -624,6 +627,18 @@ class Downloader(
+             tmpDir.findFile("$legacyName.tmp")?.delete()
+             tmpDir.findFile("${legacyName}_tmp.mkv")?.delete()
+             suspend fun placeDirectory() = retryStorageOperation {
++                if (internal) {
++                    animeDir.findFile(episodeDirname)?.let { destination ->
++                        EpisodeDownloadStorage.prepareFinalTarget(destination, stagedVideo, filename) { old ->
++                            val id = download.episode.id
++                            val bytes = old.length()
++                            logcat(LogPriority.INFO) { "Download conflicting final copy episode=$id previousBytes=$bytes stagedBytes=${stagedVideo.length()}" }
++                            EpisodeDownloadStorage.preserveConflictingVideo(old, provider.getRecoveryDir(animeDir, id))
++                            logcat(LogPriority.INFO) { "Download conflicting copy preserved episode=$id bytes=$bytes" }
++                        }
++                    }
++                }
++                currentCoroutineContext().ensureActive()
+                 tmpDir.renameToOrCopy(episodeDirname, context.contentResolver)
+             }
+ 
+@@ -896,7 +911,7 @@ class Downloader(
+      * Runs a storage operation up to three times, waiting 2 and 4 seconds in between, for providers
+      * that fail transiently right after the app was frozen or the provider process restarted.
+      */
+-    private suspend fun <T> retryStorageOperation(block: () -> T): T {
++    private suspend fun <T> retryStorageOperation(block: suspend () -> T): T {
+         var attempt = 0
+         while (true) {
+             try {
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt
+index 9170094b8..e313291d7 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/EpisodeDownloadStorage.kt
+@@ -72,10 +72,7 @@ internal object EpisodeDownloadStorage {
+         return complete
+     }
+ 
+-    /**
+-     * A verified staged file is authoritative when the same destination contains only a prefix
+-     * of it. Keep both in place so the caller can retry the normal final move with proven data.
+-     */
++    /** A canonical destination with pending data is reconciled when the staged video is ready. */
+     fun recoverFinal(
+         directory: UniFile,
+         pending: UniFile?,
+@@ -84,28 +81,80 @@ internal object EpisodeDownloadStorage {
+         repairIntoExisting: Boolean,
+     ): UniFile? {
+         val hasPending = pending != null && entries(pending).any { it.name != NO_MEDIA }
+-        val staged = if (hasPending) recover(checkNotNull(pending), filename, muxedCache) else null
+-        val finalVideo = videos(directory, filename).singleOrNull()
+-        if (repairIntoExisting && staged != null && finalVideo != null && finalVideo.name == staged.name) {
+-            val bytes = finalVideo.length()
+-            if (bytes in 0L until staged.length() &&
+-                finalVideo.openInputStream().use { a -> staged.openInputStream().use { b -> streamsEqual(a, b, prefixBytes = bytes) } }
+-            ) {
+-                return null
+-            }
+-        }
++        if (repairIntoExisting && hasPending && videos(directory, filename).size <= 1) return null
+ 
+         val completed = recover(directory, filename, muxedCache)
+         if (completed == null) {
+-            if (entries(directory).all { it.name == NO_MEDIA }) return null
++            if (videos(directory, filename).isEmpty()) return null
+             throw IOException("Existing episode is not verified; files were preserved for recovery")
+         }
+-        if (hasPending && (staged == null || !sameContents(completed, staged))) {
+-            throw IOException("Final and pending episode copies differ; files were preserved for recovery")
++        if (hasPending) {
++            val staged = recover(checkNotNull(pending), filename, muxedCache)
++            if (staged == null || !sameContents(completed, staged)) {
++                throw IOException("Final and pending episode copies differ; files were preserved for recovery")
++            }
+         }
+         return completed
+     }
+ 
++    /** A known matching copy can be merged. A different copy must be backed up before saving. */
++    suspend fun prepareFinalTarget(
++        directory: UniFile,
++        staged: UniFile,
++        filename: String,
++        preserveConflict: suspend (UniFile) -> Unit,
++    ) {
++        val existing = videos(directory, filename)
++        if (existing.isEmpty()) return
++        val video = existing.singleOrNull()
++            ?: throw IOException("Multiple final video files were preserved. Inspect the directory before retrying")
++        val bytes = video.length()
++        val stagedBytes = staged.length()
++        if (video.name == staged.name && bytes in 0L..stagedBytes) {
++            val prefix = bytes.takeIf { it < stagedBytes }
++            val identical = video.openInputStream().use { a ->
++                staged.openInputStream().use { b -> streamsEqual(a, b, prefixBytes = prefix) }
++            }
++            if (identical) return
++        }
++        currentCoroutineContext().ensureActive()
++        preserveConflict(video)
++    }
++
++    /** Keep the previous bytes in a recovery directory outside the indexed downloads. */
++    suspend fun preserveConflictingVideo(video: UniFile, recovery: UniFile) {
++        val name = video.name ?: throw IOException("Existing video has no filename")
++        val bytes = video.length()
++        if (bytes <= 0L) throw IOException("Existing video length cannot be verified. Original files were preserved")
++
++        // Recover a prior successful backup when cancellation or a provider error kept it in place.
++        var backupName = name
++        var suffix = 1
++        var backup = recovery.findFile(backupName)
++        while (backup != null && (backup.isDirectory || !sameContents(video, backup))) {
++            backupName = "${suffix++}-$name"
++            backup = recovery.findFile(backupName)
++        }
++        if (backup == null) {
++            val target = recovery.createFile(backupName)
++                ?: throw IOException("Cannot create a backup of the existing video. Original files were preserved")
++            if (target.name != backupName || target.length() != 0L) {
++                throw IOException("Storage provider returned an unexpected backup file. Original files were preserved")
++            }
++            try {
++                val copied = video.openInputStream().use { input ->
++                    target.openOutputStream().use { output -> input.copyTo(output, 256 * 1024) }
++                }
++                if (copied != bytes || !sameContents(video, target)) throw IOException("Backup video bytes could not be verified")
++            } catch (failure: Exception) {
++                runCatching { deleteRequired(target) }.exceptionOrNull()?.let(failure::addSuppressed)
++                throw failure
++            }
++        }
++        currentCoroutineContext().ensureActive()
++        if (!video.delete()) throw IOException("The previous video was backed up, but the storage provider refused to move it")
++    }
++
+     suspend fun commit(
+         download: Download,
+         stagedVideo: UniFile,
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt
+index 1748f4551..c8e3d6373 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadRecoveryTest.kt
+@@ -62,7 +62,10 @@ class NavigationChromeDownloadRecoveryTest {
+             assertArrayEquals(bytes, pending.files.getValue(name).bytes)
+             assertArrayEquals(bytes.copyOf(7), final.files.getValue(name).bytes)
+ 
+-            EpisodeDownloadStorage.commit(download, staged.file, "Episode", { pending.file.renameToOrCopy("episode") }) {
++            EpisodeDownloadStorage.commit(download, staged.file, "Episode", {
++                EpisodeDownloadStorage.prepareFinalTarget(final.file, staged.file, "Episode") { error("Matching prefix should not need a backup") }
++                pending.file.renameToOrCopy("episode")
++            }) {
+                 assertTrue(download.isSaving)
+                 assertEquals(Download.State.DOWNLOADING, download.status)
+                 assertEquals(99, download.progress)
+@@ -77,20 +80,66 @@ class NavigationChromeDownloadRecoveryTest {
+     }
+ 
+     @Test
+-    fun `a smaller final video with different bytes remains a conflict`() {
++    fun `a different final video is backed up once and staging finishes after a failed removal`() = runBlocking {
+         val pending = FakeDirectory()
+         val final = FakeDirectory()
+-        val video = pending.add("Episode.ts", byteArrayOf(1, 2, 3))
+-        val conflict = final.add("Episode.ts", byteArrayOf(1, 9))
++        val recovery = FakeDirectory()
++        val staged = pending.add("Episode.ts.anikku", byteArrayOf(1, 2, 3))
++        val conflict = final.add("Episode.mkv.anikku", byteArrayOf(1, 9, 3), deleteAllowed = false)
++        val priorBackup = recovery.add("Episode.mkv.anikku", byteArrayOf(1, 4, 3))
++        val parent = mockk<UniFile>()
++        every { pending.file.parentFile } returns parent
++        every { pending.file.renameTo("episode") } returns false
++        every { pending.file.delete() } returns true
++        every { parent.findFile("episode") } returns final.file
+ 
+-        assertThrows(IOException::class.java) {
+-            EpisodeDownloadStorage.recoverFinal(final.file, pending.file, "Episode", null, repairIntoExisting = true)
++        assertNull(EpisodeDownloadStorage.recoverFinal(final.file, pending.file, "Episode", null, repairIntoExisting = true))
++        val download = Download(mockk(), mockk(), mockk()).apply { status = Download.State.DOWNLOADING }
++        suspend fun placeDirectory(): UniFile {
++            EpisodeDownloadStorage.prepareFinalTarget(final.file, staged.file, "Episode") {
++                EpisodeDownloadStorage.preserveConflictingVideo(it, recovery.file)
++            }
++            return pending.file.renameToOrCopy("episode")
+         }
+ 
+-        assertArrayEquals(byteArrayOf(1, 2, 3), video.bytes)
+-        assertArrayEquals(byteArrayOf(1, 9), conflict.bytes)
+-        assertSame(video.file, pending.files.getValue("Episode.ts").file)
+-        assertSame(conflict.file, final.files.getValue("Episode.ts").file)
++        val failed = runCatching {
++            EpisodeDownloadStorage.commit(download, staged.file, "Episode", ::placeDirectory) { error("Blocked save cannot be registered") }
++        }.exceptionOrNull()
++        assertTrue(failed is IOException)
++        assertEquals(99, download.progress)
++        assertSame(conflict, final.files.getValue("Episode.mkv.anikku"))
++        assertSame(staged, pending.files.getValue("Episode.ts.anikku"))
++        assertArrayEquals(conflict.bytes, recovery.files.getValue("1-Episode.mkv.anikku").bytes)
++
++        conflict.deleteAllowed = true
++        EpisodeDownloadStorage.commit(download, staged.file, "Episode", ::placeDirectory) { assertSame(final.file, it) }
++        assertEquals(100, download.progress)
++        assertEquals(setOf("Episode.ts.anikku"), final.files.keys)
++        assertArrayEquals(staged.bytes, final.files.getValue("Episode.ts.anikku").bytes)
++        assertArrayEquals(conflict.bytes, recovery.files.getValue("1-Episode.mkv.anikku").bytes)
++        assertArrayEquals(byteArrayOf(1, 4, 3), priorBackup.bytes)
++        assertEquals(listOf("1-Episode.mkv.anikku"), recovery.created)
++    }
++
++    @Test
++    fun `an unverified backup cannot remove either competing video`() = runBlocking {
++        val pending = FakeDirectory()
++        val final = FakeDirectory()
++        val recovery = FakeDirectory()
++        val name = "Episode.mkv.anikku"
++        val staged = pending.add(name, byteArrayOf(1, 2, 3))
++        val conflict = final.add(name, byteArrayOf(1, 9))
++        recovery.createdVideoReportsZero = true
++
++        val failure = runCatching {
++            EpisodeDownloadStorage.prepareFinalTarget(final.file, staged.file, "Episode") {
++                EpisodeDownloadStorage.preserveConflictingVideo(it, recovery.file)
++            }
++        }.exceptionOrNull()
++        assertTrue(failure is IOException)
++        assertEquals(0, recovery.files.size)
++        assertSame(conflict, final.files.getValue(name))
++        assertSame(staged, pending.files.getValue(name))
+     }
+ 
+     @Test

@@ -117,3 +117,4 @@
 0117-download-recover-denied-hls-rendition.patch
 0118-download-recover-final-save-and-item-wake.patch
 0119-download-commit-coroutine-contracts.patch
+0120-download-preserve-conflicting-videos.patch
