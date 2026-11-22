@@ -1,0 +1,376 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 17:56:44 +0000
+Subject: [PATCH] Read download probe reports independently of player logging
+
+---
+ .../data/download/DownloadFfmpegPolicy.kt     | 44 +++++-----
+ .../data/download/DownloadProbeReport.kt      | 69 +++++++++++++++
+ .../tachiyomi/data/download/Downloader.kt     | 54 ++++--------
+ .../NavigationChromeDownloadFfmpegLogsTest.kt | 17 ++--
+ ...NavigationChromeDownloadProbeReportTest.kt | 87 +++++++++++++++++++
+ 5 files changed, 204 insertions(+), 67 deletions(-)
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadProbeReport.kt
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadProbeReportTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt
+index 60b2274a6..7c4b1f18c 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt
+@@ -69,31 +69,35 @@ internal object DownloadFfmpegPolicy {
+         return partialBytes > 0 || AAC_FRAMING_FAILURE.containsMatchIn(detail)
+     }
+ 
+-    /** Verify the file type and both stream durations against the complete local playlist. */
+-    fun isCompleteTransportStream(probeOutput: String, expectedMillis: Long): Boolean {
+-        if (expectedMillis <= 0) return false
++    /** Return only the failing measurement; reports and media paths never enter download diagnostics. */
++    fun transportStreamMismatch(probeOutput: String, expectedMillis: Long): String? {
++        if (expectedMillis <= 0) return "missing-playlist-duration"
+         val tolerance = (expectedMillis / 100).coerceIn(400L, 5000L)
+-        fun coversPlaylist(seconds: Double?): Boolean = seconds != null && seconds.isFinite() &&
+-            abs(seconds * 1000 - expectedMillis) <= tolerance
++        fun mismatch(track: String, seconds: Double?): String? = when {
++            seconds == null || !seconds.isFinite() || seconds <= 0 -> "$track-duration-missing"
++            abs(seconds * 1000 - expectedMillis) > tolerance -> "$track-duration-ms=${(seconds * 1000).toLong()}"
++            else -> null
++        }
+ 
+-        return runCatching {
+-            // FFprobe can print an AAC warning during probing before its JSON output.
+-            val start = probeOutput.indexOf('{')
+-            val end = probeOutput.lastIndexOf('}')
+-            if (start < 0 || end < start) return false
+-            val root = Json.parseToJsonElement(probeOutput.substring(start, end + 1)).jsonObject
++        return try {
++            val root = Json.parseToJsonElement(probeOutput).jsonObject
+             val format = root.getValue("format").jsonObject
+-            if (format.getValue("format_name").jsonPrimitive.content != "mpegts") return false
+-            val duration = format.getValue("duration").jsonPrimitive.content.toDoubleOrNull()
+-            if (!coversPlaylist(duration)) return false
++            if (format["format_name"]?.jsonPrimitive?.content != "mpegts") return "not-mpegts"
++            mismatch("format", format["duration"]?.jsonPrimitive?.content?.toDoubleOrNull())?.let { return it }
+             val streams = root.getValue("streams").jsonArray.map { it.jsonObject }
+-            val video = streams.filter { it.getValue("codec_type").jsonPrimitive.content == "video" }
+-            val audio = streams.filter { it.getValue("codec_type").jsonPrimitive.content == "audio" }
+-            if (video.isEmpty() || audio.isEmpty()) return false
+-            (video + audio).all { stream ->
+-                coversPlaylist(stream.getValue("duration").jsonPrimitive.content.toDoubleOrNull())
++            for (type in listOf("video", "audio")) {
++                val tracks = streams.filter { it["codec_type"]?.jsonPrimitive?.content == type }
++                if (tracks.isEmpty()) return "missing-$type"
++                for (track in tracks) {
++                    mismatch(type, track["duration"]?.jsonPrimitive?.content?.toDoubleOrNull())?.let { return it }
++                }
+             }
+-        }.getOrDefault(false)
++            null
++        } catch (_: IllegalArgumentException) {
++            "invalid-report"
++        } catch (_: NoSuchElementException) {
++            "incomplete-report"
++        }
+     }
+ 
+     private const val INVALID_DATA = -1094995529
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadProbeReport.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadProbeReport.kt
+new file mode 100644
+index 000000000..f7a4dfd88
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadProbeReport.kt
+@@ -0,0 +1,69 @@
++package eu.kanade.tachiyomi.data.download
++
++import com.arthenica.ffmpegkit.FFprobeKit
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlinx.coroutines.withTimeoutOrNull
++import java.io.File
++import java.io.IOException
++import java.util.concurrent.Executors
++import kotlin.coroutines.resume
++
++/** Read the probe's own output even when mpv owns the process-wide libav log callback. */
++internal object DownloadProbeReport {
++    data class Result(val text: String = "", val status: String)
++
++    suspend fun read(
++        cache: File,
++        options: Array<String>,
++        timeoutMillis: Long,
++        start: (Array<String>, (Int?) -> Unit) -> (() -> Unit) = ::startNative,
++    ): Result = withTimeoutOrNull(timeoutMillis) {
++        suspendCancellableCoroutine<Result> { continuation ->
++            val report = try {
++                File.createTempFile("download-probe-", ".out", cache)
++            } catch (error: IOException) {
++                continuation.resume(Result(status = "create-${error.javaClass.simpleName}"))
++                return@suspendCancellableCoroutine
++            }
++            try {
++                val cancel = start(arrayOf("-o", report.absolutePath, *options)) { code ->
++                    // The native writer is closed here, even if the caller timed out earlier.
++                    val result = try {
++                        when {
++                            !continuation.isActive -> null
++                            code != 0 -> Result(status = "exit-$code")
++                            report.length() !in 1..MAX_REPORT_BYTES -> Result(status = "report-bytes-${report.length()}")
++                            else -> Result(report.readText(), "ok")
++                        }
++                    } catch (error: IOException) {
++                        Result(status = "read-${error.javaClass.simpleName}")
++                    } finally {
++                        report.delete()
++                    }
++                    if (result != null) continuation.resume(result)
++                }
++                continuation.invokeOnCancellation { cancel() }
++            } catch (error: Exception) {
++                report.delete()
++                if (error is CancellationException) throw error
++                continuation.resume(Result(status = "start-${error.javaClass.simpleName}"))
++            }
++        }
++    } ?: Result(status = "timeout")
++
++    private fun startNative(arguments: Array<String>, done: (Int?) -> Unit): () -> Unit {
++        // Kit 1.18 leaves output_filename in native thread-local storage between invocations.
++        // A fresh thread prevents one probe from inheriting the previous probe's output path.
++        val executor = Executors.newSingleThreadExecutor()
++        return try {
++            val session = FFprobeKit.executeWithArgumentsAsync(arguments, { done(it.returnCode?.value) }, executor)
++            session::cancel
++        } finally {
++            // Shutdown accepts no more work; the one submitted probe still runs its completion callback.
++            executor.shutdown()
++        }
++    }
++
++    private const val MAX_REPORT_BYTES = 128L * 1024
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 84073a499..968c5a784 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -9,7 +9,6 @@ import android.os.SystemClock
+ import androidx.core.net.toUri
+ import com.arthenica.ffmpegkit.FFmpegKit
+ import com.arthenica.ffmpegkit.FFmpegKitConfig
+-import com.arthenica.ffmpegkit.FFprobeKit
+ import com.arthenica.ffmpegkit.LogCallback
+ import com.arthenica.ffmpegkit.StatisticsCallback
+ import com.hippo.unifile.UniFile
+@@ -62,7 +61,6 @@ import kotlinx.coroutines.suspendCancellableCoroutine
+ import kotlinx.coroutines.sync.Mutex
+ import kotlinx.coroutines.sync.withLock
+ import kotlinx.coroutines.withContext
+-import kotlinx.coroutines.withTimeoutOrNull
+ import logcat.LogPriority
+ import okhttp3.Headers
+ import tachiyomi.core.common.i18n.stringResource
+@@ -1111,31 +1109,28 @@ class Downloader(
+                 val progress = (bytes.toDouble() / prepared.bytes * 4).toInt().coerceIn(0, 4)
+                 download.progress = maxOf(download.progress, 95 + progress)
+             }
+-            verifyTransportStream(transport, prepared.durationMillis)
++            verifyTransportStream(download.episode.id, transport, prepared.durationMillis)
+             logcat(LogPriority.INFO) { "Download local transport fallback verified episode=${download.episode.id} bytes=${transport.length()}" }
+             return transport
+         }
+     }
+ 
+-    private suspend fun verifyTransportStream(outputFile: File, expectedMillis: Long) {
++    private suspend fun verifyTransportStream(episodeId: Long, outputFile: File, expectedMillis: Long) {
+         val options = arrayOf(
+             "-v", "error", "-protocol_whitelist", "file",
+             "-show_entries", "format=format_name,duration:stream=codec_type,duration",
+             "-of", "json", outputFile.absolutePath,
+         )
+-        val verified = withTimeoutOrNull(10_000) {
+-            suspendCancellableCoroutine<Boolean> { continuation ->
+-                val session = FFprobeKit.executeWithArgumentsAsync(options) { result ->
+-                    if (continuation.isActive) {
+-                        val valid = result.returnCode?.value == 0 &&
+-                            DownloadFfmpegPolicy.isCompleteTransportStream(result.getAllLogsAsString(500), expectedMillis)
+-                        continuation.resume(valid)
+-                    }
+-                }
+-                continuation.invokeOnCancellation { session.cancel() }
+-            }
++        val report = DownloadProbeReport.read(context.cacheDir, options, 30_000)
++        val problem = if (report.status == "ok") {
++            DownloadFfmpegPolicy.transportStreamMismatch(report.text, expectedMillis)
++        } else {
++            report.status
++        }
++        if (problem != null) {
++            logcat(LogPriority.WARN) { "Download local verification failed episode=$episodeId expectedMs=$expectedMillis reason=$problem" }
++            throw IOException("Offline transport stream could not be verified ($problem)")
+         }
+-        if (verified != true) throw IOException("Offline transport stream could not be verified for the full duration")
+     }
+ 
+     private suspend fun ffmpegDownload(
+@@ -1383,31 +1378,12 @@ class Downloader(
+                 "\"$videoUrl\"",
+             ).joinToString(" "),
+         )
+-        // Duration is optional. Read stdout, without an unsupported -o option, a shared cache
+-        // filename, or -v quiet muting the subsequent download's useful native diagnostics.
+-        val duration = withTimeoutOrNull(10_000) {
+-            suspendCancellableCoroutine<Float?> { continuation ->
+-                val session = FFprobeKit.executeWithArgumentsAsync(options) { result ->
+-                    if (continuation.isActive) {
+-                        val value = if (result.returnCode.isValueSuccess) {
+-                            result.getAllLogsAsString(250).lineSequence()
+-                                .mapNotNull { it.trim().toFloatOrNull() }
+-                                .firstOrNull { it.isFinite() && it > 0f }
+-                        } else {
+-                            null
+-                        }
+-                        continuation.resume(value)
+-                    }
+-                }
+-                continuation.invokeOnCancellation { session.cancel() }
+-            }
+-        }
++        val report = DownloadProbeReport.read(context.cacheDir, options, 10_000)
++        val duration = report.text.trim().toDoubleOrNull()?.takeIf { it.isFinite() && it > 0 }
+         if (duration == null) {
+-            logcat(LogPriority.WARN) {
+-                "Optional duration probe unavailable for ${DownloadFfmpegPolicy.describeInput(videoUrl)}"
+-            }
++            logcat(LogPriority.WARN) { "Optional download duration unavailable probe=${report.status}" }
+         }
+-        return duration?.let { (it.toDouble() * 1000).toLong().takeIf { value -> value > 0L } }
++        return duration?.let { (it * 1000).toLong().takeIf { millis -> millis > 0 } }
+     }
+ 
+     /**
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegLogsTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegLogsTest.kt
+index 75fa1be34..4e54e5ca4 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegLogsTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegLogsTest.kt
+@@ -69,7 +69,7 @@ class NavigationChromeDownloadFfmpegLogsTest {
+     }
+ 
+     @Test
+-    fun `transport verification accepts probe warnings and requires both streams to cover the playlist`() {
++    fun `transport verification requires a clean report and full length video and audio`() {
+         val output = """
+             {
+               "streams": [
+@@ -80,12 +80,13 @@ class NavigationChromeDownloadFfmpegLogsTest {
+             }
+         """.trimIndent()
+ 
+-        assertTrue(DownloadFfmpegPolicy.isCompleteTransportStream(output, 12000))
+-        assertTrue(DownloadFfmpegPolicy.isCompleteTransportStream("[aac] Invalid band type\n$output", 12000))
+-        assertFalse(DownloadFfmpegPolicy.isCompleteTransportStream(output.replace("11.797333", "2.837000"), 12000))
+-        assertFalse(DownloadFfmpegPolicy.isCompleteTransportStream(output.replace("\"audio\"", "\"data\""), 12000))
+-        assertFalse(DownloadFfmpegPolicy.isCompleteTransportStream(output.replace("12.021333", "3.121000"), 12000))
+-        assertFalse(DownloadFfmpegPolicy.isCompleteTransportStream(output.replace("mpegts", "matroska"), 12000))
+-        assertFalse(DownloadFfmpegPolicy.isCompleteTransportStream("{\"streams\": []}", 12000))
++        fun reason(json: String) = DownloadFfmpegPolicy.transportStreamMismatch(json, 12000)
++        assertEquals(null, reason(output))
++        assertEquals("audio-duration-ms=2837", reason(output.replace("11.797333", "2.837000")))
++        assertEquals("missing-audio", reason(output.replace("\"audio\"", "\"data\"")))
++        assertEquals("format-duration-ms=3121", reason(output.replace("12.021333", "3.121000")))
++        assertEquals("not-mpegts", reason(output.replace("mpegts", "matroska")))
++        assertEquals("incomplete-report", reason("{\"streams\": []}"))
++        assertEquals("invalid-report", reason("unrelated log\n$output"))
+     }
+ }
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadProbeReportTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadProbeReportTest.kt
+new file mode 100644
+index 000000000..079bf9453
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadProbeReportTest.kt
+@@ -0,0 +1,87 @@
++package eu.kanade.tachiyomi.data.download
++
++import kotlinx.coroutines.CoroutineStart
++import kotlinx.coroutines.async
++import kotlinx.coroutines.test.runTest
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertNotEquals
++import org.junit.jupiter.api.Assertions.assertNull
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++import org.junit.jupiter.api.io.TempDir
++import java.io.File
++
++class NavigationChromeDownloadProbeReportTest {
++    @TempDir lateinit var cache: File
++
++    // Same lengths as the transport recording rejected while mpv owned libav's log output.
++    private val full = """{"format":{"format_name":"mpegts","duration":"9919.574222"},"streams":[{"codec_type":"video","duration":"9919.552889"},{"codec_type":"audio","duration":"9919.274667"}]}"""
++
++    @Test
++    fun `concurrent probes use only their own completed output even when no session logs arrive`() = runTest {
++        val pending = mutableMapOf<String, Pair<File, (Int?) -> Unit>>()
++        suspend fun verify(input: String): String? {
++            val report = DownloadProbeReport.read(cache, arrayOf("-of", "json", input), 30_000) { args, done ->
++                assertEquals("-o", args[0])
++                pending[input] = File(args[1]) to done
++                return@read {}
++            }
++            assertEquals("ok", report.status)
++            return DownloadFfmpegPolicy.transportStreamMismatch(report.text, 9_919_553)
++        }
++
++        val good = async(start = CoroutineStart.UNDISPATCHED) { verify("full.ts") }
++        val short = async(start = CoroutineStart.UNDISPATCHED) { verify("truncated.ts") }
++        val (goodPath, finishGood) = pending.getValue("full.ts")
++        val (shortPath, finishShort) = pending.getValue("truncated.ts")
++        assertNotEquals(goodPath, shortPath)
++        shortPath.writeText(full.replace("9919.274667", "100.0"))
++        goodPath.writeText(full)
++        finishShort(0)
++        finishGood(0)
++        assertNull(good.await())
++        assertEquals("audio-duration-ms=100000", short.await())
++        assertTrue(cache.listFiles()!!.isEmpty())
++    }
++
++    @Test
++    fun `a late writer after timeout cannot overwrite a retry or resurrect its report`() = runTest {
++        lateinit var oldFile: File
++        lateinit var finishOld: (Int?) -> Unit
++        var cancelled = false
++        val old = DownloadProbeReport.read(cache, emptyArray(), 10) { args, done ->
++            oldFile = File(args[1])
++            finishOld = done
++            return@read { cancelled = true }
++        }
++        assertEquals("timeout", old.status)
++        assertTrue(cancelled)
++        val next = DownloadProbeReport.read(cache, emptyArray(), 10) { args, done ->
++            val newFile = File(args[1])
++            assertNotEquals(oldFile, newFile)
++            oldFile.writeText("stale")
++            finishOld(0)
++            newFile.writeText(full)
++            done(0)
++            return@read {}
++        }
++        assertEquals(full, next.text)
++        assertFalse(oldFile.exists())
++        assertTrue(cache.listFiles()!!.isEmpty())
++    }
++
++    @Test
++    fun `an empty report or a failed probe cannot promote a cached video`() = runTest {
++        for (code in listOf(0, 1)) {
++            val result = DownloadProbeReport.read(cache, emptyArray(), 10_000) { args, done ->
++                if (code != 0) File(args[1]).writeText(full)
++                done(code)
++                return@read {}
++            }
++            assertEquals(if (code == 0) "report-bytes-0" else "exit-1", result.status)
++            assertTrue(result.text.isEmpty())
++        }
++        assertTrue(cache.listFiles()!!.isEmpty())
++    }
++}
