@@ -1,0 +1,208 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:52:02 +0800
+Subject: [PATCH] webview: draw pages behind the system gesture handle
+
+Use the same inset policy for the extension Activity and the in-app browser. Keep tappable navigation buttons, cutouts and the IME visible. The real WebView layout regression exercises switching navigation modes and opening and closing the keyboard.
+---
+ app/src/main/AndroidManifest.xml              |  3 +-
+ .../webview/WebViewScreenContent.kt           |  2 +
+ .../tachiyomi/ui/webview/WebViewActivity.kt   |  6 ++
+ .../material/WebViewContentInsets.kt          | 19 ++++
+ .../NavigationChromeWebViewInsetsTest.kt      | 93 +++++++++++++++++++
+ 5 files changed, 122 insertions(+), 1 deletion(-)
+ create mode 100644 presentation-core/src/main/java/tachiyomi/presentation/core/components/material/WebViewContentInsets.kt
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeWebViewInsetsTest.kt
+
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 91c5677e8..d577bf914 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -292,7 +292,8 @@
+         <activity
+             android:name=".ui.webview.WebViewActivity"
+             android:configChanges="uiMode|orientation|screenSize"
+-            android:exported="false" />
++            android:exported="false"
++            android:windowSoftInputMode="adjustResize" />
+ 
+         <activity
+             android:name=".extension.util.ExtensionInstallActivity"
+diff --git a/app/src/main/java/eu/kanade/presentation/webview/WebViewScreenContent.kt b/app/src/main/java/eu/kanade/presentation/webview/WebViewScreenContent.kt
+index a81ae6299..2cdb1280d 100644
+--- a/app/src/main/java/eu/kanade/presentation/webview/WebViewScreenContent.kt
++++ b/app/src/main/java/eu/kanade/presentation/webview/WebViewScreenContent.kt
+@@ -65,6 +65,7 @@ import kotlinx.coroutines.launch
+ import tachiyomi.i18n.MR
+ import tachiyomi.i18n.ank.AMR
+ import tachiyomi.presentation.core.components.material.Scaffold
++import tachiyomi.presentation.core.components.material.webViewContentInsets
+ import tachiyomi.presentation.core.i18n.stringResource
+ 
+ class WebViewWindow(webContent: WebContent, val navigator: WebViewNavigator) {
+@@ -221,6 +222,7 @@ fun WebViewScreenContent(
+     }
+ 
+     Scaffold(
++        contentWindowInsets = webViewContentInsets(),
+         topBar = {
+             Box {
+                 Column {
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/webview/WebViewActivity.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/webview/WebViewActivity.kt
+index b89431ce6..7ebe49ad8 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/webview/WebViewActivity.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/webview/WebViewActivity.kt
+@@ -4,9 +4,12 @@ import android.app.Activity
+ import android.app.assist.AssistContent
+ import android.content.Context
+ import android.content.Intent
++import android.graphics.Color
+ import android.os.Build
+ import android.os.Bundle
+ import android.widget.Toast
++import androidx.activity.SystemBarStyle
++import androidx.activity.enableEdgeToEdge
+ import androidx.core.net.toUri
+ import eu.kanade.presentation.webview.WebViewScreenContent
+ import eu.kanade.tachiyomi.R
+@@ -16,6 +19,7 @@ import eu.kanade.tachiyomi.network.NetworkHelper
+ import eu.kanade.tachiyomi.source.online.HttpSource
+ import eu.kanade.tachiyomi.ui.base.activity.BaseActivity
+ import eu.kanade.tachiyomi.util.system.WebViewUtil
++import eu.kanade.tachiyomi.util.system.installHarmonyWindowInsets
+ import eu.kanade.tachiyomi.util.system.openInBrowser
+ import eu.kanade.tachiyomi.util.system.toShareIntent
+ import eu.kanade.tachiyomi.util.system.toast
+@@ -60,6 +64,8 @@ class WebViewActivity : BaseActivity() {
+ 
+         val url = intent.extras?.getString(URL_KEY) ?: return
+         assistUrl = url
++        enableEdgeToEdge(navigationBarStyle = SystemBarStyle.auto(Color.TRANSPARENT, Color.TRANSPARENT))
++        installHarmonyWindowInsets()
+ 
+         var headers = emptyMap<String, String>()
+         (sourceManager.get(intent.extras!!.getLong(SOURCE_KEY)) as? HttpSource)?.let { source ->
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/WebViewContentInsets.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/WebViewContentInsets.kt
+new file mode 100644
+index 000000000..492a35d6d
+--- /dev/null
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/WebViewContentInsets.kt
+@@ -0,0 +1,19 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.WindowInsetsSides
++import androidx.compose.foundation.layout.displayCutout
++import androidx.compose.foundation.layout.ime
++import androidx.compose.foundation.layout.only
++import androidx.compose.foundation.layout.systemBars
++import androidx.compose.foundation.layout.tappableElement
++import androidx.compose.foundation.layout.union
++import androidx.compose.runtime.Composable
++
++/** Let the page draw behind the bottom gesture handle, while the keyboard and system buttons keep their space. */
++@Composable
++fun webViewContentInsets(): WindowInsets =
++    WindowInsets.systemBars.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Top)
++        .union(WindowInsets.tappableElement)
++        .union(WindowInsets.displayCutout)
++        .union(WindowInsets.ime)
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeWebViewInsetsTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeWebViewInsetsTest.kt
+new file mode 100644
+index 000000000..67ecd674a
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeWebViewInsetsTest.kt
+@@ -0,0 +1,93 @@
++package tachiyomi.presentation.core.components.material
++
++import android.graphics.Insets
++import android.view.DisplayCutout
++import android.view.View
++import android.view.WindowInsets
++import android.webkit.WebView
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalView
++import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.onNodeWithTag
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.viewinterop.AndroidView
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.robolectric.annotation.GraphicsMode
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@GraphicsMode(GraphicsMode.Mode.LEGACY)
++@Config(sdk = [34])
++class NavigationChromeWebViewInsetsTest {
++    @Test
++    fun `page reaches gesture edge and responds to keyboard buttons and cutouts`() = runComposeUiTest {
++        lateinit var host: View
++        setContent {
++            host = LocalView.current
++            MaterialTheme {
++                Box(Modifier.size(360.dp, 480.dp).testTag("viewport")) {
++                    Scaffold(contentWindowInsets = webViewContentInsets()) { padding ->
++                        Box(Modifier.fillMaxSize().padding(padding)) {
++                            AndroidView(factory = { WebView(it) }, modifier = Modifier.fillMaxSize().testTag("web"))
++                        }
++                    }
++                }
++            }
++        }
++        val viewport = onNodeWithTag("viewport").fetchSemanticsNode().boundsInRoot
++        val gesture = Insets.of(0, 0, 0, 24)
++
++        fun show(
++            navigation: Insets = gesture,
++            tappable: Insets = Insets.NONE,
++            keyboard: Insets = Insets.NONE,
++            cutout: Insets = Insets.NONE,
++        ) {
++            val insets = WindowInsets.Builder()
++                .setInsets(WindowInsets.Type.statusBars(), Insets.of(0, 20, 0, 0))
++                .setInsets(WindowInsets.Type.navigationBars(), navigation)
++                .setInsets(WindowInsets.Type.tappableElement(), tappable)
++                .setInsets(WindowInsets.Type.ime(), keyboard)
++                .setDisplayCutout(DisplayCutout(cutout, null, null, null, null))
++                .setVisible(WindowInsets.Type.systemBars() or WindowInsets.Type.tappableElement(), true)
++                .setVisible(WindowInsets.Type.ime(), keyboard != Insets.NONE)
++                .build()
++            runOnIdle { host.dispatchApplyWindowInsets(insets) }
++            waitForIdle()
++        }
++
++        fun assertPage(bottom: Int, left: Int = 0, right: Int = 0) {
++            val page = onNodeWithTag("web").fetchSemanticsNode().boundsInRoot
++            assertEquals(viewport.left + left, page.left, 0.5f)
++            assertEquals(viewport.top + 20, page.top, 0.5f)
++            assertEquals(viewport.right - right, page.right, 0.5f)
++            assertEquals(viewport.bottom - bottom, page.bottom, 0.5f)
++        }
++
++        show()
++        assertPage(bottom = 0)
++        show(keyboard = Insets.of(0, 0, 0, 164))
++        assertPage(bottom = 164)
++        show()
++        assertPage(bottom = 0)
++        val buttons = Insets.of(0, 0, 0, 48)
++        show(navigation = buttons, tappable = buttons)
++        assertPage(bottom = 48)
++        val sideButtons = Insets.of(0, 0, 48, 0)
++        show(navigation = sideButtons, tappable = sideButtons, cutout = Insets.of(18, 0, 0, 0))
++        assertPage(bottom = 0, left = 18, right = 48)
++        show(cutout = Insets.of(0, 0, 0, 12))
++        assertPage(bottom = 12)
++    }
++}
