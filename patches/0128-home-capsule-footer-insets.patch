@@ -1,0 +1,248 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 14:23:36 +0000
+Subject: [PATCH] navigation: reserve the capsule before restoring the home
+ list
+
+Use the same capsule geometry as Mihon 0108. Track only consumed ancestor insets in the custom scaffold so later capsule and cast sizes reach the actual list footer.
+---
+ .../eu/kanade/tachiyomi/ui/home/HomeScreen.kt | 18 ++---
+ .../components/material/NavigationCapsule.kt  | 31 +++++--
+ .../core/components/material/Scaffold.kt      |  8 +-
+ .../NavigationChromeCapsuleFooterTest.kt      | 81 +++++++++++++++++++
+ 4 files changed, 116 insertions(+), 22 deletions(-)
+ create mode 100644 presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleFooterTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
+index 6f84a27..3b4e148 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/home/HomeScreen.kt
+@@ -83,6 +83,7 @@ import tachiyomi.presentation.core.components.material.CompactNavigationBarItem
+ import tachiyomi.presentation.core.components.material.LocalBrowsingBottomPadding
+ import tachiyomi.presentation.core.components.material.LocalBrowsingNavigationBarState
+ import tachiyomi.presentation.core.components.material.NavigationCapsule
++import tachiyomi.presentation.core.components.material.navigationCapsuleReservedHeight
+ import tachiyomi.presentation.core.components.material.NavigationRail
+ import tachiyomi.presentation.core.components.material.Scaffold
+ import tachiyomi.presentation.core.components.material.isCompactBrowsingWindow
+@@ -155,14 +156,18 @@ object HomeScreen : Screen() {
+                 val navigationTabs = TABS.fastFilter { it.isEnabled() }
+                 val compactBar = isCompactBrowsingWindow()
+                 val density = LocalDensity.current
+-                var measuredBarHeight by remember { mutableStateOf(0.dp) }
++                val barHeight = when {
++                    density.fontScale > 1.3f -> 64.dp
++                    compactBar -> 48.dp
++                    else -> 52.dp
++                }
+                 var measuredCastHeight by remember { mutableStateOf(0.dp) }
+                 CompositionLocalProvider(
+                     LocalBrowsingNavigationBarState provides navigationScroll,
+                     LocalBrowsingBottomPadding provides if (tabletUi) {
+                         0.dp
+                     } else {
+-                        (if (bottomNavVisible) measuredBarHeight else 0.dp) +
++                        (if (bottomNavVisible) navigationCapsuleReservedHeight(barHeight) else 0.dp) +
+                             (if (isConnected) measuredCastHeight else 0.dp)
+                     },
+                 ) {
+@@ -219,17 +224,10 @@ object HomeScreen : Screen() {
+                                                         tabNavigator.current = tab
+                                                     }
+                                                 },
+-                                                modifier = Modifier.onSizeChanged {
+-                                                    measuredBarHeight = with(density) { it.height.toDp() }
+-                                                },
+                                             ) {
+                                                 CompactNavigationBar(
+                                                     containerColor = Color.Transparent,
+-                                                    height = when {
+-                                                        density.fontScale > 1.3f -> 64.dp
+-                                                        compactBar -> 48.dp
+-                                                        else -> 52.dp
+-                                                    },
++                                                    height = barHeight,
+                                                     windowInsets = WindowInsets(0),
+                                                 ) {
+                                                     navigationTabs.fastForEachIndexed { index, tab ->
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+index 25b8286..ba3808f 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/NavigationCapsule.kt
+@@ -43,6 +43,7 @@ import androidx.compose.ui.platform.LocalConfiguration
+ import androidx.compose.ui.platform.LocalDensity
+ import androidx.compose.ui.platform.LocalLayoutDirection
+ import androidx.compose.ui.platform.LocalView
++import androidx.compose.ui.unit.Dp
+ import androidx.compose.ui.unit.IntSize
+ import androidx.compose.ui.unit.LayoutDirection
+ import androidx.compose.ui.unit.dp
+@@ -54,6 +55,26 @@ import kotlin.math.roundToInt
+ internal val LocalNavigationCapsule = staticCompositionLocalOf { false }
+ internal val LocalCapsulePreview = staticCompositionLocalOf<Int?> { null }
+ 
++private val CapsuleTopSpace = 2.dp
++
++@Composable
++private fun navigationCapsuleOuterGap(windowInsets: WindowInsets): Dp {
++    val density = LocalDensity.current
++    val gap = navigationCapsuleGap(
++        windowInsets.getBottom(density).toFloat(),
++        WindowInsets.tappableElement.getBottom(density).toFloat(),
++        density.density,
++    )
++    return with(density) { gap.toDp() }
++}
++
++/** Lists need the full capsule footprint on their first layout, including when restoring a scroll position. */
++@Composable
++fun navigationCapsuleReservedHeight(
++    contentHeight: Dp,
++    windowInsets: WindowInsets = WindowInsets.navigationBars.only(WindowInsetsSides.Bottom),
++): Dp = CapsuleTopSpace + contentHeight + navigationCapsuleOuterGap(windowInsets)
++
+ /** One refractive glass body. Selection is expressed by the words, never a second framed surface. */
+ @Composable
+ fun NavigationCapsule(
+@@ -90,12 +111,8 @@ fun NavigationCapsule(
+             if (id != 0) view.resources.getDimension(id).takeIf { it > 0f } else null
+         } ?: with(density) { 40.dp.toPx() }
+     }
+-    val gapPx = navigationCapsuleGap(
+-        windowInsets.getBottom(density).toFloat(),
+-        WindowInsets.tappableElement.getBottom(density).toFloat(),
+-        density.density,
+-    )
+-    val gap = with(density) { gapPx.toDp() }
++    val gap = navigationCapsuleOuterGap(windowInsets)
++    val gapPx = with(density) { gap.toPx() }
+     val height = surfaceSize.height.takeIf { it > 0 }?.toFloat() ?: with(density) { 48.dp.toPx() }
+     val radii = navigationCapsuleCorners(
+         height,
+@@ -125,7 +142,7 @@ fun NavigationCapsule(
+         }
+     }
+     Box(
+-        modifier = modifier.fillMaxWidth().padding(start = gap, top = 2.dp, end = gap, bottom = gap),
++        modifier = modifier.fillMaxWidth().padding(start = gap, top = CapsuleTopSpace, end = gap, bottom = gap),
+         contentAlignment = Alignment.Center,
+     ) {
+         Box(
+diff --git a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/Scaffold.kt b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/Scaffold.kt
+index e881beb..b211618 100644
+--- a/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/Scaffold.kt
++++ b/presentation-core/src/main/java/tachiyomi/presentation/core/components/material/Scaffold.kt
+@@ -161,15 +161,13 @@ fun Scaffold(
+         },
+     ) {
+         // Tachiyomi: Handle consumed window insets
+-        val remainingWindowInsets = remember { MutableWindowInsets() }
++        val consumedWindowInsets = remember { MutableWindowInsets() }
+         androidx.compose.material3.Surface(
+             modifier = Modifier
+                 .observeBrowsingChromeGestures(browsingBehavior?.chrome, LocalDensity.current.density)
+                 .nestedScroll(topBarScrollBehavior.nestedScrollConnection)
+                 .onConsumedWindowInsetsChanged {
+-                    remainingWindowInsets.insets = browsingInsets.exclude(
+-                        it,
+-                    )
++                    consumedWindowInsets.insets = it
+                 }
+                 .then(modifier),
+             color = if (browsingBehavior != null) MaterialTheme.colorScheme.surface else containerColor,
+@@ -193,7 +191,7 @@ fun Scaffold(
+                     Box(Modifier.fillMaxSize().browsingGlassSource(browsingBehavior?.chrome)) { content(padding) }
+                 },
+                 snackbar = snackbarHost,
+-                contentWindowInsets = remainingWindowInsets,
++                contentWindowInsets = browsingInsets.exclude(consumedWindowInsets),
+                 fab = floatingActionButton,
+             )
+         }
+diff --git a/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleFooterTest.kt b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleFooterTest.kt
+new file mode 100644
+index 0000000..60c4e88
+--- /dev/null
++++ b/presentation-core/src/test/java/tachiyomi/presentation/core/components/material/NavigationChromeCapsuleFooterTest.kt
+@@ -0,0 +1,81 @@
++package tachiyomi.presentation.core.components.material
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.windowInsetsPadding
++import androidx.compose.foundation.lazy.rememberLazyListState
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.test.ExperimentalTestApi
++import androidx.compose.ui.test.hasScrollToIndexAction
++import androidx.compose.ui.test.onNodeWithTag
++import androidx.compose.ui.test.performScrollToIndex
++import androidx.compose.ui.test.runComposeUiTest
++import androidx.compose.ui.unit.dp
++import org.junit.Test
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.robolectric.annotation.GraphicsMode
++import tachiyomi.presentation.core.components.FastScrollLazyColumn
++
++@OptIn(ExperimentalTestApi::class)
++@RunWith(RobolectricTestRunner::class)
++@GraphicsMode(GraphicsMode.Mode.LEGACY)
++@Config(sdk = [34])
++class NavigationChromeCapsuleFooterTest {
++    @Test
++    fun `last action clears the capsule on return and after insets change`() = runComposeUiTest {
++        val settingsOpen = mutableStateOf(false)
++        val height = mutableIntStateOf(48)
++        var expectedGap = 0f
++        setContent {
++            val list = rememberLazyListState()
++            MaterialTheme {
++                if (!settingsOpen.value) {
++                    val reserved = navigationCapsuleReservedHeight(height.intValue.dp, WindowInsets(bottom = 24.dp))
++                    // The parent has already removed eight dp from the viewport.
++                    expectedGap = with(LocalDensity.current) { (reserved - 8.dp).toPx() }
++                    CompositionLocalProvider(LocalBrowsingBottomPadding provides reserved) {
++                        Box(Modifier.windowInsetsPadding(WindowInsets(bottom = 8.dp))) {
++                            Scaffold(contentWindowInsets = WindowInsets(bottom = 16.dp)) { padding ->
++                                FastScrollLazyColumn(
++                                    modifier = Modifier.fillMaxSize().testTag("viewport"),
++                                    state = list,
++                                    contentPadding = padding,
++                                ) {
++                                    items(40) { Box(Modifier.fillMaxWidth().height(48.dp).testTag("row-$it")) }
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        fun checkFooter() {
++            val viewport = onNodeWithTag("viewport").fetchSemanticsNode().boundsInRoot
++            val last = onNodeWithTag("row-39").fetchSemanticsNode().boundsInRoot
++            assertEquals(expectedGap, viewport.bottom - last.bottom, 1.5f)
++        }
++        onNode(hasScrollToIndexAction()).performScrollToIndex(39)
++        checkFooter()
++        runOnIdle { settingsOpen.value = true }
++        waitForIdle()
++        runOnIdle { settingsOpen.value = false }
++        checkFooter()
++        for (next in listOf(64, 48)) {
++            runOnIdle { height.intValue = next }
++            onNode(hasScrollToIndexAction()).performScrollToIndex(39)
++            checkFooter()
++        }
++    }
++}

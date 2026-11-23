@@ -1,0 +1,832 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 14:30:10 +0000
+Subject: [PATCH] downloads: keep the current rendition and let each queue item
+ choose another
+
+Retry a fresh address at the active resolution after a segment authorization failure. Show actual source resolutions in the queue and retain isolated segment data across manual switches, pause and process restore. Keep external downloader handoff and the source playback preference independent.
+---
+ .../data/download/DownloadHlsSegments.kt      | 37 ++++----
+ .../data/download/DownloadManager.kt          |  4 +-
+ .../data/download/DownloadQualitySelector.kt  | 45 ++++-----
+ .../tachiyomi/data/download/DownloadStore.kt  |  9 +-
+ .../tachiyomi/data/download/Downloader.kt     | 85 ++++++++---------
+ .../tachiyomi/data/download/model/Download.kt |  5 +-
+ .../tachiyomi/ui/download/DownloadAdapter.kt  |  2 +
+ .../tachiyomi/ui/download/DownloadHolder.kt   |  5 +
+ .../ui/download/DownloadQualityDialog.kt      | 94 +++++++++++++++++++
+ .../ui/download/DownloadQueueScreen.kt        |  9 ++
+ .../ui/download/DownloadQueueScreenModel.kt   | 12 +++
+ app/src/main/res/menu/download_single.xml     |  4 +
+ ...NavigationChromeDownloadHlsRecoveryTest.kt | 92 +++++++++---------
+ ...NavigationChromeDownloadPausedStoreTest.kt | 12 +--
+ .../moko-resources/base/strings.xml           |  5 +
+ .../moko-resources/zh-rCN/strings.xml         |  5 +
+ 16 files changed, 278 insertions(+), 147 deletions(-)
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQualityDialog.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+index c55d3b9..c743bfd 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+@@ -24,7 +24,6 @@ import java.security.MessageDigest
+ import java.util.Locale
+ import kotlin.coroutines.resume
+ import kotlin.coroutines.resumeWithException
+-import kotlin.math.abs
+ 
+ /** Bounded, resumable TS fetches through the extension's existing loopback proxy. */
+ internal object DownloadHlsSegments {
+@@ -56,28 +55,30 @@ internal object DownloadHlsSegments {
+     suspend fun <T> withAuthorizationRecovery(
+         transfer: suspend (forceNetwork: Boolean) -> T,
+         refresh: suspend (Failure) -> Unit,
+-        selectAlternate: suspend (Failure) -> Boolean,
+     ): T {
+-        val first = try {
++        try {
+             return transfer(false)
+         } catch (failure: Failure) {
+             if (failure.httpStatus != 401 && failure.httpStatus != 403) throw failure
+-            failure
+-        }
+-        refresh(first)
+-        try {
+-            return transfer(true)
+-        } catch (failure: Failure) {
+-            // Either worker can report the first refused segment on revalidation.
+-            val firstSegment = first.segmentNumber
+-            val secondSegment = failure.segmentNumber
+-            if (first.httpStatus != 403 || failure.httpStatus != 403 || firstSegment == null || secondSegment == null ||
+-                abs(firstSegment - secondSegment) >= SEGMENT_WORKERS || !selectAlternate(failure)
+-            ) {
+-                throw failure
+-            }
++            refresh(failure)
+         }
+-        return transfer(false)
++        return transfer(true)
++    }
++
++    /** Existing releases stored segments directly under root. Keep that track usable when switching back. */
++    fun markOriginalQuality(root: File, height: Int?) {
++        val owner = File(root, "original-quality")
++        if (owner.exists()) return
++        if (!root.isDirectory && !root.mkdirs()) throw IOException("Cannot open segment cache")
++        val tmp = File(root, "original-quality.tmp")
++        tmp.writeText((height ?: 0).toString())
++        if (!tmp.renameTo(owner)) throw IOException("Cannot save segment cache quality")
++    }
++
++    fun cacheForQuality(root: File, height: Int?): File {
++        val owner = File(root, "original-quality")
++        if (!owner.isFile || owner.readText() == (height ?: 0).toString()) return root
++        return File(root, "quality-${height ?: 0}")
+     }
+ 
+     fun isLocalManifest(url: String): Boolean = localManifest(url) != null
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
+index 6da008d..5a48e54 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
+@@ -95,7 +95,9 @@ class DownloadManager(
+ 
+     fun pauseDownload(download: Download) = downloader.pauseDownload(download)
+     fun resumeDownload(download: Download) = downloader.resumeDownload(download)
+-    fun restartDownload(download: Download) = downloader.restartDownload(download)
++    fun restartDownload(download: Download, qualityHeight: Int? = null) = downloader.restartDownload(download, qualityHeight)
++    fun canChooseQuality(download: Download): Boolean = downloader.usesInternalDownloader(download)
++    suspend fun availableQualities(download: Download): List<Int> = downloader.availableQualities(download)
+ 
+     /**
+      * Tells the downloader to pause downloads.
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQualitySelector.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQualitySelector.kt
+index cd02ea2..df9b8f0 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQualitySelector.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQualitySelector.kt
+@@ -12,6 +12,7 @@ import kotlinx.coroutines.awaitAll
+ import kotlinx.coroutines.withContext
+ import logcat.LogPriority
+ import tachiyomi.core.common.util.system.logcat
++import java.io.IOException
+ 
+ /**
+  * Chooses the video for a queued episode that has none yet, by the download quality setting
+@@ -30,31 +31,29 @@ object DownloadQualitySelector {
+     suspend fun pick(source: AnimeSource, hosters: List<Hoster>, quality: String): Video? =
+         pickMatching(source, hosters, quality) { true }
+ 
+-    internal suspend fun pickResumed(
+-        source: AnimeSource,
+-        hosters: List<Hoster>,
+-        height: Int,
+-        accept: (Video) -> Boolean,
+-    ): Video? = pickMatching(source, hosters, height.toString()) { heightOf(it) == height && accept(it) }
++    internal suspend fun availableHeights(source: AnimeSource, hosters: List<Hoster>): List<Int> =
++        candidates(source, hosters, includeLazy = true).mapNotNull { video ->
++            heightOf(video) ?: if (!video.initialized) HosterLoader.getResolvedVideo(source, video)?.let(::heightOf) else null
++        }.distinct().sortedDescending()
+ 
+-    internal suspend fun pickLower(
+-        source: AnimeSource,
+-        hosters: List<Hoster>,
+-        blocked: Video,
+-        accept: (Video) -> Boolean,
+-    ): Video? {
+-        val height = heightOf(blocked) ?: return null
+-        return pickMatching(source, hosters, (height - 1).toString()) { video ->
+-            val candidateHeight = heightOf(video)
+-            candidateHeight != null && candidateHeight < height &&
+-                video.videoUrl != blocked.videoUrl && accept(video)
++    internal suspend fun pickExact(source: AnimeSource, hosters: List<Hoster>, height: Int): Video? =
++        pickMatching(source, hosters, height.toString(), exact = height) { heightOf(it) == height }
++
++    private suspend fun candidates(source: AnimeSource, hosters: List<Hoster>, includeLazy: Boolean): List<Video> =
++        withContext(Dispatchers.IO) {
++            val states = hosters.map { async { EpisodeLoader.loadHosterVideos(source, it, force = includeLazy) } }.awaitAll()
++            if (includeLazy && states.isNotEmpty() && states.all { it is HosterState.Error }) {
++                throw IOException("The source could not load its video list")
++            }
++            states.filterIsInstance<HosterState.Ready>().flatMap { it.videoList }
++                .filter { it.videoUrl.isNotEmpty() || !it.initialized }
+         }
+-    }
+ 
+     private suspend fun pickMatching(
+         source: AnimeSource,
+         hosters: List<Hoster>,
+         quality: String,
++        exact: Int? = null,
+         accept: (Video) -> Boolean,
+     ): Video? {
+         val limit = when (quality) {
+@@ -62,14 +61,10 @@ object DownloadQualitySelector {
+             HIGHEST -> Int.MAX_VALUE
+             else -> quality.toIntOrNull() ?: return null
+         }
+-        val candidates = withContext(Dispatchers.IO) {
+-            hosters.map { async { EpisodeLoader.loadHosterVideos(source, it) } }.awaitAll()
+-        }
+-            .filterIsInstance<HosterState.Ready>()
+-            .flatMap { it.videoList }
+-            .filter { it.videoUrl.isNotEmpty() || !it.initialized }
+-
++        val candidates = candidates(source, hosters, includeLazy = exact != null)
+         for (video in rank(candidates, limit)) {
++            val known = heightOf(video)
++            if (exact != null && known != null && known != exact) continue
+             val resolved = HosterLoader.getResolvedVideo(source, video)
+             if (resolved?.videoUrl?.isNotEmpty() == true && accept(resolved)) {
+                 logcat(LogPriority.INFO) { "Download quality $quality: picked '${video.videoTitle}'" }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadStore.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadStore.kt
+index 574a687..59c1661 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadStore.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadStore.kt
+@@ -5,6 +5,7 @@ import androidx.core.content.edit
+ import eu.kanade.tachiyomi.data.download.model.Download
+ import eu.kanade.tachiyomi.source.online.HttpSource
+ import kotlinx.coroutines.runBlocking
++import kotlinx.serialization.SerialName
+ import kotlinx.serialization.Serializable
+ import kotlinx.serialization.encodeToString
+ import kotlinx.serialization.json.Json
+@@ -53,7 +54,7 @@ class DownloadStore(
+     fun update(download: Download) {
+         val key = getKey(download)
+         val stored = preferences.getString(key, null)?.let(::deserialize) ?: return
+-        val updated = stored.copy(paused = download.status == Download.State.PAUSED, hlsResumeHeight = download.hlsResumeHeight)
++        val updated = stored.copy(paused = download.status == Download.State.PAUSED, selectedQualityHeight = download.selectedQualityHeight)
+         preferences.edit { putString(key, json.encodeToString(updated)) }
+     }
+ 
+@@ -120,7 +121,7 @@ class DownloadStore(
+                 val chapter = runBlocking { getChapter.await(obj.chapterId) } ?: continue
+                 downloads.add(
+                     Download(source, manga, chapter).apply {
+-                        hlsResumeHeight = obj.hlsResumeHeight?.takeIf { it > 0 }
++                        selectedQualityHeight = obj.selectedQualityHeight?.takeIf { it > 0 }
+                         status = if (obj.paused) Download.State.PAUSED else Download.State.QUEUE
+                     },
+                 )
+@@ -141,7 +142,7 @@ class DownloadStore(
+         val obj = DownloadObject(
+             download.manga.id, download.chapter.id, counter++,
+             paused = download.status == Download.State.PAUSED,
+-            hlsResumeHeight = download.hlsResumeHeight,
++            selectedQualityHeight = download.selectedQualityHeight,
+         )
+         return json.encodeToString(obj)
+     }
+@@ -173,5 +174,5 @@ private data class DownloadObject(
+     val chapterId: Long,
+     val order: Int,
+     val paused: Boolean = false,
+-    val hlsResumeHeight: Int? = null,
++    @SerialName("hlsResumeHeight") val selectedQualityHeight: Int? = null,
+ )
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index bfaf3eb..d90cc20 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -307,11 +307,12 @@ class Downloader(
+         }
+     }
+ 
+-    fun restartDownload(download: Download) = scope.launch {
++    fun restartDownload(download: Download, qualityHeight: Int? = null) = scope.launch {
+         itemControls.withLock {
+             awaitQueueReady()
+             val current = queueState.value.firstOrNull { it.episode.id == download.episode.id } ?: return@withLock
+-            if (current.status == Download.State.DOWNLOADED) return@withLock
++            if (current !== download || current.status == Download.State.DOWNLOADED) return@withLock
++            if (qualityHeight != null && (current.isSaving || !usesInternalDownloader(current))) return@withLock
+             val id = current.episode.id
+             pendingResumes.remove(id)
+             controlledIds.add(id)
+@@ -335,12 +336,16 @@ class Downloader(
+                 val animeDir = provider.findMangaDir(current.anime.ogTitle, current.source)
+                 val tempName = provider.getChapterDirName(current.episode.name, current.episode.scanlator) + TMP_DIR_SUFFIX
+                 animeDir?.findFile(tempName)?.let { EpisodeDownloadStorage.discardPending(it, filename) }
+-                if (hls.exists() && !hls.deleteRecursively()) throw IOException("Cannot clear this download's segment cache")
++                if (qualityHeight == null) {
++                    if (hls.exists() && !hls.deleteRecursively()) throw IOException("Cannot clear this download's segment cache")
++                } else if (hls.isDirectory && qualityHeight != current.selectedQualityHeight) {
++                    DownloadHlsSegments.markOriginalQuality(hls, current.selectedQualityHeight)
++                }
+                 for (file in cacheFiles.flatMap { listOf(it, completionMarker(it)) }) {
+                     if (file.exists() && !file.delete()) throw IOException("Cannot clear this download's private cache")
+                 }
+                 current.video = null
+-                current.hlsResumeHeight = null
++                if (qualityHeight != null) current.selectedQualityHeight = qualityHeight
+                 current.progress = 0
+                 current.downloadedBytes = 0
+                 current.resetSpeed()
+@@ -715,9 +720,15 @@ class Downloader(
+             if (error is CancellationException) throw error
+             logcat(LogPriority.ERROR, error) { "Download failed episode=${download.episode.id} saving=${download.isSaving}" }
+             download.video?.status = Video.State.Error(error)
+-            download.fail(error.message ?: error.javaClass.simpleName)
++            val height = download.selectedQualityHeight
++            val message = if (error is DownloadHlsSegments.Failure && height != null && error.httpStatus in listOf(401, 403)) {
++                context.stringResource(AMR.strings.harmony_download_quality_denied, height, checkNotNull(error.httpStatus))
++            } else {
++                error.message ?: error.javaClass.simpleName
++            }
++            download.fail(message)
+             notifier.onError(
+-                error.message,
++                message,
+                 download.chapter.name,
+                 download.manga.title,
+                 download.manga.id,
+@@ -734,24 +745,18 @@ class Downloader(
+         }
+     }
+ 
++    suspend fun availableQualities(download: Download): List<Int> =
++        withContext(Dispatchers.IO) { DownloadQualitySelector.availableHeights(download.source, downloadHosters(download)) }
++
+     private suspend fun resolveVideo(download: Download, hosters: List<Hoster>): Video {
+-        if (hosters.isEmpty()) throw IOException(context.stringResource(AYMR.strings.video_list_empty_error))
+-        val height = download.hlsResumeHeight
++        val height = download.selectedQualityHeight
+         if (height != null) {
+-            DownloadQualitySelector.pickResumed(download.source, hosters, height) { canResumeHlsSegments(download, it) }?.let {
+-                logcat(LogPriority.INFO) { "Download resume rendition episode=${download.episode.id} height=$height" }
+-                return it
+-            }
++            return DownloadQualitySelector.pickExact(download.source, hosters, height)
++                ?: throw IOException(context.stringResource(AMR.strings.harmony_download_quality_unavailable, height))
+         }
+-        val selected = DownloadQualitySelector.pick(download.source, hosters, downloadPreferences.downloadQuality().get())
++        return DownloadQualitySelector.pick(download.source, hosters, downloadPreferences.downloadQuality().get())
+             ?: HosterLoader.getBestVideo(download.source, hosters)
+             ?: throw IOException(context.stringResource(AYMR.strings.video_list_empty_error))
+-        if (height != null) {
+-            currentCoroutineContext().ensureActive()
+-            download.hlsResumeHeight = null
+-            store.update(download)
+-        }
+-        return selected
+     }
+ 
+     private suspend fun requireDownloadVideo(download: Download): Video {
+@@ -759,43 +764,31 @@ class Downloader(
+             logcat(LogPriority.INFO) { "Download resolving video episode=${download.episode.id}" }
+             resolveVideo(download, downloadHosters(download))
+         }
++        currentCoroutineContext().ensureActive()
++        if (download.selectedQualityHeight == null && usesInternalDownloader(download) && canResumeHlsSegments(download, video)) {
++            DownloadQualitySelector.heightOf(video)?.let {
++                download.selectedQualityHeight = it
++                store.update(download)
++            }
++        }
+         video.status = Video.State.LoadVideo
+         download.video = video
+         return video
+     }
+ 
+-    private suspend fun downloadWithFreshAddress(download: Download, directory: UniFile, filename: String): UniFile {
+-        var freshHosters = emptyList<Hoster>()
+-        return DownloadHlsSegments.withAuthorizationRecovery(
++    private suspend fun downloadWithFreshAddress(download: Download, directory: UniFile, filename: String): UniFile =
++        DownloadHlsSegments.withAuthorizationRecovery(
+             transfer = { forceNetwork -> downloadVideo(download, directory, filename, forceNetwork) },
+             refresh = { failure ->
+-                logcat(LogPriority.INFO) {
+-                    "Download authorization refresh episode=${download.episode.id} status=${failure.httpStatus} segment=${failure.segmentNumber} cache=retained"
+-                }
+-                freshHosters = downloadHosters(download)
+-                download.video = resolveVideo(download, freshHosters).apply { status = Video.State.LoadVideo }
+-            },
+-            selectAlternate = { denied ->
+-                if (download.hlsResumeHeight != null) return@withAuthorizationRecovery false
+-                val failed = checkNotNull(download.video)
+-                val alternate = DownloadQualitySelector.pickLower(download.source, freshHosters, failed) { video ->
+-                    canResumeHlsSegments(download, video)
+-                } ?: return@withAuthorizationRecovery false
+-                download.resetSpeed()
+-                download.downloadedBytes = 0L
+-                download.progress = 0
++                val height = download.selectedQualityHeight ?: throw failure
++                val fresh = resolveVideo(download, downloadHosters(download))
+                 currentCoroutineContext().ensureActive()
+-                download.video = alternate.apply { status = Video.State.LoadVideo }
+-                download.hlsResumeHeight = DownloadQualitySelector.heightOf(alternate)
+-                store.update(download)
++                download.video = fresh.apply { status = Video.State.LoadVideo }
+                 logcat(LogPriority.INFO) {
+-                    "Download alternate rendition episode=${download.episode.id} segment=${denied.segmentNumber} " +
+-                        "from=${DownloadQualitySelector.heightOf(failed)} to=${DownloadQualitySelector.heightOf(alternate)} cache=retained"
++                    "Download authorization refresh episode=${download.episode.id} height=$height status=${failure.httpStatus} cache=retained"
+                 }
+-                true
+             },
+         )
+-    }
+ 
+     private fun canResumeHlsSegments(download: Download, video: Video): Boolean =
+         DownloadHlsSegments.handlesSource(download.source.name) &&
+@@ -936,7 +929,7 @@ class Downloader(
+                         // Keep external tracks and extension-supplied FFmpeg options on their
+                         // existing path. The helper also checks MissAV and the loopback manifest.
+                         val prepared = if (canResumeHlsSegments(download, video)) {
+-                            prepareHlsSegments(download, hlsCache, forceNetwork)
++                            prepareHlsSegments(download, DownloadHlsSegments.cacheForQuality(hlsCache, download.selectedQualityHeight), forceNetwork)
+                         } else {
+                             null
+                         }
+@@ -1528,7 +1521,7 @@ class Downloader(
+         }
+     }
+ 
+-    private fun usesInternalDownloader(download: Download): Boolean =
++    fun usesInternalDownloader(download: Download): Boolean =
+         preferences.useExternalDownloader().get() == download.changeDownloader
+ 
+     /**
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt
+index b56a218..4d5ed9f 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt
+@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.data.download.model
+ 
+ import eu.kanade.tachiyomi.animesource.model.Video
+ import eu.kanade.tachiyomi.data.download.DownloadItemSpeed
++import eu.kanade.tachiyomi.data.download.DownloadQualitySelector
+ import eu.kanade.tachiyomi.network.ProgressListener
+ import eu.kanade.tachiyomi.source.online.HttpSource
+ import kotlinx.coroutines.flow.Flow
+@@ -28,9 +29,9 @@ data class Download(
+     val manga = anime
+     val chapter = episode
+ 
+-    /** Only the selected fallback height survives a retry. The extension supplies fresh media URLs. */
++    /** Keep the chosen rendition across retries without persisting its expiring address. */
+     @Volatile
+-    var hlsResumeHeight: Int? = null
++    var selectedQualityHeight: Int? = video?.let(DownloadQualitySelector::heightOf)
+ 
+     @Transient
+     private val _statusFlow = MutableStateFlow(State.NOT_DOWNLOADED)
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadAdapter.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadAdapter.kt
+index cf0ff8c..a96c71f 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadAdapter.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadAdapter.kt
+@@ -4,6 +4,7 @@ import android.view.MenuItem
+ import eu.davidea.flexibleadapter.FlexibleAdapter
+ import eu.davidea.flexibleadapter.items.AbstractFlexibleItem
+ import eu.kanade.presentation.theme.colorscheme.AndroidViewColorScheme
++import eu.kanade.tachiyomi.data.download.model.Download
+ 
+ /**
+  * Adapter storing a list of downloads.
+@@ -27,6 +28,7 @@ class DownloadAdapter(
+     }
+ 
+     interface DownloadItemListener {
++        fun canChooseQuality(download: Download): Boolean
+         fun onItemReleased(position: Int)
+         fun onToggleDownload(position: Int)
+         fun onMenuItemClick(position: Int, menuItem: MenuItem)
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
+index bad4651..6a0d57a 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
+@@ -165,6 +165,11 @@ class DownloadHolder(private val view: View, val adapter: DownloadAdapter) :
+                     title = view.context.stringResource(AMR.strings.harmony_download_restart)
+                     isVisible = download.status != Download.State.DOWNLOADED
+                 }
++                findItem(R.id.change_download_quality).apply {
++                    title = view.context.stringResource(AMR.strings.harmony_download_change_quality)
++                    isVisible = download.status != Download.State.DOWNLOADED && !download.isSaving &&
++                        adapter.downloadItemListener.canChooseQuality(download)
++                }
+                 findItem(R.id.move_to_top).isVisible = bindingAdapterPosition > 1
+                 findItem(R.id.move_to_bottom).isVisible =
+                     bindingAdapterPosition != adapter.itemCount - 1
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQualityDialog.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQualityDialog.kt
+new file mode 100644
+index 0000000..f2034c5
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQualityDialog.kt
+@@ -0,0 +1,94 @@
++package eu.kanade.tachiyomi.ui.download
++
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.selection.selectable
++import androidx.compose.foundation.selection.selectableGroup
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.RadioButton
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.key
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.semantics.Role
++import androidx.compose.ui.unit.dp
++import eu.kanade.tachiyomi.data.download.model.Download
++import kotlinx.coroutines.CancellationException
++import tachiyomi.i18n.MR
++import tachiyomi.i18n.ank.AMR
++import tachiyomi.presentation.core.i18n.stringResource
++
++@Composable
++internal fun DownloadQualityDialog(
++    download: Download,
++    loadQualities: suspend (Download) -> List<Int>,
++    onConfirm: (Int) -> Unit,
++    onDismiss: () -> Unit,
++) = key(download.episode.id) {
++    var attempt by remember { mutableIntStateOf(0) }
++    var options by remember { mutableStateOf<List<Int>?>(null) }
++    var failed by remember { mutableStateOf(false) }
++    var selected by remember { mutableStateOf(download.selectedQualityHeight) }
++    LaunchedEffect(attempt) {
++        failed = false
++        options = null
++        try {
++            options = loadQualities(download)
++        } catch (cancelled: CancellationException) {
++            throw cancelled
++        } catch (_: Exception) {
++            failed = true
++        }
++    }
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        title = { Text(stringResource(AMR.strings.harmony_download_change_quality)) },
++        text = {
++            val heights = options
++            when {
++                failed -> Text(stringResource(AMR.strings.harmony_download_quality_load_failed))
++                heights == null -> Text(stringResource(MR.strings.loading))
++                heights.isEmpty() -> Text(stringResource(AMR.strings.harmony_download_quality_empty))
++                else -> Column(Modifier.verticalScroll(rememberScrollState()).selectableGroup()) {
++                    heights.forEach { height ->
++                        Row(
++                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
++                                .selectable(selected == height, role = Role.RadioButton, onClick = { selected = height }),
++                            verticalAlignment = Alignment.CenterVertically,
++                        ) {
++                            RadioButton(selected = selected == height, onClick = null)
++                            Text("${height}p", Modifier.padding(start = 12.dp))
++                        }
++                    }
++                }
++            }
++        },
++        dismissButton = {
++            TextButton(onClick = onDismiss) { Text(stringResource(MR.strings.action_cancel)) }
++        },
++        confirmButton = {
++            if (failed) {
++                TextButton(onClick = { attempt++ }) { Text(stringResource(MR.strings.action_retry)) }
++            } else {
++                val choice = selected
++                TextButton(
++                    enabled = choice != null && options?.contains(choice) == true,
++                    onClick = { if (choice != null) onConfirm(choice) },
++                ) { Text(stringResource(AMR.strings.harmony_download_restart)) }
++            }
++        },
++    )
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreen.kt
+index 3cfd589..aa8b7b5 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreen.kt
+@@ -78,6 +78,15 @@ object DownloadQueueScreen : Screen() {
+             )
+         }
+         val downloadList by screenModel.state.collectAsState()
++        val qualityTarget by screenModel.qualityTarget.collectAsState()
++        qualityTarget?.let { download ->
++            DownloadQualityDialog(
++                download = download,
++                loadQualities = screenModel::availableQualities,
++                onConfirm = { screenModel.restartAtQuality(download, it) },
++                onDismiss = { screenModel.qualityTarget.value = null },
++            )
++        }
+         val downloadCount by remember {
+             derivedStateOf { downloadList.sumOf { it.subItems.size } }
+         }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreenModel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreenModel.kt
+index f345fea..ceaf5a0 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreenModel.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreenModel.kt
+@@ -33,6 +33,15 @@ class DownloadQueueScreenModel(
+     private val _state = MutableStateFlow(emptyList<DownloadHeaderItem>())
+     val state = _state.asStateFlow()
+ 
++    val qualityTarget = MutableStateFlow<Download?>(null)
++
++    suspend fun availableQualities(download: Download) = downloadManager.availableQualities(download)
++
++    fun restartAtQuality(download: Download, height: Int) {
++        qualityTarget.value = null
++        downloadManager.restartDownload(download, height)
++    }
++
+     lateinit var controllerBinding: DownloadListBinding
+ 
+     /**
+@@ -46,6 +55,8 @@ class DownloadQueueScreenModel(
+     private val progressJobs = mutableMapOf<Long, Job>()
+ 
+     val listener = object : DownloadAdapter.DownloadItemListener {
++        override fun canChooseQuality(download: Download): Boolean = downloadManager.canChooseQuality(download)
++
+         /**
+          * Called when an item is released from a drag.
+          *
+@@ -85,6 +96,7 @@ class DownloadQueueScreenModel(
+                     R.id.pause_download -> downloadManager.pauseDownload(item.download)
+                     R.id.resume_download -> downloadManager.resumeDownload(item.download)
+                     R.id.restart_download -> downloadManager.restartDownload(item.download)
++                    R.id.change_download_quality -> qualityTarget.value = item.download
+                     R.id.move_to_top, R.id.move_to_bottom -> {
+                         val headerItems = adapter?.headerItems ?: return
+                         val newDownloads = mutableListOf<Download>()
+diff --git a/app/src/main/res/menu/download_single.xml b/app/src/main/res/menu/download_single.xml
+index 1e7eac0..cdc7a35 100644
+--- a/app/src/main/res/menu/download_single.xml
++++ b/app/src/main/res/menu/download_single.xml
+@@ -13,6 +13,10 @@
+         android:id="@+id/restart_download"
+         android:title="@string/action_download" />
+ 
++    <item
++        android:id="@+id/change_download_quality"
++        android:title="@string/action_download" />
++
+     <item
+         android:id="@+id/move_to_top"
+         android:title="@string/action_move_to_top" />
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRecoveryTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRecoveryTest.kt
+index f703524..9e76ef0 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRecoveryTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRecoveryTest.kt
+@@ -75,7 +75,7 @@ class NavigationChromeDownloadHlsRecoveryTest {
+     }
+ 
+     @Test
+-    fun `repeated segment 169 denial retries uncached then completes a separate lower rendition`() = withCache { cache ->
++    fun `repeated segment 169 denial leaves the original track resumable until a manual quality change`() = withCache { cache ->
+         val deniedRequests = Collections.synchronizedList(mutableListOf<String?>())
+         val alternateTs = TS.copyOf().apply { this[1] = 1 }
+         val client = OkHttpClient.Builder().addInterceptor { chain ->
+@@ -101,42 +101,37 @@ class NavigationChromeDownloadHlsRecoveryTest {
+         val source = mockk<AnimeSource>()
+         val highest = Video(videoUrl = "$URL&quality=1080", videoTitle = "1080p", initialized = true)
+         val lower = Video(videoUrl = "$URL&quality=720", videoTitle = "720p", initialized = true)
+-        val unavailable = Video(videoUrl = highest.videoUrl, videoTitle = "900p", initialized = true)
+-        val hosters = listOf(Hoster(videoList = listOf(highest, lower, unavailable)))
+-        var rendition = "1080"
++        val hosters = listOf(Hoster(videoList = listOf(highest, lower, lower)))
+         var refreshes = 0
+-        val complete = DownloadHlsSegments.withAuthorizationRecovery(
+-            transfer = { forceNetwork ->
+-                DownloadHlsSegments.prepare(client, "MissAV", "http://localhost:1234/m3u8?url=$rendition", headersOf(), cache, forceNetwork) {}!!
+-            },
+-            refresh = {
+-                assertEquals(169, it.segmentNumber)
+-                refreshes++
+-            },
+-            selectAlternate = {
+-                assertEquals(169, it.segmentNumber)
+-                val next = DownloadQualitySelector.pickLower(source, hosters, highest) { candidate ->
+-                    DownloadHlsSegments.isLocalManifest(candidate.videoUrl)
+-                }!!
+-                assertEquals(lower.videoUrl, next.videoUrl)
+-                rendition = checkNotNull(DownloadQualitySelector.heightOf(next)).toString()
+-                true
+-            },
+-        )
+-
+-        val renewedLower = Video(videoUrl = "$URL&fresh=720", videoTitle = "720p", initialized = true)
+-        val resumedHosters = listOf(Hoster(videoList = listOf(highest, renewedLower)))
+-        val resumed = DownloadQualitySelector.pickResumed(source, resumedHosters, 720) {
+-            DownloadHlsSegments.isLocalManifest(it.videoUrl)
+-        }
+-        assertEquals("$URL&fresh=720", resumed?.videoUrl)
+-        assertEquals(null, DownloadQualitySelector.pickResumed(source, hosters, 360) { true })
+-
++        val failure = runCatching {
++            DownloadHlsSegments.withAuthorizationRecovery(
++                transfer = { forceNetwork ->
++                    DownloadHlsSegments.prepare(client, "MissAV", "http://localhost:1234/m3u8?url=1080", headersOf(), cache, forceNetwork) {}!!
++                },
++                refresh = {
++                    assertEquals(169, it.segmentNumber)
++                    refreshes++
++                },
++            )
++        }.exceptionOrNull()
++        assertTrue(failure is DownloadHlsSegments.Failure)
+         assertEquals(1, refreshes)
+         assertEquals(listOf(null, "no-cache"), deniedRequests)
++        val original = cache.listFiles()!!.single()
++        assertEquals(listOf(1080, 720), DownloadQualitySelector.availableHeights(source, hosters))
++        assertEquals(null, DownloadQualitySelector.pickExact(source, hosters, 360))
++
++        // Only an explicit selection starts a different rendition. Its signed address can change on resume.
++        val renewed = Video(videoUrl = "$URL&fresh=720", videoTitle = "720p", initialized = true)
++        val resumed = DownloadQualitySelector.pickExact(source, listOf(Hoster(videoList = listOf(highest, renewed))), 720)
++        assertEquals(renewed.videoUrl, resumed?.videoUrl)
++        DownloadHlsSegments.markOriginalQuality(cache, 1080)
++        val lowerRoot = DownloadHlsSegments.cacheForQuality(cache, 720)
++        assertEquals(cache, DownloadHlsSegments.cacheForQuality(cache, 1080))
++        assertTrue(lowerRoot != cache)
++        val complete = DownloadHlsSegments.prepare(client, "MissAV", "http://localhost:1234/m3u8?url=720", headersOf(), lowerRoot) {}!!
+         assertEquals(170, complete.segments)
+         assertEquals(680_000L, complete.durationMillis)
+-        val original = cache.listFiles()!!.single { it != complete.directory }
+         assertTrue(File(original, "00000.ts").readBytes().contentEquals(TS))
+         assertFalse(File(original, "00168.ts").exists())
+         val output = File(cache, "offline.ts")
+@@ -145,11 +140,27 @@ class NavigationChromeDownloadHlsRecoveryTest {
+     }
+ 
+     @Test
+-    fun `two workers can report neighbouring refused segments in either order`() = runTest {
++    fun `temporary authorization failure can recover on the same rendition`() = runTest {
++        val requests = mutableListOf<Boolean>()
++        var refreshes = 0
++        val result = DownloadHlsSegments.withAuthorizationRecovery(
++            transfer = { fresh ->
++                requests += fresh
++                if (!fresh) throw DownloadHlsSegments.Failure("denied", 403, 169)
++                1080
++            },
++            refresh = { refreshes++ },
++        )
++        assertEquals(1080, result)
++        assertEquals(1, refreshes)
++        assertEquals(listOf(false, true), requests)
++    }
++
++    @Test
++    fun `a repeated refusal stops after one refresh regardless of which worker reports it`() = runTest {
+         for ((first, second) in listOf(511 to 512, 512 to 511, 511 to 520)) {
+             var transfers = 0
+             var refreshes = 0
+-            var alternates = 0
+             val result = runCatching {
+                 DownloadHlsSegments.withAuthorizationRecovery(
+                     transfer = {
+@@ -160,20 +171,11 @@ class NavigationChromeDownloadHlsRecoveryTest {
+                         }
+                     },
+                     refresh = { refreshes++ },
+-                    selectAlternate = {
+-                        alternates++
+-                        true
+-                    },
+                 )
+             }
+             assertEquals(1, refreshes)
+-            if (second == 520) {
+-                assertEquals(0, alternates)
+-                assertTrue(result.exceptionOrNull() is DownloadHlsSegments.Failure)
+-            } else {
+-                assertEquals(1, alternates)
+-                assertEquals("complete", result.getOrThrow())
+-            }
++            assertEquals(2, transfers)
++            assertEquals(second, (result.exceptionOrNull() as DownloadHlsSegments.Failure).segmentNumber)
+         }
+     }
+ 
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadPausedStoreTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadPausedStoreTest.kt
+index 7662cad..bd8a830 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadPausedStoreTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadPausedStoreTest.kt
+@@ -31,7 +31,7 @@ class NavigationChromeDownloadPausedStoreTest {
+         fixture.values["2"] = "{\"mangaId\":2,\"chapterId\":2,\"order\":10}"
+         val restored = fixture.store.restore()
+         assertEquals(listOf(2L, 1L), restored.map { it.episode.id })
+-        assertTrue(restored.all { it.status == Download.State.QUEUE && it.hlsResumeHeight == null })
++        assertTrue(restored.all { it.status == Download.State.QUEUE && it.selectedQualityHeight == null })
+         assertTrue(fixture.values.isEmpty())
+     }
+ 
+@@ -71,25 +71,25 @@ class NavigationChromeDownloadPausedStoreTest {
+     }
+ 
+     @Test
+-    fun `a working fallback height survives pause and process restart only for that episode`() {
++    fun `the selected quality survives pause and process restart only for its episode`() {
+         val fixture = Fixture()
+         val first = fixture.download(1)
+         val second = fixture.download(2)
+         fixture.store.addAll(listOf(first, second))
+-        first.hlsResumeHeight = 720
++        first.selectedQualityHeight = 720
+         fixture.store.update(first)
+         first.status = Download.State.PAUSED
+         fixture.store.update(first)
+         val restored = fixture.store.restore()
+-        assertEquals(listOf(720, null), restored.map { it.hlsResumeHeight })
++        assertEquals(listOf(720, null), restored.map { it.selectedQualityHeight })
+         fixture.store.addAll(restored)
+         val continued = restored.first()
+         continued.status = Download.State.QUEUE
+         fixture.store.update(continued)
+         assertEquals(720, Json.parseToJsonElement(fixture.values.getValue("1")).jsonObject.getValue("hlsResumeHeight").jsonPrimitive.int)
+-        continued.hlsResumeHeight = null
++        continued.selectedQualityHeight = null
+         fixture.store.update(continued)
+-        assertTrue(fixture.store.restore().all { it.hlsResumeHeight == null })
++        assertTrue(fixture.store.restore().all { it.selectedQualityHeight == null })
+     }
+ 
+     private class Fixture {
+diff --git a/i18n-ank/src/commonMain/moko-resources/base/strings.xml b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+index 0f484dc..f9161b7 100644
+--- a/i18n-ank/src/commonMain/moko-resources/base/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+@@ -279,6 +279,11 @@
+     <string name="harmony_download_leftover_delete_failed">Could not remove the leftover \'%1$s\' from an earlier download</string>
+ 
+     <!-- Harmony fork: download quality separate from playback -->
++    <string name="harmony_download_change_quality">Change quality and restart</string>
++    <string name="harmony_download_quality_unavailable">The source no longer offers %1$dp. Choose another quality from the download menu.</string>
++    <string name="harmony_download_quality_empty">The source did not list any selectable resolutions.</string>
++    <string name="harmony_download_quality_load_failed">Could not load qualities from the source.</string>
++    <string name="harmony_download_quality_denied">The source refused %1$dp (HTTP %2$d). Resume to retry this quality or choose another from the download menu.</string>
+     <string name="pref_harmony_download_quality">Download quality</string>
+     <string name="pref_harmony_download_quality_summary">Used when an episode is queued without picking a quality; playback keeps the source\'s preferred quality.</string>
+     <string name="harmony_download_quality_highest">Highest available</string>
+diff --git a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+index 4ab6cfd..1bc6251 100644
+--- a/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/zh-rCN/strings.xml
+@@ -274,6 +274,11 @@
+     <string name="harmony_download_leftover_delete_failed">无法删除上次下载残留的「%1$s」</string>
+ 
+     <!-- Harmony fork: download quality separate from playback -->
++    <string name="harmony_download_change_quality">换画质重新下载</string>
++    <string name="harmony_download_quality_unavailable">来源暂未提供 %1$dp。可以稍后继续，或在下载菜单中手动换画质。</string>
++    <string name="harmony_download_quality_empty">来源没有列出可单独选择的分辨率。</string>
++    <string name="harmony_download_quality_load_failed">未能从来源获取画质。</string>
++    <string name="harmony_download_quality_denied">来源拒绝了 %1$dp 的下载请求（HTTP %2$d）。可继续重试此画质，或在下载菜单中手动换画质。</string>
+     <string name="pref_harmony_download_quality">下载画质</string>
+     <string name="pref_harmony_download_quality_summary">下载时未单独选择画质的剧集按此下载；在线播放仍用插件里的首选画质。</string>
+     <string name="harmony_download_quality_highest">最高可用</string>

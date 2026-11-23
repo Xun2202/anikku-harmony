@@ -125,3 +125,5 @@
 0125-webview-draw-behind-system-gesture-handle.patch
 0126-source-preferences-glass-and-native-gesture-insets.patch
 0127-download-resume-active-hls-rendition.patch
+0128-home-capsule-footer-insets.patch
+0129-queue-manual-download-quality.patch
