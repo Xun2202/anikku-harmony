@@ -1065,3 +1065,11 @@ Anikku 的播放器和 FFprobeKit 共用进程内的 libav 日志。播放器使
 来源打开的 WebViewActivity 启用透明导航栏，窗口随输入法调整大小。它和应用内 WebViewScreen 共用网页布局。网页铺到系统手势条下方，可点的系统导航键、输入法和屏幕缺口继续占用各自的空间。系统负责绘制手势条。
 
 NavigationChromeWebViewInsetsTest 向 Compose 布局分发 Android 窗口边距，通过原生 WebView 的布局检查手势、键盘开合、底部和侧边导航键以及缺口。卓易通的外观和输入体验需在设备上确认。
+
+## 2026-11-23 来源设置返回栏和卓易通手势区（0126）
+
+来源设置由 Compose 承载 AndroidX PreferenceFragment。宿主使用书架的固定磨砂栏，把首尾安全间距交给 RecyclerView，行可以滚过透明栏，首项和末项仍能完整操作。来源自己提供的偏好项继续使用 AndroidX 原生控件。
+
+来源设置和内置网页共用窗口边距处理。对于把底部细手势区同时报告为导航、可点击区域或隐藏输入法的兼容窗口，页面可延伸到手势条后方。输入法、完整系统导航键和屏幕缺口保留空间。窗口显式请求在手势条下方布局并清除导航栏底色。
+
+NavigationChromeSourcePreferencesInsetsTest 用原生 RecyclerView 检查首末项、滚动、顶栏容器和导航模式切换。NavigationChromeWebViewInsetsTest 覆盖重复报告的细手势区与键盘开合。卓易通的最终绘制效果需要真机确认。如仍出现色带，复现后可从日志中的 `native page source-settings` 或 `native page web` 读取窗口高度、页面边界和系统边距。
