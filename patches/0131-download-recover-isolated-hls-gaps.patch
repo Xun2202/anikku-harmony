@@ -1,0 +1,533 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 17:05:04 +0000
+Subject: [PATCH] downloads: keep verified HLS fragments across intermittent
+ refusals
+
+The MissAV segment workers used to cancel the rest of an episode on one forbidden fragment. Continue reachable fragments, pace and bound same-rendition recovery, and require the complete ordered playlist before saving. Cover both clustered gaps and sustained refusals. Mihon image downloads and Animeko use different transfer paths.
+---
+ .../data/download/DownloadHlsSegments.kt      | 104 ++++++++-
+ .../tachiyomi/data/download/Downloader.kt     |  12 +-
+ .../tachiyomi/ui/download/DownloadHolder.kt   |   2 +-
+ .../NavigationChromeDownloadHlsGapTest.kt     | 214 ++++++++++++++++++
+ ...NavigationChromeDownloadHlsRecoveryTest.kt |   9 +-
+ .../moko-resources/base/strings.xml           |   1 +
+ 6 files changed, 323 insertions(+), 19 deletions(-)
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+index c743bfd..e2c2332 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+@@ -35,6 +35,9 @@ internal object DownloadHlsSegments {
+         message: String,
+         val httpStatus: Int? = null,
+         val segmentNumber: Int? = null,
++        // Known only after both workers have finished the pass.
++        val missingSegments: Int? = null,
++        val newSegments: Int = 0,
+     ) : IOException(message)
+ 
+     private data class Segment(val url: HttpUrl, val seconds: BigDecimal, val millis: Long)
+@@ -56,13 +59,25 @@ internal object DownloadHlsSegments {
+         transfer: suspend (forceNetwork: Boolean) -> T,
+         refresh: suspend (Failure) -> Unit,
+     ): T {
+-        try {
+-            return transfer(false)
+-        } catch (failure: Failure) {
+-            if (failure.httpStatus != 401 && failure.httpStatus != 403) throw failure
+-            refresh(failure)
++        var refreshes = 0
++        var stalledRefreshes = 0
++        while (true) {
++            try {
++                return transfer(refreshes > 0)
++            } catch (failure: Failure) {
++                if (failure.httpStatus != 401 && failure.httpStatus != 403) throw failure
++                // A later burst after sustained progress is a new stall. Rechecking cached files is not progress.
++                if (failure.newSegments >= 16) stalledRefreshes = 0
++                val limit = if (failure.missingSegments == null) 1 else 2
++                if (stalledRefreshes >= limit || refreshes >= MAX_REFRESHES_PER_DOWNLOAD) throw failure
++                if (failure.httpStatus == 403 && failure.segmentNumber != null) {
++                    delay(if (stalledRefreshes == 0) 8_000L else 24_000L)
++                }
++                refresh(failure)
++                refreshes++
++                stalledRefreshes++
++            }
+         }
+-        return transfer(true)
+     }
+ 
+     /** Existing releases stored segments directly under root. Keep that track usable when switching back. */
+@@ -90,6 +105,7 @@ internal object DownloadHlsSegments {
+         headers: Headers,
+         cacheRoot: File,
+         forceNetwork: Boolean = false,
++        onFirstGap: (Int) -> Unit = {},
+         onProgress: (Progress) -> Unit,
+     ): Prepared? = try {
+         withContext(Dispatchers.IO) {
+@@ -124,6 +140,7 @@ internal object DownloadHlsSegments {
+             val state = ProgressState(totalMillis, onProgress)
+             val pending = mutableListOf<Int>()
+             segments.forEachIndexed { index, segment ->
++                ensureActive()
+                 val file = segmentFile(directory, index)
+                 if (validTs(file)) {
+                     state.complete(file.length(), segment.millis, notify = false)
+@@ -132,14 +149,14 @@ internal object DownloadHlsSegments {
+                 }
+             }
+             state.report() // Restore the complete cached total once, rather than replaying thousands of tiny UI updates.
+-            var next = 0
++            val input = File(directory, "input.m3u8")
++            if (pending.isNotEmpty() && input.exists() && !input.delete()) throw Failure("Cannot invalidate incomplete local HLS plan")
++            val pass = SegmentPass(pending, smallRepair = pending.size < segments.size && pending.size <= 8, onFirstGap = onFirstGap)
+             coroutineScope {
+                 repeat(minOf(SEGMENT_WORKERS, pending.size)) {
+                     launch {
+                         while (true) {
+-                            val index = synchronized(pending) {
+-                                if (next < pending.size) pending[next++] else null
+-                            } ?: break
++                            val index = pass.nextSegment() ?: break
+                             val segment = segments[index]
+                             val file = segmentFile(directory, index)
+                             var failure: IOException? = null
+@@ -173,6 +190,7 @@ internal object DownloadHlsSegments {
+                                         if (!partial.renameTo(file)) throw Failure("Cannot finalize HLS segment cache")
+                                     }
+                                     state.complete(file.length(), segment.millis)
++                                    pass.completed(index)
+                                     failure = null
+                                     break
+                                 } catch (cancelled: CancellationException) {
+@@ -186,18 +204,20 @@ internal object DownloadHlsSegments {
+                             }
+                             failure?.let {
+                                 val detail = if (it is Failure) it.message else it.javaClass.simpleName
+-                                throw Failure(
++                                val failed = Failure(
+                                     "HLS segment ${index + 1}/${segments.size} failed after $attempts attempts: $detail",
+                                     (it as? Failure)?.httpStatus,
+                                     segmentNumber = index + 1,
+                                 )
++                                if (failed.httpStatus != 403) throw failed
++                                pass.defer(index, failed)
+                             }
+                         }
+                     }
+                 }
+             }
+             ensureActive()
+-            val input = File(directory, "input.m3u8")
++            pass.requireComplete()
+             File(directory, "input.m3u8.part").let { partial ->
+                 partial.bufferedWriter().use { writer ->
+                     writer.appendLine("#EXTM3U")
+@@ -351,6 +371,64 @@ internal object DownloadHlsSegments {
+         }
+     }
+ 
++    private class SegmentPass(
++        private val pending: List<Int>,
++        private val smallRepair: Boolean,
++        private val onFirstGap: (Int) -> Unit,
++    ) {
++        private var front = 0
++        private var end = pending.size
++        private var distant: Int? = null
++        private var first: Failure? = null
++        private var count = 0
++        private var consecutive = 0
++        private var newSegments = 0
++
++        @Synchronized
++        fun nextSegment(): Int? {
++            if (front == end) return null
++            if (smallRepair || consecutive < MAX_CONSECUTIVE_DENIALS) return pending[front++]
++            // Adjacent failures can belong to a single bad range. Check one distant missing
++            // fragment before stopping. Only its worker continues while this check is pending.
++            if (distant != null) return null
++            return pending[--end].also { distant = it }
++        }
++
++        @Synchronized
++        fun completed(index: Int) {
++            if (index == distant) distant = null
++            consecutive = 0
++            newSegments++
++        }
++
++        @Synchronized
++        fun defer(index: Int, failure: Failure) {
++            if (first == null) {
++                first = failure
++                onFirstGap(checkNotNull(failure.segmentNumber))
++            }
++            count++
++            consecutive++
++            if (index == distant) {
++                distant = null
++                if (consecutive >= MAX_CONSECUTIVE_DENIALS) {
++                    val earliest = checkNotNull(first)
++                    throw Failure(
++                        "${earliest.message}; consecutive=$consecutive distant=${index + 1}",
++                        403,
++                        earliest.segmentNumber,
++                        newSegments = newSegments,
++                    )
++                }
++            }
++        }
++
++        fun requireComplete() {
++            val failed = first ?: return
++            throw Failure("${failed.message}; $count missing", 403, failed.segmentNumber, count, newSegments)
++        }
++    }
++
+     private class ProgressState(private val total: Long, private val callback: (Progress) -> Unit) {
+         private var bytes = 0L
+         private var network = 0L
+@@ -385,6 +463,8 @@ internal object DownloadHlsSegments {
+     }
+ 
+     private const val SEGMENT_WORKERS = 2
++    private const val MAX_CONSECUTIVE_DENIALS = 4
++    private const val MAX_REFRESHES_PER_DOWNLOAD = 6
+     private const val MAX_MANIFEST_BYTES = 1024L * 1024
+     private val DECIMAL = Regex("[0-9]+(?:\\.[0-9]*)?")
+ }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index d90cc20..6503da5 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -351,6 +351,9 @@ class Downloader(
+                 current.resetSpeed()
+                 current.status = Download.State.QUEUE
+                 store.update(current)
++                logcat(LogPriority.INFO) {
++                    "Download restart episode=$id resetSegments=${qualityHeight == null} height=${current.selectedQualityHeight}"
++                }
+             } catch (error: Exception) {
+                 if (error is CancellationException) throw error
+                 current.fail(error.message)
+@@ -722,7 +725,8 @@ class Downloader(
+             download.video?.status = Video.State.Error(error)
+             val height = download.selectedQualityHeight
+             val message = if (error is DownloadHlsSegments.Failure && height != null && error.httpStatus in listOf(401, 403)) {
+-                context.stringResource(AMR.strings.harmony_download_quality_denied, height, checkNotNull(error.httpStatus))
++                val denied = context.stringResource(AMR.strings.harmony_download_quality_denied, height, checkNotNull(error.httpStatus))
++                error.segmentNumber?.let { "HLS #$it · $denied" } ?: denied
+             } else {
+                 error.message ?: error.javaClass.simpleName
+             }
+@@ -785,7 +789,8 @@ class Downloader(
+                 currentCoroutineContext().ensureActive()
+                 download.video = fresh.apply { status = Video.State.LoadVideo }
+                 logcat(LogPriority.INFO) {
+-                    "Download authorization refresh episode=${download.episode.id} height=$height status=${failure.httpStatus} cache=retained"
++                    "Download authorization refresh episode=${download.episode.id} height=$height status=${failure.httpStatus} " +
++                        "segment=${failure.segmentNumber} missing=${failure.missingSegments} newSegments=${failure.newSegments} cache=retained"
+                 }
+             },
+         )
+@@ -1093,6 +1098,9 @@ class Downloader(
+             video.headers ?: download.source.headers,
+             cacheRoot,
+             forceNetwork = forceNetwork,
++            onFirstGap = { segment ->
++                logcat(LogPriority.INFO) { "Download HLS deferred episode=${download.episode.id} segment=$segment status=403" }
++            },
+         ) { state ->
+             // Cached segments advance completion, but never count as network speed.
+             val addedBytes = (state.networkBytes - networkBytes).coerceAtLeast(0)
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
+index 4282ba3..204f2e2 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
+@@ -163,7 +163,7 @@ class DownloadHolder(private val view: View, val adapter: DownloadAdapter) :
+                     isVisible = download.status == Download.State.PAUSED || download.status == Download.State.ERROR
+                 }
+                 findItem(R.id.restart_download).apply {
+-                    title = view.context.stringResource(AMR.strings.harmony_download_restart)
++                    title = view.context.stringResource(AMR.strings.harmony_download_restart_from_start)
+                     isVisible = download.status != Download.State.DOWNLOADED
+                 }
+                 findItem(R.id.change_download_quality).apply {
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt
+new file mode 100644
+index 0000000..c964113
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt
+@@ -0,0 +1,214 @@
++package eu.kanade.tachiyomi.data.download
++
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.cancelAndJoin
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.test.advanceTimeBy
++import kotlinx.coroutines.test.runCurrent
++import kotlinx.coroutines.test.runTest
++import okhttp3.Headers.Companion.headersOf
++import okhttp3.OkHttpClient
++import okhttp3.Protocol
++import okhttp3.Response
++import okhttp3.ResponseBody.Companion.toResponseBody
++import org.junit.jupiter.api.Assertions.assertArrayEquals
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertNull
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++import org.junit.jupiter.api.io.TempDir
++import java.io.File
++import java.util.concurrent.ConcurrentLinkedQueue
++import java.util.concurrent.atomic.AtomicBoolean
++import java.util.concurrent.atomic.AtomicInteger
++
++@OptIn(ExperimentalCoroutinesApi::class)
++class NavigationChromeDownloadHlsGapTest {
++    @TempDir
++    lateinit var cache: File
++
++    @Test
++    fun `later fragments finish and refresh requests only the remaining holes in order`() = runTest {
++        val source = Source(14) { pass, segment ->
++            if ((segment == 4 && pass == 1) || (segment == 8 && pass <= 2)) 403 else 200
++        }
++        val gaps = mutableListOf<Int?>()
++        val times = mutableListOf<Long>()
++        val prepared = DownloadHlsSegments.withAuthorizationRecovery(
++            transfer = { source.transfer(cache, it) },
++            refresh = {
++                gaps += it.missingSegments
++                times += testScheduler.currentTime
++                assertFalse(cache.walk().any { file -> file.name == "input.m3u8" })
++            },
++        )
++        assertEquals(listOf(2, 1), gaps)
++        assertEquals(listOf(8_000L, 32_000L), times)
++        assertEquals((1..14).toList(), source.requested(1))
++        assertEquals(listOf(4, 8), source.requested(2))
++        assertEquals(listOf(8), source.requested(3))
++        verifyOutput(prepared)
++    }
++
++    @Test
++    fun `persistent denial preserves every other fragment for a later resume`() = runTest {
++        val available = AtomicBoolean(false)
++        val source = Source(18) { _, segment -> if (segment == 6 && !available.get()) 403 else 200 }
++        val failure = runCatching {
++            DownloadHlsSegments.withAuthorizationRecovery(transfer = { source.transfer(cache, it) }, refresh = {})
++        }.exceptionOrNull() as DownloadHlsSegments.Failure
++        assertEquals(403, failure.httpStatus)
++        assertEquals(6, failure.segmentNumber)
++        assertEquals(1, failure.missingSegments)
++        assertEquals(17, cache.walk().count { it.extension == "ts" })
++        assertFalse(cache.walk().any { it.name == "input.m3u8" })
++        assertEquals(listOf(6), source.requested(2))
++        assertEquals(listOf(6), source.requested(3))
++
++        available.set(true)
++        val resumed = source.transfer(cache, false)
++        assertEquals(listOf(6), source.requested(4))
++        verifyOutput(resumed)
++    }
++
++    @Test
++    fun `widespread refusal waits before one refresh and stops probing the playlist`() = runTest {
++        val source = Source(150) { _, _ -> 403 }
++        val times = mutableListOf<Long>()
++        val failure = runCatching {
++            DownloadHlsSegments.withAuthorizationRecovery(
++                transfer = { source.transfer(cache, it) },
++                refresh = { times += testScheduler.currentTime },
++            )
++        }.exceptionOrNull() as DownloadHlsSegments.Failure
++        assertEquals(listOf(8_000L), times)
++        assertEquals(403, failure.httpStatus)
++        assertNull(failure.missingSegments)
++        for (pass in 1..2) {
++            val attempted = source.requested(pass)
++            assertTrue(attempted.size in 5..6)
++            assertEquals(150, attempted.last())
++        }
++        assertTrue(source.requested(3).isEmpty())
++        assertFalse(cache.walk().any { it.extension == "ts" || it.name == "input.m3u8" })
++    }
++
++    @Test
++    fun `a cluster of neighbouring refusals does not stop reachable fragments beyond it`() = runTest {
++        val source = Source(45) { pass, segment -> if (pass <= 2 && segment in 6..12) 403 else 200 }
++        val gaps = mutableListOf<Int?>()
++        val prepared = DownloadHlsSegments.withAuthorizationRecovery(
++            transfer = { source.transfer(cache, it) },
++            refresh = { gaps += it.missingSegments },
++        )
++        assertEquals(listOf(7, 7), gaps)
++        assertEquals((1..45).toList(), source.requested(1))
++        assertEquals((6..12).toList(), source.requested(2))
++        assertEquals((6..12).toList(), source.requested(3))
++        verifyOutput(prepared)
++    }
++
++    @Test
++    fun `a new burst after sustained verified progress can recover during the same download`() = runTest {
++        val source = Source(60) { pass, segment ->
++            if ((pass == 1 && segment >= 6) || (pass == 2 && segment >= 36)) 403 else 200
++        }
++        val refreshes = mutableListOf<DownloadHlsSegments.Failure>()
++        var alreadyCached = emptySet<Int>()
++        val prepared = DownloadHlsSegments.withAuthorizationRecovery(
++            transfer = { source.transfer(cache, it) },
++            refresh = {
++                refreshes += it
++                alreadyCached = cache.walk().filter { file -> file.extension == "ts" }.map { file -> file.nameWithoutExtension.toInt() + 1 }.toSet()
++            },
++        )
++        assertEquals(2, refreshes.size)
++        assertTrue(refreshes[1].newSegments >= 16)
++        assertTrue(source.requested(3).none { it in alreadyCached })
++        verifyOutput(prepared)
++    }
++
++    @Test
++    fun `recurring refusals have an overall ceiling even when some data keeps arriving`() = runTest {
++        var refreshes = 0
++        val failure = runCatching {
++            DownloadHlsSegments.withAuthorizationRecovery(
++                transfer = { throw DownloadHlsSegments.Failure("burst", 403, 40, newSegments = 20) },
++                refresh = { refreshes++ },
++            )
++        }.exceptionOrNull() as DownloadHlsSegments.Failure
++        assertEquals(403, failure.httpStatus)
++        assertEquals(6, refreshes)
++    }
++
++    @Test
++    fun `pausing during a refusal cooldown cancels the pending refresh`() = runTest {
++        var transfers = 0
++        var refreshes = 0
++        val job = launch {
++            DownloadHlsSegments.withAuthorizationRecovery(
++                transfer = {
++                    transfers++
++                    throw DownloadHlsSegments.Failure("synthetic refusal", 403, 4, missingSegments = 1)
++                },
++                refresh = { refreshes++ },
++            )
++        }
++        runCurrent()
++        advanceTimeBy(7_999L)
++        job.cancelAndJoin()
++        assertEquals(1, transfers)
++        assertEquals(0, refreshes)
++    }
++
++    private suspend fun verifyOutput(prepared: DownloadHlsSegments.Prepared) {
++        val output = File(cache, "offline.ts")
++        DownloadHlsSegments.writeTransportStream(prepared, output) {}
++        val expected = ByteArray(prepared.segments * FRAGMENT_BYTES) { byte ->
++            if (byte % 188 == 0) 0x47 else (byte / FRAGMENT_BYTES + 1).toByte()
++        }
++        assertArrayEquals(expected, output.readBytes())
++    }
++
++    private class Source(size: Int, status: (Int, Int) -> Int) {
++        private val pass = AtomicInteger()
++        private val calls = ConcurrentLinkedQueue<Pair<Int, Int>>()
++        private val manifest = buildString {
++            appendLine("#EXTM3U")
++            for (segment in 1..size) {
++                appendLine("#EXTINF:4,")
++                appendLine("/segment?url=$segment")
++            }
++            appendLine("#EXT-X-ENDLIST")
++        }.toByteArray()
++        private val client = OkHttpClient.Builder().addInterceptor { chain ->
++            val request = chain.request()
++            val response = Response.Builder().request(request).protocol(Protocol.HTTP_1_1).message("fixture")
++            if (request.url.encodedPath == "/m3u8") {
++                pass.incrementAndGet()
++                response.code(200).body(manifest.toResponseBody()).build()
++            } else {
++                val segment = checkNotNull(request.url.queryParameter("url")).toInt()
++                calls.add(pass.get() to segment)
++                val code = status(pass.get(), segment)
++                val bytes = if (code == 200) {
++                    ByteArray(FRAGMENT_BYTES) { if (it % 188 == 0) 0x47 else segment.toByte() }
++                } else {
++                    byteArrayOf()
++                }
++                response.code(code).body(bytes.toResponseBody()).build()
++            }
++        }.build()
++
++        fun requested(attempt: Int): List<Int> = calls.filter { it.first == attempt }.map { it.second }.sorted()
++
++        suspend fun transfer(cache: File, fresh: Boolean): DownloadHlsSegments.Prepared = checkNotNull(
++            DownloadHlsSegments.prepare(client, "MissAV", "http://localhost:1234/m3u8", headersOf(), cache, fresh) {},
++        )
++    }
++
++    private companion object {
++        const val FRAGMENT_BYTES = 188 * 4
++    }
++}
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRecoveryTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRecoveryTest.kt
+index 9e76ef0..29aedd5 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRecoveryTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRecoveryTest.kt
+@@ -4,7 +4,6 @@ import eu.kanade.tachiyomi.animesource.AnimeSource
+ import eu.kanade.tachiyomi.animesource.model.Hoster
+ import eu.kanade.tachiyomi.animesource.model.Video
+ import io.mockk.mockk
+-import kotlinx.coroutines.runBlocking
+ import kotlinx.coroutines.test.runTest
+ import okhttp3.Headers.Companion.headersOf
+ import okhttp3.Interceptor
+@@ -115,8 +114,8 @@ class NavigationChromeDownloadHlsRecoveryTest {
+             )
+         }.exceptionOrNull()
+         assertTrue(failure is DownloadHlsSegments.Failure)
+-        assertEquals(1, refreshes)
+-        assertEquals(listOf(null, "no-cache"), deniedRequests)
++        assertEquals(2, refreshes)
++        assertEquals(listOf(null, "no-cache", "no-cache"), deniedRequests)
+         val original = cache.listFiles()!!.single()
+         assertEquals(listOf(1080, 720), DownloadQualitySelector.availableHeights(source, hosters))
+         assertEquals(null, DownloadQualitySelector.pickExact(source, hosters, 360))
+@@ -134,6 +133,8 @@ class NavigationChromeDownloadHlsRecoveryTest {
+         assertEquals(680_000L, complete.durationMillis)
+         assertTrue(File(original, "00000.ts").readBytes().contentEquals(TS))
+         assertFalse(File(original, "00168.ts").exists())
++        assertTrue(File(original, "00169.ts").isFile)
++        assertFalse(File(original, "input.m3u8").exists())
+         val output = File(cache, "offline.ts")
+         DownloadHlsSegments.writeTransportStream(complete, output) {}
+         assertTrue(output.readBytes().contentEquals(ByteArray(170 * alternateTs.size) { alternateTs[it % alternateTs.size] }))
+@@ -210,7 +211,7 @@ class NavigationChromeDownloadHlsRecoveryTest {
+         .request(chain.request()).protocol(Protocol.HTTP_1_1).code(status).message("test")
+         .body(bytes.toResponseBody()).build()
+ 
+-    private fun withCache(block: suspend (File) -> Unit) = runBlocking {
++    private fun withCache(block: suspend (File) -> Unit) = runTest {
+         val cache = createTempDirectory("hls-recovery-test-").toFile()
+         try {
+             block(cache)
+diff --git a/i18n-ank/src/commonMain/moko-resources/base/strings.xml b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+index f9161b7..c44f012 100644
+--- a/i18n-ank/src/commonMain/moko-resources/base/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+@@ -300,6 +300,7 @@
+     <string name="harmony_download_resume">继续下载</string>
+     <string name="harmony_download_pause">暂停下载</string>
+     <string name="harmony_download_restart">重新下载</string>
++    <string name="harmony_download_restart_from_start">从头重新下载</string>
+     <string name="harmony_webview_certificate_title">Check the server certificate</string>
+     <string name="harmony_webview_certificate_review">This device does not trust the issuer. Compare this SHA-256 fingerprint with the one supplied by the server owner before continuing.</string>
+     <string name="harmony_webview_certificate_blocked">The secure connection could not be verified. Check the server address, certificate and expiry date before opening the page again.</string>

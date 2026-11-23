@@ -128,3 +128,4 @@
 0128-home-capsule-footer-insets.patch
 0129-queue-manual-download-quality.patch
 0130-queue-menu-bound-episode.patch
+0131-download-recover-isolated-hls-gaps.patch
