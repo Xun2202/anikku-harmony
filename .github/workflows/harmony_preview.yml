@@ -154,7 +154,9 @@ jobs:
         # -Penable-updater 打开 BuildConfig.UPDATER_ENABLED, 否则 App 不会检查更新.
         # preview 构建类型用 debug 密钥出包, 下一步再用本仓库的密钥重签.
         run: |
-          ./gradlew :presentation-core:testDebugUnitTest \
+          # Robolectric resolves its SDK inside the forked test JVM, outside Gradle dependency repositories.
+          JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+$JAVA_TOOL_OPTIONS }-Drobolectric.dependency.repo.url=https://maven-central.storage-download.googleapis.com/maven2" \
+            ./gradlew :presentation-core:testDebugUnitTest \
             --tests '*PanoramaMasonryLayoutTest' --tests '*PanoramaMasonryFlingTest.a coast from the content survives and a coast from the thumb does not' --tests '*PanoramaAutoColumnsTest' --tests '*NavigationChrome*' --tests '*Timeline*Test' \
             :app:testPreviewUnitTest \
             --tests '*PanoramaCoverShapesTest' --tests '*PanoramaShapeModeTest' --tests '*PanoramaLayoutPolicyTest' --tests '*HarmonyFramePerfTest' --tests '*NavigationChrome*' --tests '*WebViewCertificateSessionTest' \
