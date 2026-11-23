@@ -1,0 +1,479 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:54:29 +0000
+Subject: [PATCH] downloads: stream long MissAV playlists and recover partial
+ local mux failures
+
+Four real downloads stopped at the old one MiB manifest limit. Read local VOD plans incrementally and keep existing cache fingerprints. A completed segment set that produced output before FFmpeg returned EINVAL may use the byte- and duration-verified TS recovery path. Report how much of a fully scanned playlist is retained when fragments remain unavailable. Other engines do not use this segment and mux path.
+---
+ .../data/download/DownloadFfmpegLogs.kt       |   2 +-
+ .../data/download/DownloadFfmpegPolicy.kt     |   5 +-
+ .../data/download/DownloadHlsSegments.kt      | 104 ++++++++++----
+ .../tachiyomi/data/download/Downloader.kt     |  10 +-
+ .../NavigationChromeDownloadFfmpegLogsTest.kt |   9 ++
+ .../NavigationChromeDownloadHlsGapTest.kt     |   3 +
+ .../NavigationChromeDownloadLargeHlsTest.kt   | 129 ++++++++++++++++++
+ 7 files changed, 225 insertions(+), 37 deletions(-)
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadLargeHlsTest.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegLogs.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegLogs.kt
+index 04522d7..f42f02c 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegLogs.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegLogs.kt
+@@ -2,7 +2,7 @@ package eu.kanade.tachiyomi.data.download
+ 
+ /** Preserve native error severity separately from the warning tail and ffmpeg's final summary. */
+ internal class DownloadFfmpegLogs {
+-    class Failure(val returnCode: Int?, val detail: String) : java.io.IOException("ffmpeg (rc=$returnCode): $detail")
++    class Failure(val returnCode: Int?, val detail: String, val reportedBytes: Long) : java.io.IOException("ffmpeg (rc=$returnCode): $detail")
+ 
+     private val firstErrors = mutableListOf<String>()
+     private val lastErrors = ArrayDeque<String>()
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt
+index 7c4b1f1..a81b8f7 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadFfmpegPolicy.kt
+@@ -62,9 +62,9 @@ internal object DownloadFfmpegPolicy {
+         .replace(CONTEXT_PREFIX, "")
+         .trim()
+ 
+-    /** FFmpegKit can report child-thread mux errors outside the session, leaving only exit 1. */
++    /** FFmpegKit can lose the detailed error even after the local mux has written part of a video. */
+     fun shouldKeepLocalTransportStream(returnCode: Int?, partialBytes: Long, detail: String): Boolean {
+-        if (returnCode != 1 && returnCode != INVALID_DATA) return false
++        if (returnCode != 1 && returnCode != INVALID_DATA && returnCode != INVALID_ARGUMENT) return false
+         if (NON_MEDIA_FAILURE.containsMatchIn(detail)) return false
+         return partialBytes > 0 || AAC_FRAMING_FAILURE.containsMatchIn(detail)
+     }
+@@ -101,6 +101,7 @@ internal object DownloadFfmpegPolicy {
+     }
+ 
+     private const val INVALID_DATA = -1094995529
++    private const val INVALID_ARGUMENT = -22
+     private val AAC_FRAMING_FAILURE = Regex("(?i)malformed AAC bitstream|error parsing ADTS frame header|aac_adtstoasc")
+     private val NON_MEDIA_FAILURE = Regex(
+         "(?i)no space left|disk quota exceeded|permission denied|read-only file system|input/output error|" +
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+index 0f4a17a..e9c0458 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+@@ -15,6 +15,9 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
+ import okhttp3.Response
++import okio.Buffer
++import okio.BufferedSource
++import okio.ByteString.Companion.encodeUtf8
+ import java.io.EOFException
+ import java.io.File
+ import java.io.IOException
+@@ -38,7 +41,14 @@ internal object DownloadHlsSegments {
+         // Known only after both workers have finished the pass.
+         val missingSegments: Int? = null,
+         val newSegments: Int = 0,
+-    ) : IOException(message)
++        private val totalSegments: Int? = null,
++    ) : IOException(message) {
++        fun fragmentLabel(): String? {
++            val number = segmentNumber ?: return null
++            if (missingSegments == null || totalSegments == null) return "HLS #$number"
++            return "HLS ${totalSegments - missingSegments}/$totalSegments · #$number"
++        }
++    }
+ 
+     private data class Segment(val url: HttpUrl, val seconds: BigDecimal, val millis: Long)
+ 
+@@ -113,31 +123,32 @@ internal object DownloadHlsSegments {
+             if (!handlesSource(sourceName)) return@withContext null
+             val manifestUrl = localManifest(url) ?: return@withContext null
+             val requestHeaders = if (forceNetwork) headers.newBuilder().set("Cache-Control", "no-cache").build() else headers
+-            val text = readManifest(client, manifestUrl, requestHeaders)
+-            val segments = parse(text, manifestUrl) ?: return@withContext null
++            val segments = readSegments(client, manifestUrl, requestHeaders) ?: return@withContext null
+             val totalMillis = try {
+                 segments.fold(BigDecimal.ZERO) { sum, segment -> sum + segment.seconds }
+                     .movePointRight(3).setScale(0, RoundingMode.HALF_UP).longValueExact()
+             } catch (_: ArithmeticException) {
+                 return@withContext null
+             }
+-            val fingerprint = MessageDigest.getInstance("SHA-256").digest(
+-                buildString {
+-                    segments.forEach { segment ->
+-                        append(segment.seconds.stripTrailingZeros().toPlainString()).append('\n')
+-                        segment.url.queryParameterNames.sorted().forEach { name ->
+-                            segment.url.queryParameterValues(name).forEach { value ->
+-                                append(name.length).append(':').append(name)
+-                                append(value?.length ?: -1).append(':').append(value.orEmpty()).append('\n')
+-                            }
++            val digest = MessageDigest.getInstance("SHA-256")
++            for (segment in segments) {
++                // Keep the existing cache key byte-for-byte without building a second copy of the full playlist.
++                val entry = buildString {
++                    append(segment.seconds.stripTrailingZeros().toPlainString()).append('\n')
++                    segment.url.queryParameterNames.sorted().forEach { name ->
++                        segment.url.queryParameterValues(name).forEach { value ->
++                            append(name.length).append(':').append(name)
++                            append(value?.length ?: -1).append(':').append(value.orEmpty()).append('\n')
+                         }
+-                        append('\n')
+                     }
+-                }.toByteArray(Charsets.UTF_8),
+-            ).joinToString("") { "%02x".format(Locale.ROOT, it) }
++                    append('\n')
++                }
++                digest.update(entry.toByteArray(Charsets.UTF_8))
++            }
++            val fingerprint = digest.digest().joinToString("") { "%02x".format(Locale.ROOT, it) }
+             val directory = File(cacheRoot, fingerprint)
+             if (!directory.isDirectory && !directory.mkdirs()) throw Failure("Cannot create segment cache")
+-            val state = ProgressState(totalMillis, onProgress)
++            val state = ProgressState(totalMillis, segments.size, onProgress)
+             val pending = mutableListOf<Int>()
+             segments.forEachIndexed { index, segment ->
+                 ensureActive()
+@@ -151,7 +162,7 @@ internal object DownloadHlsSegments {
+             state.report() // Restore the complete cached total once, rather than replaying thousands of tiny UI updates.
+             val input = File(directory, "input.m3u8")
+             if (pending.isNotEmpty() && input.exists() && !input.delete()) throw Failure("Cannot invalidate incomplete local HLS plan")
+-            val pass = SegmentPass(pending, smallRepair = pending.size < segments.size && pending.size <= 8, onFirstGap = onFirstGap)
++            val pass = SegmentPass(pending, segments.size, onFirstGap)
+             coroutineScope {
+                 repeat(minOf(SEGMENT_WORKERS, pending.size)) {
+                     launch {
+@@ -268,16 +279,15 @@ internal object DownloadHlsSegments {
+         }
+     }
+ 
+-    private suspend fun readManifest(client: OkHttpClient, url: HttpUrl, headers: Headers): String {
++    private suspend fun readSegments(client: OkHttpClient, url: HttpUrl, headers: Headers): List<Segment>? {
+         var attempts = 0
+         while (true) {
+             try {
+                 return fetch(client, Request.Builder().url(url).headers(headers).build()) { response ->
+                     if (!response.isSuccessful) throw Failure("HLS manifest HTTP ${response.code}", response.code)
+-                    val source = response.body.source()
+-                    source.request(MAX_MANIFEST_BYTES + 1)
+-                    if (source.buffer.size > MAX_MANIFEST_BYTES) throw Failure("HLS manifest exceeds size limit")
+-                    source.readUtf8()
++                    val body = response.body
++                    if (body.contentLength() > MAX_MANIFEST_BYTES) throw Failure("HLS manifest exceeds 16 MiB")
++                    parse(manifestLines(body.source()).iterator(), url)
+                 }
+             } catch (error: IOException) {
+                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
+@@ -301,9 +311,31 @@ internal object DownloadHlsSegments {
+             }
+         }
+ 
+-    private fun parse(text: String, base: HttpUrl): List<Segment>? {
+-        val lines = text.removePrefix("\uFEFF").lineSequence().iterator()
+-        if (!lines.hasNext() || lines.next().trim() != "#EXTM3U") return null
++    private fun manifestLines(source: BufferedSource): Sequence<String> = sequence {
++        val line = Buffer()
++        var total = 0L
++        while (!source.exhausted()) {
++            val terminator = source.buffer.indexOfElement(LINE_ENDINGS)
++            val length = if (terminator < 0) source.buffer.size else terminator
++            if (line.size + length > MAX_LINE_BYTES) throw Failure("HLS manifest line exceeds 1 MiB")
++            source.readFully(line, length)
++            total += length
++            if (terminator >= 0) {
++                val separator = source.readByte()
++                total++
++                if (separator == '\r'.code.toByte() && source.request(1) && source.buffer[0] == '\n'.code.toByte()) {
++                    source.skip(1)
++                    total++
++                }
++            }
++            if (total > MAX_MANIFEST_BYTES) throw Failure("HLS manifest exceeds 16 MiB")
++            if (terminator >= 0) yield(line.readUtf8())
++        }
++        if (line.size > 0) yield(line.readUtf8())
++    }
++
++    private fun parse(lines: Iterator<String>, base: HttpUrl): List<Segment>? {
++        if (!lines.hasNext() || lines.next().removePrefix("\uFEFF").trim() != "#EXTM3U") return null
+         val result = mutableListOf<Segment>()
+         var seconds: BigDecimal? = null
+         var ended = false
+@@ -373,9 +405,11 @@ internal object DownloadHlsSegments {
+ 
+     private class SegmentPass(
+         private val pending: List<Int>,
+-        private val smallRepair: Boolean,
++        private val totalSegments: Int,
+         private val onFirstGap: (Int) -> Unit,
+     ) {
++        private val smallRepair = pending.size < totalSegments && pending.size <= 8
++        private val reportedGaps = mutableListOf<Int>()
+         private var front = 0
+         private var end = pending.size
+         private var stopped = false
+@@ -409,6 +443,7 @@ internal object DownloadHlsSegments {
+                 onFirstGap(checkNotNull(failure.segmentNumber))
+             }
+             count++
++            if (reportedGaps.size < 12) reportedGaps.add(index + 1)
+             consecutive++
+             if (index == distant) {
+                 distant = null
+@@ -428,14 +463,16 @@ internal object DownloadHlsSegments {
+ 
+         fun requireComplete() {
+             val failed = first ?: return
+-            throw Failure("${failed.message}; $count missing", 403, failed.segmentNumber, count, newSegments)
++            val sample = reportedGaps.sorted().joinToString(",")
++            throw Failure("${failed.message}; $count missing; sample=$sample", 403, failed.segmentNumber, count, newSegments, totalSegments)
+         }
+     }
+ 
+-    private class ProgressState(private val total: Long, private val callback: (Progress) -> Unit) {
++    private class ProgressState(private val total: Long, private val segmentCount: Int, private val callback: (Progress) -> Unit) {
+         private var bytes = 0L
+         private var network = 0L
+         private var millis = 0L
++        private var completed = 0
+         private var lastReport = 0L
+ 
+         @Synchronized
+@@ -452,6 +489,7 @@ internal object DownloadHlsSegments {
+         fun complete(count: Long, duration: Long, notify: Boolean = true) {
+             bytes += count
+             millis += duration
++            completed++
+             if (notify) report()
+         }
+ 
+@@ -462,12 +500,18 @@ internal object DownloadHlsSegments {
+         }
+ 
+         @Synchronized
+-        fun snapshot(): Progress = Progress(bytes, network, minOf(millis, total), total)
++        fun snapshot(): Progress {
++            // The sum of individually rounded EXTINF values may differ from the rounded full duration.
++            val duration = if (completed == segmentCount) total else minOf(millis, total - 1)
++            return Progress(bytes, network, duration, total)
++        }
+     }
+ 
+     private const val SEGMENT_WORKERS = 2
+     private const val MAX_CONSECUTIVE_DENIALS = 4
+     private const val MAX_REFRESHES_PER_DOWNLOAD = 6
+-    private const val MAX_MANIFEST_BYTES = 1024L * 1024
++    private const val MAX_MANIFEST_BYTES = 16L * 1024 * 1024
++    private const val MAX_LINE_BYTES = 1024L * 1024
++    private val LINE_ENDINGS = "\r\n".encodeUtf8()
+     private val DECIMAL = Regex("[0-9]+(?:\\.[0-9]*)?")
+ }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 6503da5..349aaa0 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -726,7 +726,7 @@ class Downloader(
+             val height = download.selectedQualityHeight
+             val message = if (error is DownloadHlsSegments.Failure && height != null && error.httpStatus in listOf(401, 403)) {
+                 val denied = context.stringResource(AMR.strings.harmony_download_quality_denied, height, checkNotNull(error.httpStatus))
+-                error.segmentNumber?.let { "HLS #$it · $denied" } ?: denied
++                error.fragmentLabel()?.let { "$it · $denied" } ?: denied
+             } else {
+                 error.message ?: error.javaClass.simpleName
+             }
+@@ -1130,9 +1130,10 @@ class Downloader(
+             ffmpegDownload(download, matroska, prepared)
+             return matroska
+         } catch (error: DownloadFfmpegLogs.Failure) {
+-            if (prepared == null || !DownloadFfmpegPolicy.shouldKeepLocalTransportStream(error.returnCode, matroska.length(), error.detail)) throw error
++            val muxedBytes = maxOf(matroska.length(), error.reportedBytes)
++            if (prepared == null || !DownloadFfmpegPolicy.shouldKeepLocalTransportStream(error.returnCode, muxedBytes, error.detail)) throw error
+             if (matroska.exists() && !matroska.delete()) throw IOException("Could not remove incomplete Matroska output", error)
+-            logcat(LogPriority.INFO) { "Download local transport fallback episode=${download.episode.id} firstRc=${error.returnCode} cachedBytes=${prepared.bytes}" }
++            logcat(LogPriority.INFO) { "Download local transport fallback episode=${download.episode.id} firstRc=${error.returnCode} muxedBytes=$muxedBytes cachedBytes=${prepared.bytes}" }
+             DownloadHlsSegments.writeTransportStream(prepared, transport) { bytes ->
+                 val progress = (bytes.toDouble() / prepared.bytes * 4).toInt().coerceIn(0, 4)
+                 download.progress = maxOf(download.progress, 95 + progress)
+@@ -1271,7 +1272,8 @@ class Downloader(
+                                         } else {
+                                             val allLogs = result.getAllLogsAsString(500)
+                                             val detail = nativeLogs.failureDetail(allLogs, returnCode.toString())
+-                                            continuation.resumeWithException(DownloadFfmpegLogs.Failure(returnCode, detail))
++                                            val reportedBytes = synchronized(progressLock) { tracker.update(0).bytes }
++                                            continuation.resumeWithException(DownloadFfmpegLogs.Failure(returnCode, detail, reportedBytes))
+                                         }
+                                     }
+                                 } finally {
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegLogsTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegLogsTest.kt
+index 4e54e5c..f2b5046 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegLogsTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadFfmpegLogsTest.kt
+@@ -68,6 +68,15 @@ class NavigationChromeDownloadFfmpegLogsTest {
+         assertFalse(DownloadFfmpegPolicy.shouldKeepLocalTransportStream(1, 96_692_153, "Permission denied"))
+     }
+ 
++    @Test
++    fun `a partial local mux that returns EINVAL can recover through the verified TS path`() {
++        val detail = DownloadFfmpegLogs().failureDetail("", "-22")
++        assertTrue(DownloadFfmpegPolicy.shouldKeepLocalTransportStream(-22, 182_332_479L, detail))
++        assertFalse(DownloadFfmpegPolicy.shouldKeepLocalTransportStream(-22, 0L, detail))
++        assertFalse(DownloadFfmpegPolicy.shouldKeepLocalTransportStream(-22, 182_332_479L, "No space left on device"))
++        assertFalse(DownloadFfmpegPolicy.shouldKeepLocalTransportStream(-22, 182_332_479L, "Unrecognized option"))
++    }
++
+     @Test
+     fun `transport verification requires a clean report and full length video and audio`() {
+         val output = """
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt
+index 37caf20..a3b5705 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt
+@@ -61,6 +61,8 @@ class NavigationChromeDownloadHlsGapTest {
+         assertEquals(403, failure.httpStatus)
+         assertEquals(6, failure.segmentNumber)
+         assertEquals(1, failure.missingSegments)
++        assertEquals("HLS 17/18 · #6", failure.fragmentLabel())
++        assertTrue(failure.message.orEmpty().endsWith("sample=6"))
+         assertEquals(17, cache.walk().count { it.extension == "ts" })
+         assertFalse(cache.walk().any { it.name == "input.m3u8" })
+         assertEquals(listOf(6), source.requested(2))
+@@ -85,6 +87,7 @@ class NavigationChromeDownloadHlsGapTest {
+         assertEquals(listOf(8_000L), times)
+         assertEquals(403, failure.httpStatus)
+         assertNull(failure.missingSegments)
++        assertEquals("HLS #${failure.segmentNumber}", failure.fragmentLabel())
+         for (pass in 1..2) {
+             val attempted = source.requested(pass)
+             assertTrue(attempted.size in 5..6, "Pass $pass requested $attempted")
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadLargeHlsTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadLargeHlsTest.kt
+new file mode 100644
+index 0000000..85282e3
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadLargeHlsTest.kt
+@@ -0,0 +1,129 @@
++package eu.kanade.tachiyomi.data.download
++
++import kotlinx.coroutines.runBlocking
++import okhttp3.Headers.Companion.headersOf
++import okhttp3.OkHttpClient
++import okhttp3.Protocol
++import okhttp3.Response
++import okhttp3.ResponseBody
++import okhttp3.ResponseBody.Companion.asResponseBody
++import okhttp3.ResponseBody.Companion.toResponseBody
++import okio.Buffer
++import okio.ForwardingSource
++import okio.buffer
++import okio.source
++import org.junit.jupiter.api.Assertions.assertArrayEquals
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++import org.junit.jupiter.api.io.TempDir
++import java.io.File
++import java.io.InputStream
++import java.io.SequenceInputStream
++import java.util.Collections
++import java.util.concurrent.atomic.AtomicInteger
++
++class NavigationChromeDownloadLargeHlsTest {
++    @TempDir
++    lateinit var cache: File
++
++    @Test
++    fun `a chunked playlist above one MiB downloads and saves every fragment in order`() = runBlocking {
++        val segments = 513
++        val query = "x".repeat(2200)
++        val manifest = buildString {
++            append("\uFEFF#EXTM3U\r\n#EXT-X-TOKEN=")
++            append("x".repeat(96 * 1024)).append("\r\n")
++            repeat(segments) { index ->
++                append("#EXTINF:4,\r\n/segment?url=$index&fixture=$query\r\n")
++            }
++            append("#EXT-X-ENDLIST")
++        }
++        assertTrue(manifest.toByteArray().size > 1024 * 1024)
++        val requests = AtomicInteger()
++        val prepared = prepare(
++            manifest = {
++                object : ForwardingSource(Buffer().writeUtf8(manifest)) {
++                    override fun read(sink: Buffer, byteCount: Long): Long = super.read(sink, minOf(257L, byteCount))
++                }.buffer().asResponseBody()
++            },
++            segment = { value ->
++                requests.incrementAndGet()
++                fragment(value)
++            },
++        )
++        assertEquals(segments, requests.get())
++        assertEquals(segments, prepared.segments)
++        assertEquals(segments * 4000L, prepared.durationMillis)
++        val output = File(cache, "offline.ts")
++        DownloadHlsSegments.writeTransportStream(prepared, output) {}
++        assertEquals(segments * PACKET_BYTES.toLong(), output.length())
++        output.inputStream().buffered().use { stream ->
++            for (index in 0 until segments) assertArrayEquals(fragment(index), stream.readNBytes(PACKET_BYTES))
++        }
++    }
++
++    @Test
++    fun `a preview 73 cache is recognized without requesting any fragment`() = runBlocking {
++        val original = File(cache, "8210eec375f0d0d4e74b1eff68d15a54e8ab0646da8cff5b32d0e9fe4d04133e")
++        assertTrue(original.mkdir())
++        File(original, "00000.ts").writeBytes(fragment(0))
++        File(original, "00001.ts").writeBytes(fragment(1))
++        val oldPlan = "#EXTM3U\r#EXTINF:1.0,\r/segment?url=0\r#EXTINF:1.00,\r/segment?url=1\r#EXT-X-ENDLIST"
++        val result = prepare({ oldPlan.toResponseBody() }) { error("Downloaded an existing fragment") }
++        assertEquals(original, result.directory)
++        assertEquals(2L * PACKET_BYTES, result.bytes)
++    }
++
++    @Test
++    fun `the final verified fragment reaches the exact duration despite per-fragment rounding`() = runBlocking {
++        val plan = "#EXTM3U\n" + (1..4).joinToString("") { "#EXTINF:0.0014,\n/segment?url=$it\n" } + "#EXT-X-ENDLIST"
++        val progress = mutableListOf<DownloadHlsSegments.Progress>()
++        val result = prepare({ plan.toResponseBody() }, progress::add, ::fragment)
++        assertEquals(6L, result.durationMillis)
++        assertEquals(result.durationMillis, progress.last().completedMillis)
++        assertTrue(progress.dropLast(1).all { it.completedMillis < it.totalMillis })
++    }
++
++    @Test
++    fun `unknown length oversized lines and oversized playlists stop before requesting media`() = runBlocking {
++        val longLine = "#EXTM3U\n#EXT-X-TOKEN=" + "x".repeat(1024 * 1024)
++        val block = ("#EXT-X-TOKEN=" + "x".repeat(8192) + "\n").toByteArray()
++        val blocks = buildList<InputStream> {
++            add("#EXTM3U\n".byteInputStream())
++            repeat(2048) { add(block.inputStream()) }
++        }
++        val tooManyBytes = SequenceInputStream(Collections.enumeration(blocks)).source().buffer().asResponseBody()
++        for ((body, reason) in listOf(Buffer().writeUtf8(longLine).asResponseBody() to "1 MiB", tooManyBytes to "16 MiB")) {
++            val failure = runCatching { prepare({ body }) { error("Requested a fragment") } }.exceptionOrNull()
++            assertTrue(failure is DownloadHlsSegments.Failure)
++            assertTrue(failure?.message.orEmpty().endsWith(reason))
++        }
++        assertTrue(cache.listFiles().orEmpty().isEmpty())
++    }
++
++    private suspend fun prepare(
++        manifest: () -> ResponseBody,
++        onProgress: (DownloadHlsSegments.Progress) -> Unit = {},
++        segment: (Int) -> ByteArray,
++    ): DownloadHlsSegments.Prepared {
++        val client = OkHttpClient.Builder().addInterceptor { chain ->
++            val request = chain.request()
++            val body = if (request.url.encodedPath == "/m3u8") {
++                manifest()
++            } else {
++                segment(checkNotNull(request.url.queryParameter("url")).toInt()).toResponseBody()
++            }
++            Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("test").body(body).build()
++        }.build()
++        return checkNotNull(DownloadHlsSegments.prepare(client, "MissAV", "http://localhost:1234/m3u8", headersOf(), cache, onProgress = onProgress))
++    }
++
++    private fun fragment(index: Int) = ByteArray(PACKET_BYTES) { offset ->
++        if (offset % 188 == 0) 0x47 else (index % 251).toByte()
++    }
++
++    private companion object {
++        const val PACKET_BYTES = 188 * 4
++    }
++}

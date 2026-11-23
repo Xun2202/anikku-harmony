@@ -130,3 +130,4 @@
 0130-queue-menu-bound-episode.patch
 0131-download-recover-isolated-hls-gaps.patch
 0132-download-stop-denied-segment-assignment.patch
+0133-download-long-playlists-and-local-mux-recovery.patch
