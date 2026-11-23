@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 17:12:26 +0000
+Subject: [PATCH] downloads: stop assigning denied fragments before worker
+ cancellation
+
+Keep the terminal decision under the assignment lock. A sibling must not claim another fragment while coroutineScope propagates the terminal exception.
+---
+ .../eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt | 5 ++++-
+ .../data/download/NavigationChromeDownloadHlsGapTest.kt      | 2 +-
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+index e2c2332..0f4a17a 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+@@ -378,6 +378,7 @@ internal object DownloadHlsSegments {
+     ) {
+         private var front = 0
+         private var end = pending.size
++        private var stopped = false
+         private var distant: Int? = null
+         private var first: Failure? = null
+         private var count = 0
+@@ -386,7 +387,7 @@ internal object DownloadHlsSegments {
+ 
+         @Synchronized
+         fun nextSegment(): Int? {
+-            if (front == end) return null
++            if (stopped || front == end) return null
+             if (smallRepair || consecutive < MAX_CONSECUTIVE_DENIALS) return pending[front++]
+             // Adjacent failures can belong to a single bad range. Check one distant missing
+             // fragment before stopping. Only its worker continues while this check is pending.
+@@ -412,6 +413,8 @@ internal object DownloadHlsSegments {
+             if (index == distant) {
+                 distant = null
+                 if (consecutive >= MAX_CONSECUTIVE_DENIALS) {
++                    // Stop assignment under the same lock. Sibling cancellation arrives after this throws.
++                    stopped = true
+                     val earliest = checkNotNull(first)
+                     throw Failure(
+                         "${earliest.message}; consecutive=$consecutive distant=${index + 1}",
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt
+index c964113..37caf20 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt
+@@ -87,7 +87,7 @@ class NavigationChromeDownloadHlsGapTest {
+         assertNull(failure.missingSegments)
+         for (pass in 1..2) {
+             val attempted = source.requested(pass)
+-            assertTrue(attempted.size in 5..6)
++            assertTrue(attempted.size in 5..6, "Pass $pass requested $attempted")
+             assertEquals(150, attempted.last())
+         }
+         assertTrue(source.requested(3).isEmpty())
