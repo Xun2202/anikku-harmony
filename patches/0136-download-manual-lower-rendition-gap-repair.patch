@@ -1,0 +1,1487 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 17:38:01 +0000
+Subject: [PATCH] downloads: let the user fill missing HLS intervals from a
+ lower rendition
+
+Keep validated primary fragments and the chosen donor in separate caches. Align by media time, verify splice keyframes, clocks and tracks, preserve encoded packets, and verify the closed transport file before committing it. Limit media repair to the selected MissAV episode.
+---
+ .../data/download/DownloadHlsRepairMedia.kt   |  76 ++++++
+ .../data/download/DownloadHlsRepairPlan.kt    |  46 ++++
+ .../download/DownloadHlsRepairTransport.kt    | 140 +++++++++++
+ .../data/download/DownloadHlsSegments.kt      | 221 +++++++++++++-----
+ .../data/download/DownloadManager.kt          |   2 +
+ .../tachiyomi/data/download/DownloadStore.kt  |  13 +-
+ .../tachiyomi/data/download/Downloader.kt     |  57 ++++-
+ .../tachiyomi/data/download/model/Download.kt |   4 +
+ .../tachiyomi/ui/download/DownloadAdapter.kt  |   1 +
+ .../tachiyomi/ui/download/DownloadHolder.kt   |   7 +-
+ .../ui/download/DownloadQualityDialog.kt      |  31 ++-
+ .../ui/download/DownloadQueueScreen.kt        |   7 +-
+ .../ui/download/DownloadQueueScreenModel.kt   |  15 +-
+ app/src/main/res/menu/download_single.xml     |   4 +
+ .../NavigationChromeDownloadHlsRepairTest.kt  | 211 +++++++++++++++++
+ ...NavigationChromeDownloadPausedStoreTest.kt |  16 +-
+ .../kanade/tachiyomi/network/NetworkHelper.kt |   2 +
+ .../HlsRepairResponseInterceptor.kt           | 109 +++++++++
+ .../moko-resources/base/strings.xml           |   7 +
+ 19 files changed, 894 insertions(+), 75 deletions(-)
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsRepairMedia.kt
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsRepairPlan.kt
+ create mode 100644 app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsRepairTransport.kt
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRepairTest.kt
+ create mode 100644 core/common/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/HlsRepairResponseInterceptor.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsRepairMedia.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsRepairMedia.kt
+new file mode 100644
+index 0000000..c789862
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsRepairMedia.kt
+@@ -0,0 +1,76 @@
++package eu.kanade.tachiyomi.data.download
++
++import kotlinx.serialization.json.Json
++import kotlinx.serialization.json.JsonObject
++import kotlinx.serialization.json.jsonArray
++import kotlinx.serialization.json.jsonObject
++import kotlinx.serialization.json.jsonPrimitive
++import java.io.File
++import kotlin.math.abs
++import kotlin.math.round
++
++/** Check the encoded tracks at the actual splice, in addition to matching EXTINF times. */
++internal object DownloadHlsRepairMedia {
++    private data class Tracks(
++        val videoCodec: String,
++        val audioCodec: String,
++        val videoPid: String,
++        val audioPid: String,
++        val rate: String,
++        val channels: String,
++    )
++
++    private data class Sample(val tracks: Tracks, val height: Int, val videoStart: Double, val audioStart: Double, val keyframe: Boolean)
++
++    fun probeOptions(file: File) = arrayOf(
++        "-v", "error", "-protocol_whitelist", "file", "-read_intervals", "%+#96", "-show_packets",
++        "-show_entries", "stream=index,id,codec_type,codec_name,height,start_time,sample_rate,channels:packet=stream_index,flags",
++        "-of", "json", file.absolutePath,
++    )
++
++    suspend fun verify(switches: List<DownloadHlsSegments.SwitchSample>, probe: suspend (File) -> String) {
++        var anchor: Sample? = null
++        var lowestOriginal = Int.MAX_VALUE
++        var highestLower = 0
++        for (point in switches) {
++            val text = probe(point.file)
++            val sample = try {
++                parse(text)
++            } catch (_: RuntimeException) {
++                throw DownloadHlsSegments.Failure("无法确认补缺交界处的音视频轨道。已保留分片。")
++            }
++            val first = anchor ?: sample.also { anchor = it }
++            val elapsed = (point.startMillis - switches.first().startMillis) / 1000.0
++            if (sample.tracks != first.tracks || (point.entry && !sample.keyframe) ||
++                !aligned(sample.videoStart - first.videoStart - elapsed) || !aligned(sample.audioStart - first.audioStart - elapsed)
++            ) {
++                throw DownloadHlsSegments.Failure("两档视频在 ${point.startMillis / 1000} 秒处的编码、关键帧或时间戳不匹配。请换一档补缺。")
++            }
++            if (point.lower) highestLower = maxOf(highestLower, sample.height) else lowestOriginal = minOf(lowestOriginal, sample.height)
++        }
++        if (highestLower !in 1 until lowestOriginal) throw DownloadHlsSegments.Failure("补缺片段的实际分辨率与所选档位不符")
++    }
++
++    private fun aligned(difference: Double): Boolean {
++        val wrapSeconds = (1L shl 33) / 90_000.0
++        return abs(difference - round(difference / wrapSeconds) * wrapSeconds) <= 0.25
++    }
++
++    private fun parse(text: String): Sample {
++        val root = Json.parseToJsonElement(text).jsonObject
++        fun JsonObject.field(name: String) = getValue(name).jsonPrimitive.content
++        val streams = root.getValue("streams").jsonArray.map { it.jsonObject }
++        val video = streams.single { it.field("codec_type") == "video" }
++        val audio = streams.single { it.field("codec_type") == "audio" }
++        val videoCodec = video.field("codec_name")
++        require(videoCodec == "h264" || videoCodec == "hevc")
++        val firstVideo = root.getValue("packets").jsonArray.first { it.jsonObject.field("stream_index") == video.field("index") }
++        return Sample(
++            Tracks(videoCodec, audio.field("codec_name"), video.field("id"), audio.field("id"), audio.field("sample_rate"), audio.field("channels")),
++            video.field("height").toInt().also { require(it > 0) },
++            video.field("start_time").toDouble(),
++            audio.field("start_time").toDouble(),
++            'K' in firstVideo.jsonObject.field("flags"),
++        )
++    }
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsRepairPlan.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsRepairPlan.kt
+new file mode 100644
+index 0000000..367e5aa
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsRepairPlan.kt
+@@ -0,0 +1,46 @@
++package eu.kanade.tachiyomi.data.download
++
++import java.math.BigDecimal
++import java.math.RoundingMode
++import kotlin.math.abs
++
++/** Match whole missing time ranges. Segment numbers can differ between two encodes of the same episode. */
++internal object DownloadHlsRepairPlan {
++    data class Part(val index: Int, val lower: Boolean)
++
++    fun boundaries(durations: List<BigDecimal>): LongArray {
++        var elapsed = BigDecimal.ZERO
++        return LongArray(durations.size + 1) { i ->
++            if (i > 0) elapsed += durations[i - 1]
++            elapsed.movePointRight(3).setScale(0, RoundingMode.HALF_UP).longValueExact()
++        }
++    }
++
++    fun match(original: LongArray, lower: LongArray, missing: Set<Int>): List<Part>? {
++        if (abs(original.last() - lower.last()) > BOUNDARY_TOLERANCE_MS || missing.size >= original.lastIndex) return null
++        val parts = mutableListOf<Part>()
++        var i = 0
++        while (i < original.lastIndex) {
++            if (i !in missing) {
++                parts += Part(i++, lower = false)
++                continue
++            }
++            val first = alignedBoundary(lower, original[i]) ?: return null
++            while (i in missing) i++
++            val end = alignedBoundary(lower, original[i]) ?: return null
++            if (end <= first) return null
++            for (index in first until end) parts += Part(index, lower = true)
++        }
++        return parts
++    }
++
++    private fun alignedBoundary(times: LongArray, at: Long): Int? {
++        val found = times.binarySearch(at)
++        if (found >= 0) return found
++        val after = -found - 1
++        return listOf(after - 1, after).filter { it in times.indices }.minByOrNull { abs(times[it] - at) }
++            ?.takeIf { abs(times[it] - at) <= BOUNDARY_TOLERANCE_MS }
++    }
++
++    private const val BOUNDARY_TOLERANCE_MS = 50L
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsRepairTransport.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsRepairTransport.kt
+new file mode 100644
+index 0000000..c1f70a2
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsRepairTransport.kt
+@@ -0,0 +1,140 @@
++package eu.kanade.tachiyomi.data.download
++
++import kotlinx.coroutines.currentCoroutineContext
++import kotlinx.coroutines.ensureActive
++import java.io.DataInputStream
++import java.io.File
++import java.io.IOException
++
++/** Join independent, clock-aligned renditions. Keep every PES payload, including in-band decoder configuration. */
++internal object DownloadHlsRepairTransport {
++    private const val PACKET = 188
++
++    suspend fun write(prepared: DownloadHlsSegments.Prepared, target: File, onBytes: (Long) -> Unit) {
++        require(prepared.switches.isNotEmpty())
++        val continuity = Continuity()
++        val buffer = ByteArray(PACKET * 1024)
++        var sourceBytes = 0L
++        var written = 0L
++        var parts = 0
++        target.outputStream().buffered(buffer.size).use { output ->
++            prepared.input.bufferedReader().useLines { lines ->
++                for (line in lines) {
++                    if (line == "#EXT-X-DISCONTINUITY") continuity.beginRendition()
++                    if (line.isEmpty() || line.startsWith('#')) continue
++                    val file = File(prepared.directory, line)
++                    val length = file.length()
++                    readPackets(file, buffer) { size ->
++                        continuity.adjust(buffer, size)
++                        output.write(buffer, 0, size)
++                        written += size
++                    }
++                    sourceBytes += length
++                    parts++
++                    onBytes(sourceBytes)
++                }
++            }
++        }
++        if (parts != prepared.segments || sourceBytes != prepared.bytes || written == 0L || target.length() != written) {
++            throw DownloadHlsSegments.Failure("合成时分片发生变化，请继续下载重试")
++        }
++    }
++
++    suspend fun packetized(file: File, buffer: ByteArray = ByteArray(PACKET * 256)): Boolean {
++        if (!file.isFile || file.length() < 3 * PACKET) return false
++        return try {
++            readPackets(file, buffer) { size ->
++                for (i in 0 until size step PACKET) checkedHeader(buffer, i)
++            }
++            true
++        } catch (_: IOException) {
++            false
++        }
++    }
++
++    /** Only restore bytes if the proxy successfully returned this same payload with bytes removed. */
++    suspend fun restoreIntactResponse(received: File, original: File?): Boolean {
++        if (original == null || original.length() - received.length() !in 1..minOf(65_536L, original.length() / 20) ||
++            !packetized(original)
++        ) {
++            return false
++        }
++        val coroutine = currentCoroutineContext()
++        val matches = received.inputStream().buffered().use { proxy ->
++            original.inputStream().buffered().use { source ->
++                var wanted = proxy.read()
++                var checked = 0
++                while (wanted >= 0) {
++                    if (checked++ % 65_536 == 0) coroutine.ensureActive()
++                    val next = source.read()
++                    if (next < 0) break
++                    if (next == wanted) wanted = proxy.read()
++                }
++                wanted < 0
++            }
++        }
++        return matches && original.renameTo(received)
++    }
++
++    private suspend fun readPackets(file: File, buffer: ByteArray, read: (Int) -> Unit) {
++        val coroutine = currentCoroutineContext()
++        val length = file.length()
++        DataInputStream(file.inputStream().buffered()).use { input ->
++            val head = minOf(length, 4096L, buffer.size.toLong()).toInt()
++            input.mark(head)
++            input.readFully(buffer, 0, head)
++            if (head >= 2 * PACKET + 1 && buffer[0] == 0x47.toByte() && buffer[PACKET] == 0x47.toByte() &&
++                buffer[2 * PACKET] == 0x47.toByte() && length % PACKET != 0L
++            ) {
++                throw DownloadHlsSegments.Failure("TS 分片长度不完整")
++            }
++            val prefix = (0 until head - 2 * PACKET).firstOrNull { i ->
++                (length - i) % PACKET == 0L && buffer[i] == 0x47.toByte() &&
++                    buffer[i + PACKET] == 0x47.toByte() && buffer[i + 2 * PACKET] == 0x47.toByte()
++            } ?: throw DownloadHlsSegments.Failure("补缺视频含有无法对齐的 TS 数据包，已保留分片")
++            input.reset()
++            if (input.skipBytes(prefix) != prefix) throw DownloadHlsSegments.Failure("无法读取分片开头")
++            var remaining = length - prefix
++            while (remaining > 0) {
++                coroutine.ensureActive()
++                val size = minOf(buffer.size.toLong(), remaining).toInt()
++                input.readFully(buffer, 0, size)
++                read(size)
++                remaining -= size
++            }
++        }
++    }
++
++    private fun checkedHeader(bytes: ByteArray, i: Int): Int {
++        val header = bytes[i + 3].toInt() and 0xff
++        if (bytes[i] != 0x47.toByte() || bytes[i + 1].toInt() and 0x80 != 0 || header and 0xc0 != 0 || header and 0x30 == 0) {
++            throw DownloadHlsSegments.Failure("补缺视频包含无效的 TS 数据包，已保留分片")
++        }
++        return header
++    }
++
++    private class Continuity {
++        private val last = IntArray(8192) { -1 }
++        private val adjustment = IntArray(8192) { -1 }
++
++        fun beginRendition() = adjustment.fill(-1)
++
++        fun adjust(bytes: ByteArray, size: Int) {
++            for (i in 0 until size step PACKET) {
++                val header = checkedHeader(bytes, i)
++                val flags = bytes[i + 1].toInt() and 0xff
++                val pid = ((flags and 0x1f) shl 8) or (bytes[i + 2].toInt() and 0xff)
++                if (pid == 0x1fff) continue
++                val source = header and 0x0f
++                if (adjustment[pid] < 0) {
++                    // Only realign at a rendition switch. Preserve duplicates and genuine discontinuities within each input.
++                    val next = if (header and 0x10 != 0) 1 else 0
++                    adjustment[pid] = if (last[pid] < 0) 0 else (last[pid] + next - source) and 0x0f
++                }
++                val counter = (source + adjustment[pid]) and 0x0f
++                last[pid] = counter
++                bytes[i + 3] = ((header and 0xf0) or counter).toByte()
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+index 76e0880..da54b42 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+@@ -1,6 +1,7 @@
+ package eu.kanade.tachiyomi.data.download
+ 
+ import eu.kanade.tachiyomi.network.interceptor.HlsPlaylistRedirectInterceptor
++import eu.kanade.tachiyomi.network.interceptor.HlsRepairResponseInterceptor
+ import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.coroutineScope
+@@ -39,7 +40,16 @@ internal object DownloadHlsSegments {
+ 
+     data class CacheStatus(val planId: String, val total: Int, val retained: Int, val linked: Int)
+ 
+-    data class Prepared(val input: File, val directory: File, val bytes: Long, val durationMillis: Long, val segments: Int)
++    data class RepairTrack(val height: Int, val url: String, val headers: Headers)
++    data class SwitchSample(val file: File, val startMillis: Long, val lower: Boolean, val entry: Boolean)
++    data class Prepared(
++        val input: File,
++        val directory: File,
++        val bytes: Long,
++        val durationMillis: Long,
++        val segments: Int,
++        val switches: List<SwitchSample> = emptyList(),
++    )
+ 
+     class Failure(
+         message: String,
+@@ -51,7 +61,13 @@ internal object DownloadHlsSegments {
+         private val totalSegments: Int? = null,
+         val untriedSegments: Int = 0,
+         val startMillis: Long? = null,
++        val repairHeight: Int? = null,
+     ) : IOException(message) {
++        fun atRepairHeight(height: Int) = Failure(
++            "${height}p 补缺失败 · ${message.orEmpty()}", httpStatus, segmentNumber, missingSegments, newSegments,
++            totalSegments, untriedSegments, startMillis, height,
++        )
++
+         fun fragmentLabel(): String? {
+             val number = segmentNumber ?: return null
+             val label = if (missingSegments == null || totalSegments == null) "HLS #$number" else "HLS ${totalSegments - missingSegments}/$totalSegments · #$number"
+@@ -67,6 +83,8 @@ internal object DownloadHlsSegments {
+ 
+     private data class Segment(val url: HttpUrl, val seconds: BigDecimal, val millis: Long)
+ 
++    private data class LocalPart(val segment: Segment, val file: File, val lower: Boolean = false)
++
+     fun handlesSource(name: String): Boolean = name.equals("MissAV", ignoreCase = true)
+ 
+     /** A truncated compressed response can fail after OkHttp has delivered the headers. */
+@@ -90,7 +108,7 @@ internal object DownloadHlsSegments {
+             try {
+                 return transfer(refreshes > 0)
+             } catch (failure: Failure) {
+-                if (failure.httpStatus != 401 && failure.httpStatus != 403) throw failure
++                if (failure.repairHeight != null || (failure.httpStatus != 401 && failure.httpStatus != 403)) throw failure
+                 // A later burst after sustained progress is a new stall. Rechecking cached files is not progress.
+                 if (failure.newSegments >= 16) stalledRefreshes = 0
+                 val limit = if (failure.missingSegments == null || failure.untriedSegments > 0) 1 else 2
+@@ -130,6 +148,9 @@ internal object DownloadHlsSegments {
+         headers: Headers,
+         cacheRoot: File,
+         forceNetwork: Boolean = false,
++        repair: (suspend () -> RepairTrack)? = null,
++        onRepair: (height: Int, missingOriginals: Int, neededLower: Int) -> Unit = { _, _, _ -> },
++        onOriginalResponse: (Int) -> Unit = {},
+         onFirstGap: (Int) -> Unit = {},
+         onCacheReady: (CacheStatus) -> Unit = {},
+         onRedirect: (Int) -> Unit = {},
+@@ -140,21 +161,13 @@ internal object DownloadHlsSegments {
+             if (!handlesSource(sourceName)) return@withContext null
+             val manifestUrl = localManifest(url) ?: return@withContext null
+             val requestHeaders = if (forceNetwork) headers.newBuilder().set("Cache-Control", "no-cache").build() else headers
+-            val upstream = manifestUrl.queryParameter("url")?.toHttpUrlOrNull()
+-            val segments = HlsPlaylistRedirectInterceptor.during(upstream, onRedirect) {
+-                readSegments(client, manifestUrl, requestHeaders)
+-            } ?: return@withContext null
+-            val starts = LongArray(segments.size)
+-            val totalMillis = try {
+-                var elapsed = BigDecimal.ZERO
+-                segments.forEachIndexed { index, segment ->
+-                    starts[index] = elapsed.toMillis()
+-                    elapsed += segment.seconds
+-                }
+-                elapsed.toMillis()
++            val segments = readVod(client, manifestUrl, requestHeaders, onRedirect) ?: return@withContext null
++            val originalTimes = try {
++                DownloadHlsRepairPlan.boundaries(segments.map { it.seconds })
+             } catch (_: ArithmeticException) {
+                 return@withContext null
+             }
++            val totalMillis = originalTimes.last()
+             val digest = MessageDigest.getInstance("SHA-256")
+             val entryDigest = MessageDigest.getInstance("SHA-256")
+             val identities = Buffer()
+@@ -186,17 +199,17 @@ internal object DownloadHlsSegments {
+             if (!directory.isDirectory && !directory.mkdirs()) throw Failure("Cannot create segment cache")
+             val keys = identities.readByteString()
+             val donors = if (absoluteResources) indexedPlans(directory, keys) else emptyList()
+-            val state = ProgressState(totalMillis, segments.size, onProgress)
+-            val pending = mutableListOf<Int>()
++            val missing = mutableSetOf<Int>()
++            val validationBuffer = if (repair == null) null else ByteArray(188 * 512)
+             var linked = 0
+-            segments.forEachIndexed { index, segment ->
++            segments.indices.forEach { index ->
+                 ensureActive()
+                 val file = segmentFile(directory, index)
+                 var reused = false
+                 if (donors.isNotEmpty() && !file.exists()) {
+                     val offset = (index + 1) * HASH_BYTES
+                     for ((plan, otherKeys) in donors) {
+-                        if (!keys.rangeEquals(offset, otherKeys, offset, HASH_BYTES)) continue
++                        if (!keys.rangeEquals(offset, otherKeys, offset, HASH_BYTES) || File(plan, "${file.name}.invalid").exists()) continue
+                         try {
+                             Files.createLink(file.toPath(), File(plan, file.name).toPath())
+                             reused = true
+@@ -208,54 +221,113 @@ internal object DownloadHlsSegments {
+                         }
+                     }
+                 }
+-                if (validTs(file)) {
++                val rejected = File(directory, "${file.name}.invalid")
++                val intact = when {
++                    validationBuffer != null -> DownloadHlsRepairTransport.packetized(file, validationBuffer)
++                    rejected.exists() -> false
++                    else -> validTs(file)
++                }
++                if (intact) {
+                     if (reused) linked++
+-                    state.complete(file.length(), segment.millis, notify = false)
+                 } else {
+-                    pending += index
++                    if (validationBuffer != null && file.isFile) rejected.createNewFile()
++                    missing += index
++                }
++            }
++            onCacheReady(CacheStatus(fingerprint.take(12), segments.size, segments.size - missing.size, linked))
++            val originalInput = File(directory, "input.m3u8")
++            if (missing.isNotEmpty() && originalInput.exists() && !originalInput.delete()) throw Failure("Cannot invalidate incomplete local HLS plan")
++            var transferHeaders = requestHeaders
++            val original = segments.mapIndexed { index, segment -> LocalPart(segment, segmentFile(directory, index)) }
++            val track = if (repair != null && missing.isNotEmpty()) {
++                if (missing.size == segments.size) throw Failure("没有可保留的原画质分片。请先继续原任务，或选择更换整集画质。")
++                repair()
++            } else {
++                null
++            }
++            val parts = if (track != null) {
++                val lowerUrl = localManifest(track.url) ?: throw Failure("所选画质没有可对应的点播清单")
++                transferHeaders = track.headers.newBuilder().set("Cache-Control", "no-cache").build()
++                val lower = try {
++                    readVod(client, lowerUrl, transferHeaders, onRedirect)
++                } catch (e: Failure) {
++                    throw e.atRepairHeight(track.height)
++                } ?: throw Failure("所选画质的点播清单无法用于补缺")
++                val lowerTimes = try {
++                    DownloadHlsRepairPlan.boundaries(lower.map { it.seconds })
++                } catch (_: ArithmeticException) {
++                    throw Failure("所选画质的时长无效")
+                 }
++                val mapping = DownloadHlsRepairPlan.match(originalTimes, lowerTimes, missing)
++                    ?: throw Failure("两个画质的缺口时间边界不一致。原分片已保留，可选其他画质。")
++                val cache = repairDirectory(directory, lower, track)
++                onRepair(track.height, missing.size, mapping.count { it.lower })
++                mapping.map { (index, useLower) ->
++                    if (useLower) LocalPart(lower[index], segmentFile(cache, index), lower = true) else original[index]
++                }
++            } else {
++                original
+             }
+-            onCacheReady(CacheStatus(fingerprint.take(12), segments.size, segments.size - pending.size, linked))
+-            state.report() // Restore the complete cached total once, rather than replaying thousands of tiny UI updates.
+-            val input = File(directory, "input.m3u8")
+-            if (pending.isNotEmpty() && input.exists() && !input.delete()) throw Failure("Cannot invalidate incomplete local HLS plan")
+-            val pass = SegmentPass(pending, segments.size, File(directory, "deferred.bin"), onFirstGap)
++            val starts = if (track == null) originalTimes else DownloadHlsRepairPlan.boundaries(parts.map { it.segment.seconds })
++            val state = ProgressState(totalMillis, parts.size, onProgress)
++            val pending = mutableListOf<Int>()
++            parts.forEachIndexed { index, part ->
++                val present = if (part.lower) DownloadHlsRepairTransport.packetized(part.file, checkNotNull(validationBuffer)) else track != null || index !in missing
++                if (present) state.complete(part.file.length(), part.segment.millis, notify = false) else pending += index
++            }
++            state.report()
++            val input = if (track == null) originalInput else File(directory, "repaired.m3u8")
++            val history = if (track == null) File(directory, "deferred.bin") else File(parts.first { it.lower }.file.parentFile, "repair-deferred.bin")
++            val pass = SegmentPass(pending, parts.size, history, onFirstGap)
+             coroutineScope {
+                 repeat(minOf(SEGMENT_WORKERS, pending.size)) {
+                     launch {
+                         while (true) {
+                             val index = pass.nextSegment() ?: break
+-                            val segment = segments[index]
+-                            val file = segmentFile(directory, index)
++                            val (segment, file) = parts[index]
++                            val rejected = File(file.parentFile, "${file.name}.invalid")
++                            val checkPackets = track != null || rejected.exists()
+                             var failure: IOException? = null
+                             var attempts = 0
+                             for (attempt in 0..2) {
+                                 attempts++
+                                 ensureActive()
+-                                val partial = File(directory, "${file.name}.part")
++                                val partial = File(file.parentFile, "${file.name}.part")
+                                 try {
+-                                    fetch(client, Request.Builder().url(segment.url).headers(requestHeaders).build()) { response ->
+-                                        if (!response.isSuccessful) throw segmentFailure(response)
+-                                        val expected = response.body.contentLength()
+-                                        var count = 0L
+-                                        partial.outputStream().use { output ->
+-                                            response.body.byteStream().use { input ->
+-                                                val buffer = ByteArray(32 * 1024)
+-                                                while (true) {
+-                                                    ensureActive()
+-                                                    val read = input.read(buffer)
+-                                                    if (read < 0) break
+-                                                    count += read
+-                                                    state.received(read.toLong())
+-                                                    output.write(buffer, 0, read)
++                                    val upstream = if (checkPackets && segment.url.queryParameter("key") == null) {
++                                        segment.url.queryParameter("url")?.toHttpUrlOrNull()
++                                    } else {
++                                        null
++                                    }
++                                    HlsRepairResponseInterceptor.during(upstream, File(file.parentFile, "${file.name}.source.part")) { original ->
++                                        fetch(client, Request.Builder().url(segment.url).headers(transferHeaders).build()) { response ->
++                                            if (!response.isSuccessful) throw segmentFailure(response)
++                                            val expected = response.body.contentLength()
++                                            var count = 0L
++                                            partial.outputStream().use { output ->
++                                                response.body.byteStream().use { input ->
++                                                    val buffer = ByteArray(32 * 1024)
++                                                    while (true) {
++                                                        ensureActive()
++                                                        val read = input.read(buffer)
++                                                        if (read < 0) break
++                                                        count += read
++                                                        state.received(read.toLong())
++                                                        output.write(buffer, 0, read)
++                                                    }
+                                                 }
+                                             }
++                                            if (count == 0L || (expected >= 0 && expected != count) || (!checkPackets && !validTs(partial))) {
++                                                throw Failure("Invalid or incomplete HLS TS segment")
++                                            }
+                                         }
+-                                        if (count == 0L || (expected >= 0 && expected != count) || !validTs(partial)) {
+-                                            throw Failure("Invalid or incomplete HLS TS segment")
++                                        if (checkPackets) {
++                                            if (DownloadHlsRepairTransport.restoreIntactResponse(partial, original())) onOriginalResponse(index + 1)
++                                            if (!DownloadHlsRepairTransport.packetized(partial)) throw Failure("来源返回的补缺分片不完整，其他分片已保留")
+                                         }
+                                         ensureActive()
+                                         if (!partial.renameTo(file)) throw Failure("Cannot finalize HLS segment cache")
++                                        if (checkPackets && rejected.exists()) rejected.delete()
+                                     }
+                                     state.complete(file.length(), segment.millis)
+                                     pass.completed(index)
+@@ -273,12 +345,12 @@ internal object DownloadHlsSegments {
+                             failure?.let {
+                                 val detail = if (it is Failure) it.message else it.javaClass.simpleName
+                                 val failed = Failure(
+-                                    "HLS segment ${index + 1}/${segments.size} failed after $attempts attempts: $detail",
++                                    "HLS segment ${index + 1}/${parts.size} failed after $attempts attempts: $detail",
+                                     (it as? Failure)?.httpStatus,
+                                     segmentNumber = index + 1,
+                                     startMillis = starts[index],
+                                 )
+-                                if (failed.httpStatus != 403) throw failed
++                                if (failed.httpStatus != 403) throw if (track == null) failed else failed.atRepairHeight(track.height)
+                                 pass.defer(index, failed)
+                             }
+                         }
+@@ -286,25 +358,39 @@ internal object DownloadHlsSegments {
+                 }
+             }
+             ensureActive()
+-            pass.requireComplete()
+-            File(directory, "input.m3u8.part").let { partial ->
++            try {
++                pass.requireComplete()
++            } catch (failure: Failure) {
++                throw if (track == null) failure else failure.atRepairHeight(track.height)
++            }
++            File(directory, "${input.name}.part").let { partial ->
+                 partial.bufferedWriter().use { writer ->
+                     writer.appendLine("#EXTM3U")
+                     writer.appendLine("#EXT-X-VERSION:3")
+                     writer.appendLine("#EXT-X-PLAYLIST-TYPE:VOD")
+-                    val target = segments.maxOf { it.seconds }.setScale(0, RoundingMode.CEILING).toPlainString()
++                    val target = parts.maxOf { it.segment.seconds }.setScale(0, RoundingMode.CEILING).toPlainString()
+                     writer.appendLine("#EXT-X-TARGETDURATION:$target")
+                     // The HLS demuxer retains TS/PES/AAC parser state across files. The concat
+                     // demuxer treats each file independently and can split an ADTS audio frame.
+-                    segments.forEachIndexed { index, segment ->
+-                        writer.appendLine("#EXTINF:${segment.seconds.toPlainString()},")
+-                        writer.appendLine(segmentFile(directory, index).name)
++                    parts.forEachIndexed { index, part ->
++                        if (index > 0 && part.lower != parts[index - 1].lower) writer.appendLine("#EXT-X-DISCONTINUITY")
++                        writer.appendLine("#EXTINF:${part.segment.seconds.toPlainString()},")
++                        writer.appendLine(part.file.relativeTo(directory).invariantSeparatorsPath)
+                     }
+                     writer.appendLine("#EXT-X-ENDLIST")
+                 }
+                 if (!partial.renameTo(input)) throw Failure("Cannot finalize local HLS plan")
+             }
+-            Prepared(input, directory, state.snapshot().bytes, totalMillis, segments.size)
++            val switches = if (track == null) {
++                emptyList()
++            } else {
++                parts.mapIndexedNotNull { index, part ->
++                    val entry = index == 0 || parts[index - 1].lower != part.lower
++                    val beforeSwitch = index < parts.lastIndex && parts[index + 1].lower != part.lower
++                    if (entry || beforeSwitch) SwitchSample(part.file, starts[index], part.lower, entry) else null
++                }
++            }
++            Prepared(input, directory, state.snapshot().bytes, totalMillis, parts.size, switches)
+         }
+     } catch (cancelled: CancellationException) {
+         throw cancelled
+@@ -314,6 +400,7 @@ internal object DownloadHlsSegments {
+ 
+     /** The HLS demuxer reads these TS fragments in order. Preserve every byte, including packets split across chunks. */
+     suspend fun writeTransportStream(prepared: Prepared, target: File, onBytesCopied: (Long) -> Unit) {
++        check(prepared.switches.isEmpty()) { "Mixed renditions must be remuxed with their transitions" }
+         val coroutine = currentCoroutineContext()
+         var copied = 0L
+         val buffer = ByteArray(256 * 1024)
+@@ -359,6 +446,32 @@ internal object DownloadHlsSegments {
+         return Failure("HLS segment HTTP $code (target=$target)", code)
+     }
+ 
++    private suspend fun readVod(client: OkHttpClient, url: HttpUrl, headers: Headers, onRedirect: (Int) -> Unit): List<Segment>? =
++        HlsPlaylistRedirectInterceptor.during(url.queryParameter("url")?.toHttpUrlOrNull(), onRedirect) {
++            readSegments(client, url, headers)
++        }
++
++    /** Lower files never become originals, including after an interrupted repair or a quality change. */
++    private fun repairDirectory(parent: File, segments: List<Segment>, track: RepairTrack): File {
++        val digest = MessageDigest.getInstance("SHA-256")
++        fun field(value: String) {
++            digest.update(value.toByteArray(Charsets.UTF_8))
++            digest.update(0)
++        }
++        for ((name, value) in track.headers) {
++            field(name.lowercase(Locale.ROOT))
++            field(value)
++        }
++        for (segment in segments) {
++            field(segment.seconds.toPlainString())
++            field(segment.url.encodedQuery.orEmpty())
++        }
++        val id = digest.digest().toByteString().hex()
++        val directory = File(parent, "repair-${track.height}-$id")
++        if (!directory.isDirectory && !directory.mkdirs()) throw Failure("无法创建补缺缓存")
++        return directory
++    }
++
+     private suspend fun readSegments(client: OkHttpClient, url: HttpUrl, headers: Headers): List<Segment>? {
+         var attempts = 0
+         while (true) {
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
+index 5a48e54..a5f9627 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadManager.kt
+@@ -95,6 +95,8 @@ class DownloadManager(
+ 
+     fun pauseDownload(download: Download) = downloader.pauseDownload(download)
+     fun resumeDownload(download: Download) = downloader.resumeDownload(download)
++    fun canRepairGaps(download: Download): Boolean = downloader.canRepairGaps(download)
++    fun repairDownload(download: Download, height: Int) = downloader.resumeDownload(download, height)
+     fun restartDownload(download: Download, qualityHeight: Int? = null) = downloader.restartDownload(download, qualityHeight)
+     fun canChooseQuality(download: Download): Boolean = downloader.usesInternalDownloader(download)
+     suspend fun availableQualities(download: Download): List<Int> = downloader.availableQualities(download)
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadStore.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadStore.kt
+index 59c1661..40f050d 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadStore.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadStore.kt
+@@ -54,7 +54,11 @@ class DownloadStore(
+     fun update(download: Download) {
+         val key = getKey(download)
+         val stored = preferences.getString(key, null)?.let(::deserialize) ?: return
+-        val updated = stored.copy(paused = download.status == Download.State.PAUSED, selectedQualityHeight = download.selectedQualityHeight)
++        val updated = stored.copy(
++            paused = download.status == Download.State.PAUSED,
++            selectedQualityHeight = download.selectedQualityHeight,
++            repairQualityHeight = download.repairQualityHeight,
++        )
+         preferences.edit { putString(key, json.encodeToString(updated)) }
+     }
+ 
+@@ -122,6 +126,7 @@ class DownloadStore(
+                 downloads.add(
+                     Download(source, manga, chapter).apply {
+                         selectedQualityHeight = obj.selectedQualityHeight?.takeIf { it > 0 }
++                        repairQualityHeight = obj.repairQualityHeight?.takeIf { it in 1 until (selectedQualityHeight ?: 0) }
+                         status = if (obj.paused) Download.State.PAUSED else Download.State.QUEUE
+                     },
+                 )
+@@ -140,9 +145,12 @@ class DownloadStore(
+      */
+     private fun serialize(download: Download): String {
+         val obj = DownloadObject(
+-            download.manga.id, download.chapter.id, counter++,
++            download.manga.id,
++            download.chapter.id,
++            counter++,
+             paused = download.status == Download.State.PAUSED,
+             selectedQualityHeight = download.selectedQualityHeight,
++            repairQualityHeight = download.repairQualityHeight,
+         )
+         return json.encodeToString(obj)
+     }
+@@ -175,4 +183,5 @@ private data class DownloadObject(
+     val order: Int,
+     val paused: Boolean = false,
+     @SerialName("hlsResumeHeight") val selectedQualityHeight: Int? = null,
++    val repairQualityHeight: Int? = null,
+ )
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index d8ad76e..741989d 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -261,13 +261,19 @@ class Downloader(
+         }
+     }
+ 
+-    fun resumeDownload(download: Download) = scope.launch {
++    fun canRepairGaps(download: Download): Boolean =
++        download.selectedQualityHeight != null && DownloadHlsSegments.handlesSource(download.source.name) &&
++            usesInternalDownloader(download) && (download.status == Download.State.PAUSED || download.status == Download.State.ERROR)
++
++    fun resumeDownload(download: Download, repairHeight: Int? = null) = scope.launch {
+         val id = download.episode.id
+         val request = currentCoroutineContext().job
+         val (downloadToResume, stopping) = itemControls.withLock {
+             awaitQueueReady()
+             val current = queueState.value.firstOrNull { it.episode.id == id } ?: return@launch
+             if (current.status != Download.State.PAUSED && current.status != Download.State.ERROR) return@launch
++            if (current !== download) return@launch
++            if (repairHeight != null && (!canRepairGaps(current) || repairHeight !in 1..(current.selectedQualityHeight ?: 0))) return@launch
+             if (pendingResumes.putIfAbsent(id, request) != null) return@launch
+             current to activeWorkers?.requestStop(id)
+         }
+@@ -277,6 +283,14 @@ class Downloader(
+             itemControls.withLock {
+                 if (pendingResumes[id] != request || queueState.value.none { it === downloadToResume }) return@withLock
+                 if (downloadToResume.status != Download.State.PAUSED && downloadToResume.status != Download.State.ERROR) return@withLock
++                if (repairHeight != null) {
++                    val filename = DiskUtil.buildValidFilename(downloadToResume.episode.name)
++                    if (completedCache(cacheOutputFiles(downloadToResume, filename)) != null) {
++                        downloadToResume.fail(context.stringResource(AMR.strings.harmony_download_repair_already_complete))
++                        return@withLock
++                    }
++                    downloadToResume.repairQualityHeight = repairHeight.takeIf { it != downloadToResume.selectedQualityHeight }
++                }
+                 downloadToResume.video = null
+                 downloadToResume.resetSpeed()
+                 downloadToResume.status = Download.State.QUEUE
+@@ -346,6 +360,7 @@ class Downloader(
+                     if (file.exists() && !file.delete()) throw IOException("Cannot clear this download's private cache")
+                 }
+                 current.video = null
++                current.repairQualityHeight = null
+                 if (qualityHeight != null) current.selectedQualityHeight = qualityHeight
+                 current.progress = 0
+                 current.downloadedBytes = 0
+@@ -725,13 +740,19 @@ class Downloader(
+             logcat(LogPriority.ERROR, error) { "Download failed episode=${download.episode.id} saving=${download.isSaving}" }
+             download.video?.status = Video.State.Error(error)
+             val height = download.selectedQualityHeight
+-            val detail = if (error is DownloadHlsSegments.Failure && height != null && error.httpStatus in listOf(401, 403)) {
++            val detail = if (error is DownloadHlsSegments.Failure && error.repairHeight == null && height != null && error.httpStatus in listOf(401, 403)) {
+                 context.stringResource(AMR.strings.harmony_download_quality_denied, height, checkNotNull(error.httpStatus))
+             } else {
+                 error.message ?: error.javaClass.simpleName
+             }
+             val position = (error as? DownloadHlsSegments.Failure)?.fragmentLabel()
+             val message = position?.let { "$it · $detail" } ?: detail
++            if (position != null && error is DownloadHlsSegments.Failure) {
++                logcat(LogPriority.INFO) {
++                    "Download HLS gap episode=${download.episode.id} primaryHeight=$height repairHeight=${error.repairHeight} " +
++                        "position=$position status=${error.httpStatus}"
++                }
++            }
+             download.fail(message)
+             notifier.onError(
+                 message,
+@@ -952,6 +973,7 @@ class Downloader(
+                         } else {
+                             null
+                         }
++                        if (download.repairQualityHeight != null && prepared == null) throw DownloadHlsSegments.Failure("原清单不支持按时段补缺")
+                         try {
+                             finalizeLocalVideo(download, matroska, transport, prepared)
+                         } catch (cancelled: CancellationException) {
+@@ -1112,6 +1134,13 @@ class Downloader(
+             video.headers ?: download.source.headers,
+             cacheRoot,
+             forceNetwork = forceNetwork,
++            repair = download.repairQualityHeight?.let { height -> { resolveRepairTrack(download, height) } },
++            onRepair = { height, missing, count ->
++                logcat(LogPriority.INFO) { "Download HLS repair episode=${download.episode.id} height=$height originalGaps=$missing lowerSegments=$count" }
++            },
++            onOriginalResponse = { segment ->
++                logcat(LogPriority.INFO) { "Download HLS intact source bytes episode=${download.episode.id} repairSegment=$segment" }
++            },
+             onFirstGap = { segment ->
+                 logcat(LogPriority.INFO) { "Download HLS deferred episode=${download.episode.id} segment=$segment status=403" }
+             },
+@@ -1143,12 +1172,36 @@ class Downloader(
+         }
+     }
+ 
++    private suspend fun resolveRepairTrack(download: Download, height: Int): DownloadHlsSegments.RepairTrack =
++        SourceRevalidationInterceptor.revalidate {
++            // This source publishes a single master for the episode. Never mix independent hosters/editions.
++            val hoster = downloadHosters(download).singleOrNull() ?: throw DownloadHlsSegments.Failure("无法确认两个画质来自同一组视频")
++            val alternate = DownloadQualitySelector.pickExact(download.source, listOf(hoster), height)
++                ?: throw DownloadHlsSegments.Failure(context.stringResource(AMR.strings.harmony_download_quality_unavailable, height))
++            if (!canResumeHlsSegments(download, alternate)) throw DownloadHlsSegments.Failure("所选画质不支持按时段补缺")
++            DownloadHlsSegments.RepairTrack(height, alternate.videoUrl, alternate.headers ?: download.source.headers)
++        }
++
+     private suspend fun finalizeLocalVideo(
+         download: Download,
+         matroska: File,
+         transport: File,
+         prepared: DownloadHlsSegments.Prepared?,
+     ): File {
++        if (prepared != null && prepared.switches.isNotEmpty()) {
++            DownloadHlsRepairMedia.verify(prepared.switches) { file ->
++                val report = DownloadProbeReport.read(context.cacheDir, DownloadHlsRepairMedia.probeOptions(file), 15_000)
++                if (report.status != "ok") throw IOException("无法验证补缺交界处的音视频 (${report.status})")
++                report.text
++            }
++            // MPEG-TS carries the changing H.264/HEVC parameters in-band. A single Matroska codec header may not.
++            DownloadHlsRepairTransport.write(prepared, transport) { bytes ->
++                download.progress = 95 + (bytes.toDouble() / prepared.bytes * 4).toInt().coerceIn(0, 4)
++            }
++            verifyTransportStream(download.episode.id, transport, prepared.durationMillis)
++            logcat(LogPriority.INFO) { "Download mixed HLS verified episode=${download.episode.id} height=${download.repairQualityHeight} durationMs=${prepared.durationMillis}" }
++            return transport
++        }
+         try {
+             ffmpegDownload(download, matroska, prepared)
+             return matroska
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt
+index 4d5ed9f..2df5ee1 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/model/Download.kt
+@@ -33,6 +33,10 @@ data class Download(
+     @Volatile
+     var selectedQualityHeight: Int? = video?.let(DownloadQualitySelector::heightOf)
+ 
++    /** Explicit per-episode choice. The primary rendition stays selected and owns its cache. */
++    @Volatile
++    var repairQualityHeight: Int? = null
++
+     @Transient
+     private val _statusFlow = MutableStateFlow(State.NOT_DOWNLOADED)
+ 
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadAdapter.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadAdapter.kt
+index a96c71f..79e4981 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadAdapter.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadAdapter.kt
+@@ -28,6 +28,7 @@ class DownloadAdapter(
+     }
+ 
+     interface DownloadItemListener {
++        fun canRepairGaps(download: Download): Boolean
+         fun canChooseQuality(download: Download): Boolean
+         fun onItemReleased(position: Int)
+         fun onToggleDownload(position: Int)
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
+index 204f2e2..c96e46a 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
+@@ -85,7 +85,8 @@ class DownloadHolder(private val view: View, val adapter: DownloadAdapter) :
+         val percent = download.progress.takeIf { it > 0 }?.let {
+             view.context.stringResource(AYMR.strings.episode_download_progress, it)
+         }
+-        val saved = listOfNotNull(percent, bytes).joinToString(" · ")
++        val repair = download.repairQualityHeight?.let { view.context.stringResource(AMR.strings.harmony_download_repair_status, it) }
++        val saved = listOfNotNull(repair, percent, bytes).joinToString(" · ")
+         val text = when {
+             download.status == Download.State.ERROR -> {
+                 listOf(view.context.stringResource(MR.strings.download_notifier_title_error), saved)
+@@ -166,6 +167,10 @@ class DownloadHolder(private val view: View, val adapter: DownloadAdapter) :
+                     title = view.context.stringResource(AMR.strings.harmony_download_restart_from_start)
+                     isVisible = download.status != Download.State.DOWNLOADED
+                 }
++                findItem(R.id.repair_download_gaps).apply {
++                    title = view.context.stringResource(AMR.strings.harmony_download_repair_gaps)
++                    isVisible = adapter.downloadItemListener.canRepairGaps(download)
++                }
+                 findItem(R.id.change_download_quality).apply {
+                     title = view.context.stringResource(AMR.strings.harmony_download_change_quality)
+                     isVisible = download.status != Download.State.DOWNLOADED && !download.isSaving &&
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQualityDialog.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQualityDialog.kt
+index ea48c2d..adaa768 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQualityDialog.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQualityDialog.kt
+@@ -36,19 +36,28 @@ import tachiyomi.presentation.core.i18n.stringResource
+ @Composable
+ internal fun DownloadQualityDialog(
+     download: Download,
++    repairOnly: Boolean,
+     loadQualities: suspend (Download) -> List<Int>,
+     onConfirm: (Int) -> Unit,
+     onDismiss: () -> Unit,
+-) = key(download.episode.id) {
++) = key(download.episode.id, repairOnly) {
+     var attempt by remember { mutableIntStateOf(0) }
+     var options by remember { mutableStateOf<List<Int>?>(null) }
+     var failed by remember { mutableStateOf(false) }
+-    var selected by remember { mutableStateOf(download.selectedQualityHeight) }
++    var selected by remember { mutableStateOf(if (repairOnly) download.repairQualityHeight else download.selectedQualityHeight) }
+     LaunchedEffect(attempt) {
+         failed = false
+         options = null
+         try {
+-            options = loadQualities(download)
++            val available = loadQualities(download)
++            val primary = download.selectedQualityHeight
++            val choices = if (repairOnly) {
++                available.filter { it < (primary ?: 0) } + listOfNotNull(primary?.takeIf { download.repairQualityHeight != null })
++            } else {
++                available
++            }
++            options = choices
++            if (repairOnly && selected !in choices) selected = choices.firstOrNull()
+         } catch (cancelled: CancellationException) {
+             throw cancelled
+         } catch (_: Exception) {
+@@ -59,7 +68,7 @@ internal fun DownloadQualityDialog(
+         onDismissRequest = onDismiss,
+         title = {
+             Column {
+-                Text(stringResource(AMR.strings.harmony_download_change_quality))
++                Text(stringResource(if (repairOnly) AMR.strings.harmony_download_repair_gaps else AMR.strings.harmony_download_change_quality))
+                 Text(
+                     download.episode.name,
+                     style = MaterialTheme.typography.bodyMedium,
+@@ -73,8 +82,11 @@ internal fun DownloadQualityDialog(
+             when {
+                 failed -> Text(stringResource(AMR.strings.harmony_download_quality_load_failed))
+                 heights == null -> Text(stringResource(MR.strings.loading))
+-                heights.isEmpty() -> Text(stringResource(AMR.strings.harmony_download_quality_empty))
++                heights.isEmpty() -> Text(stringResource(if (repairOnly) AMR.strings.harmony_download_repair_empty else AMR.strings.harmony_download_quality_empty))
+                 else -> Column(Modifier.verticalScroll(rememberScrollState()).selectableGroup()) {
++                    if (repairOnly) {
++                        Text(stringResource(AMR.strings.harmony_download_repair_explain, download.selectedQualityHeight ?: 0))
++                    }
+                     heights.forEach { height ->
+                         Row(
+                             modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+@@ -82,7 +94,12 @@ internal fun DownloadQualityDialog(
+                             verticalAlignment = Alignment.CenterVertically,
+                         ) {
+                             RadioButton(selected = selected == height, onClick = null)
+-                            Text("${height}p", Modifier.padding(start = 12.dp))
++                            val label = if (repairOnly && height == download.selectedQualityHeight) {
++                                stringResource(AMR.strings.harmony_download_original_only, height)
++                            } else {
++                                "${height}p"
++                            }
++                            Text(label, Modifier.padding(start = 12.dp))
+                         }
+                     }
+                 }
+@@ -99,7 +116,7 @@ internal fun DownloadQualityDialog(
+                 TextButton(
+                     enabled = choice != null && options?.contains(choice) == true,
+                     onClick = { if (choice != null) onConfirm(choice) },
+-                ) { Text(stringResource(AMR.strings.harmony_download_restart)) }
++                ) { Text(stringResource(if (repairOnly) AMR.strings.harmony_download_repair_confirm else AMR.strings.harmony_download_restart)) }
+             }
+         },
+     )
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreen.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreen.kt
+index aa8b7b5..104a69a 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreen.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreen.kt
+@@ -79,11 +79,12 @@ object DownloadQueueScreen : Screen() {
+         }
+         val downloadList by screenModel.state.collectAsState()
+         val qualityTarget by screenModel.qualityTarget.collectAsState()
+-        qualityTarget?.let { download ->
++        qualityTarget?.let { target ->
+             DownloadQualityDialog(
+-                download = download,
++                download = target.download,
++                repairOnly = target.repairOnly,
+                 loadQualities = screenModel::availableQualities,
+-                onConfirm = { screenModel.restartAtQuality(download, it) },
++                onConfirm = { screenModel.applyQuality(target, it) },
+                 onDismiss = { screenModel.qualityTarget.value = null },
+             )
+         }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreenModel.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreenModel.kt
+index 53df33e..9cc27b8 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreenModel.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadQueueScreenModel.kt
+@@ -33,13 +33,15 @@ class DownloadQueueScreenModel(
+     private val _state = MutableStateFlow(emptyList<DownloadHeaderItem>())
+     val state = _state.asStateFlow()
+ 
+-    val qualityTarget = MutableStateFlow<Download?>(null)
++    data class QualityTarget(val download: Download, val repairOnly: Boolean)
++
++    val qualityTarget = MutableStateFlow<QualityTarget?>(null)
+ 
+     suspend fun availableQualities(download: Download) = downloadManager.availableQualities(download)
+ 
+-    fun restartAtQuality(download: Download, height: Int) {
++    fun applyQuality(target: QualityTarget, height: Int) {
+         qualityTarget.value = null
+-        downloadManager.restartDownload(download, height)
++        if (target.repairOnly) downloadManager.repairDownload(target.download, height) else downloadManager.restartDownload(target.download, height)
+     }
+ 
+     lateinit var controllerBinding: DownloadListBinding
+@@ -55,6 +57,8 @@ class DownloadQueueScreenModel(
+     private val progressJobs = mutableMapOf<Long, Job>()
+ 
+     val listener = object : DownloadAdapter.DownloadItemListener {
++        override fun canRepairGaps(download: Download): Boolean = downloadManager.canRepairGaps(download)
++
+         override fun canChooseQuality(download: Download): Boolean = downloadManager.canChooseQuality(download)
+ 
+         /**
+@@ -96,7 +100,8 @@ class DownloadQueueScreenModel(
+                     R.id.pause_download -> downloadManager.pauseDownload(item.download)
+                     R.id.resume_download -> downloadManager.resumeDownload(item.download)
+                     R.id.restart_download -> downloadManager.restartDownload(item.download)
+-                    R.id.change_download_quality -> qualityTarget.value = item.download
++                    R.id.change_download_quality -> qualityTarget.value = QualityTarget(item.download, repairOnly = false)
++                    R.id.repair_download_gaps -> qualityTarget.value = QualityTarget(item.download, repairOnly = true)
+                     R.id.move_to_top, R.id.move_to_bottom -> {
+                         val headerItems = adapter?.headerItems ?: return
+                         val newDownloads = mutableListOf<Download>()
+@@ -153,7 +158,7 @@ class DownloadQueueScreenModel(
+         screenModelScope.launch {
+             downloadManager.queueState
+                 .map { downloads ->
+-                    qualityTarget.update { target -> target?.takeIf { downloads.any { it === target } } }
++                    qualityTarget.update { target -> target?.takeIf { selected -> downloads.any { it === selected.download } } }
+                     downloads
+                         .groupBy { it.source }
+                         .map { entry ->
+diff --git a/app/src/main/res/menu/download_single.xml b/app/src/main/res/menu/download_single.xml
+index cdc7a35..c6fcfbd 100644
+--- a/app/src/main/res/menu/download_single.xml
++++ b/app/src/main/res/menu/download_single.xml
+@@ -13,6 +13,10 @@
+         android:id="@+id/restart_download"
+         android:title="@string/action_download" />
+ 
++    <item
++        android:id="@+id/repair_download_gaps"
++        android:title="@string/action_download" />
++
+     <item
+         android:id="@+id/change_download_quality"
+         android:title="@string/action_download" />
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRepairTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRepairTest.kt
+new file mode 100644
+index 0000000..6a4c5a3
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRepairTest.kt
+@@ -0,0 +1,211 @@
++package eu.kanade.tachiyomi.data.download
++
++import eu.kanade.tachiyomi.network.interceptor.HlsRepairResponseInterceptor
++import kotlinx.coroutines.test.runTest
++import okhttp3.Headers.Companion.headersOf
++import okhttp3.HttpUrl.Companion.toHttpUrl
++import okhttp3.OkHttpClient
++import okhttp3.Protocol
++import okhttp3.Request
++import okhttp3.Response
++import okhttp3.ResponseBody.Companion.toResponseBody
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertNull
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++import org.junit.jupiter.api.io.TempDir
++import java.io.File
++import java.util.concurrent.ConcurrentLinkedQueue
++
++class NavigationChromeDownloadHlsRepairTest {
++    @TempDir
++    lateinit var root: File
++
++    @Test
++    fun `missing windows may span multiple segments in either rendition but cannot consume a retained frame`() {
++        fun match(high: List<Int>, low: List<Int>, gaps: Set<Int>) = DownloadHlsRepairPlan.match(
++            DownloadHlsRepairPlan.boundaries(high.map { it.toBigDecimal() }),
++            DownloadHlsRepairPlan.boundaries(low.map { it.toBigDecimal() }),
++            gaps,
++        )?.map { (index, lower) -> (if (lower) "L" else "H") + index }
++        assertEquals(listOf("L0", "L1", "H1", "L4", "L5"), match(listOf(4, 4, 4), List(6) { 2 }, setOf(0, 2)))
++        assertEquals(listOf("H0", "H1", "L1"), match(List(4) { 2 }, listOf(4, 4), setOf(2, 3)))
++        assertNull(match(listOf(4, 4, 4), listOf(3, 4, 5), setOf(1)))
++        assertNull(match(listOf(4, 4), listOf(4, 5), setOf(0)))
++        assertNull(match(listOf(4, 4), listOf(4, 4), setOf(0, 1)))
++    }
++
++    @Test
++    fun `TS splice keeps payloads and advances counters for payload packets only`() = runTest {
++        fun packet(counter: Int, payload: Boolean = true) = ByteArray(188) { 7 }.apply {
++            this[0] = 0x47
++            this[1] = 1
++            this[2] = 0
++            this[3] = ((if (payload) 0x10 else 0x20) or counter).toByte()
++        }
++        val first = File(root, "original.ts").apply { writeBytes(packet(13) + packet(14) + packet(15)) }
++        val low = File(root, "lower.ts").apply { writeBytes(byteArrayOf(1, 2) + packet(4, false) + packet(5) + packet(5) + packet(6)) }
++        val last = File(root, "return.ts").apply { writeBytes(packet(2) + packet(3) + packet(4)) }
++        val playlist = File(root, "repaired.m3u8").apply {
++            writeText("#EXTM3U\noriginal.ts\n#EXT-X-DISCONTINUITY\nlower.ts\n#EXT-X-DISCONTINUITY\nreturn.ts\n")
++        }
++        val prepared = DownloadHlsSegments.Prepared(
++            playlist,
++            root,
++            first.length() + low.length() + last.length(),
++            6000,
++            3,
++            listOf(DownloadHlsSegments.SwitchSample(low, 2000, lower = true, entry = true)),
++        )
++        val output = File(root, "finished.ts")
++        DownloadHlsRepairTransport.write(prepared, output) {}
++        val expected = first.readBytes() + packet(15, false) + packet(0) + packet(0) + packet(1) + packet(2) + packet(3) + packet(4)
++        assertTrue(expected.contentEquals(output.readBytes()))
++        last.appendBytes(byteArrayOf(0))
++        assertTrue(runCatching { DownloadHlsRepairTransport.write(prepared, output) {} }.isFailure)
++    }
++
++    @Test
++    fun `an alternate needs compatible tracks keyframes and clocks at the splice`() = runTest {
++        val high = File(root, "original.ts")
++        val low = File(root, "lower.ts")
++        val points = listOf(
++            DownloadHlsSegments.SwitchSample(high, 0, lower = false, entry = true),
++            DownloadHlsSegments.SwitchSample(low, 2000, lower = true, entry = true),
++        )
++        suspend fun verify(lowStart: Double = 3.4, flags: String = "K", channels: Int = 2) = DownloadHlsRepairMedia.verify(points) { file ->
++            val start = if (file == high) 1.4 else lowStart
++            val height = if (file == high) 1080 else 720
++            val audioChannels = if (file == high) 2 else channels
++            val packet = if (file == high) "K" else flags
++            """{"streams":[{"codec_type":"video","codec_name":"h264","index":0,"id":"0x100","height":$height,"start_time":$start},
++                {"codec_type":"audio","codec_name":"aac","id":"0x101","sample_rate":"48000","channels":$audioChannels,"start_time":$start}],
++                "packets":[{"stream_index":0,"flags":"$packet"}]}"""
++        }
++        verify()
++        assertTrue(runCatching { verify(lowStart = 5.4) }.isFailure)
++        assertTrue(runCatching { verify(flags = "_") }.isFailure)
++        assertTrue(runCatching { verify(channels = 1) }.isFailure)
++    }
++
++    @Test
++    fun `only one successful plaintext response can repair a locally shortened copy`() = runTest {
++        val url = "https://example.test/ordinary.ts".toHttpUrl()
++        val ts = ByteArray(188 * 20) { i ->
++            when (i % 188) {
++                0 -> 0x47
++                1 -> 1
++                3 -> 0x10
++                else -> (i % 113).toByte()
++            }
++        }
++        var code = 200
++        val client = OkHttpClient.Builder().addInterceptor(HlsRepairResponseInterceptor).addInterceptor { chain ->
++            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).message("fixture").code(code).body(ts.toResponseBody()).build()
++        }.build()
++        fun read() = client.newCall(Request.Builder().url(url).build()).execute().use { it.body.bytes() }
++        val raw = File(root, "observed.part")
++        val local = File(root, "from-proxy.ts")
++        HlsRepairResponseInterceptor.during(url, raw) { observed ->
++            read()
++            local.writeBytes(ByteArray(ts.size - 8) { -1 })
++            assertFalse(DownloadHlsRepairTransport.restoreIntactResponse(local, observed()))
++            local.writeBytes(ts.copyOfRange(0, 1024) + ts.copyOfRange(1032, ts.size))
++            assertTrue(DownloadHlsRepairTransport.restoreIntactResponse(local, observed()))
++            assertTrue(ts.contentEquals(local.readBytes()))
++        }
++        code = 403
++        HlsRepairResponseInterceptor.during(url, raw) { observed ->
++            read()
++            assertNull(observed())
++        }
++        code = 200
++        HlsRepairResponseInterceptor.during(url, raw) { observed ->
++            read()
++            read()
++            assertNull(observed())
++        }
++        assertFalse(raw.exists())
++    }
++
++    @Test
++    fun `manual alternate fills only holes survives a retry and never enters the original cache`() = runTest {
++        val requests = ConcurrentLinkedQueue<String>()
++        var denyLow = true
++        val client = OkHttpClient.Builder().addInterceptor { chain ->
++            val req = chain.request()
++            val response = Response.Builder().request(req).protocol(Protocol.HTTP_1_1).message("fixture")
++            if (req.url.encodedPath == "/m3u8") {
++                val track = req.url.queryParameter("track")
++                val lines = (0..5).joinToString("\n") { "#EXTINF:2,\n/segment?url=https://example.test/$track/$it" }
++                response.code(200).body("#EXTM3U\n$lines\n#EXT-X-ENDLIST\n".toResponseBody()).build()
++            } else {
++                val resource = req.url.queryParameter("url")!!.toHttpUrl().pathSegments.joinToString("/")
++                requests += resource
++                val low = resource.startsWith("low/")
++                if (low) assertEquals("donor", req.header("X-Track"))
++                val denied = resource in listOf("high/1", "high/4") || (denyLow && resource == "low/4")
++                val ts = ByteArray(188 * 4) {
++                    when (it % 188) {
++                        0 -> 0x47
++                        3 -> 0x10
++                        else -> if (low) 2 else 1
++                    }
++                }
++                response.code(if (denied) 403 else 200).body(ts.toResponseBody()).build()
++            }
++        }.build()
++        var lookups = 0
++        suspend fun prepare(optIn: Boolean) = DownloadHlsSegments.prepare(
++            client,
++            "MissAV",
++            "http://localhost:1234/m3u8?track=high",
++            headersOf(),
++            root,
++            repair = if (!optIn) {
++                null
++            } else {
++                {
++                    lookups++
++                    DownloadHlsSegments.RepairTrack(720, "http://localhost:1234/m3u8?track=low", headersOf("X-Track", "donor"))
++                }
++            },
++        ) {}
++        assertTrue(runCatching { prepare(true) }.isFailure)
++        assertEquals(0, lookups)
++        val original = runCatching { prepare(false) }.exceptionOrNull() as DownloadHlsSegments.Failure
++        assertEquals(2, original.missingSegments)
++        val directory = root.listFiles()!!.single()
++        requests.clear()
++        val error = runCatching { prepare(true) }.exceptionOrNull() as DownloadHlsSegments.Failure
++        assertEquals(720, error.repairHeight, error.message)
++        assertEquals(8000L, error.startMillis)
++        assertEquals(listOf("low/1", "low/4"), requests.sorted())
++        assertFalse(File(directory, "repaired.m3u8").exists())
++        val retried = runCatching {
++            DownloadHlsSegments.withAuthorizationRecovery(transfer = { throw error }, refresh = { throw AssertionError("Unexpected high refresh") })
++        }.exceptionOrNull()
++        assertEquals(error, retried)
++        requests.clear()
++        denyLow = false
++        val done = prepare(true)!!
++        assertEquals(listOf("low/4"), requests.toList())
++        assertEquals(4, done.input.readLines().count { it == "#EXT-X-DISCONTINUITY" })
++        val files = done.input.readLines().filter { !it.startsWith("#") }.map { File(directory, it) }
++        assertEquals(listOf(1, 2, 1, 1, 2, 1), files.map { it.readBytes()[1].toInt() })
++        assertFalse(File(directory, "00001.ts").exists())
++        assertFalse(File(directory, "00004.ts").exists())
++        assertFalse(File(directory, "input.m3u8").exists())
++        // A previously cached original with a truncated packet also needs a replacement. Opting out
++        // must request the genuine original again rather than treating damaged or lower bytes as original.
++        File(directory, "00002.ts").appendBytes(byteArrayOf(0))
++        requests.clear()
++        assertTrue(prepare(true) != null)
++        assertEquals(listOf("low/2"), requests.sorted())
++        requests.clear()
++        assertTrue(runCatching { prepare(false) }.isFailure)
++        assertEquals(listOf("high/1", "high/2", "high/4"), requests.sorted())
++        assertFalse(File(directory, "00002.ts.invalid").exists())
++    }
++}
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadPausedStoreTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadPausedStoreTest.kt
+index bd8a830..85cc2ac 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadPausedStoreTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadPausedStoreTest.kt
+@@ -31,7 +31,7 @@ class NavigationChromeDownloadPausedStoreTest {
+         fixture.values["2"] = "{\"mangaId\":2,\"chapterId\":2,\"order\":10}"
+         val restored = fixture.store.restore()
+         assertEquals(listOf(2L, 1L), restored.map { it.episode.id })
+-        assertTrue(restored.all { it.status == Download.State.QUEUE && it.selectedQualityHeight == null })
++        assertTrue(restored.all { it.status == Download.State.QUEUE && it.selectedQualityHeight == null && it.repairQualityHeight == null })
+         assertTrue(fixture.values.isEmpty())
+     }
+ 
+@@ -92,6 +92,20 @@ class NavigationChromeDownloadPausedStoreTest {
+         assertTrue(fixture.store.restore().all { it.selectedQualityHeight == null })
+     }
+ 
++    @Test
++    fun `repair consent survives pause and restore independently of selected quality`() {
++        val fixture = Fixture()
++        val download = fixture.download(1).apply { selectedQualityHeight = 1080 }
++        fixture.store.addAll(listOf(download))
++        download.repairQualityHeight = 720
++        download.status = Download.State.PAUSED
++        fixture.store.update(download)
++        val restored = fixture.store.restore().single()
++        assertEquals(1080, restored.selectedQualityHeight)
++        assertEquals(720, restored.repairQualityHeight)
++        assertEquals(Download.State.PAUSED, restored.status)
++    }
++
+     private class Fixture {
+         val values = linkedMapOf<String, String>()
+         private val preferences = mockk<SharedPreferences>()
+diff --git a/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt b/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt
+index 7fbb162..20d1dfa 100644
+--- a/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt
++++ b/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt
+@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.network
+ import android.content.Context
+ import eu.kanade.tachiyomi.network.interceptor.CloudflareInterceptor
+ import eu.kanade.tachiyomi.network.interceptor.HlsPlaylistRedirectInterceptor
++import eu.kanade.tachiyomi.network.interceptor.HlsRepairResponseInterceptor
+ import eu.kanade.tachiyomi.network.interceptor.IgnoreGzipInterceptor
+ import eu.kanade.tachiyomi.network.interceptor.SourceRevalidationInterceptor
+ import eu.kanade.tachiyomi.network.interceptor.UncaughtExceptionInterceptor
+@@ -56,6 +57,7 @@ import kotlin.random.Random
+                 ),
+             )
+             .addInterceptor(HlsPlaylistRedirectInterceptor)
++            .addInterceptor(HlsRepairResponseInterceptor)
+             .addInterceptor(SourceRevalidationInterceptor)
+             .addInterceptor(UncaughtExceptionInterceptor())
+             .addInterceptor(UserAgentInterceptor(::defaultUserAgentProvider))
+diff --git a/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/HlsRepairResponseInterceptor.kt b/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/HlsRepairResponseInterceptor.kt
+new file mode 100644
+index 0000000..b29ba29
+--- /dev/null
++++ b/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/HlsRepairResponseInterceptor.kt
+@@ -0,0 +1,109 @@
++package eu.kanade.tachiyomi.network.interceptor
++
++import okhttp3.HttpUrl
++import okhttp3.Interceptor
++import okhttp3.Response
++import okhttp3.ResponseBody
++import okio.Buffer
++import okio.ForwardingSource
++import okio.buffer
++import okio.sink
++import java.io.File
++import java.io.IOException
++import java.util.concurrent.ConcurrentHashMap
++import java.util.concurrent.atomic.AtomicInteger
++
++/** Observe the already successful response used by the local source proxy. Never make a network request. */
++object HlsRepairResponseInterceptor : Interceptor {
++    private const val MAX_BYTES = 16L * 1024 * 1024
++    private class Capture(val file: File) {
++        val responses = AtomicInteger()
++
++        @Volatile var complete = false
++    }
++
++    private val active = ConcurrentHashMap<HttpUrl, Capture>()
++
++    suspend fun <T> during(url: HttpUrl?, temporary: File, read: suspend (original: () -> File?) -> T): T {
++        if (url == null) return read { null }
++        val capture = Capture(temporary)
++        val existing = active.putIfAbsent(url, capture)
++        if (existing != null) {
++            existing.responses.incrementAndGet()
++            return read { null }
++        }
++        try {
++            return read { temporary.takeIf { capture.responses.get() == 1 && capture.complete } }
++        } finally {
++            active.remove(url, capture)
++            temporary.delete()
++        }
++    }
++
++    override fun intercept(chain: Interceptor.Chain): Response {
++        val request = chain.request()
++        val capture = active[request.url]
++        val response = chain.proceed(request)
++        if (capture == null || capture.responses.incrementAndGet() != 1 || request.method != "GET" || response.code != 200) return response
++        val body = response.body
++        val declared = body.contentLength()
++        if (declared > MAX_BYTES || (declared >= 0 && declared % 188 != 0L)) return response
++        val head = try {
++            response.peekBody(377).bytes()
++        } catch (_: IOException) {
++            return response
++        }
++        if (head.size < 377 || listOf(0, 188, 376).any { head[it] != 0x47.toByte() }) return response
++        val file = try {
++            capture.file.sink().buffer()
++        } catch (_: IOException) {
++            return response
++        }
++        val observed = object : ForwardingSource(body.source()) {
++            var copied = 0L
++            var open = true
++            val chunk = Buffer()
++
++            fun finish(complete: Boolean) {
++                if (!open) return
++                open = false
++                try {
++                    file.close()
++                    capture.complete = complete && copied > 0 && (declared < 0 || copied == declared)
++                } catch (_: IOException) {
++                    capture.complete = false
++                }
++            }
++
++            override fun read(sink: Buffer, byteCount: Long): Long {
++                val before = sink.size
++                val count = super.read(sink, byteCount)
++                if (!open) return count
++                if (count < 0 || copied + count > MAX_BYTES) {
++                    finish(count < 0)
++                } else if (count > 0) {
++                    try {
++                        sink.copyTo(chunk, before, count)
++                        file.write(chunk, count)
++                        copied += count
++                    } catch (_: IOException) {
++                        finish(false)
++                    }
++                }
++                return count
++            }
++
++            override fun close() {
++                finish(declared >= 0 && declared == copied)
++                super.close()
++            }
++        }.buffer()
++        return response.newBuilder().body(
++            object : ResponseBody() {
++                override fun contentType() = body.contentType()
++                override fun contentLength() = declared
++                override fun source() = observed
++            },
++        ).build()
++    }
++}
+diff --git a/i18n-ank/src/commonMain/moko-resources/base/strings.xml b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+index c44f012..8d3cb3c 100644
+--- a/i18n-ank/src/commonMain/moko-resources/base/strings.xml
++++ b/i18n-ank/src/commonMain/moko-resources/base/strings.xml
+@@ -279,6 +279,13 @@
+     <string name="harmony_download_leftover_delete_failed">Could not remove the leftover \'%1$s\' from an earlier download</string>
+ 
+     <!-- Harmony fork: download quality separate from playback -->
++    <string name="harmony_download_repair_gaps">用低画质补缺</string>
++    <string name="harmony_download_original_only">只用原画质（%1$dp）继续</string>
++    <string name="harmony_download_repair_empty">该来源没有提供比原画质更低的档位。</string>
++    <string name="harmony_download_repair_explain">已下载的 %1$dp 片段会保留。只用所选画质补齐缺失时段。</string>
++    <string name="harmony_download_repair_status">%1$dp 补缺</string>
++    <string name="harmony_download_repair_confirm">开始补缺</string>
++    <string name="harmony_download_repair_already_complete">视频已经合成，请点「继续下载」完成保存。</string>
+     <string name="harmony_download_change_quality">Change quality and restart</string>
+     <string name="harmony_download_quality_unavailable">The source no longer offers %1$dp. Choose another quality from the download menu.</string>
+     <string name="harmony_download_quality_empty">The source did not list any selectable resolutions.</string>

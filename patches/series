@@ -133,3 +133,4 @@
 0133-download-long-playlists-and-local-mux-recovery.patch
 0134-download-revalidate-source-and-resume-fragments.patch
 0135-download-resolve-redirected-vod-references.patch
+0136-download-manual-lower-rendition-gap-repair.patch
