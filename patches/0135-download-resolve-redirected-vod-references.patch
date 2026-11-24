@@ -1,0 +1,472 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:27:30 +0000
+Subject: [PATCH] downloads: resolve MissAV VOD references from the effective
+ playlist URL
+
+The loopback extension reads the followed response but resolves media references against the URL before the redirect. In a controlled 1080p stream the browser played all eight fragments while the download lost exactly two relative references. Rebase only the successful finite media playlist being read for a MissAV download, on the source client's own response. Retain original quality and fail on upstream refusals. Report the missing time and a redacted error target.
+
+The image downloader in Mihon and the independent Animeko player do not share this path.
+---
+ .../data/download/DownloadHlsSegments.kt      |  53 +++++++-
+ .../tachiyomi/data/download/Downloader.kt     |  10 +-
+ .../NavigationChromeDownloadHlsGapTest.kt     |   5 +-
+ ...NavigationChromeDownloadHlsRedirectTest.kt | 100 +++++++++++++++
+ ...ationChromeDownloadQueueConcurrencyTest.kt |  12 +-
+ .../kanade/tachiyomi/network/NetworkHelper.kt |   2 +
+ .../HlsPlaylistRedirectInterceptor.kt         | 119 ++++++++++++++++++
+ 7 files changed, 287 insertions(+), 14 deletions(-)
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRedirectTest.kt
+ create mode 100644 core/common/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/HlsPlaylistRedirectInterceptor.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+index 5138cb7..76e0880 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+@@ -1,5 +1,6 @@
+ package eu.kanade.tachiyomi.data.download
+ 
++import eu.kanade.tachiyomi.network.interceptor.HlsPlaylistRedirectInterceptor
+ import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.coroutineScope
+@@ -49,11 +50,18 @@ internal object DownloadHlsSegments {
+         val newSegments: Int = 0,
+         private val totalSegments: Int? = null,
+         val untriedSegments: Int = 0,
++        val startMillis: Long? = null,
+     ) : IOException(message) {
+         fun fragmentLabel(): String? {
+             val number = segmentNumber ?: return null
+-            if (missingSegments == null || totalSegments == null) return "HLS #$number"
+-            return "HLS ${totalSegments - missingSegments}/$totalSegments · #$number"
++            val label = if (missingSegments == null || totalSegments == null) "HLS #$number" else "HLS ${totalSegments - missingSegments}/$totalSegments · #$number"
++            val seconds = startMillis?.div(1000) ?: return label
++            val time = if (seconds >= 3600) {
++                "%d:%02d:%02d".format(Locale.ROOT, seconds / 3600, seconds / 60 % 60, seconds % 60)
++            } else {
++                "%02d:%02d".format(Locale.ROOT, seconds / 60, seconds % 60)
++            }
++            return "$label · $time"
+         }
+     }
+ 
+@@ -124,6 +132,7 @@ internal object DownloadHlsSegments {
+         forceNetwork: Boolean = false,
+         onFirstGap: (Int) -> Unit = {},
+         onCacheReady: (CacheStatus) -> Unit = {},
++        onRedirect: (Int) -> Unit = {},
+         onProgress: (Progress) -> Unit,
+     ): Prepared? = try {
+         withContext(Dispatchers.IO) {
+@@ -131,10 +140,18 @@ internal object DownloadHlsSegments {
+             if (!handlesSource(sourceName)) return@withContext null
+             val manifestUrl = localManifest(url) ?: return@withContext null
+             val requestHeaders = if (forceNetwork) headers.newBuilder().set("Cache-Control", "no-cache").build() else headers
+-            val segments = readSegments(client, manifestUrl, requestHeaders) ?: return@withContext null
++            val upstream = manifestUrl.queryParameter("url")?.toHttpUrlOrNull()
++            val segments = HlsPlaylistRedirectInterceptor.during(upstream, onRedirect) {
++                readSegments(client, manifestUrl, requestHeaders)
++            } ?: return@withContext null
++            val starts = LongArray(segments.size)
+             val totalMillis = try {
+-                segments.fold(BigDecimal.ZERO) { sum, segment -> sum + segment.seconds }
+-                    .movePointRight(3).setScale(0, RoundingMode.HALF_UP).longValueExact()
++                var elapsed = BigDecimal.ZERO
++                segments.forEachIndexed { index, segment ->
++                    starts[index] = elapsed.toMillis()
++                    elapsed += segment.seconds
++                }
++                elapsed.toMillis()
+             } catch (_: ArithmeticException) {
+                 return@withContext null
+             }
+@@ -218,7 +235,7 @@ internal object DownloadHlsSegments {
+                                 val partial = File(directory, "${file.name}.part")
+                                 try {
+                                     fetch(client, Request.Builder().url(segment.url).headers(requestHeaders).build()) { response ->
+-                                        if (!response.isSuccessful) throw Failure("HLS segment HTTP ${response.code}", response.code)
++                                        if (!response.isSuccessful) throw segmentFailure(response)
+                                         val expected = response.body.contentLength()
+                                         var count = 0L
+                                         partial.outputStream().use { output ->
+@@ -259,6 +276,7 @@ internal object DownloadHlsSegments {
+                                     "HLS segment ${index + 1}/${segments.size} failed after $attempts attempts: $detail",
+                                     (it as? Failure)?.httpStatus,
+                                     segmentNumber = index + 1,
++                                    startMillis = starts[index],
+                                 )
+                                 if (failed.httpStatus != 403) throw failed
+                                 pass.defer(index, failed)
+@@ -319,6 +337,28 @@ internal object DownloadHlsSegments {
+         }
+     }
+ 
++    private fun BigDecimal.toMillis(): Long = movePointRight(3).setScale(0, RoundingMode.HALF_UP).longValueExact()
++
++    private fun segmentFailure(response: Response): Failure {
++        val code = response.code
++        if (code != 401 && code != 403 && code != 404) return Failure("HLS segment HTTP $code", code)
++        // The local extension may identify the upstream resource in its error body. Never log that URL.
++        val prefix = "Upstream $code for "
++        val target = try {
++            val firstLine = response.peekBody(4096).string().substringBefore('\n').trimEnd('\r')
++            val url = response.request.url
++            when {
++                !firstLine.startsWith(prefix) -> "unknown"
++                firstLine.removePrefix(prefix) == url.queryParameter("url") -> "media"
++                firstLine.removePrefix(prefix) == url.queryParameter("key") -> "key"
++                else -> "upstream"
++            }
++        } catch (_: IOException) {
++            "unknown"
++        }
++        return Failure("HLS segment HTTP $code (target=$target)", code)
++    }
++
+     private suspend fun readSegments(client: OkHttpClient, url: HttpUrl, headers: Headers): List<Segment>? {
+         var attempts = 0
+         while (true) {
+@@ -561,6 +601,7 @@ internal object DownloadHlsSegments {
+                 newSegments,
+                 totalSegments,
+                 untried,
++                failed.startMillis,
+             )
+         }
+     }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 04bfd6b..d8ad76e 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -725,12 +725,13 @@ class Downloader(
+             logcat(LogPriority.ERROR, error) { "Download failed episode=${download.episode.id} saving=${download.isSaving}" }
+             download.video?.status = Video.State.Error(error)
+             val height = download.selectedQualityHeight
+-            val message = if (error is DownloadHlsSegments.Failure && height != null && error.httpStatus in listOf(401, 403)) {
+-                val denied = context.stringResource(AMR.strings.harmony_download_quality_denied, height, checkNotNull(error.httpStatus))
+-                error.fragmentLabel()?.let { "$it · $denied" } ?: denied
++            val detail = if (error is DownloadHlsSegments.Failure && height != null && error.httpStatus in listOf(401, 403)) {
++                context.stringResource(AMR.strings.harmony_download_quality_denied, height, checkNotNull(error.httpStatus))
+             } else {
+                 error.message ?: error.javaClass.simpleName
+             }
++            val position = (error as? DownloadHlsSegments.Failure)?.fragmentLabel()
++            val message = position?.let { "$it · $detail" } ?: detail
+             download.fail(message)
+             notifier.onError(
+                 message,
+@@ -1114,6 +1115,9 @@ class Downloader(
+             onFirstGap = { segment ->
+                 logcat(LogPriority.INFO) { "Download HLS deferred episode=${download.episode.id} segment=$segment status=403" }
+             },
++            onRedirect = { count ->
++                logcat(LogPriority.INFO) { "Download HLS playlist redirected episode=${download.episode.id} correctedReferences=$count" }
++            },
+             onCacheReady = { cache ->
+                 logcat(LogPriority.INFO) {
+                     "Download HLS plan episode=${download.episode.id} plan=${cache.planId} revalidate=$forceNetwork " +
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt
+index 3336d77..aaa7ad7 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt
+@@ -60,7 +60,7 @@ class NavigationChromeDownloadHlsGapTest {
+         assertEquals(403, failure.httpStatus)
+         assertEquals(6, failure.segmentNumber)
+         assertEquals(1, failure.missingSegments)
+-        assertEquals("HLS 17/18 · #6", failure.fragmentLabel())
++        assertEquals("HLS 17/18 · #6 · 00:20", failure.fragmentLabel())
+         assertTrue(failure.message.orEmpty().endsWith("sample=6"))
+         assertEquals(17, cache.walk().count { it.extension == "ts" })
+         assertFalse(cache.walk().any { it.name == "input.m3u8" })
+@@ -87,7 +87,8 @@ class NavigationChromeDownloadHlsGapTest {
+         assertEquals(403, failure.httpStatus)
+         assertEquals(150, failure.missingSegments)
+         assertEquals(150 - source.requested(2).size, failure.untriedSegments)
+-        assertEquals("HLS 0/150 · #${failure.segmentNumber}", failure.fragmentLabel())
++        assertTrue(failure.fragmentLabel().orEmpty().startsWith("HLS 0/150 · #${failure.segmentNumber} · "))
++        assertEquals((checkNotNull(failure.segmentNumber) - 1) * 4000L, failure.startMillis)
+         for (pass in 1..2) {
+             val attempted = source.requested(pass)
+             assertTrue(attempted.size in 5..6, "Pass $pass requested $attempted")
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRedirectTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRedirectTest.kt
+new file mode 100644
+index 0000000..c170029
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRedirectTest.kt
+@@ -0,0 +1,100 @@
++package eu.kanade.tachiyomi.data.download
++
++import eu.kanade.tachiyomi.network.interceptor.HlsPlaylistRedirectInterceptor
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.runBlocking
++import kotlinx.coroutines.withContext
++import okhttp3.Headers.Companion.headersOf
++import okhttp3.HttpUrl.Companion.toHttpUrl
++import okhttp3.OkHttpClient
++import okhttp3.Protocol
++import okhttp3.Request
++import okhttp3.Response
++import okhttp3.ResponseBody.Companion.toResponseBody
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++import org.junit.jupiter.api.io.TempDir
++import java.io.File
++
++class NavigationChromeDownloadHlsRedirectTest {
++    @TempDir
++    lateinit var directory: File
++
++    @Test
++    fun `a redirected VOD resolves segment key and map against its effective URL only during the download`() = runBlocking {
++        val from = "/original/list"
++        val to = "/final/1080/vod.m3u8"
++        NavigationChromeDownloadQueueConcurrencyTest.LoopbackHttpServer(redirects = mapOf(from to to, "/other-source" to to)).use { server ->
++            val base = "http://127.0.0.1:${server.port}"
++            val entry = (base + from).toHttpUrl()
++            val input = listOf(
++                "#EXTM3U",
++                "#EXT-X-MAP:URI=\"init.mp4\"",
++                "#EXT-X-KEY:METHOD=AES-128,KEYFORMAT=\"a,b\",URI=\"../k?auth=a%2Bb\",IV=0x01",
++                "#EXTINF:4,",
++                "seg.ts?name=a%2Fb",
++                "#EXTINF:4,",
++                "$base/static/other.ts?x=%2B",
++                "#EXT-X-ENDLIST",
++            ).joinToString("\n")
++            var manifest = input
++            server.handler = { manifest.toByteArray() }
++            server.start()
++            val client = OkHttpClient.Builder().addInterceptor(HlsPlaylistRedirectInterceptor).build()
++            fun read(path: String = from) = client.newCall(Request.Builder().url(base + path).build()).execute().use { it.body.string() }
++            val events = mutableListOf<Int>()
++            assertEquals(input, read())
++            val fixed = HlsPlaylistRedirectInterceptor.during(entry, events::add) {
++                withContext(Dispatchers.IO) {
++                    assertEquals(input, read("/other-source"))
++                    read()
++                }
++            }
++            assertEquals(listOf(3), events)
++            assertTrue("URI=\"$base/final/1080/init.mp4\"" in fixed)
++            assertTrue("KEYFORMAT=\"a,b\",URI=\"$base/final/k?auth=a%2Bb\",IV=0x01" in fixed)
++            assertTrue("$base/final/1080/seg.ts?name=a%2Fb" in fixed)
++            assertTrue("$base/static/other.ts?x=%2B" in fixed)
++            assertEquals(input, read())
++
++            // A live playlist, an unknown URI-bearing tag and an ordinary unredirected fetch stay source-owned.
++            for (other in listOf(input.replace("#EXT-X-ENDLIST", ""), input.replace("#EXTINF:4,", "#EXT-X-PART:URI=\"p\"\n#EXTINF:4,"))) {
++                manifest = other
++                assertEquals(other, HlsPlaylistRedirectInterceptor.during(entry, events::add) { read() })
++            }
++            manifest = input
++            assertEquals(input, HlsPlaylistRedirectInterceptor.during((base + to).toHttpUrl(), events::add) { read(to) })
++            assertEquals(listOf(3), events)
++        }
++    }
++
++    @Test
++    fun `a persistent upstream refusal reports the timestamp without exporting a media or key address`() = runBlocking {
++        val media = "https://fixture.invalid/part?private=sample"
++        val key = "https://fixture.invalid/key?private=sample"
++        val base = "http://localhost:8765"
++        val segment = "$base/segment".toHttpUrl().newBuilder().addQueryParameter("url", media).addQueryParameter("key", key).build()
++        val playlist = "#EXTM3U\n#EXTINF:65.5,\n/segment?url=first\n#EXTINF:4,\n$segment\n#EXT-X-ENDLIST"
++        val ts = ByteArray(188 * 4) { if (it % 188 == 0) 0x47 else 0 }
++        val client = OkHttpClient.Builder().addInterceptor { chain ->
++            val req = chain.request()
++            val reply = Response.Builder().request(req).protocol(Protocol.HTTP_1_1).message("fixture")
++            when {
++                req.url.encodedPath == "/m3u8" -> reply.code(200).body(playlist.toResponseBody()).build()
++                req.url.queryParameter("url") == "first" -> reply.code(200).body(ts.toResponseBody()).build()
++                else -> reply.code(403).body("Upstream 403 for $key\nforbidden".toResponseBody()).build()
++            }
++        }.build()
++        val failure = runCatching {
++            DownloadHlsSegments.prepare(client, "MissAV", "$base/m3u8", headersOf(), directory) {}
++        }.exceptionOrNull() as DownloadHlsSegments.Failure
++        assertEquals(403, failure.httpStatus)
++        assertEquals(65_500L, failure.startMillis)
++        assertEquals("HLS 1/2 · #2 · 01:05", failure.fragmentLabel())
++        assertTrue("target=key" in failure.message.orEmpty())
++        assertFalse("private" in failure.message.orEmpty())
++        assertFalse(directory.walk().any { it.name == "input.m3u8" })
++    }
++}
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt
+index 4783545..5b4f85b 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt
+@@ -428,7 +428,10 @@ class NavigationChromeDownloadQueueConcurrencyTest {
+     }
+ 
+     /** Minimal HTTP/1.1 fixture using only APIs present in Android's unit-test bootclasspath. */
+-    internal class LoopbackHttpServer(private val cacheControl: String = "no-store") : Closeable {
++    internal class LoopbackHttpServer(
++        private val cacheControl: String = "no-store",
++        private val redirects: Map<String, String> = emptyMap(),
++    ) : Closeable {
+         private val listener = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
+         private val executor = Executors.newFixedThreadPool(4)
+         private val sockets = ConcurrentHashMap.newKeySet<Socket>()
+@@ -453,8 +456,11 @@ class NavigationChromeDownloadQueueConcurrencyTest {
+                                     if (line.isEmpty()) break
+                                     check(++lines <= 100)
+                                 }
+-                                val body = handler(request.split(' ')[1])
+-                                val header = "HTTP/1.1 200 OK\r\nContent-Length: ${body.size}\r\nCache-Control: $cacheControl\r\nConnection: close\r\n\r\n"
++                                val path = request.split(' ')[1]
++                                val location = redirects[path]
++                                val body = if (location == null) handler(path) else byteArrayOf()
++                                val status = if (location == null) "200 OK" else "302 Found\r\nLocation: $location"
++                                val header = "HTTP/1.1 $status\r\nContent-Length: ${body.size}\r\nCache-Control: $cacheControl\r\nConnection: close\r\n\r\n"
+                                 it.getOutputStream().use { output ->
+                                     output.write(header.toByteArray(Charsets.US_ASCII))
+                                     output.write(body)
+diff --git a/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt b/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt
+index ef0707f..7fbb162 100644
+--- a/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt
++++ b/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt
+@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.network
+ 
+ import android.content.Context
+ import eu.kanade.tachiyomi.network.interceptor.CloudflareInterceptor
++import eu.kanade.tachiyomi.network.interceptor.HlsPlaylistRedirectInterceptor
+ import eu.kanade.tachiyomi.network.interceptor.IgnoreGzipInterceptor
+ import eu.kanade.tachiyomi.network.interceptor.SourceRevalidationInterceptor
+ import eu.kanade.tachiyomi.network.interceptor.UncaughtExceptionInterceptor
+@@ -54,6 +55,7 @@ import kotlin.random.Random
+                     maxSize = 5L * 1024 * 1024, // 5 MiB
+                 ),
+             )
++            .addInterceptor(HlsPlaylistRedirectInterceptor)
+             .addInterceptor(SourceRevalidationInterceptor)
+             .addInterceptor(UncaughtExceptionInterceptor())
+             .addInterceptor(UserAgentInterceptor(::defaultUserAgentProvider))
+diff --git a/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/HlsPlaylistRedirectInterceptor.kt b/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/HlsPlaylistRedirectInterceptor.kt
+new file mode 100644
+index 0000000..9c28f1b
+--- /dev/null
++++ b/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/HlsPlaylistRedirectInterceptor.kt
+@@ -0,0 +1,119 @@
++package eu.kanade.tachiyomi.network.interceptor
++
++import okhttp3.HttpUrl
++import okhttp3.Interceptor
++import okhttp3.Response
++import okhttp3.ResponseBody.Companion.toResponseBody
++import okio.utf8Size
++import java.io.IOException
++import java.util.concurrent.ConcurrentHashMap
++
++/**
++ * The extension's loopback proxy resolves media URIs against its input URL even after its HTTP client follows a redirect.
++ * While that proxy is reading a download playlist, resolve relative references on the successful response that supplied them.
++ */
++object HlsPlaylistRedirectInterceptor : Interceptor {
++    private class Watch {
++        @Volatile
++        var changed: Int = 0
++    }
++
++    private val active = ConcurrentHashMap<HttpUrl, List<Watch>>()
++    private const val MAX_BYTES = 16L * 1024 * 1024
++    private val attribute = Regex("""([A-Z0-9-]+)=("[^"]*"|[^,]*)""")
++
++    suspend fun <T> during(url: HttpUrl?, report: (Int) -> Unit, read: suspend () -> T): T {
++        if (url == null) return read()
++        val watch = Watch()
++        active.compute(url) { _, watches -> watches.orEmpty() + watch }
++        try {
++            return read()
++        } finally {
++            active.computeIfPresent(url) { _, watches -> (watches - watch).ifEmpty { null } }
++            if (watch.changed > 0) report(watch.changed)
++        }
++    }
++
++    override fun intercept(chain: Interceptor.Chain): Response {
++        val request = chain.request()
++        val watchers = active[request.url]
++        val response = chain.proceed(request)
++        if (watchers == null || request.method != "GET" || response.code != 200) return response
++        val effective = response.request.url
++        val original = request.url
++        if (original == effective || (original.isHttps && !effective.isHttps) ||
++            effective.username.isNotEmpty() || effective.password.isNotEmpty() ||
++            generateSequence(response.priorResponse) { it.priorResponse }.none { it.isRedirect } ||
++            response.header("Content-Encoding")?.equals("identity", ignoreCase = true) == false ||
++            response.body.contentLength() > MAX_BYTES
++        ) {
++            return response
++        }
++
++        try {
++            if (!response.peekBody(16).string().removePrefix("\uFEFF").startsWith("#EXTM3U")) return response
++            val copy = response.peekBody(MAX_BYTES + 1)
++            if (copy.contentLength() > MAX_BYTES) return response
++            val result = rebase(copy.string(), original, effective) ?: return response
++            val body = result.text.toResponseBody(response.body.contentType())
++            response.close()
++            watchers.forEach { it.changed = result.count }
++            return response.newBuilder()
++                .removeHeader("ETag")
++                .removeHeader("Content-MD5")
++                .removeHeader("Digest")
++                .header("Content-Length", body.contentLength().toString())
++                .body(body)
++                .build()
++        } catch (error: IOException) {
++            response.close()
++            throw error
++        }
++    }
++
++    private data class Rebased(val text: String, val count: Int)
++
++    private fun rebase(text: String, original: HttpUrl, effective: HttpUrl): Rebased? {
++        if (text.lineSequence().firstOrNull()?.removePrefix("\uFEFF")?.trim() != "#EXTM3U") return null
++        var count = 0
++        fun resolve(value: String): String {
++            if (value.isBlank()) return value
++            val destination = effective.resolve(value) ?: return value
++            if (destination == original.resolve(value) || destination.username.isNotEmpty() || destination.password.isNotEmpty()) {
++                return value
++            }
++            count++
++            return destination.toString()
++        }
++
++        var media = false
++        var ended = false
++        var bytes = 0L
++        val output = StringBuilder(text.length)
++        for (line in text.lineSequence()) {
++            if (line.length > 1024 * 1024) return null
++            val raw = line.trim()
++            val replacement = when {
++                raw.startsWith("#EXTINF:") -> line.also { media = true }
++                raw == "#EXT-X-ENDLIST" -> line.also { ended = true }
++                raw.startsWith("#EXT-X-KEY:") || raw.startsWith("#EXT-X-MAP:") -> attribute.replace(line) { match ->
++                    val value = match.groupValues[2]
++                    if (match.groupValues[1] == "URI" && value.startsWith('"') && value.endsWith('"')) {
++                        "URI=\"${resolve(value.removeSurrounding("\""))}\""
++                    } else {
++                        match.value
++                    }
++                }
++                // Leave playlists with other resource-bearing tags entirely to the source.
++                raw.startsWith("#EXT-X-DEFINE:") || (raw.startsWith("#EXT-X-") && raw.contains("URI=")) -> return null
++                raw.isEmpty() || raw.startsWith('#') -> line
++                else -> resolve(raw)
++            }
++            bytes += replacement.utf8Size() + if (output.isEmpty()) 0 else 1
++            if (bytes > MAX_BYTES) return null
++            if (output.isNotEmpty()) output.append('\n')
++            output.append(replacement)
++        }
++        return if (media && ended && count > 0) Rebased(output.toString(), count) else null
++    }
++}
