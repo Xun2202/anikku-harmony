@@ -1,0 +1,675 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 07:40:32 +0000
+Subject: [PATCH] downloads: revalidate MissAV sources and resume untried
+ fragments
+
+A normal source lookup may serve the episode and master from a fresh HTTP cache entry even after a segment refusal. Revalidate both during same-quality recovery. Save which missing fragments a bounded pass has already tried and prioritize the rest after refresh or process restart. Report the retained count after both workers finish.
+
+Keep the legacy plan hash. When only part of a playlist changes, hard-link validated fragments at the same position with identical resource, request headers and duration within this episode and quality. Never finalize with holes. Regression fixtures exercise both the disk HTTP cache and a 1,837-fragment repair. Mihon's image downloader and Animeko's independent player do not use this path.
+---
+ .../data/download/DownloadHlsSegments.kt      | 146 +++++++++++++++---
+ .../tachiyomi/data/download/Downloader.kt     |  31 +++-
+ ...igationChromeDownloadHlsChangedPlanTest.kt |  99 ++++++++++++
+ .../NavigationChromeDownloadHlsGapTest.kt     |  39 ++++-
+ ...ationChromeDownloadQueueConcurrencyTest.kt |   4 +-
+ ...ionChromeDownloadSourceRevalidationTest.kt |  57 +++++++
+ .../kanade/tachiyomi/network/NetworkHelper.kt |   2 +
+ .../SourceRevalidationInterceptor.kt          |  21 +++
+ 8 files changed, 363 insertions(+), 36 deletions(-)
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsChangedPlanTest.kt
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadSourceRevalidationTest.kt
+ create mode 100644 core/common/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/SourceRevalidationInterceptor.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+index e9c0458..5138cb7 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+@@ -17,13 +17,17 @@ import okhttp3.Request
+ import okhttp3.Response
+ import okio.Buffer
+ import okio.BufferedSource
++import okio.ByteString
+ import okio.ByteString.Companion.encodeUtf8
++import okio.ByteString.Companion.toByteString
+ import java.io.EOFException
+ import java.io.File
+ import java.io.IOException
+ import java.math.BigDecimal
+ import java.math.RoundingMode
++import java.nio.file.Files
+ import java.security.MessageDigest
++import java.util.BitSet
+ import java.util.Locale
+ import kotlin.coroutines.resume
+ import kotlin.coroutines.resumeWithException
+@@ -32,6 +36,8 @@ import kotlin.coroutines.resumeWithException
+ internal object DownloadHlsSegments {
+     data class Progress(val bytes: Long, val networkBytes: Long, val completedMillis: Long, val totalMillis: Long)
+ 
++    data class CacheStatus(val planId: String, val total: Int, val retained: Int, val linked: Int)
++
+     data class Prepared(val input: File, val directory: File, val bytes: Long, val durationMillis: Long, val segments: Int)
+ 
+     class Failure(
+@@ -42,6 +48,7 @@ internal object DownloadHlsSegments {
+         val missingSegments: Int? = null,
+         val newSegments: Int = 0,
+         private val totalSegments: Int? = null,
++        val untriedSegments: Int = 0,
+     ) : IOException(message) {
+         fun fragmentLabel(): String? {
+             val number = segmentNumber ?: return null
+@@ -78,7 +85,7 @@ internal object DownloadHlsSegments {
+                 if (failure.httpStatus != 401 && failure.httpStatus != 403) throw failure
+                 // A later burst after sustained progress is a new stall. Rechecking cached files is not progress.
+                 if (failure.newSegments >= 16) stalledRefreshes = 0
+-                val limit = if (failure.missingSegments == null) 1 else 2
++                val limit = if (failure.missingSegments == null || failure.untriedSegments > 0) 1 else 2
+                 if (stalledRefreshes >= limit || refreshes >= MAX_REFRESHES_PER_DOWNLOAD) throw failure
+                 if (failure.httpStatus == 403 && failure.segmentNumber != null) {
+                     delay(if (stalledRefreshes == 0) 8_000L else 24_000L)
+@@ -116,6 +123,7 @@ internal object DownloadHlsSegments {
+         cacheRoot: File,
+         forceNetwork: Boolean = false,
+         onFirstGap: (Int) -> Unit = {},
++        onCacheReady: (CacheStatus) -> Unit = {},
+         onProgress: (Progress) -> Unit,
+     ): Prepared? = try {
+         withContext(Dispatchers.IO) {
+@@ -131,6 +139,11 @@ internal object DownloadHlsSegments {
+                 return@withContext null
+             }
+             val digest = MessageDigest.getInstance("SHA-256")
++            val entryDigest = MessageDigest.getInstance("SHA-256")
++            val identities = Buffer()
++            val headerIdentity = headers.joinToString("\n") { (name, value) -> "${name.lowercase(Locale.ROOT)}:$value" }
++            identities.write(headerIdentity.encodeUtf8().sha256())
++            var absoluteResources = true
+             for (segment in segments) {
+                 // Keep the existing cache key byte-for-byte without building a second copy of the full playlist.
+                 val entry = buildString {
+@@ -143,26 +156,53 @@ internal object DownloadHlsSegments {
+                     }
+                     append('\n')
+                 }
+-                digest.update(entry.toByteArray(Charsets.UTF_8))
++                val bytes = entry.toByteArray(Charsets.UTF_8)
++                digest.update(bytes)
++                identities.write(entryDigest.digest(bytes))
++                if (absoluteResources) {
++                    absoluteResources = segment.url.queryParameter("url")?.toHttpUrlOrNull() != null &&
++                        segment.url.queryParameter("key")?.let { it.toHttpUrlOrNull() != null } != false
++                }
+             }
+             val fingerprint = digest.digest().joinToString("") { "%02x".format(Locale.ROOT, it) }
+             val directory = File(cacheRoot, fingerprint)
+             if (!directory.isDirectory && !directory.mkdirs()) throw Failure("Cannot create segment cache")
++            val keys = identities.readByteString()
++            val donors = if (absoluteResources) indexedPlans(directory, keys) else emptyList()
+             val state = ProgressState(totalMillis, segments.size, onProgress)
+             val pending = mutableListOf<Int>()
++            var linked = 0
+             segments.forEachIndexed { index, segment ->
+                 ensureActive()
+                 val file = segmentFile(directory, index)
++                var reused = false
++                if (donors.isNotEmpty() && !file.exists()) {
++                    val offset = (index + 1) * HASH_BYTES
++                    for ((plan, otherKeys) in donors) {
++                        if (!keys.rangeEquals(offset, otherKeys, offset, HASH_BYTES)) continue
++                        try {
++                            Files.createLink(file.toPath(), File(plan, file.name).toPath())
++                            reused = true
++                            break
++                        } catch (_: IOException) {
++                            // The old fragment can be missing, or this filesystem may not support links.
++                        } catch (_: UnsupportedOperationException) {
++                            break
++                        }
++                    }
++                }
+                 if (validTs(file)) {
++                    if (reused) linked++
+                     state.complete(file.length(), segment.millis, notify = false)
+                 } else {
+                     pending += index
+                 }
+             }
++            onCacheReady(CacheStatus(fingerprint.take(12), segments.size, segments.size - pending.size, linked))
+             state.report() // Restore the complete cached total once, rather than replaying thousands of tiny UI updates.
+             val input = File(directory, "input.m3u8")
+             if (pending.isNotEmpty() && input.exists() && !input.delete()) throw Failure("Cannot invalidate incomplete local HLS plan")
+-            val pass = SegmentPass(pending, segments.size, onFirstGap)
++            val pass = SegmentPass(pending, segments.size, File(directory, "deferred.bin"), onFirstGap)
+             coroutineScope {
+                 repeat(minOf(SEGMENT_WORKERS, pending.size)) {
+                     launch {
+@@ -381,6 +421,41 @@ internal object DownloadHlsSegments {
+ 
+     private fun localManifest(url: String): HttpUrl? = url.toHttpUrlOrNull()?.takeIf { isProxy(it) && it.encodedPath == "/m3u8" }
+ 
++    /** Only share an identical resource at the same position, in this episode's selected quality cache. */
++    private fun indexedPlans(directory: File, keys: ByteString): List<Pair<File, ByteString>> {
++        val indexName = "segments-v1.sha256"
++        val own = File(directory, indexName)
++        if (!own.exists()) {
++            val temp = File(directory, "$indexName.tmp")
++            try {
++                temp.outputStream().use(keys::write)
++                temp.renameTo(own)
++            } catch (_: IOException) {
++                // The exact-plan cache (including pre-index releases) still works.
++            } finally {
++                temp.delete()
++            }
++        } else if (readIndex(own, keys.size) != keys) {
++            // Once a directory has been written under multiple header sets, it cannot donate fragments.
++            if (own.length() != 0L) own.outputStream().close()
++            return emptyList()
++        }
++        return directory.parentFile?.listFiles().orEmpty().asSequence()
++            .filter { it != directory && it.name.length == HASH_BYTES * 2 && it.isDirectory }
++            .sortedByDescending { it.lastModified() }
++            .take(3)
++            .mapNotNull { other ->
++                val saved = readIndex(File(other, indexName), keys.size) ?: return@mapNotNull null
++                if (keys.rangeEquals(0, saved, 0, HASH_BYTES)) other to saved else null
++            }.toList()
++    }
++
++    private fun readIndex(file: File, size: Int): ByteString? = try {
++        if (file.length() == size.toLong()) file.readBytes().toByteString().takeIf { it.size == size } else null
++    } catch (_: IOException) {
++        null
++    }
++
+     private fun segmentFile(directory: File, index: Int): File = File(directory, "%05d.ts".format(Locale.ROOT, index))
+ 
+     private fun validTs(file: File): Boolean {
+@@ -404,14 +479,23 @@ internal object DownloadHlsSegments {
+     }
+ 
+     private class SegmentPass(
+-        private val pending: List<Int>,
++        pending: List<Int>,
+         private val totalSegments: Int,
++        private val history: File,
+         private val onFirstGap: (Int) -> Unit,
+     ) {
++        private val denied = try {
++            if (history.length() in 1..((totalSegments + 7) / 8).toLong()) BitSet.valueOf(history.readBytes()) else BitSet()
++        } catch (_: IOException) {
++            BitSet()
++        }.apply {
++            if (pending.all(::get)) clear()
++        }
++        private val untested = ArrayDeque(pending.filterNot(denied::get))
++        private val deferred = ArrayDeque(pending.filter(denied::get))
++        private val pendingCount = pending.size
+         private val smallRepair = pending.size < totalSegments && pending.size <= 8
+         private val reportedGaps = mutableListOf<Int>()
+-        private var front = 0
+-        private var end = pending.size
+         private var stopped = false
+         private var distant: Int? = null
+         private var first: Failure? = null
+@@ -421,12 +505,10 @@ internal object DownloadHlsSegments {
+ 
+         @Synchronized
+         fun nextSegment(): Int? {
+-            if (stopped || front == end) return null
+-            if (smallRepair || consecutive < MAX_CONSECUTIVE_DENIALS) return pending[front++]
+-            // Adjacent failures can belong to a single bad range. Check one distant missing
+-            // fragment before stopping. Only its worker continues while this check is pending.
+-            if (distant != null) return null
+-            return pending[--end].also { distant = it }
++            if (stopped || distant != null) return null
++            val queue = if (untested.isNotEmpty()) untested else deferred
++            if (smallRepair || consecutive < MAX_CONSECUTIVE_DENIALS) return queue.removeFirstOrNull()
++            return queue.removeLastOrNull()?.also { distant = it }
+         }
+ 
+         @Synchronized
+@@ -442,29 +524,44 @@ internal object DownloadHlsSegments {
+                 first = failure
+                 onFirstGap(checkNotNull(failure.segmentNumber))
+             }
++            denied.set(index)
+             count++
+             if (reportedGaps.size < 12) reportedGaps.add(index + 1)
+             consecutive++
+             if (index == distant) {
++                stopped = consecutive >= MAX_CONSECUTIVE_DENIALS
+                 distant = null
+-                if (consecutive >= MAX_CONSECUTIVE_DENIALS) {
+-                    // Stop assignment under the same lock. Sibling cancellation arrives after this throws.
+-                    stopped = true
+-                    val earliest = checkNotNull(first)
+-                    throw Failure(
+-                        "${earliest.message}; consecutive=$consecutive distant=${index + 1}",
+-                        403,
+-                        earliest.segmentNumber,
+-                        newSegments = newSegments,
+-                    )
+-                }
+             }
+         }
+ 
+         fun requireComplete() {
++            val untried = pendingCount - count - newSegments
++            if (untried > 0) {
++                // Scheduling hint only. Cached media and its validation are independent of this file.
++                val tmp = File(history.parentFile, "deferred.tmp")
++                try {
++                    tmp.writeBytes(denied.toByteArray())
++                    tmp.renameTo(history)
++                } catch (_: IOException) {
++                    // A later resume can still reconstruct all retained fragments from disk.
++                } finally {
++                    tmp.delete()
++                }
++            } else {
++                history.delete()
++            }
+             val failed = first ?: return
++            val missing = pendingCount - newSegments
+             val sample = reportedGaps.sorted().joinToString(",")
+-            throw Failure("${failed.message}; $count missing; sample=$sample", 403, failed.segmentNumber, count, newSegments, totalSegments)
++            throw Failure(
++                "${failed.message}; $missing missing; untried=$untried; sample=$sample",
++                403,
++                failed.segmentNumber,
++                missing,
++                newSegments,
++                totalSegments,
++                untried,
++            )
+         }
+     }
+ 
+@@ -507,6 +604,7 @@ internal object DownloadHlsSegments {
+         }
+     }
+ 
++    private const val HASH_BYTES = 32
+     private const val SEGMENT_WORKERS = 2
+     private const val MAX_CONSECUTIVE_DENIALS = 4
+     private const val MAX_REFRESHES_PER_DOWNLOAD = 6
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 349aaa0..04bfd6b 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -21,6 +21,7 @@ import eu.kanade.tachiyomi.data.library.LibraryUpdateNotifier
+ import eu.kanade.tachiyomi.data.notification.NotificationHandler
+ import eu.kanade.tachiyomi.data.torrentServer.service.TorrentServerService
+ import eu.kanade.tachiyomi.network.NetworkHelper
++import eu.kanade.tachiyomi.network.interceptor.SourceRevalidationInterceptor
+ import eu.kanade.tachiyomi.source.online.HttpSource
+ import eu.kanade.tachiyomi.torrentServer.TorrentServerApi
+ import eu.kanade.tachiyomi.torrentServer.TorrentServerUtils
+@@ -763,10 +764,19 @@ class Downloader(
+             ?: throw IOException(context.stringResource(AYMR.strings.video_list_empty_error))
+     }
+ 
++    private suspend fun resolveQueuedVideo(download: Download): Video {
++        suspend fun read() = resolveVideo(download, downloadHosters(download))
++        return if (download.selectedQualityHeight != null && usesInternalDownloader(download) && DownloadHlsSegments.handlesSource(download.source.name)) {
++            SourceRevalidationInterceptor.revalidate { read() }
++        } else {
++            read()
++        }
++    }
++
+     private suspend fun requireDownloadVideo(download: Download): Video {
+         val video = download.video ?: run {
+             logcat(LogPriority.INFO) { "Download resolving video episode=${download.episode.id}" }
+-            resolveVideo(download, downloadHosters(download))
++            resolveQueuedVideo(download)
+         }
+         currentCoroutineContext().ensureActive()
+         if (download.selectedQualityHeight == null && usesInternalDownloader(download) && canResumeHlsSegments(download, video)) {
+@@ -780,20 +790,23 @@ class Downloader(
+         return video
+     }
+ 
+-    private suspend fun downloadWithFreshAddress(download: Download, directory: UniFile, filename: String): UniFile =
+-        DownloadHlsSegments.withAuthorizationRecovery(
+-            transfer = { forceNetwork -> downloadVideo(download, directory, filename, forceNetwork) },
++    private suspend fun downloadWithFreshAddress(download: Download, directory: UniFile, filename: String): UniFile {
++        val resuming = download.selectedQualityHeight != null
++        return DownloadHlsSegments.withAuthorizationRecovery(
++            transfer = { forceNetwork -> downloadVideo(download, directory, filename, resuming || forceNetwork) },
+             refresh = { failure ->
+                 val height = download.selectedQualityHeight ?: throw failure
+-                val fresh = resolveVideo(download, downloadHosters(download))
++                val fresh = resolveQueuedVideo(download)
+                 currentCoroutineContext().ensureActive()
+                 download.video = fresh.apply { status = Video.State.LoadVideo }
+                 logcat(LogPriority.INFO) {
+                     "Download authorization refresh episode=${download.episode.id} height=$height status=${failure.httpStatus} " +
+-                        "segment=${failure.segmentNumber} missing=${failure.missingSegments} newSegments=${failure.newSegments} cache=retained"
++                        "segment=${failure.segmentNumber} missing=${failure.missingSegments} untried=${failure.untriedSegments} " +
++                        "newSegments=${failure.newSegments} cache=retained"
+                 }
+             },
+         )
++    }
+ 
+     private fun canResumeHlsSegments(download: Download, video: Video): Boolean =
+         DownloadHlsSegments.handlesSource(download.source.name) &&
+@@ -1101,6 +1114,12 @@ class Downloader(
+             onFirstGap = { segment ->
+                 logcat(LogPriority.INFO) { "Download HLS deferred episode=${download.episode.id} segment=$segment status=403" }
+             },
++            onCacheReady = { cache ->
++                logcat(LogPriority.INFO) {
++                    "Download HLS plan episode=${download.episode.id} plan=${cache.planId} revalidate=$forceNetwork " +
++                        "retained=${cache.retained}/${cache.total} linked=${cache.linked}"
++                }
++            },
+         ) { state ->
+             // Cached segments advance completion, but never count as network speed.
+             val addedBytes = (state.networkBytes - networkBytes).coerceAtLeast(0)
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsChangedPlanTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsChangedPlanTest.kt
+new file mode 100644
+index 0000000..b73b858
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsChangedPlanTest.kt
+@@ -0,0 +1,99 @@
++package eu.kanade.tachiyomi.data.download
++
++import kotlinx.coroutines.test.runTest
++import okhttp3.Headers.Companion.headersOf
++import okhttp3.HttpUrl.Companion.toHttpUrl
++import okhttp3.OkHttpClient
++import okhttp3.Protocol
++import okhttp3.Response
++import okhttp3.ResponseBody.Companion.toResponseBody
++import org.junit.jupiter.api.Assertions.assertArrayEquals
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertFalse
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++import org.junit.jupiter.api.io.TempDir
++import java.io.File
++import java.nio.file.Files
++import java.util.concurrent.ConcurrentLinkedQueue
++
++class NavigationChromeDownloadHlsChangedPlanTest {
++    @TempDir
++    lateinit var cache: File
++
++    @Test
++    fun `a renewed 1837-fragment playlist fills four holes and refetches a changed neighbour`() = runTest {
++        val holes = setOf(83, 86, 244, 314)
++        val changed = holes + 84
++        val requested = ConcurrentLinkedQueue<Int>()
++        var revision = 0
++        suspend fun fetch(size: Int, header: String = "same"): DownloadHlsSegments.Prepared {
++            val manifest = buildString {
++                appendLine("#EXTM3U")
++                for (number in 1..size) {
++                    val version = if (number in changed) revision else 0
++                    val resource = "https://fixture.invalid/$number/$version"
++                    val url = "http://localhost:1234/segment".toHttpUrl().newBuilder().addQueryParameter("url", resource).build()
++                    appendLine("#EXTINF:4,")
++                    appendLine(url)
++                }
++                appendLine("#EXT-X-ENDLIST")
++            }
++            val client = OkHttpClient.Builder().addInterceptor { chain ->
++                val req = chain.request()
++                val response = Response.Builder().request(req).protocol(Protocol.HTTP_1_1).message("fixture")
++                if (req.url.encodedPath == "/m3u8") {
++                    response.code(200).body(manifest.toResponseBody()).build()
++                } else {
++                    val parts = checkNotNull(req.url.queryParameter("url")).toHttpUrl().pathSegments
++                    val number = parts.first().toInt()
++                    requested.add(number)
++                    val denied = revision == 0 && number in holes
++                    response.code(if (denied) 403 else 200).body(fragment(number, parts.last().toInt()).toResponseBody()).build()
++                }
++            }.build()
++            return checkNotNull(DownloadHlsSegments.prepare(client, "MissAV", "http://localhost:1234/m3u8", headersOf("X-Fixture", header), cache) {})
++        }
++
++        val size = 1837
++        val denied = runCatching { fetch(size) }.exceptionOrNull() as DownloadHlsSegments.Failure
++        assertEquals(4, denied.missingSegments)
++        val old = cache.listFiles()!!.single()
++        assertFalse(File(old, "input.m3u8").exists())
++        assertEquals(1833, old.listFiles()!!.count { it.extension == "ts" })
++
++        // Before this release the exact-plan directory had no per-fragment identity index.
++        assertTrue(File(old, "segments-v1.sha256").delete())
++        requested.clear()
++        val stillDenied = runCatching { fetch(size) }.exceptionOrNull() as DownloadHlsSegments.Failure
++        assertEquals(4, stillDenied.missingSegments)
++        assertEquals(holes.sorted(), requested.sorted())
++        assertFalse(File(old, "input.m3u8").exists())
++
++        revision++
++        requested.clear()
++        val complete = fetch(size)
++        assertEquals(changed.sorted(), requested.sorted())
++        assertTrue(Files.isSameFile(File(old, "00000.ts").toPath(), File(complete.directory, "00000.ts").toPath()))
++        val output = File(cache, "result.ts")
++        DownloadHlsSegments.writeTransportStream(complete, output) {}
++        output.inputStream().buffered().use { input ->
++            val actual = ByteArray(188 * 4)
++            val data = java.io.DataInputStream(input)
++            for (number in 1..size) {
++                data.readFully(actual)
++                assertArrayEquals(fragment(number, if (number in changed) 1 else 0), actual)
++            }
++            assertEquals(-1, data.read())
++        }
++
++        // Matching URL and position alone do not establish identity under different source headers.
++        revision++
++        requested.clear()
++        fetch(size, header = "different")
++        assertEquals((1..size).toList(), requested.sorted())
++    }
++
++    private fun fragment(number: Int, revision: Int): ByteArray =
++        ByteArray(188 * 4) { if (it % 188 == 0) 0x47 else (number + revision).toByte() }
++}
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt
+index a3b5705..3336d77 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsGapTest.kt
+@@ -14,7 +14,6 @@ import okhttp3.ResponseBody.Companion.toResponseBody
+ import org.junit.jupiter.api.Assertions.assertArrayEquals
+ import org.junit.jupiter.api.Assertions.assertEquals
+ import org.junit.jupiter.api.Assertions.assertFalse
+-import org.junit.jupiter.api.Assertions.assertNull
+ import org.junit.jupiter.api.Assertions.assertTrue
+ import org.junit.jupiter.api.Test
+ import org.junit.jupiter.api.io.TempDir
+@@ -86,17 +85,49 @@ class NavigationChromeDownloadHlsGapTest {
+         }.exceptionOrNull() as DownloadHlsSegments.Failure
+         assertEquals(listOf(8_000L), times)
+         assertEquals(403, failure.httpStatus)
+-        assertNull(failure.missingSegments)
+-        assertEquals("HLS #${failure.segmentNumber}", failure.fragmentLabel())
++        assertEquals(150, failure.missingSegments)
++        assertEquals(150 - source.requested(2).size, failure.untriedSegments)
++        assertEquals("HLS 0/150 · #${failure.segmentNumber}", failure.fragmentLabel())
+         for (pass in 1..2) {
+             val attempted = source.requested(pass)
+             assertTrue(attempted.size in 5..6, "Pass $pass requested $attempted")
+-            assertEquals(150, attempted.last())
++            assertTrue(attempted.last() >= 149)
+         }
++        assertTrue(source.requested(1).intersect(source.requested(2).toSet()).isEmpty())
+         assertTrue(source.requested(3).isEmpty())
+         assertFalse(cache.walk().any { it.extension == "ts" || it.name == "input.m3u8" })
+     }
+ 
++    @Test
++    fun `resuming a sparse cache does not let the same rejected samples starve other missing fragments`() = runTest {
++        val missing = (1..120 step 3).toList()
++        val refused = (missing.take(6) + missing.last()).toSet()
++        val source = Source(120) { pass, segment ->
++            when {
++                pass == 1 -> 200
++                pass <= 3 && segment in refused -> 403
++                else -> 200
++            }
++        }
++        val first = source.transfer(cache, false)
++        missing.forEach { assertTrue(File(first.directory, "%05d.ts".format(java.util.Locale.ROOT, it - 1)).delete()) }
++        val stopped = runCatching { source.transfer(cache, true) }.exceptionOrNull() as DownloadHlsSegments.Failure
++        assertEquals(missing.size, stopped.missingSegments)
++        assertTrue(stopped.untriedSegments > 30)
++        assertFalse(first.input.isFile)
++
++        // A new downloader instance reads the previous pass from disk, including after process death.
++        val partial = runCatching { source.transfer(cache, true) }.exceptionOrNull() as DownloadHlsSegments.Failure
++        assertEquals(refused.size, partial.missingSegments)
++        assertEquals(missing.size - refused.size, partial.newSegments)
++        assertTrue(source.requested(3).all { it in missing })
++        assertFalse(first.input.isFile)
++
++        val complete = source.transfer(cache, true)
++        assertEquals(refused.sorted(), source.requested(4))
++        verifyOutput(complete)
++    }
++
+     @Test
+     fun `a cluster of neighbouring refusals does not stop reachable fragments beyond it`() = runTest {
+         val source = Source(45) { pass, segment -> if (pass <= 2 && segment in 6..12) 403 else 200 }
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt
+index c4f4bb1..4783545 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt
+@@ -428,7 +428,7 @@ class NavigationChromeDownloadQueueConcurrencyTest {
+     }
+ 
+     /** Minimal HTTP/1.1 fixture using only APIs present in Android's unit-test bootclasspath. */
+-    private class LoopbackHttpServer : Closeable {
++    internal class LoopbackHttpServer(private val cacheControl: String = "no-store") : Closeable {
+         private val listener = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
+         private val executor = Executors.newFixedThreadPool(4)
+         private val sockets = ConcurrentHashMap.newKeySet<Socket>()
+@@ -454,7 +454,7 @@ class NavigationChromeDownloadQueueConcurrencyTest {
+                                     check(++lines <= 100)
+                                 }
+                                 val body = handler(request.split(' ')[1])
+-                                val header = "HTTP/1.1 200 OK\r\nContent-Length: ${body.size}\r\nConnection: close\r\n\r\n"
++                                val header = "HTTP/1.1 200 OK\r\nContent-Length: ${body.size}\r\nCache-Control: $cacheControl\r\nConnection: close\r\n\r\n"
+                                 it.getOutputStream().use { output ->
+                                     output.write(header.toByteArray(Charsets.US_ASCII))
+                                     output.write(body)
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadSourceRevalidationTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadSourceRevalidationTest.kt
+new file mode 100644
+index 0000000..197f9e2
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadSourceRevalidationTest.kt
+@@ -0,0 +1,57 @@
++package eu.kanade.tachiyomi.data.download
++
++import eu.kanade.tachiyomi.network.interceptor.SourceRevalidationInterceptor
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.runBlocking
++import kotlinx.coroutines.withContext
++import okhttp3.Cache
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++import org.junit.jupiter.api.io.TempDir
++import java.io.File
++import java.util.concurrent.ConcurrentLinkedQueue
++import java.util.concurrent.atomic.AtomicInteger
++
++class NavigationChromeDownloadSourceRevalidationTest {
++    @TempDir
++    lateinit var directory: File
++
++    @Test
++    fun `resumed episode and nested master playlist are both revalidated while ordinary requests stay cached`() = runBlocking {
++        NavigationChromeDownloadQueueConcurrencyTest.LoopbackHttpServer("public, max-age=3600").use { server ->
++            val version = AtomicInteger(1)
++            val origin = ConcurrentLinkedQueue<String>()
++            server.handler = { path ->
++                origin.add(path)
++                when (path) {
++                    "/episode" -> "/master".toByteArray()
++                    else -> version.get().toString().toByteArray()
++                }
++            }
++            server.start()
++            Cache(directory, 1024 * 1024).use { cache ->
++                val client = OkHttpClient.Builder().cache(cache).addInterceptor(SourceRevalidationInterceptor).build()
++                fun get(path: String): String {
++                    val request = Request.Builder().url("http://127.0.0.1:${server.port}$path").build()
++                    return client.newCall(request).execute().use { it.body.string() }
++                }
++                fun lookup(): String = get(get("/episode"))
++
++                assertEquals("1", lookup())
++                assertEquals("1", get("/unrelated"))
++                version.set(2)
++                assertEquals("1", lookup())
++                origin.clear()
++                assertEquals("2", SourceRevalidationInterceptor.revalidate { withContext(Dispatchers.IO) { lookup() } })
++                assertEquals(listOf("/episode", "/master"), origin.toList())
++                origin.clear()
++                assertEquals("2", lookup())
++                assertEquals("1", get("/unrelated"))
++                assertTrue(origin.isEmpty())
++            }
++        }
++    }
++}
+diff --git a/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt b/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt
+index 849a28f..ef0707f 100644
+--- a/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt
++++ b/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt
+@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.network
+ import android.content.Context
+ import eu.kanade.tachiyomi.network.interceptor.CloudflareInterceptor
+ import eu.kanade.tachiyomi.network.interceptor.IgnoreGzipInterceptor
++import eu.kanade.tachiyomi.network.interceptor.SourceRevalidationInterceptor
+ import eu.kanade.tachiyomi.network.interceptor.UncaughtExceptionInterceptor
+ import eu.kanade.tachiyomi.network.interceptor.UserAgentInterceptor
+ import logcat.LogPriority
+@@ -53,6 +54,7 @@ import kotlin.random.Random
+                     maxSize = 5L * 1024 * 1024, // 5 MiB
+                 ),
+             )
++            .addInterceptor(SourceRevalidationInterceptor)
+             .addInterceptor(UncaughtExceptionInterceptor())
+             .addInterceptor(UserAgentInterceptor(::defaultUserAgentProvider))
+             .addNetworkInterceptor(IgnoreGzipInterceptor())
+diff --git a/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/SourceRevalidationInterceptor.kt b/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/SourceRevalidationInterceptor.kt
+new file mode 100644
+index 0000000..c90cf76
+--- /dev/null
++++ b/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/SourceRevalidationInterceptor.kt
+@@ -0,0 +1,21 @@
++package eu.kanade.tachiyomi.network.interceptor
++
++import kotlinx.coroutines.asContextElement
++import kotlinx.coroutines.withContext
++import okhttp3.Interceptor
++import okhttp3.Response
++
++/** Revalidate the synchronous episode and playlist GETs made by a source during this lookup. */
++object SourceRevalidationInterceptor : Interceptor {
++    private val active = ThreadLocal<Boolean>()
++
++    suspend fun <T> revalidate(lookup: suspend () -> T): T = withContext(active.asContextElement(true)) { lookup() }
++
++    override fun intercept(chain: Interceptor.Chain): Response {
++        val request = chain.request()
++        if (active.get() != true || request.method != "GET" || request.cacheControl.onlyIfCached || request.cacheControl.noCache) {
++            return chain.proceed(request)
++        }
++        return chain.proceed(request.newBuilder().addHeader("Cache-Control", "no-cache").build())
++    }
++}
