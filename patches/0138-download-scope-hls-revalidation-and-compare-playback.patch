@@ -1,0 +1,552 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 18:22:29 +0000
+Subject: [PATCH] downloads: refresh HLS playlists separately from media and
+ compare exact playback responses
+
+---
+ .../data/download/DownloadHlsSegments.kt      |  33 ++++--
+ .../tachiyomi/data/download/Downloader.kt     |  10 +-
+ .../tachiyomi/ui/player/PlayerActivity.kt     |  20 ++++
+ ...ChromeDownloadHlsPlaybackComparisonTest.kt |  71 ++++++++++++
+ ...NavigationChromeDownloadHlsRecoveryTest.kt |   5 +-
+ ...NavigationChromeDownloadHlsRedirectTest.kt |   9 +-
+ .../NavigationChromeDownloadHlsRepairTest.kt  |  11 +-
+ ...NavigationChromeDownloadHlsSegmentsTest.kt |  35 ++++++
+ .../kanade/tachiyomi/network/NetworkHelper.kt |   2 +
+ .../interceptor/HlsPlaybackComparison.kt      | 102 ++++++++++++++++++
+ 10 files changed, 283 insertions(+), 15 deletions(-)
+ create mode 100644 app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsPlaybackComparisonTest.kt
+ create mode 100644 core/common/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/HlsPlaybackComparison.kt
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+index da54b42..4646f40 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+@@ -11,6 +11,7 @@ import kotlinx.coroutines.ensureActive
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.suspendCancellableCoroutine
+ import kotlinx.coroutines.withContext
++import okhttp3.CacheControl
+ import okhttp3.Headers
+ import okhttp3.HttpUrl
+ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+@@ -154,14 +155,14 @@ internal object DownloadHlsSegments {
+         onFirstGap: (Int) -> Unit = {},
+         onCacheReady: (CacheStatus) -> Unit = {},
+         onRedirect: (Int) -> Unit = {},
++        onOriginalDenied: (segment: Int, startMillis: Long, media: HttpUrl) -> Unit = { _, _, _ -> },
+         onProgress: (Progress) -> Unit,
+     ): Prepared? = try {
+         withContext(Dispatchers.IO) {
+             // Other extensions can expose the same proxy endpoints. This rollout is MissAV only.
+             if (!handlesSource(sourceName)) return@withContext null
+             val manifestUrl = localManifest(url) ?: return@withContext null
+-            val requestHeaders = if (forceNetwork) headers.newBuilder().set("Cache-Control", "no-cache").build() else headers
+-            val segments = readVod(client, manifestUrl, requestHeaders, onRedirect) ?: return@withContext null
++            val segments = readVod(client, manifestUrl, headers, forceNetwork, onRedirect) ?: return@withContext null
+             val originalTimes = try {
+                 DownloadHlsRepairPlan.boundaries(segments.map { it.seconds })
+             } catch (_: ArithmeticException) {
+@@ -237,7 +238,6 @@ internal object DownloadHlsSegments {
+             onCacheReady(CacheStatus(fingerprint.take(12), segments.size, segments.size - missing.size, linked))
+             val originalInput = File(directory, "input.m3u8")
+             if (missing.isNotEmpty() && originalInput.exists() && !originalInput.delete()) throw Failure("Cannot invalidate incomplete local HLS plan")
+-            var transferHeaders = requestHeaders
+             val original = segments.mapIndexed { index, segment -> LocalPart(segment, segmentFile(directory, index)) }
+             val track = if (repair != null && missing.isNotEmpty()) {
+                 if (missing.size == segments.size) throw Failure("没有可保留的原画质分片。请先继续原任务，或选择更换整集画质。")
+@@ -247,9 +247,8 @@ internal object DownloadHlsSegments {
+             }
+             val parts = if (track != null) {
+                 val lowerUrl = localManifest(track.url) ?: throw Failure("所选画质没有可对应的点播清单")
+-                transferHeaders = track.headers.newBuilder().set("Cache-Control", "no-cache").build()
+                 val lower = try {
+-                    readVod(client, lowerUrl, transferHeaders, onRedirect)
++                    readVod(client, lowerUrl, track.headers, refresh = true, onRedirect)
+                 } catch (e: Failure) {
+                     throw e.atRepairHeight(track.height)
+                 } ?: throw Failure("所选画质的点播清单无法用于补缺")
+@@ -268,6 +267,7 @@ internal object DownloadHlsSegments {
+             } else {
+                 original
+             }
++            val mediaHeaders = track?.headers ?: headers
+             val starts = if (track == null) originalTimes else DownloadHlsRepairPlan.boundaries(parts.map { it.segment.seconds })
+             val state = ProgressState(totalMillis, parts.size, onProgress)
+             val pending = mutableListOf<Int>()
+@@ -300,8 +300,12 @@ internal object DownloadHlsSegments {
+                                         null
+                                     }
+                                     HlsRepairResponseInterceptor.during(upstream, File(file.parentFile, "${file.name}.source.part")) { original ->
+-                                        fetch(client, Request.Builder().url(segment.url).headers(transferHeaders).build()) { response ->
+-                                            if (!response.isSuccessful) throw segmentFailure(response)
++                                        fetch(client, Request.Builder().url(segment.url).headers(mediaHeaders).build()) { response ->
++                                            if (!response.isSuccessful) {
++                                                throw segmentFailure(response) { url ->
++                                                    if (track == null) onOriginalDenied(index + 1, starts[index], url)
++                                                }
++                                            }
+                                             val expected = response.body.contentLength()
+                                             var count = 0L
+                                             partial.outputStream().use { output ->
+@@ -426,7 +430,7 @@ internal object DownloadHlsSegments {
+ 
+     private fun BigDecimal.toMillis(): Long = movePointRight(3).setScale(0, RoundingMode.HALF_UP).longValueExact()
+ 
+-    private fun segmentFailure(response: Response): Failure {
++    private fun segmentFailure(response: Response, onDeniedMedia: (HttpUrl) -> Unit): Failure {
+         val code = response.code
+         if (code != 401 && code != 403 && code != 404) return Failure("HLS segment HTTP $code", code)
+         // The local extension may identify the upstream resource in its error body. Never log that URL.
+@@ -443,12 +447,21 @@ internal object DownloadHlsSegments {
+         } catch (_: IOException) {
+             "unknown"
+         }
++        if (target == "media" && code == 403) response.request.url.queryParameter("url")?.toHttpUrlOrNull()?.let(onDeniedMedia)
+         return Failure("HLS segment HTTP $code (target=$target)", code)
+     }
+ 
+-    private suspend fun readVod(client: OkHttpClient, url: HttpUrl, headers: Headers, onRedirect: (Int) -> Unit): List<Segment>? =
++    private suspend fun readVod(client: OkHttpClient, url: HttpUrl, headers: Headers, refresh: Boolean, onRedirect: (Int) -> Unit): List<Segment>? =
+         HlsPlaylistRedirectInterceptor.during(url.queryParameter("url")?.toHttpUrlOrNull(), onRedirect) {
+-            readSegments(client, url, headers)
++            // The local source proxy forwards Cache-Control to its upstream. Refresh only the VOD index.
++            val policy = CacheControl.parse(headers)
++            val playlistHeaders = if (refresh && !policy.noCache && !policy.onlyIfCached) {
++                val directives = headers.values("Cache-Control") + "no-cache"
++                headers.newBuilder().set("Cache-Control", directives.joinToString(", ")).build()
++            } else {
++                headers
++            }
++            readSegments(client, url, playlistHeaders)
+         }
+ 
+     /** Lower files never become originals, including after an interrupted repair or a quality change. */
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 741989d..85989f0 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -21,6 +21,7 @@ import eu.kanade.tachiyomi.data.library.LibraryUpdateNotifier
+ import eu.kanade.tachiyomi.data.notification.NotificationHandler
+ import eu.kanade.tachiyomi.data.torrentServer.service.TorrentServerService
+ import eu.kanade.tachiyomi.network.NetworkHelper
++import eu.kanade.tachiyomi.network.interceptor.HlsPlaybackComparison
+ import eu.kanade.tachiyomi.network.interceptor.SourceRevalidationInterceptor
+ import eu.kanade.tachiyomi.source.online.HttpSource
+ import eu.kanade.tachiyomi.torrentServer.TorrentServerApi
+@@ -969,7 +970,9 @@ class Downloader(
+                         // Keep external tracks and extension-supplied FFmpeg options on their
+                         // existing path. The helper also checks MissAV and the loopback manifest.
+                         val prepared = if (canResumeHlsSegments(download, video)) {
+-                            prepareHlsSegments(download, DownloadHlsSegments.cacheForQuality(hlsCache, download.selectedQualityHeight), forceNetwork)
++                            HlsPlaybackComparison.shared.duringDownload {
++                                prepareHlsSegments(download, DownloadHlsSegments.cacheForQuality(hlsCache, download.selectedQualityHeight), forceNetwork)
++                            }
+                         } else {
+                             null
+                         }
+@@ -1141,6 +1144,11 @@ class Downloader(
+             onOriginalResponse = { segment ->
+                 logcat(LogPriority.INFO) { "Download HLS intact source bytes episode=${download.episode.id} repairSegment=$segment" }
+             },
++            onOriginalDenied = { segment, startMillis, media ->
++                download.selectedQualityHeight?.let { height ->
++                    HlsPlaybackComparison.shared.remember(download.episode.id, height, segment, startMillis, media)
++                }
++            },
+             onFirstGap = { segment ->
+                 logcat(LogPriority.INFO) { "Download HLS deferred episode=${download.episode.id} segment=$segment status=403" }
+             },
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerActivity.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerActivity.kt
+index b1efde9..611f8f6 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerActivity.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerActivity.kt
+@@ -73,9 +73,12 @@ import eu.kanade.tachiyomi.animesource.model.SerializableHoster.Companion.serial
+ import eu.kanade.tachiyomi.animesource.model.Video
+ import eu.kanade.tachiyomi.data.connections.discord.DiscordRPCService
+ import eu.kanade.tachiyomi.data.connections.discord.PlayerData
++import eu.kanade.tachiyomi.data.download.DownloadHlsSegments
++import eu.kanade.tachiyomi.data.download.DownloadQualitySelector
+ import eu.kanade.tachiyomi.data.notification.NotificationReceiver
+ import eu.kanade.tachiyomi.data.notification.Notifications
+ import eu.kanade.tachiyomi.data.torrentServer.service.TorrentServerService
++import eu.kanade.tachiyomi.network.interceptor.HlsPlaybackComparison
+ import eu.kanade.tachiyomi.source.isNsfw
+ import eu.kanade.tachiyomi.source.online.HttpSource
+ import eu.kanade.tachiyomi.torrentServer.TorrentServerApi
+@@ -122,6 +125,7 @@ class PlayerActivity : BaseActivity() {
+     private val viewModel by viewModels<PlayerViewModel>()
+     private val mpv by lazy { viewModel.mpv }
+     private val player by lazy { AniyomiMPVView(this, null) }
++    private val hlsPlaybackSession = Any()
+     private val playerObserver by lazy { PlayerObserver(this) }
+     private val windowInsetsController by lazy { WindowCompat.getInsetsController(window, window.decorView) }
+     private val audioManager by lazy { getSystemService(AUDIO_SERVICE) as AudioManager }
+@@ -386,6 +390,7 @@ class PlayerActivity : BaseActivity() {
+     }
+ 
+     override fun onDestroy() {
++        HlsPlaybackComparison.shared.closePlayer(hlsPlaybackSession)
+         player.isExiting = true
+ 
+         audioFocusRequest?.let {
+@@ -1360,9 +1365,24 @@ class PlayerActivity : BaseActivity() {
+     }
+ 
+     private fun setHttpOptions(video: Video) {
++        HlsPlaybackComparison.shared.closePlayer(hlsPlaybackSession)
+         if (viewModel.isEpisodeOnline() != true) return
+         val source = viewModel.currentSource.value as? HttpSource ?: return
+ 
++        val episodeId = viewModel.currentEpisode.value?.id
++        if (episodeId != null && DownloadHlsSegments.handlesSource(source.name) && DownloadHlsSegments.isLocalManifest(video.videoUrl)) {
++            DownloadQualitySelector.heightOf(video)?.let { height ->
++                val pending = HlsPlaybackComparison.shared.openPlayer(hlsPlaybackSession, episodeId, height) { match ->
++                    logcat(LogPriority.INFO) {
++                        "HLS playback comparison episode=$episodeId height=$height segment=${match.segment} " +
++                            "positionMs=${match.startMillis} downloadStatus=403 playbackStatus=${match.status} " +
++                            "networkStatus=${match.networkStatus} cached=${match.cached} redirected=${match.redirected}"
++                    }
++                }
++                if (pending > 0) logcat(LogPriority.INFO) { "HLS playback comparison armed episode=$episodeId height=$height gaps=$pending" }
++            }
++        }
++
+         val headers = (video.headers ?: source.headers)
+             .toMultimap()
+             .mapValues { it.value.firstOrNull() ?: "" }
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsPlaybackComparisonTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsPlaybackComparisonTest.kt
+new file mode 100644
+index 0000000..507a642
+--- /dev/null
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsPlaybackComparisonTest.kt
+@@ -0,0 +1,71 @@
++package eu.kanade.tachiyomi.data.download
++
++import eu.kanade.tachiyomi.network.interceptor.HlsPlaybackComparison
++import kotlinx.coroutines.runBlocking
++import kotlinx.coroutines.test.runTest
++import okhttp3.HttpUrl.Companion.toHttpUrl
++import okhttp3.OkHttpClient
++import okhttp3.Protocol
++import okhttp3.Request
++import okhttp3.Response
++import okhttp3.ResponseBody.Companion.toResponseBody
++import org.junit.jupiter.api.Assertions.assertEquals
++import org.junit.jupiter.api.Assertions.assertTrue
++import org.junit.jupiter.api.Test
++import java.util.concurrent.TimeUnit
++
++class NavigationChromeDownloadHlsPlaybackComparisonTest {
++    @Test
++    fun `only independent playback of the same resource episode and quality reports once`() = runTest {
++        var now = 0L
++        val observer = HlsPlaybackComparison { now }
++        val owner = Any()
++        val original = "https://example.test/media.ts?revision=one".toHttpUrl()
++        val matches = mutableListOf<HlsPlaybackComparison.Match>()
++        var requests = 0
++        var status = 403
++        var beforeResponse: () -> Unit = {}
++        val client = OkHttpClient.Builder().addInterceptor(observer).addInterceptor { chain ->
++            requests++
++            beforeResponse()
++            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(status).message("fixture").body(byteArrayOf(7).toResponseBody()).build()
++        }.build()
++        fun read(url: String = original.toString()) = client.newCall(Request.Builder().url(url).build()).execute().use {
++            assertEquals(status, it.code)
++            assertTrue(it.body.bytes().contentEquals(byteArrayOf(7)))
++        }
++        fun open(episode: Long = 5, height: Int = 1080) = observer.openPlayer(owner, episode, height, matches::add)
++        fun remember() = observer.remember(5, 1080, 3, 8000, original)
++
++        remember()
++        read()
++        open(6)
++        read()
++        open(height = 720)
++        read()
++        open()
++        read("https://example.test/media.ts?revision=two")
++        observer.duringDownload { read() }
++        beforeResponse = { runBlocking { observer.duringDownload { Unit } } }
++        read()
++        beforeResponse = { observer.closePlayer(owner) }
++        read()
++        beforeResponse = {}
++        open()
++        observer.closePlayer(Any())
++        assertTrue(matches.isEmpty())
++        read()
++        read()
++        assertEquals(listOf(403), matches.map { it.status })
++        remember()
++        status = 200
++        read()
++        assertEquals(listOf(403, 200), matches.map { it.status })
++        assertTrue(matches.all { it.segment == 3 && it.startMillis == 8000L })
++        remember()
++        now = TimeUnit.MINUTES.toNanos(31)
++        read()
++        assertEquals(2, matches.size)
++        assertEquals(11, requests)
++    }
++}
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRecoveryTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRecoveryTest.kt
+index 29aedd5..a1e75c5 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRecoveryTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRecoveryTest.kt
+@@ -76,11 +76,13 @@ class NavigationChromeDownloadHlsRecoveryTest {
+     @Test
+     fun `repeated segment 169 denial leaves the original track resumable until a manual quality change`() = withCache { cache ->
+         val deniedRequests = Collections.synchronizedList(mutableListOf<String?>())
++        val manifestPolicies = Collections.synchronizedList(mutableListOf<String?>())
+         val alternateTs = TS.copyOf().apply { this[1] = 1 }
+         val client = OkHttpClient.Builder().addInterceptor { chain ->
+             val request = chain.request()
+             val route = request.url.queryParameter("url").orEmpty()
+             if (request.url.encodedPath == "/m3u8") {
++                manifestPolicies += request.header("Cache-Control")
+                 val manifest = buildString {
+                     appendLine("#EXTM3U")
+                     repeat(170) { index ->
+@@ -115,7 +117,8 @@ class NavigationChromeDownloadHlsRecoveryTest {
+         }.exceptionOrNull()
+         assertTrue(failure is DownloadHlsSegments.Failure)
+         assertEquals(2, refreshes)
+-        assertEquals(listOf(null, "no-cache", "no-cache"), deniedRequests)
++        assertEquals(listOf(null, "no-cache", "no-cache"), manifestPolicies)
++        assertEquals(listOf(null, null, null), deniedRequests)
+         val original = cache.listFiles()!!.single()
+         assertEquals(listOf(1080, 720), DownloadQualitySelector.availableHeights(source, hosters))
+         assertEquals(null, DownloadQualitySelector.pickExact(source, hosters, 360))
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRedirectTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRedirectTest.kt
+index c170029..9570acb 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRedirectTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRedirectTest.kt
+@@ -88,7 +88,14 @@ class NavigationChromeDownloadHlsRedirectTest {
+             }
+         }.build()
+         val failure = runCatching {
+-            DownloadHlsSegments.prepare(client, "MissAV", "$base/m3u8", headersOf(), directory) {}
++            DownloadHlsSegments.prepare(
++                client,
++                "MissAV",
++                "$base/m3u8",
++                headersOf(),
++                directory,
++                onOriginalDenied = { _, _, _ -> throw AssertionError("A denied key must not arm a media comparison") },
++            ) {}
+         }.exceptionOrNull() as DownloadHlsSegments.Failure
+         assertEquals(403, failure.httpStatus)
+         assertEquals(65_500L, failure.startMillis)
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRepairTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRepairTest.kt
+index c21c3d9..29d26a7 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRepairTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRepairTest.kt
+@@ -178,13 +178,20 @@ class NavigationChromeDownloadHlsRepairTest {
+             val response = Response.Builder().request(req).protocol(Protocol.HTTP_1_1).message("fixture")
+             if (req.url.encodedPath == "/m3u8") {
+                 val track = req.url.queryParameter("track")
++                if (track == "low") {
++                    assertTrue(req.cacheControl.noCache)
++                    assertTrue(req.cacheControl.noStore)
++                }
+                 val lines = (0..5).joinToString("\n") { "#EXTINF:2,\n/segment?url=https://example.test/$track/$it" }
+                 response.code(200).body("#EXTM3U\n$lines\n#EXT-X-ENDLIST\n".toResponseBody()).build()
+             } else {
+                 val resource = req.url.queryParameter("url")!!.toHttpUrl().pathSegments.joinToString("/")
+                 requests += resource
+                 val low = resource.startsWith("low/")
+-                if (low) assertEquals("donor", req.header("X-Track"))
++                if (low) {
++                    assertEquals("donor", req.header("X-Track"))
++                    assertEquals("no-store", req.header("Cache-Control"))
++                }
+                 val denied = resource in listOf("high/1", "high/4") || (denyLow && resource == "low/4")
+                 val ts = ByteArray(188 * 4) {
+                     when (it % 188) {
+@@ -208,7 +215,7 @@ class NavigationChromeDownloadHlsRepairTest {
+             } else {
+                 {
+                     lookups++
+-                    DownloadHlsSegments.RepairTrack(720, "http://localhost:1234/m3u8?track=low", headersOf("X-Track", "donor"))
++                    DownloadHlsSegments.RepairTrack(720, "http://localhost:1234/m3u8?track=low", headersOf("X-Track", "donor", "Cache-Control", "no-store"))
+                 }
+             },
+         ) {}
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsSegmentsTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsSegmentsTest.kt
+index ef28eb6..c8c9101 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsSegmentsTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsSegmentsTest.kt
+@@ -237,6 +237,41 @@ class NavigationChromeDownloadHlsSegmentsTest {
+         assertTrue(cache.listFiles().orEmpty().isEmpty())
+     }
+ 
++    @Test
++    fun `refresh preserves the sources cache contract and only watches a named original media denial`() = withCache { cache ->
++        val sourcePolicies = listOf(null, "private, max-age=15", "no-store", "no-cache", "only-if-cached")
++        for ((index, policy) in sourcePolicies.withIndex()) {
++            val origin = "https://example.test/media-$index"
++            val denied = mutableListOf<Triple<Int, Long, String>>()
++            val sourceHeaders = if (policy == null) headersOf() else headersOf("Cache-Control", policy)
++            val client = client { chain ->
++                val req = chain.request()
++                if (req.url.encodedPath == "/m3u8") {
++                    assertEquals(policy == "only-if-cached", req.cacheControl.onlyIfCached)
++                    assertEquals(policy != "only-if-cached", req.cacheControl.noCache)
++                    if (policy != null) assertTrue(req.header("Cache-Control")!!.contains(policy))
++                    response(chain, "#EXTM3U\n#EXTINF:4,\n/segment?url=$origin&key=https://example.test/key\n#EXT-X-ENDLIST\n".toByteArray())
++                } else {
++                    assertEquals(sourceHeaders.values("Cache-Control"), req.headers.values("Cache-Control"))
++                    response(chain, "Upstream 403 for $origin\n".toByteArray(), 403)
++                }
++            }
++            val failure = runCatching {
++                DownloadHlsSegments.prepare(
++                    client,
++                    "MissAV",
++                    "http://localhost:1234/m3u8?url=$index",
++                    sourceHeaders,
++                    File(cache, "$index"),
++                    forceNetwork = true,
++                    onOriginalDenied = { n, ms, url -> denied += Triple(n, ms, url.toString()) },
++                ) {}
++            }.exceptionOrNull() as DownloadHlsSegments.Failure
++            assertEquals(403, failure.httpStatus)
++            assertEquals(listOf(Triple(1, 0L, origin)), denied)
++        }
++    }
++
+     private fun withCache(block: suspend (File) -> Unit) = runBlocking {
+         val cache = createTempDirectory("hls-segments-test").toFile()
+         try {
+diff --git a/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt b/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt
+index 20d1dfa..c985540 100644
+--- a/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt
++++ b/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt
+@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.network
+ 
+ import android.content.Context
+ import eu.kanade.tachiyomi.network.interceptor.CloudflareInterceptor
++import eu.kanade.tachiyomi.network.interceptor.HlsPlaybackComparison
+ import eu.kanade.tachiyomi.network.interceptor.HlsPlaylistRedirectInterceptor
+ import eu.kanade.tachiyomi.network.interceptor.HlsRepairResponseInterceptor
+ import eu.kanade.tachiyomi.network.interceptor.IgnoreGzipInterceptor
+@@ -56,6 +57,7 @@ import kotlin.random.Random
+                     maxSize = 5L * 1024 * 1024, // 5 MiB
+                 ),
+             )
++            .addInterceptor(HlsPlaybackComparison.shared)
+             .addInterceptor(HlsPlaylistRedirectInterceptor)
+             .addInterceptor(HlsRepairResponseInterceptor)
+             .addInterceptor(SourceRevalidationInterceptor)
+diff --git a/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/HlsPlaybackComparison.kt b/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/HlsPlaybackComparison.kt
+new file mode 100644
+index 0000000..42c10e9
+--- /dev/null
++++ b/core/common/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/HlsPlaybackComparison.kt
+@@ -0,0 +1,102 @@
++package eu.kanade.tachiyomi.network.interceptor
++
++import okhttp3.HttpUrl
++import okhttp3.Interceptor
++import okhttp3.Response
++import okio.ByteString
++import okio.ByteString.Companion.encodeUtf8
++import java.util.concurrent.TimeUnit
++
++/** Passively compare a denied download with a later online playback request for the exact resource. */
++class HlsPlaybackComparison(private val nanoTime: () -> Long = System::nanoTime) : Interceptor {
++    data class Match(
++        val segment: Int,
++        val startMillis: Long,
++        val status: Int,
++        val networkStatus: Int?,
++        val cached: Boolean,
++        val redirected: Boolean,
++    )
++
++    private data class Track(val episode: Long, val height: Int)
++    private data class Gap(val digest: ByteString, val segment: Int, val startMillis: Long, val recorded: Long)
++    private class Player(val owner: Any, val track: Track, val report: (Match) -> Unit)
++
++    // Only digests of denied upstream media addresses are held in memory. Keep the first few visible gaps.
++    private val gaps = LinkedHashMap<Track, MutableList<Gap>>(4, 0.75f, true)
++
++    @Volatile private var player: Player? = null
++    private var activeDownloads = 0
++    private var generation = 0L
++
++    @Synchronized
++    fun remember(episode: Long, height: Int, segment: Int, startMillis: Long, url: HttpUrl) {
++        val now = nanoTime()
++        val group = gaps.getOrPut(Track(episode, height)) { mutableListOf() }
++        group.removeAll { now - it.recorded >= LIFETIME || it.segment == segment }
++        group += Gap(url.toString().encodeUtf8().sha256(), segment, startMillis, now)
++        group.sortBy { it.segment }
++        if (group.size > 8) group.removeAt(group.lastIndex)
++        if (gaps.size > 4) gaps.remove(gaps.keys.first())
++    }
++
++    @Synchronized
++    fun openPlayer(owner: Any, episode: Long, height: Int, report: (Match) -> Unit): Int {
++        val track = Track(episode, height)
++        player = Player(owner, track, report)
++        return gaps[track].orEmpty().count { nanoTime() - it.recorded < LIFETIME }
++    }
++
++    @Synchronized
++    fun closePlayer(owner: Any) {
++        if (player?.owner === owner) player = null
++    }
++
++    suspend fun <T> duringDownload(read: suspend () -> T): T {
++        synchronized(this) {
++            activeDownloads++
++            generation++
++        }
++        try {
++            return read()
++        } finally {
++            synchronized(this) { activeDownloads-- }
++        }
++    }
++
++    override fun intercept(chain: Interceptor.Chain): Response {
++        val request = chain.request()
++        val session = player
++        if (session == null || request.method != "GET") return chain.proceed(request)
++        val candidate = synchronized(this) {
++            val group = gaps[session.track]
++            if (player !== session || activeDownloads != 0 || group.isNullOrEmpty()) return@synchronized null
++            val hash = request.url.toString().encodeUtf8().sha256()
++            group.firstOrNull { it.digest == hash && nanoTime() - it.recorded < LIFETIME }?.let { it to generation }
++        }
++        val response = chain.proceed(request)
++        if (candidate != null) {
++            val (gap, before) = candidate
++            val matched = synchronized(this) {
++                player === session && generation == before && gaps[session.track]?.remove(gap) == true
++            }
++            if (matched) {
++                val match = Match(
++                    gap.segment,
++                    gap.startMillis,
++                    response.code,
++                    networkStatus = response.networkResponse?.code,
++                    cached = response.cacheResponse != null,
++                    redirected = response.request.url != request.url,
++                )
++                session.report(match)
++            }
++        }
++        return response
++    }
++
++    companion object {
++        val shared = HlsPlaybackComparison()
++        private val LIFETIME = TimeUnit.MINUTES.toNanos(30)
++    }
++}
