@@ -1,0 +1,645 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xun2202 <98207886+Xun2202@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 18:43:30 +0000
+Subject: [PATCH] downloads: recover originals before gap fallback and retire
+ committed queue items
+
+---
+ .../data/download/DownloadHlsRepairPlan.kt    |   8 +
+ .../data/download/DownloadHlsSegments.kt      | 245 ++++++++++++++----
+ .../data/download/DownloadQueueConcurrency.kt |   9 +
+ .../tachiyomi/data/download/Downloader.kt     |  30 ++-
+ .../tachiyomi/ui/download/DownloadHolder.kt   |   2 +
+ .../NavigationChromeDownloadHlsRepairTest.kt  |  73 +++++-
+ ...ationChromeDownloadQueueConcurrencyTest.kt |  26 ++
+ 7 files changed, 323 insertions(+), 70 deletions(-)
+
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsRepairPlan.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsRepairPlan.kt
+index 367e5aa..6e52afa 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsRepairPlan.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsRepairPlan.kt
+@@ -34,6 +34,14 @@ internal object DownloadHlsRepairPlan {
+         return parts
+     }
+ 
++    /** Lower fragments needed to cover one original, including when their boundaries differ. */
++    fun covering(times: LongArray, start: Long, end: Long): IntRange {
++        if (start < times.first() - BOUNDARY_TOLERANCE_MS || end > times.last() + BOUNDARY_TOLERANCE_MS) return IntRange.EMPTY
++        val first = alignedBoundary(times, start) ?: (-times.binarySearch(start) - 2)
++        val after = alignedBoundary(times, end) ?: (-times.binarySearch(end) - 1)
++        return first.coerceAtLeast(0) until after.coerceAtMost(times.lastIndex)
++    }
++
+     private fun alignedBoundary(times: LongArray, at: Long): Int? {
+         val found = times.binarySearch(at)
+         if (found >= 0) return found
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+index 4646f40..f319085 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadHlsSegments.kt
+@@ -82,6 +82,8 @@ internal object DownloadHlsSegments {
+         }
+     }
+ 
++    private class InvalidMedia(message: String) : IOException(message)
++
+     private data class Segment(val url: HttpUrl, val seconds: BigDecimal, val millis: Long)
+ 
+     private data class LocalPart(val segment: Segment, val file: File, val lower: Boolean = false)
+@@ -156,6 +158,8 @@ internal object DownloadHlsSegments {
+         onCacheReady: (CacheStatus) -> Unit = {},
+         onRedirect: (Int) -> Unit = {},
+         onOriginalDenied: (segment: Int, startMillis: Long, media: HttpUrl) -> Unit = { _, _, _ -> },
++        onOriginalCheck: (tried: Int, recovered: Int, covered: Int) -> Unit = { _, _, _ -> },
++        onRepairDenied: (height: Int, segment: Int, startMillis: Long, media: HttpUrl) -> Unit = { _, _, _, _ -> },
+         onProgress: (Progress) -> Unit,
+     ): Prepared? = try {
+         withContext(Dispatchers.IO) {
+@@ -240,11 +244,16 @@ internal object DownloadHlsSegments {
+             if (missing.isNotEmpty() && originalInput.exists() && !originalInput.delete()) throw Failure("Cannot invalidate incomplete local HLS plan")
+             val original = segments.mapIndexed { index, segment -> LocalPart(segment, segmentFile(directory, index)) }
+             val track = if (repair != null && missing.isNotEmpty()) {
+-                if (missing.size == segments.size) throw Failure("没有可保留的原画质分片。请先继续原任务，或选择更换整集画质。")
++                if (missing.size == segments.size && original.none { it.file.isFile }) throw Failure("没有可保留的原画质分片。请先继续原任务，或选择更换整集画质。")
+                 repair()
+             } else {
+                 null
+             }
++            val donorChecks = mutableMapOf<File, Boolean>()
++            suspend fun validDonor(file: File) = donorChecks.getOrPut(file) {
++                DownloadHlsRepairTransport.packetized(file, checkNotNull(validationBuffer))
++            }
++            var carriedNetwork = 0L
+             val parts = if (track != null) {
+                 val lowerUrl = localManifest(track.url) ?: throw Failure("所选画质没有可对应的点播清单")
+                 val lower = try {
+@@ -257,34 +266,79 @@ internal object DownloadHlsSegments {
+                 } catch (_: ArithmeticException) {
+                     throw Failure("所选画质的时长无效")
+                 }
+-                val mapping = DownloadHlsRepairPlan.match(originalTimes, lowerTimes, missing)
+-                    ?: throw Failure("两个画质的缺口时间边界不一致。原分片已保留，可选其他画质。")
+                 val cache = repairDirectory(directory, lower, track)
+-                onRepair(track.height, missing.size, mapping.count { it.lower })
+-                mapping.map { (index, useLower) ->
+-                    if (useLower) LocalPart(lower[index], segmentFile(cache, index), lower = true) else original[index]
++                val counted = BitSet(lower.size)
++                val probes = mutableListOf<Int>()
++                var covered = 0
++                val originalState = ProgressState(totalMillis, segments.size, onProgress)
++                for ((i, part) in original.withIndex()) {
++                    if (i !in missing) {
++                        originalState.complete(part.file.length(), part.segment.millis, notify = false)
++                        continue
++                    }
++                    val range = DownloadHlsRepairPlan.covering(lowerTimes, originalTimes[i], originalTimes[i + 1])
++                    val hasDonor = !range.isEmpty() && range.all { j -> validDonor(segmentFile(cache, j)) }
++                    if (hasDonor) {
++                        // One donor may cover multiple originals. Count its storage only once.
++                        var bytes = 0L
++                        for (j in range) {
++                            if (!counted[j]) {
++                                bytes += segmentFile(cache, j).length()
++                                counted.set(j)
++                            }
++                        }
++                        originalState.complete(bytes, part.segment.millis, notify = false)
++                        covered++
++                    } else if (!unavailableMarker(part.file).exists()) {
++                        probes += i
++                    }
++                }
++                originalState.report()
++                val restored = recoverOriginals(
++                    client,
++                    original,
++                    originalTimes,
++                    headers,
++                    probes,
++                    originalState,
++                    onOriginalDenied,
++                    onOriginalResponse,
++                )
++                missing.removeAll(restored)
++                carriedNetwork = originalState.snapshot().networkBytes
++                onOriginalCheck(probes.size, restored.size, covered)
++                if (missing.isEmpty()) {
++                    original
++                } else {
++                    val mapping = DownloadHlsRepairPlan.match(originalTimes, lowerTimes, missing)
++                        ?: throw Failure("两个画质的缺口时间边界不一致。原分片已保留，可选其他画质。")
++                    onRepair(track.height, missing.size, mapping.count { it.lower })
++                    mapping.map { (index, useLower) ->
++                        if (useLower) LocalPart(lower[index], segmentFile(cache, index), lower = true) else original[index]
++                    }
+                 }
+             } else {
+                 original
+             }
++            val mixed = parts.any { it.lower }
+             val mediaHeaders = track?.headers ?: headers
+             val starts = if (track == null) originalTimes else DownloadHlsRepairPlan.boundaries(parts.map { it.segment.seconds })
+-            val state = ProgressState(totalMillis, parts.size, onProgress)
++            val state = ProgressState(totalMillis, parts.size, onProgress, carriedNetwork)
+             val pending = mutableListOf<Int>()
+             parts.forEachIndexed { index, part ->
+-                val present = if (part.lower) DownloadHlsRepairTransport.packetized(part.file, checkNotNull(validationBuffer)) else track != null || index !in missing
++                val present = if (part.lower) validDonor(part.file) else track != null || index !in missing
+                 if (present) state.complete(part.file.length(), part.segment.millis, notify = false) else pending += index
+             }
+             state.report()
+-            val input = if (track == null) originalInput else File(directory, "repaired.m3u8")
+-            val history = if (track == null) File(directory, "deferred.bin") else File(parts.first { it.lower }.file.parentFile, "repair-deferred.bin")
++            val input = if (!mixed) originalInput else File(directory, "repaired.m3u8")
++            val history = if (!mixed) File(directory, "deferred.bin") else File(parts.first { it.lower }.file.parentFile, "repair-deferred.bin")
+             val pass = SegmentPass(pending, parts.size, history, onFirstGap)
+             coroutineScope {
+                 repeat(minOf(SEGMENT_WORKERS, pending.size)) {
+                     launch {
+                         while (true) {
+                             val index = pass.nextSegment() ?: break
+-                            val (segment, file) = parts[index]
++                            val file = parts[index].file
+                             val rejected = File(file.parentFile, "${file.name}.invalid")
+                             val checkPackets = track != null || rejected.exists()
+                             var failure: IOException? = null
+@@ -292,48 +346,16 @@ internal object DownloadHlsSegments {
+                             for (attempt in 0..2) {
+                                 attempts++
+                                 ensureActive()
+-                                val partial = File(file.parentFile, "${file.name}.part")
+                                 try {
+-                                    val upstream = if (checkPackets && segment.url.queryParameter("key") == null) {
+-                                        segment.url.queryParameter("url")?.toHttpUrlOrNull()
+-                                    } else {
+-                                        null
+-                                    }
+-                                    HlsRepairResponseInterceptor.during(upstream, File(file.parentFile, "${file.name}.source.part")) { original ->
+-                                        fetch(client, Request.Builder().url(segment.url).headers(mediaHeaders).build()) { response ->
+-                                            if (!response.isSuccessful) {
+-                                                throw segmentFailure(response) { url ->
+-                                                    if (track == null) onOriginalDenied(index + 1, starts[index], url)
+-                                                }
+-                                            }
+-                                            val expected = response.body.contentLength()
+-                                            var count = 0L
+-                                            partial.outputStream().use { output ->
+-                                                response.body.byteStream().use { input ->
+-                                                    val buffer = ByteArray(32 * 1024)
+-                                                    while (true) {
+-                                                        ensureActive()
+-                                                        val read = input.read(buffer)
+-                                                        if (read < 0) break
+-                                                        count += read
+-                                                        state.received(read.toLong())
+-                                                        output.write(buffer, 0, read)
+-                                                    }
+-                                                }
+-                                            }
+-                                            if (count == 0L || (expected >= 0 && expected != count) || (!checkPackets && !validTs(partial))) {
+-                                                throw Failure("Invalid or incomplete HLS TS segment")
+-                                            }
+-                                        }
+-                                        if (checkPackets) {
+-                                            if (DownloadHlsRepairTransport.restoreIntactResponse(partial, original())) onOriginalResponse(index + 1)
+-                                            if (!DownloadHlsRepairTransport.packetized(partial)) throw Failure("来源返回的补缺分片不完整，其他分片已保留")
++                                    fetchPart(client, parts[index], mediaHeaders, checkPackets, state, onIntact = { onOriginalResponse(index + 1) }) { url ->
++                                        if (track == null) {
++                                            onOriginalDenied(index + 1, starts[index], url)
++                                        } else {
++                                            onRepairDenied(track.height, index + 1, starts[index], url)
+                                         }
+-                                        ensureActive()
+-                                        if (!partial.renameTo(file)) throw Failure("Cannot finalize HLS segment cache")
+-                                        if (checkPackets && rejected.exists()) rejected.delete()
+                                     }
+-                                    state.complete(file.length(), segment.millis)
++                                    if (track == null) unavailableMarker(file).delete()
++                                    state.complete(file.length(), parts[index].segment.millis)
+                                     pass.completed(index)
+                                     failure = null
+                                     break
+@@ -342,6 +364,17 @@ internal object DownloadHlsSegments {
+                                 } catch (error: IOException) {
+                                     ensureActive()
+                                     failure = error
++                                    if (error is Failure && unavailable(error)) {
++                                        if (track == null) {
++                                            markUnavailable(file)
++                                        } else {
++                                            // Both renditions can recover independently. A later manual resume can
++                                            // recheck the original of this gap while keeping other completed donors.
++                                            for (i in DownloadHlsRepairPlan.covering(originalTimes, starts[index], starts[index + 1])) {
++                                                unavailableMarker(original[i].file).delete()
++                                            }
++                                        }
++                                    }
+                                     if (error is Failure && error.httpStatus != null && error.httpStatus !in setOf(408, 429, 500, 502, 503, 504)) break
+                                     if (attempt < 2) delay((attempt + 1) * 1000L)
+                                 }
+@@ -385,7 +418,7 @@ internal object DownloadHlsSegments {
+                 }
+                 if (!partial.renameTo(input)) throw Failure("Cannot finalize local HLS plan")
+             }
+-            val switches = if (track == null) {
++            val switches = if (!mixed) {
+                 emptyList()
+             } else {
+                 parts.mapIndexedNotNull { index, part ->
+@@ -430,6 +463,112 @@ internal object DownloadHlsSegments {
+ 
+     private fun BigDecimal.toMillis(): Long = movePointRight(3).setScale(0, RoundingMode.HALF_UP).longValueExact()
+ 
++    private suspend fun recoverOriginals(
++        client: OkHttpClient,
++        original: List<LocalPart>,
++        times: LongArray,
++        headers: Headers,
++        probes: List<Int>,
++        state: ProgressState,
++        onDenied: (Int, Long, HttpUrl) -> Unit,
++        onIntact: (Int) -> Unit,
++    ): Set<Int> = coroutineScope {
++        val remaining = ArrayDeque(probes)
++        val restored = mutableSetOf<Int>()
++        var consecutiveDenials = 0
++        repeat(minOf(SEGMENT_WORKERS, probes.size)) {
++            launch {
++                while (true) {
++                    val i = synchronized(remaining) {
++                        if (probes.size > 32 && remaining.isNotEmpty() && consecutiveDenials >= MAX_CONSECUTIVE_DENIALS * 2) {
++                            throw Failure("原画质连续被拒，还有 ${remaining.size} 片待核对。已下载分片会保留，可稍后继续。")
++                        }
++                        remaining.removeFirstOrNull()
++                    } ?: break
++                    val part = original[i]
++                    try {
++                        fetchPart(client, part, headers, true, state, onIntact = { onIntact(i + 1) }) { onDenied(i + 1, times[i], it) }
++                    } catch (error: IOException) {
++                        if (!unavailable(error)) throw error
++                        markUnavailable(part.file)
++                        synchronized(remaining) {
++                            consecutiveDenials = if (error is Failure && error.httpStatus == 403) consecutiveDenials + 1 else 0
++                        }
++                        continue
++                    }
++                    synchronized(remaining) {
++                        consecutiveDenials = 0
++                        restored += i
++                    }
++                    state.complete(part.file.length(), part.segment.millis)
++                }
++            }
++        }
++        restored
++    }
++
++    private suspend fun fetchPart(
++        client: OkHttpClient,
++        part: LocalPart,
++        mediaHeaders: Headers,
++        checkPackets: Boolean,
++        state: ProgressState,
++        onIntact: () -> Unit,
++        onDenied: (HttpUrl) -> Unit,
++    ) {
++        val (segment, file) = part
++        val context = currentCoroutineContext()
++        val rejected = File(file.parentFile, "${file.name}.invalid")
++        val partial = File(file.parentFile, "${file.name}.part")
++        val upstream = if (checkPackets && segment.url.queryParameter("key") == null) {
++            segment.url.queryParameter("url")?.toHttpUrlOrNull()
++        } else {
++            null
++        }
++        HlsRepairResponseInterceptor.during(upstream, File(file.parentFile, "${file.name}.source.part")) { original ->
++            fetch(client, Request.Builder().url(segment.url).headers(mediaHeaders).build()) { response ->
++                if (!response.isSuccessful) throw segmentFailure(response, onDenied)
++                val expected = response.body.contentLength()
++                var count = 0L
++                partial.outputStream().use { output ->
++                    response.body.byteStream().use { input ->
++                        val buffer = ByteArray(32 * 1024)
++                        while (true) {
++                            context.ensureActive()
++                            val read = input.read(buffer)
++                            if (read < 0) break
++                            count += read
++                            state.received(read.toLong())
++                            output.write(buffer, 0, read)
++                        }
++                    }
++                }
++                if (count == 0L || (expected >= 0 && expected != count)) throw EOFException("Incomplete HLS TS segment")
++                if (!checkPackets && !validTs(partial)) throw InvalidMedia("Invalid or incomplete HLS TS segment")
++            }
++            if (checkPackets) {
++                if (DownloadHlsRepairTransport.restoreIntactResponse(partial, original())) onIntact()
++                if (!DownloadHlsRepairTransport.packetized(partial)) throw InvalidMedia("来源返回的分片不完整，其他分片已保留")
++            }
++            context.ensureActive()
++            if (!partial.renameTo(file)) throw Failure("Cannot finalize HLS segment cache")
++            if (checkPackets && rejected.exists()) rejected.delete()
++        }
++    }
++
++    private fun unavailable(error: IOException) = error is InvalidMedia || (error is Failure && error.httpStatus in setOf(403, 404, 410))
++
++    private fun unavailableMarker(file: File) = File(file.parentFile, "${file.name}.unavailable")
++
++    private fun markUnavailable(file: File) {
++        // A scheduling hint only. Explicit original-quality retries always fetch the original again.
++        try {
++            unavailableMarker(file).createNewFile()
++        } catch (_: IOException) {
++            // A later repair can recheck this original if the hint was not saved.
++        }
++    }
++
+     private fun segmentFailure(response: Response, onDeniedMedia: (HttpUrl) -> Unit): Failure {
+         val code = response.code
+         if (code != 401 && code != 403 && code != 404) return Failure("HLS segment HTTP $code", code)
+@@ -732,9 +871,9 @@ internal object DownloadHlsSegments {
+         }
+     }
+ 
+-    private class ProgressState(private val total: Long, private val segmentCount: Int, private val callback: (Progress) -> Unit) {
++    private class ProgressState(private val total: Long, private val segmentCount: Int, private val callback: (Progress) -> Unit, initialNetwork: Long = 0L) {
+         private var bytes = 0L
+-        private var network = 0L
++        private var network = initialNetwork
+         private var millis = 0L
+         private var completed = 0
+         private var lastReport = 0L
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt
+index 3287dcc..df1a770 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadQueueConcurrency.kt
+@@ -32,6 +32,15 @@ internal object DownloadQueueConcurrency {
+         }
+     }
+ 
++    /** A committed file must leave the queue even when rescheduling cancels its worker during cleanup. */
++    suspend fun runWorker(download: Download, transfer: suspend () -> Unit, removeCompleted: () -> Unit) {
++        try {
++            transfer()
++        } finally {
++            if (download.status == Download.State.DOWNLOADED) removeCompleted()
++        }
++    }
++
+     /** Reconcile by immutable episode id; a reduced limit pauses excess jobs before replacements. */
+     class Workers(private val canStart: (Download) -> Boolean = { true }) {
+         private val mutex = Mutex()
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+index 85989f0..42df2fe 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt
+@@ -477,14 +477,12 @@ class Downloader(
+         try {
+             if (download !in queueState.value || download.status.value > Download.State.DOWNLOADING.value) return@launch
+             logcat(LogPriority.INFO) { "Download worker started episode=${download.episode.id}" }
+-            downloadEpisode(download)
+-            ensureActive()
+-
+-            // Remove successful download from queue
+-            if (download.status == Download.State.DOWNLOADED) {
+-                val ticket = systemTransfers.ticket(download.episode.id)
+-                removeFromQueue(download)
+-                if (ticket != null) systemTransfers.cleanup(ticket)
++            DownloadQueueConcurrency.runWorker(download, transfer = { downloadEpisode(download) }) {
++                if (queueState.value.any { it === download }) {
++                    val ticket = systemTransfers.ticket(download.episode.id)
++                    removeFromQueue(download)
++                    if (ticket != null) systemTransfers.cleanup(ticket)
++                }
+             }
+         } catch (e: Throwable) {
+             if (e is CancellationException) {
+@@ -888,7 +886,8 @@ class Downloader(
+             return videoFile
+         }
+ 
+-        download.progress = 0
++        // A resumable transfer keeps its last estimate until the verified cache can report a new one.
++        if (!internal || download.selectedQualityHeight == null || !DownloadHlsSegments.handlesSource(download.source.name)) download.progress = 0
+         notifier.onProgressChange(download, remainingDownloads())
+         if (internal) {
+             if (completedCache == null) {
+@@ -1144,6 +1143,14 @@ class Downloader(
+             onOriginalResponse = { segment ->
+                 logcat(LogPriority.INFO) { "Download HLS intact source bytes episode=${download.episode.id} repairSegment=$segment" }
+             },
++            onOriginalCheck = { tried, recovered, covered ->
++                logcat(LogPriority.INFO) {
++                    "Download HLS original check episode=${download.episode.id} tried=$tried recovered=$recovered coveredByCachedLower=$covered"
++                }
++            },
++            onRepairDenied = { height, segment, startMillis, media ->
++                HlsPlaybackComparison.shared.remember(download.episode.id, height, segment, startMillis, media)
++            },
+             onOriginalDenied = { segment, startMillis, media ->
+                 download.selectedQualityHeight?.let { height ->
+                     HlsPlaybackComparison.shared.remember(download.episode.id, height, segment, startMillis, media)
+@@ -1641,12 +1648,13 @@ class Downloader(
+     }
+ 
+     private fun removeFromQueue(download: Download) {
+-        _queueState.update {
++        _queueState.update { queue ->
++            if (queue.none { it === download }) return@update queue
+             store.remove(download)
+             if (download.status == Download.State.DOWNLOADING || download.status == Download.State.QUEUE) {
+                 download.status = Download.State.NOT_DOWNLOADED
+             }
+-            it - download
++            queue.filterNot { it === download }
+         }
+     }
+ 
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
+index c96e46a..f5f8502 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/download/DownloadHolder.kt
+@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.ui.download
+ 
+ import android.text.format.Formatter
+ import android.view.View
++import androidx.core.view.isVisible
+ import androidx.recyclerview.widget.ItemTouchHelper
+ import androidx.recyclerview.widget.RecyclerView
+ import eu.davidea.viewholders.FlexibleViewHolder
+@@ -122,6 +123,7 @@ class DownloadHolder(private val view: View, val adapter: DownloadAdapter) :
+         binding.toggleDownload.contentDescription = view.context.stringResource(
+             if (canPause) AMR.strings.harmony_download_pause else AMR.strings.harmony_download_resume,
+         )
++        binding.toggleDownload.isVisible = download.status != Download.State.DOWNLOADED
+         binding.toggleDownload.isEnabled = download.status != Download.State.DOWNLOADED
+         // Harmony: error notifications are not shown inside 卓易通, so put the reason in the row itself.
+         val error = download.error.takeIf { download.status == Download.State.ERROR }
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRepairTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRepairTest.kt
+index 29d26a7..c357c97 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRepairTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadHlsRepairTest.kt
+@@ -169,9 +169,64 @@ class NavigationChromeDownloadHlsRepairTest {
+         assertFalse(temporary.exists())
+     }
+ 
++    @Test
++    fun `an interrupted original read never switches quality and a recovered original can finish without donors`() = runTest {
++        val paths = ConcurrentLinkedQueue<String>()
++        val ts = ByteArray(188 * 4) {
++            if (it % 188 == 0) {
++                0x47
++            } else if (it % 188 == 3) {
++                0x10
++            } else {
++                4
++            }
++        }
++        var truncated = false
++        val client = OkHttpClient.Builder().addInterceptor { chain ->
++            val req = chain.request()
++            val reply = Response.Builder().request(req).protocol(Protocol.HTTP_1_1).message("test")
++            if (req.url.encodedPath == "/m3u8") {
++                val track = req.url.queryParameter("track")
++                reply.code(200).body("#EXTM3U\n#EXTINF:4,\n/segment?url=https://example.test/$track/0\n#EXTINF:4,\n/segment?url=https://example.test/$track/1\n#EXT-X-ENDLIST\n".toResponseBody()).build()
++            } else {
++                val path = req.url.queryParameter("url")!!.toHttpUrl().encodedPath
++                paths += path
++                val bytes = if (truncated && path.endsWith("/1")) byteArrayOf() else ts
++                reply.code(200).body(bytes.toResponseBody()).build()
++            }
++        }.build()
++        suspend fun prepare(repair: Boolean) = DownloadHlsSegments.prepare(
++            client,
++            "MissAV",
++            "http://localhost:1234/m3u8?track=high",
++            headersOf(),
++            root,
++            repair = if (repair) {
++                { DownloadHlsSegments.RepairTrack(720, "http://localhost:1234/m3u8?track=low", headersOf()) }
++            } else {
++                null
++            },
++        ) {}!!
++        val directory = prepare(false).directory
++        File(directory, "00001.ts").appendBytes(byteArrayOf(0))
++        paths.clear()
++        truncated = true
++        assertTrue(runCatching { prepare(true) }.isFailure)
++        assertEquals(listOf("/high/1"), paths.toList())
++        assertFalse(File(directory, "00001.ts.unavailable").exists())
++        truncated = false
++        paths.clear()
++        val ready = prepare(true)
++        assertEquals(listOf("/high/1"), paths.toList())
++        assertEquals("input.m3u8", ready.input.name)
++        assertTrue(ready.switches.isEmpty())
++        assertTrue(File(directory, "00001.ts").readBytes().contentEquals(ts))
++    }
++
+     @Test
+     fun `manual alternate fills only holes survives a retry and never enters the original cache`() = runTest {
+         val requests = ConcurrentLinkedQueue<String>()
++        val deniedDonors = ConcurrentLinkedQueue<Triple<Int, Int, Long>>()
+         var denyLow = true
+         val client = OkHttpClient.Builder().addInterceptor { chain ->
+             val req = chain.request()
+@@ -200,7 +255,8 @@ class NavigationChromeDownloadHlsRepairTest {
+                         else -> if (low) 2 else 1
+                     }
+                 }
+-                response.code(if (denied) 403 else 200).body(ts.toResponseBody()).build()
++                val body = if (denied) "Upstream 403 for ${req.url.queryParameter("url")}\n".toResponseBody() else ts.toResponseBody()
++                response.code(if (denied) 403 else 200).body(body).build()
+             }
+         }.build()
+         var lookups = 0
+@@ -218,6 +274,7 @@ class NavigationChromeDownloadHlsRepairTest {
+                     DownloadHlsSegments.RepairTrack(720, "http://localhost:1234/m3u8?track=low", headersOf("X-Track", "donor", "Cache-Control", "no-store"))
+                 }
+             },
++            onRepairDenied = { height, segment, ms, _ -> deniedDonors += Triple(height, segment, ms) },
+         ) {}
+         assertTrue(runCatching { prepare(true) }.isFailure)
+         assertEquals(0, lookups)
+@@ -227,6 +284,7 @@ class NavigationChromeDownloadHlsRepairTest {
+         requests.clear()
+         val error = runCatching { prepare(true) }.exceptionOrNull() as DownloadHlsSegments.Failure
+         assertEquals(720, error.repairHeight, error.message)
++        assertEquals(listOf(Triple(720, 5, 8000L)), deniedDonors.toList())
+         assertEquals(8000L, error.startMillis)
+         assertEquals(listOf("low/1", "low/4"), requests.sorted())
+         assertFalse(File(directory, "repaired.m3u8").exists())
+@@ -234,25 +292,28 @@ class NavigationChromeDownloadHlsRepairTest {
+             DownloadHlsSegments.withAuthorizationRecovery(transfer = { throw error }, refresh = { throw AssertionError("Unexpected high refresh") })
+         }.exceptionOrNull()
+         assertEquals(error, retried)
++        // Legacy .77 caches predate original-denial hints. Reuse the verified lower donor,
++        // checking only the as-yet uncovered interval at original quality before falling back.
++        directory.listFiles()!!.filter { it.name.endsWith(".unavailable") }.forEach { it.delete() }
+         requests.clear()
+         denyLow = false
+         val done = prepare(true)!!
+-        assertEquals(listOf("low/4"), requests.toList())
++        assertEquals(listOf("high/4", "low/4"), requests.toList())
+         assertEquals(4, done.input.readLines().count { it == "#EXT-X-DISCONTINUITY" })
+         val files = done.input.readLines().filter { !it.startsWith("#") }.map { File(directory, it) }
+         assertEquals(listOf(1, 2, 1, 1, 2, 1), files.map { it.readBytes()[1].toInt() })
+         assertFalse(File(directory, "00001.ts").exists())
+         assertFalse(File(directory, "00004.ts").exists())
+         assertFalse(File(directory, "input.m3u8").exists())
+-        // A previously cached original with a truncated packet also needs a replacement. Opting out
+-        // must request the genuine original again rather than treating damaged or lower bytes as original.
++        // A damaged original and an untried hole both get their own original before using any new donor.
+         File(directory, "00002.ts").appendBytes(byteArrayOf(0))
++        assertTrue(File(directory, "00005.ts").delete())
+         requests.clear()
+         assertTrue(prepare(true) != null)
+-        assertEquals(listOf("low/2"), requests.sorted())
++        assertEquals(listOf("high/2", "high/5"), requests.sorted())
+         requests.clear()
+         assertTrue(runCatching { prepare(false) }.isFailure)
+-        assertEquals(listOf("high/1", "high/2", "high/4"), requests.sorted())
++        assertEquals(listOf("high/1", "high/4"), requests.sorted())
+         assertFalse(File(directory, "00002.ts.invalid").exists())
+     }
+ }
+diff --git a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt
+index 5b4f85b..1030e87 100644
+--- a/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt
++++ b/app/src/test/java/eu/kanade/tachiyomi/data/download/NavigationChromeDownloadQueueConcurrencyTest.kt
+@@ -118,6 +118,32 @@ class NavigationChromeDownloadQueueConcurrencyTest {
+         }
+     }
+ 
++    @Test
++    fun `rescheduling after storage commit removes the completed episode and keeps incomplete work`() = runBlocking {
++        val src = source(1, "Source")
++        val saved = download(src, 1)
++        val paused = download(src, 2)
++        val queue = mutableListOf(saved, paused)
++        val committed = CompletableDeferred<Unit>()
++        val workers = DownloadQueueConcurrency.Workers()
++        workers.update(listOf(saved, paused)) { item ->
++            launch(start = CoroutineStart.UNDISPATCHED) {
++                DownloadQueueConcurrency.runWorker(item, transfer = {
++                    item.status = Download.State.DOWNLOADING
++                    if (item === saved) {
++                        item.finishSaving()
++                        committed.complete(Unit)
++                    }
++                    awaitCancellation()
++                }) { queue.remove(item) }
++            }
++        }
++        committed.await()
++        workers.update(emptyList()) { error("Unexpected replacement") }
++        assertEquals(listOf(paused), queue)
++        assertEquals(Download.State.DOWNLOADED, saved.status)
++    }
++
+     @Test
+     fun `repeated updates and mutable Video changes never launch an episode twice`() = runBlocking {
+         val owner = SupervisorJob()
