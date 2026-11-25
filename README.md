@@ -58,6 +58,12 @@ Anikku 先在用户选择的 SAF 目录里创建 `Video.tmp`，再把这个 `con
 
 使用系统手势导航时，网页和来源设置列表都可以延伸到屏幕底部的小横杠下方。打开键盘时，页面会给输入法留出空间。来源设置使用与书架相同的磨砂返回栏，滚动到末尾时，最后一项会停在手势条上方。Jellyfin Web 登录页勾选「记住我」后，从同一地址再次进入即可沿用有效的登录会话。
 
+### 通过 SyncYomi 同步视频书架
+
+在「更多 → 设置 → 数据与存储 → 同步」选择 SyncYomi，填写服务器地址和视频专用 API 密钥。在支持 v2 的服务器上使用新密钥时，首次同步发送所选范围的完整书架，平时传输变更的作品、剧集和观看进度。距上次全量核对满 24 小时，或改了同步范围，下次同步会再做一次全量核对。协议一栏显示最近成功使用的版本。在「创建同步触发条件」里开启「资料库变更后同步」，可以将收藏、分类和资料修改合并后上传，也可以手动或定时同步。
+
+漫画与视频各用一把密钥。已有的 v1 视频书架继续使用 v1。要启用 v2，可先备份本机书架，再在支持 v2 的服务端新建空白视频密钥。遇到漫画或混合书架，Anikku 会提示更换密钥。同步包含扩展能提供的作品网页和图片地址，视频与图片文件由下载或归档工具保存。
+
 ## 下载与安装
 
 - 到 [Releases](../../releases) 下载最新的 `Anikku-<tag>-arm64-v8a.apk`（华为设备均为 arm64）。
@@ -155,6 +161,7 @@ Anikku 先在用户选择的 SAF 目录里创建 `Video.tmp`，再把这个 `con
 | [`0045-browse-panorama-refresh-paging-snapshot.patch`](./patches/0045-browse-panorama-refresh-paging-snapshot.patch) | 全景浏览网格在组合阶段捕获分页快照和加载状态，让下一页、刷新及 loading footer 变化使布局缓存失效；仅移植 Mihon 0044 中与本问题相关的处理。 |
 | [`0046-presentation-panorama-readable-auto-columns.patch`](./patches/0046-presentation-panorama-readable-auto-columns.patch) | 按可用宽度、密度与封面比例选列；宽封面紧凑窗口保留两列，窗口高度变化不改列数。 |
 | [`0047-presentation-unify-panorama-surfaces.patch`](./patches/0047-presentation-unify-panorama-surfaces.patch) | 统一书架、浏览、相关推荐的全景宿主、占位、形状采样与有限预读，保留分页及点击回调。 |
+| [0140-syncyomi-v2-anime.patch](./patches/0140-syncyomi-v2-anime.patch) | SyncYomi v2 视频书架、增量同步、密钥隔离与书架变更触发。 |
 
 补丁按 [`patches/series`](./patches/series) 的顺序套用；已被官方合入的补丁会被 `prepare-source.sh` 自动跳过。
 
